@@ -528,7 +528,7 @@ fn discover_base(hosts_file: &Path) -> Vec<Mount> {
             dest: "/lib".into(),
         },
         Mount::Symlink {
-            src: "usr/lib".into(),
+            src: "usr/lib64".into(),
             dest: "/lib64".into(),
         },
         Mount::RoBind {
