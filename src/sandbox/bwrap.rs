@@ -831,6 +831,9 @@ fn project_mount(project_dir: &Path, readonly: bool) -> Vec<Mount> {
 mod tests {
     use super::*;
 
+    // Tests that mutate process-global env vars must hold this lock.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn minimal_test_config() -> Config {
         Config {
             command: vec!["bash".into()],
@@ -998,6 +1001,7 @@ mod tests {
 
     #[test]
     fn bwrap_bin_env_override_is_used() {
+        let _env = ENV_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir()
             .join(format!("ai-jail-bwrap.{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
@@ -1015,6 +1019,7 @@ mod tests {
 
     #[test]
     fn bwrap_bin_env_override_invalid_path_falls_back() {
+        let _env = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var(BWRAP_ENV_VAR, "/definitely/not/a/real/bwrap")
         };
