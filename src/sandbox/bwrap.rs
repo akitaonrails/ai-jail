@@ -168,24 +168,44 @@ impl MountSet {
 
 pub struct SandboxGuard {
     hosts_path: PathBuf,
+    resolv_path: Option<PathBuf>,
+    /// Where to mount the resolv temp file inside the sandbox.
+    /// If /etc/resolv.conf is a symlink, this is the symlink target
+    /// so the symlink inside /etc (from --ro-bind /etc) resolves.
+    /// If it's a regular file, this is /etc/resolv.conf itself.
+    resolv_dest: Option<PathBuf>,
 }
 
 impl SandboxGuard {
     fn hosts_path(&self) -> &Path {
         &self.hosts_path
     }
+
+    fn resolv_mount(&self) -> Option<(&Path, &Path)> {
+        match (&self.resolv_path, &self.resolv_dest) {
+            (Some(src), Some(dest)) => Some((src, dest)),
+            _ => None,
+        }
+    }
 }
 
 impl Drop for SandboxGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.hosts_path);
+        if let Some(ref p) = self.resolv_path {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
 #[cfg(test)]
 impl SandboxGuard {
     fn test_with_hosts(path: PathBuf) -> Self {
-        SandboxGuard { hosts_path: path }
+        SandboxGuard {
+            hosts_path: path,
+            resolv_path: None,
+            resolv_dest: None,
+        }
     }
 }
 
@@ -335,7 +355,76 @@ pub fn prepare() -> Result<SandboxGuard, String> {
     file.sync_all()
         .map_err(|e| format!("Failed to sync temp hosts file: {e}"))?;
 
-    Ok(SandboxGuard { hosts_path: path })
+    let (resolv_path, resolv_dest) = new_resolv_file();
+
+    Ok(SandboxGuard {
+        hosts_path: path,
+        resolv_path,
+        resolv_dest,
+    })
+}
+
+/// Create a temp copy of /etc/resolv.conf and determine where to
+/// mount it inside the sandbox.
+///
+/// If /etc/resolv.conf is a symlink (common on WSL and systemd-resolved),
+/// we mount the temp file at the symlink *target* so the symlink inside
+/// the sandbox (inherited from --ro-bind /etc) resolves correctly.
+/// If it is a regular file, we mount directly over /etc/resolv.conf.
+fn new_resolv_file() -> (Option<PathBuf>, Option<PathBuf>) {
+    let resolv = Path::new("/etc/resolv.conf");
+
+    // Determine where to mount inside the sandbox
+    let dest = match std::fs::read_link(resolv) {
+        Ok(target) => {
+            // Symlink: mount at the target path so the symlink works
+            if target.is_absolute() {
+                target
+            } else {
+                PathBuf::from("/etc").join(target)
+            }
+        }
+        Err(_) => {
+            // Regular file: mount directly over /etc/resolv.conf
+            resolv.to_path_buf()
+        }
+    };
+
+    let contents = match std::fs::read(resolv) {
+        Ok(c) => c,
+        Err(e) => {
+            output::warn(&format!("Cannot read /etc/resolv.conf: {e}"));
+            return (None, None);
+        }
+    };
+
+    let tmp = std::env::temp_dir();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = format!("bwrap-resolv.{}.{}", std::process::id(), nonce);
+    let path = tmp.join(name);
+
+    match OpenOptions::new().create_new(true).write(true).open(&path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(&contents) {
+                output::warn(&format!("Cannot write temp resolv.conf: {e}"));
+                let _ = std::fs::remove_file(&path);
+                return (None, None);
+            }
+            let _ = f.sync_all();
+            let _ = std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+            (Some(path), Some(dest))
+        }
+        Err(e) => {
+            output::warn(&format!("Cannot create temp resolv.conf: {e}"));
+            (None, None)
+        }
+    }
 }
 
 pub fn build(
@@ -344,8 +433,13 @@ pub fn build(
     project_dir: &Path,
     verbose: bool,
 ) -> Command {
-    let mount_set =
-        discover_mounts(config, project_dir, guard.hosts_path(), verbose);
+    let mount_set = discover_mounts(
+        config,
+        project_dir,
+        guard.hosts_path(),
+        guard.resolv_mount(),
+        verbose,
+    );
     let lockdown = config.lockdown_enabled();
     let bwrap = bwrap_program_for_exec();
     let launch = super::build_launch_command(config);
@@ -408,8 +502,13 @@ pub fn dry_run(
     project_dir: &Path,
     verbose: bool,
 ) -> String {
-    let args =
-        build_dry_run_args(config, project_dir, guard.hosts_path(), verbose);
+    let args = build_dry_run_args(
+        config,
+        project_dir,
+        guard.hosts_path(),
+        guard.resolv_mount(),
+        verbose,
+    );
     format_dry_run_args(&args)
 }
 
@@ -417,9 +516,11 @@ fn build_dry_run_args(
     config: &Config,
     project_dir: &Path,
     hosts_file: &Path,
+    resolv_mount: Option<(&Path, &Path)>,
     verbose: bool,
 ) -> Vec<String> {
-    let mount_set = discover_mounts(config, project_dir, hosts_file, verbose);
+    let mount_set =
+        discover_mounts(config, project_dir, hosts_file, resolv_mount, verbose);
     let lockdown = config.lockdown_enabled();
     let launch = super::build_launch_command(config);
     let mut args: Vec<String> =
@@ -534,6 +635,7 @@ fn discover_mounts(
     config: &Config,
     project_dir: &Path,
     hosts_file: &Path,
+    resolv_mount: Option<(&Path, &Path)>,
     verbose: bool,
 ) -> MountSet {
     let lockdown = config.lockdown_enabled();
@@ -548,7 +650,7 @@ fn discover_mounts(
     };
 
     MountSet {
-        base: discover_base(hosts_file),
+        base: discover_base(hosts_file, resolv_mount),
         home_dotfiles: discover_home_dotfiles(lockdown, verbose),
         config_hide: if lockdown {
             vec![]
@@ -587,8 +689,11 @@ fn discover_mounts(
     }
 }
 
-fn discover_base(hosts_file: &Path) -> Vec<Mount> {
-    vec![
+fn discover_base(
+    hosts_file: &Path,
+    resolv_mount: Option<(&Path, &Path)>,
+) -> Vec<Mount> {
+    let mut mounts = vec![
         Mount::RoBind {
             src: "/usr".into(),
             dest: "/usr".into(),
@@ -613,6 +718,16 @@ fn discover_base(hosts_file: &Path) -> Vec<Mount> {
             src: hosts_file.to_path_buf(),
             dest: "/etc/hosts".into(),
         },
+    ];
+
+    if let Some((src, dest)) = resolv_mount {
+        mounts.push(Mount::FileRoBind {
+            src: src.to_path_buf(),
+            dest: dest.to_path_buf(),
+        });
+    }
+
+    mounts.extend([
         Mount::RoBind {
             src: "/opt".into(),
             dest: "/opt".into(),
@@ -633,7 +748,9 @@ fn discover_base(hosts_file: &Path) -> Vec<Mount> {
         Mount::Tmpfs {
             dest: "/run".into(),
         },
-    ]
+    ]);
+
+    mounts
 }
 
 fn discover_home_dotfiles(lockdown: bool, verbose: bool) -> Vec<Mount> {
@@ -951,8 +1068,13 @@ mod tests {
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let project = PathBuf::from("/home/user/project");
 
-        let args =
-            build_dry_run_args(&config, &project, guard.hosts_path(), false);
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            false,
+        );
         let sep = args.iter().position(|a| a == "--");
         assert!(sep.is_some(), "dry-run args must include -- separator");
     }
@@ -964,8 +1086,13 @@ mod tests {
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let project = PathBuf::from("/home/user/project");
 
-        let args =
-            build_dry_run_args(&config, &project, guard.hosts_path(), false);
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            false,
+        );
 
         assert!(args.contains(&"--die-with-parent".to_string()));
         assert!(args.contains(&"--unshare-pid".to_string()));
@@ -986,8 +1113,13 @@ mod tests {
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let project = PathBuf::from("/home/user/project");
 
-        let args =
-            build_dry_run_args(&config, &project, guard.hosts_path(), false);
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            false,
+        );
         let has_project_ro = args.windows(3).any(|w| {
             w[0] == "--ro-bind"
                 && w[1] == "/home/user/project"
@@ -1004,8 +1136,13 @@ mod tests {
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let project = PathBuf::from("/home/user/project");
 
-        let args =
-            build_dry_run_args(&config, &project, guard.hosts_path(), false);
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            false,
+        );
 
         assert!(args.contains(&"--unshare-net".to_string()));
         assert!(args.contains(&"--clearenv".to_string()));
@@ -1020,8 +1157,13 @@ mod tests {
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let project = PathBuf::from("/home/user/project");
 
-        let args =
-            build_dry_run_args(&config, &project, guard.hosts_path(), false);
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            false,
+        );
 
         let has_tmp_bind = args
             .windows(3)
@@ -1065,8 +1207,13 @@ mod tests {
         let guard =
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let project = PathBuf::from("/home/user/project");
-        let args =
-            build_dry_run_args(&config, &project, guard.hosts_path(), false);
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            false,
+        );
         assert!(
             args.first().is_some_and(|s| s.starts_with('/')),
             "dry-run must show absolute bwrap path"
@@ -1080,8 +1227,13 @@ mod tests {
         let guard =
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let project = PathBuf::from("/home/user/project");
-        let args =
-            build_dry_run_args(&config, &project, guard.hosts_path(), false);
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            false,
+        );
 
         // Should contain the wrapper dest path
         assert!(
@@ -1113,8 +1265,13 @@ mod tests {
         let guard =
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let project = PathBuf::from("/home/user/project");
-        let args =
-            build_dry_run_args(&config, &project, guard.hosts_path(), false);
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            false,
+        );
 
         assert!(
             !args.contains(&"--landlock-exec".to_string()),
