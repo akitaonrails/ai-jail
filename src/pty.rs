@@ -477,15 +477,17 @@ fn io_loop(master: &OwnedFd) {
                     Ok(0) => break,
                     Ok(n) => {
                         write_all_raw(nix::libc::STDOUT_FILENO, &buf[..n]);
-                        let ev = reset.scan(&buf[..n]);
-                        if !matches!(ev, ResetEvent::None) {
-                            pending_redraw = true;
-                        }
-                        if matches!(ev, ResetEvent::RedrawAndClamp) {
+                        if matches!(
+                            reset.scan(&buf[..n]),
+                            ResetEvent::RedrawAndClamp
+                        ) {
                             pending_clamp = true;
-                            pending_redraw = true;
                         }
                         stream.update(&buf[..n]);
+                        // Any child output may have overwritten
+                        // the status bar row; always refresh once
+                        // the child goes quiet.
+                        pending_redraw = true;
                     }
                     Err(nix::errno::Errno::EINTR) => {}
                     Err(nix::errno::Errno::EIO) => break,
@@ -500,15 +502,14 @@ fn io_loop(master: &OwnedFd) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             write_all_raw(nix::libc::STDOUT_FILENO, &buf[..n]);
-                            let ev = reset.scan(&buf[..n]);
-                            if !matches!(ev, ResetEvent::None) {
-                                pending_redraw = true;
-                            }
-                            if matches!(ev, ResetEvent::RedrawAndClamp) {
+                            if matches!(
+                                reset.scan(&buf[..n]),
+                                ResetEvent::RedrawAndClamp
+                            ) {
                                 pending_clamp = true;
-                                pending_redraw = true;
                             }
                             stream.update(&buf[..n]);
+                            pending_redraw = true;
                         }
                     }
                 }
