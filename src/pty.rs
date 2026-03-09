@@ -464,6 +464,7 @@ fn flush_statusbar_if_safe(
     stream: &StreamState,
     pending_redraw: &mut bool,
     pending_clamp: &mut bool,
+    pending_sigwinch: &mut bool,
 ) {
     if !*pending_redraw || !stream.can_inject() {
         return;
@@ -474,6 +475,12 @@ fn flush_statusbar_if_safe(
         *pending_clamp = false;
     }
     *pending_redraw = false;
+    // Forward SIGWINCH AFTER the scroll region is re-established
+    // so the child redraws onto a clean canvas.
+    if *pending_sigwinch {
+        forward_sigwinch();
+        *pending_sigwinch = false;
+    }
 }
 
 fn io_loop(master: &OwnedFd) {
@@ -486,6 +493,7 @@ fn io_loop(master: &OwnedFd) {
     let mut reset = ResetDetector::new();
     let mut pending_redraw = false;
     let mut pending_clamp = false;
+    let mut pending_sigwinch = false;
 
     loop {
         let mut fds = [
@@ -493,12 +501,17 @@ fn io_loop(master: &OwnedFd) {
             PollFd::new(master_bfd, PollFlags::POLLIN),
         ];
 
-        let (req_redraw, req_clamp) = crate::statusbar::take_requests();
+        let (req_redraw, req_clamp, req_sigwinch) =
+            crate::statusbar::take_requests();
         if req_redraw {
             pending_redraw = true;
         }
         if req_clamp {
             pending_clamp = true;
+            pending_redraw = true;
+        }
+        if req_sigwinch {
+            pending_sigwinch = true;
             pending_redraw = true;
         }
 
@@ -515,6 +528,10 @@ fn io_loop(master: &OwnedFd) {
                         pending_clamp = false;
                     }
                     pending_redraw = false;
+                    if pending_sigwinch {
+                        forward_sigwinch();
+                        pending_sigwinch = false;
+                    }
                 }
                 continue;
             }
@@ -563,6 +580,7 @@ fn io_loop(master: &OwnedFd) {
                     &stream,
                     &mut pending_redraw,
                     &mut pending_clamp,
+                    &mut pending_sigwinch,
                 );
                 break;
             }
@@ -576,6 +594,7 @@ fn io_loop(master: &OwnedFd) {
                 &stream,
                 &mut pending_redraw,
                 &mut pending_clamp,
+                &mut pending_sigwinch,
             );
         }
 
