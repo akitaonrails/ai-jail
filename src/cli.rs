@@ -18,6 +18,8 @@ OPTIONS:
     --map <PATH>            Mount PATH read-only inside sandbox (repeatable)
     --lockdown / --no-lockdown Enable/disable strict read-only lockdown mode
     --landlock / --no-landlock Enable/disable Landlock LSM (Linux 5.13+, default: on)
+    --seccomp / --no-seccomp   Enable/disable seccomp syscall filter (Linux, default: on)
+    --rlimits / --no-rlimits   Enable/disable resource limits (default: on)
     --no-gpu / --gpu        Disable/enable GPU device passthrough (Linux only)
     --no-docker / --docker  Disable/enable Docker socket passthrough
     --no-display / --display Disable/enable X11/Wayland passthrough (Linux only)
@@ -40,6 +42,8 @@ pub struct CliArgs {
     pub ro_maps: Vec<PathBuf>,
     pub lockdown: Option<bool>,
     pub landlock: Option<bool>,
+    pub seccomp: Option<bool>,
+    pub rlimits: Option<bool>,
     pub gpu: Option<bool>,
     pub docker: Option<bool>,
     pub display: Option<bool>,
@@ -82,6 +86,10 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long("no-lockdown") => args.lockdown = Some(false),
             Long("landlock") => args.landlock = Some(true),
             Long("no-landlock") => args.landlock = Some(false),
+            Long("seccomp") => args.seccomp = Some(true),
+            Long("no-seccomp") => args.seccomp = Some(false),
+            Long("rlimits") => args.rlimits = Some(true),
+            Long("no-rlimits") => args.rlimits = Some(false),
             Long("gpu") => args.gpu = Some(true),
             Long("no-gpu") => args.gpu = Some(false),
             Long("docker") => args.docker = Some(true),

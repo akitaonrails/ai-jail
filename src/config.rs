@@ -31,6 +31,10 @@ pub struct Config {
     pub no_status_bar: Option<bool>,
     #[serde(default)]
     pub status_bar_style: Option<String>,
+    #[serde(default)]
+    pub no_seccomp: Option<bool>,
+    #[serde(default)]
+    pub no_rlimits: Option<bool>,
 }
 
 impl Config {
@@ -60,6 +64,12 @@ impl Config {
             Some("light") => "light",
             _ => "dark",
         }
+    }
+    pub fn seccomp_enabled(&self) -> bool {
+        self.no_seccomp != Some(true)
+    }
+    pub fn rlimits_enabled(&self) -> bool {
+        self.no_rlimits != Some(true)
     }
 }
 
@@ -141,6 +151,12 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     }
     if local.no_landlock.is_some() {
         c.no_landlock = local.no_landlock;
+    }
+    if local.no_seccomp.is_some() {
+        c.no_seccomp = local.no_seccomp;
+    }
+    if local.no_rlimits.is_some() {
+        c.no_rlimits = local.no_rlimits;
     }
     // Status bar stays from global — local should not override
     c
@@ -295,6 +311,12 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     if let Some(v) = cli.landlock {
         config.no_landlock = Some(!v);
     }
+    if let Some(v) = cli.seccomp {
+        config.no_seccomp = Some(!v);
+    }
+    if let Some(v) = cli.rlimits {
+        config.no_rlimits = Some(!v);
+    }
     if let Some(v) = cli.status_bar {
         config.no_status_bar = Some(!v);
     }
@@ -354,6 +376,8 @@ pub fn display_status(config: &Config) {
     bool_opt("Display", config.no_display);
     bool_opt("Mise", config.no_mise);
     bool_opt("Landlock", config.no_landlock);
+    bool_opt("Seccomp", config.no_seccomp);
+    bool_opt("Rlimits", config.no_rlimits);
     bool_opt("Lockdown", config.lockdown.map(|v| !v));
     match config.no_status_bar {
         Some(true) => output::status_header("  Status bar", "disabled"),
@@ -498,6 +522,8 @@ another_removed_field = true
         assert_eq!(cfg.lockdown, None);
         assert_eq!(cfg.no_landlock, None);
         assert_eq!(cfg.no_status_bar, None);
+        assert_eq!(cfg.no_seccomp, None);
+        assert_eq!(cfg.no_rlimits, None);
     }
 
     #[test]
@@ -536,6 +562,27 @@ no_landlock = false
     }
 
     #[test]
+    fn regression_v0_5_3_config_without_seccomp_rlimits() {
+        // v0.5.3 configs don't have no_seccomp or no_rlimits fields.
+        // They must still parse and default to both enabled.
+        let toml = r#"
+command = ["claude"]
+rw_maps = []
+ro_maps = []
+no_gpu = false
+no_docker = false
+lockdown = false
+no_landlock = false
+no_status_bar = false
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.no_seccomp, None);
+        assert_eq!(cfg.no_rlimits, None);
+        assert!(cfg.seccomp_enabled());
+        assert!(cfg.rlimits_enabled());
+    }
+
+    #[test]
     fn regression_empty_config_file() {
         // An empty .ai-jail file must not crash
         let cfg = parse_toml("").unwrap();
@@ -565,6 +612,8 @@ no_landlock = false
             no_landlock: Some(false),
             no_status_bar: None,
             status_bar_style: None,
+            no_seccomp: None,
+            no_rlimits: None,
         };
         let serialized = serialize_config(&config).unwrap();
         let deserialized = parse_toml(&serialized).unwrap();
@@ -577,6 +626,8 @@ no_landlock = false
         assert_eq!(deserialized.no_mise, config.no_mise);
         assert_eq!(deserialized.lockdown, config.lockdown);
         assert_eq!(deserialized.no_landlock, config.no_landlock);
+        assert_eq!(deserialized.no_seccomp, config.no_seccomp);
+        assert_eq!(deserialized.no_rlimits, config.no_rlimits);
     }
 
     // ── Merge tests ────────────────────────────────────────────
@@ -1040,6 +1091,8 @@ no_landlock = false
             no_landlock: None,
             no_status_bar: None,
             status_bar_style: None,
+            no_seccomp: None,
+            no_rlimits: None,
         };
         save(&config);
 
