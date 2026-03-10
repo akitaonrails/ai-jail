@@ -21,6 +21,7 @@ struct Limit {
 
 fn limits_for(config: &Config) -> Vec<Limit> {
     let lockdown = config.lockdown_enabled();
+    #[allow(unused_mut)]
     let mut limits = vec![
         Limit {
             resource: Resource::RLIMIT_NOFILE,

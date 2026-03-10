@@ -1,12 +1,13 @@
 use crate::config::Config;
 use crate::output;
 use landlock::{
-    path_beneath_rules, Access, AccessFs, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus, ABI,
+    path_beneath_rules, Access, AccessFs, AccessNet, NetPort, Ruleset,
+    RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
 };
 use std::path::{Path, PathBuf};
 
 const ABI_VERSION: ABI = ABI::V3;
+const ABI_NET: ABI = ABI::V4;
 
 pub fn apply(
     config: &Config,
@@ -91,7 +92,58 @@ fn do_apply(
         .add_rules(path_beneath_rules(rw_paths, access_all))?
         .restrict_self()?;
 
+    // Stack a second ruleset for V4 network restrictions.
+    // This is separate from the filesystem ruleset so V3
+    // behavior is preserved on kernels without V4 support.
+    apply_net_rules(config, verbose);
+
     Ok(status.ruleset)
+}
+
+/// Apply Landlock V4 network restrictions as a stacked ruleset.
+/// In lockdown mode: deny all TCP bind/connect.
+/// In normal mode: no restrictions (don't handle net access).
+/// Best-effort: silently skipped if kernel < 6.5 (no V4).
+fn apply_net_rules(config: &Config, verbose: bool) {
+    if !config.lockdown_enabled() {
+        // Normal mode: no network restrictions via Landlock.
+        return;
+    }
+
+    let net_access = AccessNet::from_all(ABI_NET);
+    if net_access.is_empty() {
+        return;
+    }
+
+    // Handle net access but add NO NetPort rules → all TCP
+    // bind/connect is denied (defense-in-depth alongside
+    // bwrap's --unshare-net).
+    match Ruleset::default()
+        .handle_access(net_access)
+        .and_then(|r| r.create())
+        .and_then(|r| r.restrict_self())
+    {
+        Ok(status) => {
+            if verbose {
+                let enforced = match status.ruleset {
+                    RulesetStatus::FullyEnforced => "fully enforced",
+                    RulesetStatus::PartiallyEnforced => "partially enforced",
+                    RulesetStatus::NotEnforced => "not enforced",
+                };
+                output::verbose(&format!(
+                    "Landlock V4 net: {enforced} (lockdown)"
+                ));
+            }
+        }
+        Err(_) => {
+            if verbose {
+                output::verbose(
+                    "Landlock V4 net: unavailable \
+                     (kernel < 6.5, using --unshare-net only)",
+                );
+            }
+        }
+    }
 }
 
 fn collect_lockdown_paths(
@@ -525,5 +577,43 @@ mod tests {
 
         unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
         let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn abi_net_returns_nonempty_access() {
+        // Verify that our ABI_NET constant produces valid
+        // AccessNet flags (BindTcp + ConnectTcp).
+        let access = AccessNet::from_all(ABI_NET);
+        assert!(!access.is_empty());
+        assert!(access.contains(AccessNet::BindTcp));
+        assert!(access.contains(AccessNet::ConnectTcp));
+    }
+
+    #[test]
+    fn abi_v3_returns_empty_net_access() {
+        // Confirm that V3 has no network access, justifying
+        // the separate ABI_NET constant for stacked rulesets.
+        let access = AccessNet::from_all(ABI::V3);
+        assert!(access.is_empty());
+    }
+
+    #[test]
+    fn apply_net_rules_normal_is_noop() {
+        // Normal mode should not apply any net restrictions.
+        let config = Config::default();
+        assert!(!config.lockdown_enabled());
+        // Must not panic or error
+        apply_net_rules(&config, true);
+    }
+
+    #[test]
+    fn apply_net_rules_lockdown_does_not_panic() {
+        // On macOS/kernels without V4, this is best-effort.
+        let config = Config {
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        // Must not panic regardless of kernel support
+        apply_net_rules(&config, true);
     }
 }
