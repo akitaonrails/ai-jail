@@ -45,8 +45,8 @@
 use crate::config::Config;
 use crate::output;
 use landlock::{
-    path_beneath_rules, Access, AccessFs, AccessNet, NetPort, Ruleset,
-    RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
+    path_beneath_rules, Access, AccessFs, AccessNet, Ruleset, RulesetAttr,
+    RulesetCreatedAttr, RulesetStatus, ABI,
 };
 use std::path::{Path, PathBuf};
 

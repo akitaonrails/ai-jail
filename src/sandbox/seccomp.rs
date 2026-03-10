@@ -30,6 +30,7 @@
 
 use crate::config::Config;
 use crate::output;
+use nix::libc;
 use seccompiler::{SeccompAction, SeccompFilter};
 use std::collections::BTreeMap;
 use std::convert::TryInto;
