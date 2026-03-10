@@ -65,6 +65,7 @@ impl Mount {
 
 struct MountSet {
     base: Vec<Mount>,
+    sys_masks: Vec<Mount>,
     home_dotfiles: Vec<Mount>,
     config_hide: Vec<Mount>,
     cache_hide: Vec<Mount>,
@@ -79,9 +80,10 @@ struct MountSet {
 }
 
 impl MountSet {
-    fn ordered_mounts(&self) -> [&[Mount]; 11] {
+    fn ordered_mounts(&self) -> [&[Mount]; 12] {
         [
             &self.base,
+            &self.sys_masks,
             &self.gpu,
             &self.shm,
             &self.docker,
@@ -709,6 +711,7 @@ fn discover_mounts(
 
     MountSet {
         base: discover_base(hosts_file, resolv_mount),
+        sys_masks: discover_sys_masks(lockdown),
         home_dotfiles: discover_home_dotfiles(lockdown, verbose),
         config_hide: if lockdown {
             vec![]
@@ -915,6 +918,38 @@ fn discover_local_overrides() -> Vec<Mount> {
         }
     }
 
+    mounts
+}
+
+// Sensitive /sys paths masked with tmpfs to reduce information
+// leakage useful for kernel/namespace escape reconnaissance.
+const SYS_MASK_ALWAYS: &[&str] = &[
+    "/sys/firmware",        // BIOS/UEFI/ACPI tables
+    "/sys/kernel/security", // LSM interfaces
+    "/sys/kernel/debug",    // debugfs
+    "/sys/fs/fuse",         // FUSE control
+];
+
+const SYS_MASK_LOCKDOWN: &[&str] = &[
+    "/sys/module",              // loaded kernel modules
+    "/sys/devices/virtual/dmi", // DMI/SMBIOS tables
+    "/sys/class/net",           // network interface enumeration
+];
+
+fn discover_sys_masks(lockdown: bool) -> Vec<Mount> {
+    let mut mounts = Vec::new();
+    let lists: &[&[&str]] = if lockdown {
+        &[SYS_MASK_ALWAYS, SYS_MASK_LOCKDOWN]
+    } else {
+        &[SYS_MASK_ALWAYS]
+    };
+    for list in lists {
+        for &path in *list {
+            if super::path_exists(&PathBuf::from(path)) {
+                mounts.push(Mount::Tmpfs { dest: path.into() });
+            }
+        }
+    }
     mounts
 }
 
