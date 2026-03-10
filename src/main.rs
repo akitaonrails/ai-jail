@@ -140,6 +140,10 @@ fn run() -> Result<i32, String> {
     // sandbox after bwrap finishes mount namespace setup.
     let mut cmd = sandbox::build(&guard, &config, &project_dir, cli.verbose)?;
 
+    // Apply resource limits before spawning. Limits are inherited
+    // by the child across fork+exec.
+    sandbox::rlimits::apply(&config, cli.verbose);
+
     let exit_code = if use_status_bar {
         // PTY proxy path: ai-jail owns the real terminal, child
         // gets a PTY slave. This keeps the status bar persistent.

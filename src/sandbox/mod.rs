@@ -9,6 +9,8 @@ mod landlock;
 #[cfg(target_os = "macos")]
 mod seatbelt;
 
+pub(crate) mod rlimits;
+
 #[cfg(target_os = "linux")]
 pub use bwrap::SandboxGuard;
 #[cfg(target_os = "macos")]
