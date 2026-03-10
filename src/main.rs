@@ -26,6 +26,11 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     // Apply Landlock inside the sandbox (after bwrap namespace setup)
     sandbox::apply_landlock(&config, &project_dir, cli.verbose)?;
 
+    // Apply seccomp filter after Landlock (reduces kernel syscall
+    // surface). Must happen before exec so the user command inherits
+    // the filter.
+    sandbox::apply_seccomp(&config, cli.verbose)?;
+
     // Replace this process with the real command
     let err = std::process::Command::new(&cli.command[0])
         .args(&cli.command[1..])

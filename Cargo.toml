@@ -21,6 +21,7 @@ nix = { version = "0.29", features = ["signal", "process", "poll", "term", "reso
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
+seccompiler = "0.5"
 
 [profile.release]
 strip = true

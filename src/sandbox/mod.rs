@@ -8,6 +8,8 @@ pub(crate) mod bwrap;
 mod landlock;
 #[cfg(target_os = "macos")]
 mod seatbelt;
+#[cfg(target_os = "linux")]
+mod seccomp;
 
 pub(crate) mod rlimits;
 
@@ -140,6 +142,18 @@ pub fn apply_landlock(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (config, project_dir, verbose);
+        Ok(())
+    }
+}
+
+pub fn apply_seccomp(config: &Config, verbose: bool) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        seccomp::apply(config, verbose)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (config, verbose);
         Ok(())
     }
 }
