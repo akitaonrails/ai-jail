@@ -1,3 +1,47 @@
+// Landlock LSM filesystem and network restrictions for Linux.
+//
+// Applied before seccomp (but after bwrap sets up the mount
+// namespace) to restrict which paths the sandboxed process can
+// read, write, and execute — even if bwrap's bind mounts expose
+// them.
+//
+// THREAT MODEL
+//
+// bwrap provides mount-namespace isolation: only explicitly bound
+// paths are visible inside the sandbox. Landlock adds a second,
+// independent filesystem restriction layer that:
+//
+//  1. Survives mount-namespace escapes — if an attacker finds a
+//     way to remount or move_mount (blocked by seccomp, but
+//     defense-in-depth), Landlock still prevents access to paths
+//     outside the allowed set.
+//  2. Enforces read-only where bwrap uses ro-bind — Landlock's
+//     VFS-level checks catch writes even through /proc/self/fd
+//     or mmap(PROT_WRITE) on a read-only bind mount.
+//  3. Restricts network (V4, kernel ≥ 6.5) — in lockdown mode,
+//     denies all TCP bind/connect as defense-in-depth alongside
+//     bwrap's --unshare-net.
+//
+// Path selection philosophy:
+//  - System dirs (/usr, /etc, /opt, …) are read-only: agents
+//    need compilers and libraries but must not modify them.
+//  - /proc is read-write: bwrap writes /proc/self/uid_map
+//    during namespace setup. Individual /proc files are further
+//    restricted by the kernel's own permission checks.
+//  - /dev is read-write: bwrap creates a minimal private /dev
+//    (null, zero, random, urandom, tty). GPU passthrough needs
+//    write access to /dev/nvidia* and /dev/dri/*.
+//  - /tmp is read-write: language runtimes and build tools
+//    create temporary files here.
+//  - $HOME is a tmpfs: Landlock allows writes because the real
+//    home is hidden; individual dotdirs are bind-mounted ro/rw
+//    by bwrap (Landlock defers to the stricter of the two).
+//  - Project dir is read-write (normal) or read-only (lockdown):
+//    the primary work directory for the AI agent.
+//  - In lockdown mode, the allowed set is minimal: system ro,
+//    /proc + /dev + /tmp rw, project ro. No $HOME, no dotdirs,
+//    no Docker, no GPU, no display.
+
 use crate::config::Config;
 use crate::output;
 use landlock::{
@@ -71,6 +115,14 @@ pub fn apply(
 
 /// Collect paths that need read-only access and paths that
 /// need read-write access, then build and apply the ruleset.
+///
+/// Two rulesets are stacked:
+///  1. Filesystem (V3): ro/rw path rules. handle_access(all)
+///     means any filesystem operation not covered by a rule is
+///     denied — this is an allowlist, not a blocklist.
+///  2. Network (V4): TCP bind/connect rules, lockdown only.
+///     Stacked separately so V3-only kernels still get full
+///     filesystem protection.
 fn do_apply(
     config: &Config,
     project_dir: &Path,
@@ -100,10 +152,18 @@ fn do_apply(
     Ok(status.ruleset)
 }
 
-/// Apply Landlock V4 network restrictions as a stacked ruleset.
-/// In lockdown mode: deny all TCP bind/connect.
-/// In normal mode: no restrictions (don't handle net access).
-/// Best-effort: silently skipped if kernel < 6.5 (no V4).
+/// Apply Landlock V4 (kernel ≥ 6.5) network restrictions.
+///
+/// In lockdown mode: handle BindTcp + ConnectTcp but add NO port
+/// rules → all TCP is denied. This is defense-in-depth alongside
+/// bwrap's --unshare-net (network namespace with no interfaces).
+/// Even if an attacker escapes the network namespace, Landlock
+/// still blocks TCP.
+///
+/// In normal mode: no network restrictions via Landlock. Agents
+/// need outbound HTTP(S) for package downloads, API calls, etc.
+///
+/// Best-effort: silently skipped if kernel lacks V4 support.
 fn apply_net_rules(config: &Config, verbose: bool) {
     if !config.lockdown_enabled() {
         // Normal mode: no network restrictions via Landlock.
@@ -146,6 +206,12 @@ fn apply_net_rules(config: &Config, verbose: bool) {
     }
 }
 
+/// Lockdown paths: minimal set for a read-only sandbox.
+///
+/// Only system libraries (ro), /proc + /dev + /tmp (rw), and the
+/// project directory (ro) are accessible. This prevents the agent
+/// from writing anywhere except /tmp, so it cannot persist
+/// backdoors, modify configs, or exfiltrate data to disk.
 fn collect_lockdown_paths(
     project_dir: &Path,
     verbose: bool,
@@ -170,18 +236,26 @@ fn collect_lockdown_paths(
         output::verbose("Landlock lockdown: system ro");
     }
 
-    // /proc: read-write (bwrap writes /proc/self/uid_map)
+    // /proc: read-write — bwrap writes /proc/self/uid_map
+    // during user-namespace setup. The kernel's own permission
+    // model further restricts what /proc files are accessible
+    // (e.g. /proc/kcore, /proc/sysrq-trigger are root-only).
     rw.push(PathBuf::from("/proc"));
-    // /dev: read-write for null/tty compatibility inside sandbox's private /dev
+    // /dev: read-write — bwrap creates a minimal private /dev
+    // with null, zero, random, urandom, tty. Write access is
+    // needed for PTY allocation and /dev/null output.
     rw.push(PathBuf::from("/dev"));
 
-    // /tmp: read-write (only writable user location)
+    // /tmp: read-write — the only user-writable location in
+    // lockdown. Build tools, language runtimes, and package
+    // managers all need scratch space for temp files.
     rw.push(PathBuf::from("/tmp"));
     if verbose {
         output::verbose("Landlock lockdown: /proc, /dev, /tmp rw");
     }
 
-    // Project: read-only
+    // Project: read-only — the agent can read source code but
+    // cannot modify it, write backdoors, or alter build configs.
     ro.push(project_dir.to_path_buf());
     if verbose {
         output::verbose(&format!(
@@ -193,6 +267,18 @@ fn collect_lockdown_paths(
     (ro, rw)
 }
 
+/// Normal-mode paths: broader access for day-to-day development.
+///
+/// The agent can read system libraries, write to /tmp and the
+/// project directory, and access home dotdirs needed by dev tools
+/// (mise, npm, cargo, etc.). Optional passthrough for Docker,
+/// GPU, and display sockets is controlled by config flags.
+///
+/// Security invariant: even with broad Landlock access, bwrap's
+/// mount namespace hides paths not explicitly bind-mounted. The
+/// two layers are complementary — Landlock prevents writes to
+/// ro-bind-mounted paths, bwrap prevents access to unmounted
+/// paths.
 fn collect_normal_paths(
     config: &Config,
     project_dir: &Path,
@@ -220,7 +306,12 @@ fn collect_normal_paths(
     }
 
     // Writable system paths
-    // /proc must be rw: bwrap writes /proc/self/uid_map for namespace setup
+    // /proc must be rw: bwrap writes /proc/self/uid_map for
+    // namespace setup; /proc/self/fd is used for fd passing.
+    // /tmp must be rw: compilers, language runtimes, and
+    // package managers create temp files and sockets here.
+    // /dev must be rw: PTY allocation, /dev/null output, and
+    // optional GPU device access.
     rw.push(PathBuf::from("/proc"));
     rw.push(PathBuf::from("/tmp"));
     rw.push(PathBuf::from("/dev"));
@@ -228,13 +319,17 @@ fn collect_normal_paths(
         output::verbose("Landlock: /proc, /tmp, /dev rw");
     }
 
-    // /dev/shm
+    // /dev/shm: shared memory for IPC. Some runtimes (Chrome/
+    // Electron, Node.js workers) need this for shared memory
+    // segments. Only added if it exists on the host.
     let shm = PathBuf::from("/dev/shm");
     if shm.is_dir() {
         rw.push(shm);
     }
 
-    // Project directory: read-write
+    // Project directory: read-write — the agent's primary work
+    // area. Must be writable so it can edit source, run builds,
+    // and create output files.
     rw.push(project_dir.to_path_buf());
     if verbose {
         output::verbose(&format!("Landlock: {} rw", project_dir.display()));
@@ -249,10 +344,16 @@ fn collect_normal_paths(
         output::verbose("Landlock: $HOME rw");
     }
 
-    // Home dotdirs
+    // Home dotdirs: classified as ro or rw based on DOTDIR_RW /
+    // DOTDIR_DENY lists in sandbox/mod.rs. Dirs like .cargo,
+    // .npm, .local/share are rw (caches, tool state). Dirs like
+    // .ssh, .gnupg are denied entirely (never bind-mounted by
+    // bwrap, so Landlock allowing them is moot — but we still
+    // skip them for defense-in-depth). Everything else is ro.
     collect_home_paths(&home, &mut ro, &mut rw, verbose);
 
-    // $HOME/.local: read-write
+    // $HOME/.local: read-write — mise, pipx, and other tools
+    // store binaries and state here.
     let dot_local = home.join(".local");
     if dot_local.is_dir() {
         if verbose {
@@ -261,7 +362,9 @@ fn collect_normal_paths(
         rw.push(dot_local);
     }
 
-    // $HOME/.claude.json: read-write
+    // $HOME/.claude.json: read-write — Claude Code stores its
+    // auth token and settings here. Must be writable so the
+    // agent can update its own config during bootstrap.
     let claude_json = home.join(".claude.json");
     if claude_json.is_file() {
         if verbose {
@@ -270,7 +373,9 @@ fn collect_normal_paths(
         rw.push(claude_json);
     }
 
-    // $HOME/.gitconfig: read-only
+    // $HOME/.gitconfig: read-only — git needs user.name and
+    // user.email for commits, but the agent must not modify
+    // the user's git identity or credential helpers.
     let gitconfig = home.join(".gitconfig");
     if gitconfig.is_file() {
         if verbose {
@@ -279,7 +384,9 @@ fn collect_normal_paths(
         ro.push(gitconfig);
     }
 
-    // Extra user mounts
+    // Extra user mounts: --rw-map and --ro-map from CLI/config.
+    // These extend the sandbox with user-specified paths. Missing
+    // paths are skipped with a warning (never crash on missing).
     for p in &config.rw_maps {
         if super::path_exists(p) {
             rw.push(p.clone());
@@ -304,7 +411,11 @@ fn collect_normal_paths(
         output::verbose("Landlock: extra maps");
     }
 
-    // Docker socket
+    // Docker socket: read-write — allows the agent to build and
+    // run containers. This is a deliberate trust extension: the
+    // Docker socket grants effective root on the host. Controlled
+    // by --no-docker / config flag; auto-enabled if the socket
+    // exists on the host.
     if config.docker_enabled() {
         let sock = PathBuf::from("/var/run/docker.sock");
         if super::path_exists(&sock) {
@@ -315,13 +426,17 @@ fn collect_normal_paths(
         }
     }
 
-    // GPU devices
+    // GPU devices: read-write — needed for CUDA/OpenCL/Vulkan
+    // workloads. Grants access to /dev/nvidia* and /dev/dri/*.
+    // Controlled by --no-gpu config flag.
     if config.gpu_enabled() {
         collect_gpu_paths(&mut rw, verbose);
     }
 
-    // Display runtime directory is bind-mounted by bwrap in normal mode.
-    // Ensure Landlock allows writes there for Wayland/XDG sockets.
+    // Display runtime: read-write — Wayland/X11 sockets live in
+    // XDG_RUNTIME_DIR. Needed for GUI apps the agent might
+    // launch (browsers for testing, display servers for
+    // screenshots). Controlled by --no-display.
     if config.display_enabled() {
         if let Ok(xdg_dir) = std::env::var("XDG_RUNTIME_DIR") {
             let xdg_path = PathBuf::from(&xdg_dir);
@@ -337,7 +452,10 @@ fn collect_normal_paths(
         }
     }
 
-    // bwrap binary: read+execute (covered by from_read)
+    // bwrap binary: read+execute — Landlock's from_read()
+    // includes execute permission. Without this, the initial
+    // bwrap exec would fail after Landlock restricts the
+    // process.
     if let Ok(bwrap) = super::bwrap::bwrap_binary_path() {
         if verbose {
             output::verbose(&format!("Landlock: bwrap {} ro", bwrap.display()));
@@ -348,6 +466,14 @@ fn collect_normal_paths(
     (ro, rw)
 }
 
+/// Classify home dotdirs into read-only or read-write.
+///
+/// Sensitive dirs (DOTDIR_DENY: .ssh, .gnupg, etc.) are skipped
+/// entirely — bwrap never bind-mounts them, so they are invisible
+/// inside the sandbox. Writable dirs (DOTDIR_RW: .cargo, .npm,
+/// .cache, etc.) are tool caches that agents legitimately modify.
+/// Everything else defaults to read-only (safe to read config
+/// from but not modify).
 fn collect_home_paths(
     home: &Path,
     ro: &mut Vec<PathBuf>,
@@ -389,6 +515,13 @@ fn collect_home_paths(
     }
 }
 
+/// Grant rw access to GPU device nodes.
+///
+/// Covers NVIDIA (/dev/nvidia0, /dev/nvidiactl, /dev/nvidia-uvm,
+/// etc.) and DRI (/dev/dri/card*, /dev/dri/renderD*). These are
+/// needed for CUDA, OpenCL, and Vulkan workloads that some AI
+/// agents run (e.g. local model inference). Note: AMD RDNA GPUs
+/// are accessed through DRI, not separate device nodes.
 fn collect_gpu_paths(rw: &mut Vec<PathBuf>, verbose: bool) {
     if let Ok(entries) = std::fs::read_dir("/dev") {
         for entry in entries.flatten() {
