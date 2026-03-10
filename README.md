@@ -88,6 +88,18 @@ The default mode favors usability over maximum lockdown. These are intentionally
 2. Display passthrough mounts `XDG_RUNTIME_DIR` on Linux, which can expose host IPC sockets.
 3. Environment variables are inherited (tokens/secrets in your shell env are visible in-jail).
 
+### Defense-in-depth layers (Linux)
+
+ai-jail applies multiple overlapping security layers:
+
+- **Namespace isolation** (bwrap): PID, UTS, IPC, mount namespaces. Network namespace in lockdown.
+- **Landlock LSM** (V3 filesystem + V4 network): VFS-level access control independent of mount namespaces.
+- **Seccomp-bpf** syscall filter: blocks ~30 dangerous syscalls (module loading, `ptrace`, `bpf`, namespace escape, etc.). Lockdown blocks additional NUMA/hostname syscalls.
+- **Resource limits**: RLIMIT_NPROC (4096/1024 lockdown), RLIMIT_NOFILE (65536/4096 lockdown), RLIMIT_CORE=0. Prevents fork bombs and limits resource abuse.
+- **Sensitive /sys masking**: tmpfs overlays hide `/sys/firmware`, `/sys/kernel/security`, `/sys/kernel/debug`, `/sys/fs/fuse`. Lockdown also masks `/sys/module`, `/sys/devices/virtual/dmi`, `/sys/class/net`.
+
+Each layer can be individually disabled (`--no-seccomp`, `--no-rlimits`, `--no-landlock`) if it causes issues.
+
 For hostile/untrusted workloads, use `--lockdown` (see below).
 
 ## What this is and isn't
@@ -177,9 +189,10 @@ PID, UTS, and IPC namespaces are isolated. Hostname inside is `ai-sandbox`. The 
 
 On Linux 5.13+, ai-jail applies [Landlock](https://landlock.io/) restrictions as defense-in-depth on top of bwrap. Landlock controls what the process can do at the VFS level, independent of mount namespaces. This closes attack vectors that bwrap alone doesn't cover: `/proc` escape routes, symlink tricks within allowed mounts, and acts as insurance against namespace bugs.
 
-- Uses ABI V3 (Linux 6.2+) with best-effort degradation to V1 on 5.13+ or no-op on older kernels.
+- Uses ABI V3 (Linux 6.2+) for filesystem rules with best-effort degradation to V1 on 5.13+ or no-op on older kernels.
+- On Linux 6.5+, a second V4 ruleset adds network restrictions: lockdown mode denies all TCP bind/connect (defense-in-depth alongside `--unshare-net`).
 - Applied in the parent process before spawning bwrap, so restrictions inherit through fork+exec.
-- In `--lockdown`, Landlock rules are stricter: project is read-only, no home dotdirs, only `/tmp` is writable.
+- In `--lockdown`, Landlock rules are stricter: project is read-only, no home dotdirs, only `/tmp` is writable, no network.
 - Disable with `--no-landlock` if it causes issues with specific tools.
 
 ### Status bar
@@ -225,6 +238,8 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--map <PATH>` | Mount PATH read-only (repeatable) |
 | `--lockdown` / `--no-lockdown` | Enable/disable strict read-only lockdown mode |
 | `--landlock` / `--no-landlock` | Enable/disable Landlock LSM (Linux 5.13+, default: on) |
+| `--seccomp` / `--no-seccomp` | Enable/disable seccomp syscall filter (Linux, default: on) |
+| `--rlimits` / `--no-rlimits` | Enable/disable resource limits (default: on) |
 | `--gpu` / `--no-gpu` | Enable/disable GPU passthrough |
 | `--docker` / `--no-docker` | Enable/disable Docker socket |
 | `--display` / `--no-display` | Enable/disable X11/Wayland |
@@ -303,6 +318,8 @@ When CLI flags and an existing config are both present:
 | `no_display` | bool | not set (auto) | `true` disables X11/Wayland |
 | `no_mise` | bool | not set (auto) | `true` disables mise integration |
 | `no_landlock` | bool | not set (auto) | `true` disables Landlock LSM (Linux only) |
+| `no_seccomp` | bool | not set (auto) | `true` disables seccomp syscall filter (Linux only) |
+| `no_rlimits` | bool | not set (auto) | `true` disables resource limits |
 | `lockdown` | bool | not set (disabled) | `true` enables strict read-only lockdown mode |
 
 Status bar preferences (`no_status_bar`, `status_bar_style`) are stored in `$HOME/.ai-jail` (global user config), not in per-project `.ai-jail` files.

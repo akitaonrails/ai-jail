@@ -14,7 +14,9 @@ src/
   sandbox/
     mod.rs        -- shared sandbox logic, mount lists, launch wrapper
     bwrap.rs      -- bwrap command builder + mount discovery (Linux)
-    landlock.rs   -- Landlock LSM path rules (Linux)
+    landlock.rs   -- Landlock LSM path + network rules (Linux)
+    seccomp.rs    -- seccomp-bpf syscall filter (Linux)
+    rlimits.rs    -- resource limits (NPROC, NOFILE, CORE)
     seatbelt.rs   -- sandbox-exec SBPL profile generation (macOS)
   pty.rs          -- PTY proxy for status bar (raw mode, IO loop, escape tracking)
   statusbar.rs    -- persistent terminal status bar (scroll region, redraw, update check)
@@ -52,7 +54,7 @@ There are regression tests in `src/config.rs` that parse old config file formats
 ## Coding Conventions
 
 - **No async, no tokio.** This is a synchronous CLI tool.
-- **Minimal dependencies.** Current deps: `lexopt`, `serde`, `toml`, `serde_json`, `nix`. Do not add new crates without a strong justification.
+- **Minimal dependencies.** Current deps: `lexopt`, `serde`, `toml`, `serde_json`, `nix`, `landlock`, `seccompiler` (Linux). Do not add new crates without a strong justification.
 - **No clap.** We use `lexopt` for argument parsing to keep the binary small.
 - **Raw ANSI for colors.** No color crate — `output.rs` handles this with raw escape codes.
 - **Warn and skip, never crash.** Missing paths, unreadable dirs, and non-critical errors produce a warning and continue. Only truly fatal errors (no bwrap, can't get cwd) should cause an exit.
@@ -64,16 +66,17 @@ There are regression tests in `src/config.rs` that parse old config file formats
 The bwrap command mounts are order-dependent. The sequence in `sandbox.rs` must be:
 
 1. Base mounts (`/usr`, `/etc`, `/opt`, `/sys`, `/dev`, `/proc`, `/tmp`, `/run`)
-2. GPU devices
-3. Shared memory (`/dev/shm`)
-4. Docker socket
-5. Display mounts (X11, Wayland, XDG_RUNTIME_DIR)
-6. Home directory (tmpfs `$HOME` first, then dotfiles on top)
-7. Config hide (tmpfs over sensitive `~/.config/*` subdirs)
-8. Cache hide (tmpfs over sensitive `~/.cache/*` subdirs)
-9. Local overrides (`~/.local/state`, `~/.local/share/*` rw subdirs)
-10. Extra user mounts (`--map`, `--rw-map`)
-11. Project directory (pwd, rw)
+2. Sensitive /sys masks (tmpfs over `/sys/firmware`, `/sys/kernel/security`, etc.)
+3. GPU devices
+4. Shared memory (`/dev/shm`)
+5. Docker socket
+6. Display mounts (X11, Wayland, XDG_RUNTIME_DIR)
+7. Home directory (tmpfs `$HOME` first, then dotfiles on top)
+8. Config hide (tmpfs over sensitive `~/.config/*` subdirs)
+9. Cache hide (tmpfs over sensitive `~/.cache/*` subdirs)
+10. Local overrides (`~/.local/state`, `~/.local/share/*` rw subdirs)
+11. Extra user mounts (`--map`, `--rw-map`)
+12. Project directory (pwd, rw)
 
 Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts.
 
