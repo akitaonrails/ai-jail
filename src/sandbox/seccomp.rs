@@ -28,16 +28,31 @@ const DENY_ALWAYS: &[i64] = &[
     libc::SYS_mount,
     libc::SYS_umount2,
     libc::SYS_pivot_root,
+    // New mount API (Linux 5.2+) — bypasses classic mount()
+    libc::SYS_open_tree,
+    libc::SYS_move_mount,
+    libc::SYS_fsopen,
+    libc::SYS_fsconfig,
+    libc::SYS_fsmount,
+    libc::SYS_fspick,
+    libc::SYS_mount_setattr,
     // Process introspection
     libc::SYS_ptrace,
     libc::SYS_process_vm_readv,
     libc::SYS_process_vm_writev,
+    libc::SYS_kcmp,
     // Kernel exploit primitives
     libc::SYS_userfaultfd,
     libc::SYS_bpf,
     libc::SYS_perf_event_open,
     libc::SYS_personality,
+    // io_uring — powerful async I/O that can bypass seccomp
+    // filters on individual syscalls, enabling sandbox escapes
+    libc::SYS_io_uring_setup,
+    libc::SYS_io_uring_enter,
+    libc::SYS_io_uring_register,
     // Namespace escape vectors
+    libc::SYS_clone3,
     libc::SYS_open_by_handle_at,
     libc::SYS_unshare,
     libc::SYS_setns,
