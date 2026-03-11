@@ -1,4 +1,16 @@
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// When set, suppress info/warn/verbose output (--exec mode).
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+pub fn set_quiet(q: bool) {
+    QUIET.store(q, Ordering::SeqCst);
+}
+
+pub fn is_quiet() -> bool {
+    QUIET.load(Ordering::SeqCst)
+}
 
 fn is_tty() -> bool {
     io::stderr().is_terminal()
@@ -13,6 +25,9 @@ const CYAN: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
 
 pub fn info(msg: &str) {
+    if QUIET.load(Ordering::SeqCst) {
+        return;
+    }
     let mut out = io::stderr().lock();
     if is_tty() {
         let _ = writeln!(out, "{BOLD}{GREEN}▸{RESET} {msg}");
@@ -22,6 +37,9 @@ pub fn info(msg: &str) {
 }
 
 pub fn warn(msg: &str) {
+    if QUIET.load(Ordering::SeqCst) {
+        return;
+    }
     let mut out = io::stderr().lock();
     if is_tty() {
         let _ = writeln!(out, "{BOLD}{YELLOW}⚠{RESET} {msg}");
@@ -49,6 +67,9 @@ pub fn ok(msg: &str) {
 }
 
 pub fn verbose(msg: &str) {
+    if QUIET.load(Ordering::SeqCst) {
+        return;
+    }
     let mut out = io::stderr().lock();
     if is_tty() {
         let _ = writeln!(out, "{DIM}  {msg}{RESET}");

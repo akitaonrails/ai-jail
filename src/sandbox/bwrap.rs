@@ -565,6 +565,12 @@ pub fn build(
         cmd.arg(arg);
     }
 
+    // Propagate quiet mode into the sandbox so the inner
+    // landlock-exec process suppresses its output too.
+    if crate::output::is_quiet() {
+        cmd.arg("--setenv").arg("AI_JAIL_QUIET").arg("1");
+    }
+
     cmd.arg("--");
 
     if wrapper.is_some() {

@@ -42,8 +42,17 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
 fn run() -> Result<i32, String> {
     let cli = cli::parse()?;
 
+    // Suppress info/warn output in --exec mode for clean stdout
+    if cli.exec {
+        output::set_quiet(true);
+    }
+
     // Internal: apply Landlock and exec (used inside bwrap sandbox)
     if cli.landlock_exec {
+        // Inherit quiet mode from outer ai-jail via env var
+        if std::env::var("AI_JAIL_QUIET").is_ok() {
+            output::set_quiet(true);
+        }
         return run_landlock_exec(&cli);
     }
 
