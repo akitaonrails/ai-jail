@@ -235,6 +235,14 @@ fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
                         let screen = parser.screen();
                         let now_alt = screen.alternate_screen();
 
+                        // Forward kitty keyboard protocol
+                        // sequences that vt100 silently drops.
+                        // Only needed on alt screen paths —
+                        // primary screen uses raw pass-through.
+                        if now_alt || now_alt != was_alt_screen {
+                            forward_keyboard_protocol(stdout, &buf[..n]);
+                        }
+
                         if now_alt != was_alt_screen {
                             // Alt screen transition: full re-render
                             if now_alt {
@@ -327,6 +335,65 @@ fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
     // Clean up: reset scroll region so terminal is in a
     // known state after ai-jail exits.
     write_all_raw(stdout, b"\x1b[r");
+}
+
+/// Scan child output for kitty keyboard protocol sequences and
+/// forward them to the real terminal.  The vt100 crate does not
+/// understand these, so `state_diff()` / `state_formatted()` will
+/// silently drop them.  Without forwarding, the real terminal
+/// never enables the protocol and modifier keys (Shift+Enter,
+/// Ctrl+i vs Tab, etc.) are lost.
+///
+/// Recognised sequences (CSI with `>`, `<`, or `?` prefix,
+/// final byte `u`):
+///   - `\x1b[>flags u`  — push keyboard mode
+///   - `\x1b[<u`        — pop keyboard mode
+///   - `\x1b[?u`        — query keyboard mode
+fn forward_keyboard_protocol(fd: i32, data: &[u8]) {
+    // Tiny state machine:  0=ground  1=ESC  2=CSI-start  3=params
+    let mut st: u8 = 0;
+    let mut start: usize = 0;
+    let mut is_kbd = false;
+    for (i, &b) in data.iter().enumerate() {
+        match st {
+            0 => {
+                if b == 0x1b {
+                    start = i;
+                    is_kbd = false;
+                    st = 1;
+                }
+            }
+            1 => {
+                if b == b'[' {
+                    st = 2;
+                } else {
+                    st = 0;
+                }
+            }
+            2 => {
+                // First byte after CSI — check for > < ?
+                if b == b'>' || b == b'<' || b == b'?' {
+                    is_kbd = true;
+                    st = 3;
+                } else if (0x40..=0x7e).contains(&b) {
+                    st = 0; // final byte, not ours
+                } else {
+                    st = 3; // params
+                }
+            }
+            3 => {
+                if (0x40..=0x7e).contains(&b) {
+                    // Final byte
+                    if is_kbd && b == b'u' {
+                        write_all_raw(fd, &data[start..=i]);
+                    }
+                    st = 0;
+                }
+                // else: still in params
+            }
+            _ => st = 0,
+        }
+    }
 }
 
 /// Check whether raw output ends at the ground state of the VT
@@ -577,6 +644,60 @@ mod tests {
     }
 
     use super::ends_at_ground_state;
+    use super::forward_keyboard_protocol;
+    use std::os::unix::io::AsRawFd;
+
+    fn capture_kbd_forward(data: &[u8]) -> Vec<u8> {
+        let (r, w) = nix::unistd::pipe().unwrap();
+        forward_keyboard_protocol(w.as_raw_fd(), data);
+        drop(w);
+        let mut out = vec![0u8; 256];
+        let n = nix::unistd::read(r.as_raw_fd(), &mut out).unwrap_or(0);
+        out.truncate(n);
+        out
+    }
+
+    #[test]
+    fn kbd_push_mode_forwarded() {
+        // CSI > 1 u  — push keyboard mode flags=1
+        let out = capture_kbd_forward(b"\x1b[>1u");
+        assert_eq!(out, b"\x1b[>1u");
+    }
+
+    #[test]
+    fn kbd_pop_mode_forwarded() {
+        // CSI < u  — pop keyboard mode
+        let out = capture_kbd_forward(b"\x1b[<u");
+        assert_eq!(out, b"\x1b[<u");
+    }
+
+    #[test]
+    fn kbd_query_mode_forwarded() {
+        // CSI ? u  — query keyboard mode
+        let out = capture_kbd_forward(b"\x1b[?u");
+        assert_eq!(out, b"\x1b[?u");
+    }
+
+    #[test]
+    fn kbd_mixed_with_other_csi() {
+        // SGR + keyboard push + cursor move
+        let data = b"\x1b[31m\x1b[>1u\x1b[H";
+        let out = capture_kbd_forward(data);
+        assert_eq!(out, b"\x1b[>1u");
+    }
+
+    #[test]
+    fn kbd_no_false_positives() {
+        // Regular CSI sequences should not be forwarded
+        let out = capture_kbd_forward(b"\x1b[31m\x1b[H\x1b[J");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn kbd_plain_text_ignored() {
+        let out = capture_kbd_forward(b"hello world");
+        assert!(out.is_empty());
+    }
 
     #[test]
     fn ground_state_plain_text() {
