@@ -27,6 +27,7 @@ OPTIONS:
     -s, --status-bar[=light] Set status line theme (default on, dark unless =light)
     --no-status-bar          Disable persistent status line
     --exec                   Direct execution mode (no PTY proxy, no status bar)
+    --allow-tcp-port <PORT> Allow outbound TCP to PORT in lockdown (repeatable)
     --clean                 Ignore existing .ai-jail config, start fresh
     --dry-run               Print the sandbox command without executing
     --init                  Create/update .ai-jail config and exit
@@ -51,6 +52,7 @@ pub struct CliArgs {
     pub mise: Option<bool>,
     pub status_bar: Option<bool>,
     pub status_bar_style: Option<String>,
+    pub allow_tcp_ports: Vec<u16>,
     pub exec: bool,
     pub clean: bool,
     pub dry_run: bool,
@@ -92,6 +94,17 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long("no-seccomp") => args.seccomp = Some(false),
             Long("rlimits") => args.rlimits = Some(true),
             Long("no-rlimits") => args.rlimits = Some(false),
+            Long("allow-tcp-port") => {
+                let val: String = parser
+                    .value()
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .into_owned();
+                let port: u16 = val
+                    .parse()
+                    .map_err(|_| format!("invalid port number: {val}"))?;
+                args.allow_tcp_ports.push(port);
+            }
             Long("gpu") => args.gpu = Some(true),
             Long("no-gpu") => args.gpu = Some(false),
             Long("docker") => args.docker = Some(true),
@@ -519,6 +532,56 @@ mod tests {
     fn parse_status_bar_eq_invalid() {
         let result = parse_test(&["--status-bar=neon", "bash"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_allow_tcp_port_single() {
+        let args =
+            parse_test(&["--lockdown", "--allow-tcp-port", "32000", "bash"])
+                .unwrap();
+        assert_eq!(args.allow_tcp_ports, vec![32000]);
+        assert_eq!(args.lockdown, Some(true));
+    }
+
+    #[test]
+    fn parse_allow_tcp_port_multiple() {
+        let args = parse_test(&[
+            "--allow-tcp-port",
+            "32000",
+            "--allow-tcp-port",
+            "8080",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.allow_tcp_ports, vec![32000, 8080]);
+    }
+
+    #[test]
+    fn parse_allow_tcp_port_boundary_values() {
+        let args = parse_test(&[
+            "--allow-tcp-port",
+            "0",
+            "--allow-tcp-port",
+            "65535",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.allow_tcp_ports, vec![0, 65535]);
+    }
+
+    #[test]
+    fn parse_allow_tcp_port_overflow() {
+        assert!(parse_test(&["--allow-tcp-port", "65536"]).is_err());
+    }
+
+    #[test]
+    fn parse_allow_tcp_port_invalid() {
+        assert!(parse_test(&["--allow-tcp-port", "abc"]).is_err());
+    }
+
+    #[test]
+    fn parse_allow_tcp_port_missing_value() {
+        assert!(parse_test(&["--allow-tcp-port"]).is_err());
     }
 
     #[test]
