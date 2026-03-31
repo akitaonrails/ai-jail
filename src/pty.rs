@@ -126,6 +126,13 @@ fn set_scroll_region(fd: i32, content_rows: u16) {
     write_all_raw(fd, seq.as_bytes());
 }
 
+/// Sync the vt100 cursor position into the status bar module
+/// so that `draw()` can restore the cursor via CUP.
+fn sync_statusbar_cursor(parser: &vt100::Parser) {
+    let (row, col) = parser.screen().cursor_position();
+    crate::statusbar::set_cursor_position(row + 1, col + 1);
+}
+
 fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let master_raw = master.as_raw_fd();
@@ -192,6 +199,7 @@ fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
                 was_alt_screen = on_alt;
 
                 // Redraw status bar, then notify child
+                sync_statusbar_cursor(&parser);
                 crate::statusbar::redraw();
                 resize_pty();
                 forward_sigwinch();
@@ -213,6 +221,7 @@ fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
         match poll(&mut fds, PollTimeout::from(100_u16)) {
             Ok(0) => {
                 if pending_redraw {
+                    sync_statusbar_cursor(&parser);
                     crate::statusbar::redraw();
                     pending_redraw = false;
                 }
@@ -314,6 +323,7 @@ fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
                 write_all_raw(stdout, &diff);
                 // Reset scroll region before exit
                 write_all_raw(stdout, b"\x1b[r");
+                sync_statusbar_cursor(&parser);
                 crate::statusbar::redraw();
                 break;
             }
@@ -325,6 +335,7 @@ fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
             Some(r) if r.contains(PollFlags::POLLIN)
         ) && pending_redraw
         {
+            sync_statusbar_cursor(&parser);
             crate::statusbar::redraw();
             pending_redraw = false;
         }
