@@ -45,8 +45,8 @@
 use crate::config::Config;
 use crate::output;
 use landlock::{
-    path_beneath_rules, Access, AccessFs, AccessNet, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus, ABI,
+    path_beneath_rules, Access, AccessFs, AccessNet, NetPort, Ruleset,
+    RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
 };
 use std::path::{Path, PathBuf};
 
@@ -68,7 +68,7 @@ pub fn apply(
         return Ok(());
     }
 
-    match do_apply(config, project_dir, verbose) {
+    let fs_result = match do_apply(config, project_dir, verbose) {
         Ok(status) => match status {
             RulesetStatus::FullyEnforced => {
                 output::info("Landlock: fully enforced");
@@ -76,7 +76,9 @@ pub fn apply(
             }
             RulesetStatus::PartiallyEnforced => {
                 if config.lockdown_enabled() {
-                    Err("Landlock: partially enforced in lockdown mode".into())
+                    Err("Landlock: partially enforced \
+                         in lockdown mode"
+                        .into())
                 } else {
                     output::info(
                         "Landlock: partially enforced \
@@ -87,7 +89,8 @@ pub fn apply(
             }
             RulesetStatus::NotEnforced => {
                 if config.lockdown_enabled() {
-                    Err("Landlock: not enforced in lockdown mode \
+                    Err("Landlock: not enforced in \
+                         lockdown mode \
                          (kernel too old, bwrap-only)"
                         .into())
                 } else {
@@ -101,7 +104,10 @@ pub fn apply(
         },
         Err(e) => {
             if config.lockdown_enabled() {
-                Err(format!("Landlock: failed to apply in lockdown mode ({e})"))
+                Err(format!(
+                    "Landlock: failed to apply in \
+                     lockdown mode ({e})"
+                ))
             } else {
                 output::warn(&format!(
                     "Landlock: failed to apply ({e}), \
@@ -110,7 +116,13 @@ pub fn apply(
                 Ok(())
             }
         }
-    }
+    };
+    fs_result?;
+
+    // V4 network rules are stacked as a separate ruleset so
+    // filesystem enforcement is preserved on kernels without
+    // V4 support.
+    apply_net_rules(config, verbose)
 }
 
 /// Collect paths that need read-only access and paths that
@@ -144,63 +156,115 @@ fn do_apply(
         .add_rules(path_beneath_rules(rw_paths, access_all))?
         .restrict_self()?;
 
-    // Stack a second ruleset for V4 network restrictions.
-    // This is separate from the filesystem ruleset so V3
-    // behavior is preserved on kernels without V4 support.
-    apply_net_rules(config, verbose);
-
     Ok(status.ruleset)
 }
 
 /// Apply Landlock V4 (kernel ≥ 6.5) network restrictions.
 ///
-/// In lockdown mode: handle BindTcp + ConnectTcp but add NO port
-/// rules → all TCP is denied. This is defense-in-depth alongside
-/// bwrap's --unshare-net (network namespace with no interfaces).
-/// Even if an attacker escapes the network namespace, Landlock
-/// still blocks TCP.
+/// In lockdown mode with no allowed ports: handle BindTcp +
+/// ConnectTcp but add NO port rules → all TCP is denied. This
+/// is defense-in-depth alongside bwrap's --unshare-net.
 ///
-/// In normal mode: no network restrictions via Landlock. Agents
-/// need outbound HTTP(S) for package downloads, API calls, etc.
+/// In lockdown mode with allowed ports: handle BindTcp +
+/// ConnectTcp and add NetPort rules for each allowed port
+/// (ConnectTcp only). Unlisted ports are denied. bwrap's
+/// --unshare-net is skipped so the sandbox shares the host
+/// network stack (otherwise allowed ports would be unreachable).
 ///
-/// Best-effort: silently skipped if kernel lacks V4 support.
-fn apply_net_rules(config: &Config, verbose: bool) {
+/// In normal mode: no network restrictions via Landlock.
+///
+/// Best-effort when no allowed ports: silently skipped if kernel
+/// lacks V4 support (--unshare-net provides the isolation).
+///
+/// Hard-fail when allowed ports are configured but V4 is
+/// unavailable: --unshare-net was already skipped so there
+/// would be no network restriction at all, violating lockdown's
+/// security guarantee.
+///
+/// LIMITATION: Landlock V4 only covers TCP. When allowed ports
+/// are configured, --unshare-net is skipped and UDP/ICMP traffic
+/// is unrestricted. Seccomp blocks raw/packet sockets but
+/// regular UDP datagrams can still be sent and received.
+fn apply_net_rules(config: &Config, verbose: bool) -> Result<(), String> {
     if !config.lockdown_enabled() {
-        // Normal mode: no network restrictions via Landlock.
-        return;
+        return Ok(());
     }
 
     let net_access = AccessNet::from_all(ABI_NET);
     if net_access.is_empty() {
-        return;
+        return Ok(());
     }
 
-    // Handle net access but add NO NetPort rules → all TCP
-    // bind/connect is denied (defense-in-depth alongside
-    // bwrap's --unshare-net).
-    match Ruleset::default()
+    let allowed = config.allow_tcp_ports();
+
+    let result = Ruleset::default()
         .handle_access(net_access)
         .and_then(|r| r.create())
-        .and_then(|r| r.restrict_self())
-    {
-        Ok(status) => {
-            if verbose {
-                let enforced = match status.ruleset {
-                    RulesetStatus::FullyEnforced => "fully enforced",
-                    RulesetStatus::PartiallyEnforced => "partially enforced",
-                    RulesetStatus::NotEnforced => "not enforced",
-                };
-                output::verbose(&format!(
-                    "Landlock V4 net: {enforced} (lockdown)"
-                ));
+        .and_then(|r| {
+            let mut created = r;
+            for &port in allowed {
+                created = created
+                    .add_rule(NetPort::new(port, AccessNet::ConnectTcp))?;
             }
-        }
-        Err(_) => {
+            created.restrict_self()
+        });
+
+    match result {
+        Ok(status) => {
+            let enforced = match status.ruleset {
+                RulesetStatus::FullyEnforced => "fully enforced",
+                RulesetStatus::PartiallyEnforced => "partially enforced",
+                RulesetStatus::NotEnforced => "not enforced",
+            };
+
+            if !allowed.is_empty() {
+                match status.ruleset {
+                    RulesetStatus::FullyEnforced => {}
+                    _ => {
+                        return Err(format!(
+                            "Landlock V4 net: {enforced} \
+                             — cannot guarantee port \
+                             allowlist (--unshare-net \
+                             was skipped)"
+                        ));
+                    }
+                }
+            }
+
             if verbose {
-                output::verbose(
-                    "Landlock V4 net: unavailable \
-                     (kernel < 6.5, using --unshare-net only)",
-                );
+                if allowed.is_empty() {
+                    output::verbose(&format!(
+                        "Landlock V4 net: {enforced} \
+                         (lockdown, all TCP denied)"
+                    ));
+                } else {
+                    output::verbose(&format!(
+                        "Landlock V4 net: {enforced} \
+                         (lockdown, allowed ports: \
+                         {allowed:?})"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if allowed.is_empty() {
+                if verbose {
+                    output::verbose(
+                        "Landlock V4 net: unavailable \
+                         (kernel < 6.5, using \
+                         --unshare-net only)",
+                    );
+                }
+                Ok(())
+            } else {
+                Err(format!(
+                    "Landlock V4 required for \
+                     --allow-tcp-port but unavailable \
+                     ({e}). Cannot enforce port \
+                     allowlist without network \
+                     namespace — refusing to start"
+                ))
             }
         }
     }
@@ -732,21 +796,46 @@ mod tests {
 
     #[test]
     fn apply_net_rules_normal_is_noop() {
-        // Normal mode should not apply any net restrictions.
         let config = Config::default();
         assert!(!config.lockdown_enabled());
-        // Must not panic or error
-        apply_net_rules(&config, true);
+        assert!(apply_net_rules(&config, true).is_ok());
     }
 
     #[test]
     fn apply_net_rules_lockdown_does_not_panic() {
-        // On macOS/kernels without V4, this is best-effort.
         let config = Config {
             lockdown: Some(true),
             ..Config::default()
         };
-        // Must not panic regardless of kernel support
-        apply_net_rules(&config, true);
+        // On macOS / kernels without V4: Ok (ABI_NET is empty).
+        // On Linux with V4: Ok (deny-all TCP).
+        let _ = apply_net_rules(&config, true);
+    }
+
+    #[test]
+    fn apply_net_rules_lockdown_with_ports() {
+        let config = Config {
+            lockdown: Some(true),
+            allow_tcp_ports: vec![32000, 8080],
+            ..Config::default()
+        };
+        // On macOS / kernels without V4 ABI: Ok (early return,
+        //   net_access is empty).
+        // On Linux with V4: Ok (NetPort rules applied).
+        // On Linux without V4 but with net ABI: Err (hard-fail
+        //   because --unshare-net was skipped).
+        let _ = apply_net_rules(&config, true);
+    }
+
+    #[test]
+    fn apply_net_rules_lockdown_empty_ports() {
+        let config = Config {
+            lockdown: Some(true),
+            allow_tcp_ports: vec![],
+            ..Config::default()
+        };
+        // Empty ports → same as no ports → best-effort V4 or
+        // fallback to --unshare-net only.
+        let _ = apply_net_rules(&config, true);
     }
 }
