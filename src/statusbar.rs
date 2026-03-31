@@ -23,6 +23,11 @@ static CMD_LEN: AtomicUsize = AtomicUsize::new(0);
 
 static UPDATE_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
+// Cursor position (1-based) for restore after draw.
+// Set by the PTY proxy before each redraw.
+static CURSOR_ROW: AtomicUsize = AtomicUsize::new(1);
+static CURSOR_COL: AtomicUsize = AtomicUsize::new(1);
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // U+2026 HORIZONTAL ELLIPSIS: 3 UTF-8 bytes, 1 visible column
@@ -156,6 +161,14 @@ pub fn is_active() -> bool {
     ACTIVE.load(Ordering::SeqCst)
 }
 
+/// Store the cursor position (1-based) so `draw()` can restore it
+/// via absolute CUP instead of DECSC/DECRC. Must be called before
+/// `redraw()` whenever the PTY proxy knows the current position.
+pub fn set_cursor_position(row: u16, col: u16) {
+    CURSOR_ROW.store(row as usize, Ordering::SeqCst);
+    CURSOR_COL.store(col as usize, Ordering::SeqCst);
+}
+
 /// Request a redraw from async contexts.
 pub fn request_redraw() {
     DIRTY.store(true, Ordering::SeqCst);
@@ -268,8 +281,12 @@ fn draw(rows: u16, cols: u16) {
         }};
     }
 
-    // 1. Save cursor
-    put!(b"\x1b7");
+    // 1. Read the saved cursor position for CUP restore.
+    //    Avoids DECSC/DECRC (\x1b7/\x1b8) which on macOS terminals
+    //    also save/restore scroll margins AND clobber the child's
+    //    DECSC save slot, causing cursor offset artifacts.
+    let restore_row = CURSOR_ROW.load(Ordering::SeqCst) as u16;
+    let restore_col = CURSOR_COL.load(Ordering::SeqCst) as u16;
 
     // 2. Move to last row + clear it: \x1b[{rows};1H\x1b[2K
     put!(b"\x1b[");
@@ -421,8 +438,12 @@ fn draw(rows: u16, cols: u16) {
     // 6. Reset attributes
     put!(b"\x1b[0m");
 
-    // 7. Restore cursor
-    put!(b"\x1b8");
+    // 7. Restore cursor via absolute CUP (no DECRC).
+    put!(b"\x1b[");
+    pos += write_u16(restore_row, &mut buf[pos..]);
+    put!(b";");
+    pos += write_u16(restore_col, &mut buf[pos..]);
+    put!(b"H");
 
     raw_write(&buf[..pos]);
 }
