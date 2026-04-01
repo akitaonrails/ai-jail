@@ -28,6 +28,58 @@ const DOTDIR_DENY: &[&str] = &[
     ".sparrow",
 ];
 
+/// Returns true if the dotdir name requires read-write access.
+/// `name` should be the dotdir name with or without leading dot (e.g., ".cargo" or "cargo").
+fn is_dotdir_rw(name: &str) -> bool {
+    let normalized = name.strip_prefix('.').unwrap_or(name);
+    DOTDIR_RW
+        .iter()
+        .any(|&d| d.strip_prefix('.').unwrap_or(d) == normalized)
+}
+
+/// Returns true if the dotdir name is in the deny list.
+/// Checks both built-in DOTDIR_DENY and user-specified extras.
+/// `name` should be the dotdir name with or without leading dot (e.g., ".aws" or "aws").
+/// If user tries to deny a built-in RW directory, warns and returns false.
+#[expect(dead_code)]
+pub fn is_dotdir_denied(name: &str, extra: &[String]) -> bool {
+    let normalized = name.strip_prefix('.').unwrap_or(name);
+    // Check built-in list
+    if DOTDIR_DENY
+        .iter()
+        .any(|&d| d.strip_prefix('.').unwrap_or(d) == normalized)
+    {
+        return true;
+    }
+    // Check user-specified extras, but reject RW-required dirs
+    for e in extra {
+        let e_normalized = e.strip_prefix('.').unwrap_or(e);
+        if e_normalized == normalized {
+            if is_dotdir_rw(normalized) {
+                crate::output::warn(&format!(
+                    "Cannot hide {e}: it is required for sandboxed tool operation"
+                ));
+                return false;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns an iterator over all denied dotdir names (without leading dot).
+/// Includes both built-in DOTDIR_DENY and user-specified extras.
+pub fn denied_dotdirs(extra: &[String]) -> impl Iterator<Item = String> + '_ {
+    DOTDIR_DENY
+        .iter()
+        .map(|s| s.strip_prefix('.').unwrap_or(s).to_string())
+        .chain(
+            extra
+                .iter()
+                .map(|s| s.strip_prefix('.').unwrap_or(s).to_string()),
+        )
+}
+
 // Dotdirs requiring read-write access
 const DOTDIR_RW: &[&str] = &[
     ".claude",
@@ -73,7 +125,11 @@ fn mise_bin() -> Option<PathBuf> {
     std::env::var("PATH").ok().and_then(|paths| {
         paths.split(':').find_map(|dir| {
             let p = PathBuf::from(dir).join("mise");
-            if p.is_file() { Some(p) } else { None }
+            if p.is_file() {
+                Some(p)
+            } else {
+                None
+            }
         })
     })
 }
@@ -340,5 +396,74 @@ mod tests {
                 "{name} is in both deny and rw lists"
             );
         }
+    }
+
+    #[test]
+    fn is_dotdir_denied_builtin() {
+        assert!(is_dotdir_denied(".gnupg", &[]));
+        assert!(is_dotdir_denied("gnupg", &[])); // Without dot
+        assert!(is_dotdir_denied(".aws", &[]));
+        assert!(is_dotdir_denied(".ssh", &[]));
+        assert!(is_dotdir_denied(".mozilla", &[]));
+        assert!(is_dotdir_denied(".basilisk-dev", &[]));
+        assert!(is_dotdir_denied(".sparrow", &[]));
+    }
+
+    #[test]
+    fn is_dotdir_denied_extra() {
+        let extra = vec![".my_secrets".into(), ".proton".into()];
+        assert!(is_dotdir_denied(".my_secrets", &extra));
+        assert!(is_dotdir_denied("my_secrets", &extra)); // Without dot
+        assert!(is_dotdir_denied(".proton", &extra));
+        assert!(is_dotdir_denied("proton", &extra));
+    }
+
+    #[test]
+    fn is_dotdir_denied_not_in_list() {
+        assert!(!is_dotdir_denied(".cargo", &[]));
+        assert!(!is_dotdir_denied(".config", &[]));
+        assert!(!is_dotdir_denied(".my_custom", &[]));
+    }
+
+    #[test]
+    fn is_dotdir_denied_combined() {
+        let extra = vec![".my_secrets".into()];
+        // Built-in
+        assert!(is_dotdir_denied(".aws", &extra));
+        // Extra
+        assert!(is_dotdir_denied(".my_secrets", &extra));
+        // Not denied
+        assert!(!is_dotdir_denied(".cargo", &extra));
+    }
+
+    #[test]
+    fn cannot_deny_rw_required_dirs() {
+        for name in &[".cargo", ".cache", ".config", ".claude"] {
+            let extra = vec![name.to_string()];
+            assert!(
+                !is_dotdir_denied(name, &extra),
+                "{name} should not be deniable - it's RW-required"
+            );
+        }
+    }
+
+    #[test]
+    fn is_dotdir_rw_check() {
+        assert!(is_dotdir_rw(".cargo"));
+        assert!(is_dotdir_rw("cargo"));
+        assert!(is_dotdir_rw(".config"));
+        assert!(is_dotdir_rw(".cache"));
+        assert!(!is_dotdir_rw(".aws"));
+        assert!(!is_dotdir_rw(".my_secrets"));
+    }
+
+    #[test]
+    fn denied_dotdirs_iter() {
+        let extra: Vec<String> = vec![".my_secrets".into(), ".proton".into()];
+        let denied: Vec<String> = denied_dotdirs(&extra).collect();
+        assert!(denied.contains(&"gnupg".to_string()));
+        assert!(denied.contains(&"aws".to_string()));
+        assert!(denied.contains(&"my_secrets".to_string()));
+        assert!(denied.contains(&"proton".to_string()));
     }
 }

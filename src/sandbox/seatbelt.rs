@@ -127,7 +127,7 @@ fn generate_sbpl_profile(
     enable_docker: bool,
     lockdown: bool,
 ) -> String {
-    let deny_paths = macos_read_deny_paths();
+    let deny_paths = macos_read_deny_paths(&config.hide_dotdirs);
     let writable_paths = macos_writable_paths(project_dir, config, lockdown);
 
     let mut profile = String::new();
@@ -283,12 +283,11 @@ fn format_dry_run_macos(command_line: &str, profile: &str) -> String {
     out
 }
 
-fn macos_read_deny_paths() -> Vec<PathBuf> {
+fn macos_read_deny_paths(hide_dotdirs: &[String]) -> Vec<PathBuf> {
     let home = super::home_dir();
 
-    let mut candidates: Vec<PathBuf> = super::DOTDIR_DENY
-        .iter()
-        .map(|name| home.join(name))
+    let mut candidates: Vec<PathBuf> = super::denied_dotdirs(hide_dotdirs)
+        .map(|name| home.join(format!(".{}", name)))
         .collect();
 
     candidates.extend([
@@ -451,10 +450,8 @@ mod tests {
         let profile = generate_sbpl_profile(&config, &project, false, true);
         assert!(!profile.contains("(allow network-outbound)"));
         assert!(!profile.contains("(allow file-read*)\n"));
-        assert!(
-            profile
-                .contains("(allow file-read* (subpath \"/tmp/test-project\"))")
-        );
+        assert!(profile
+            .contains("(allow file-read* (subpath \"/tmp/test-project\"))"));
         // Lockdown should have no path-based write allowances (project, dotfiles, tmp)
         // but still allows device writes (/dev/null etc.) and PTY writes
         assert!(profile.contains("no host file-write allowances"));
