@@ -16,6 +16,7 @@ COMMANDS (positional):
 OPTIONS:
     --rw-map <PATH>         Mount PATH read-write inside sandbox (repeatable)
     --map <PATH>            Mount PATH read-only inside sandbox (repeatable)
+    --hide-dotdir <NAME>    Never mount dotdir NAME (e.g., .my_secrets) (repeatable)
     --lockdown / --no-lockdown Enable/disable strict read-only lockdown mode
     --landlock / --no-landlock Enable/disable Landlock LSM (Linux 5.13+, default: on)
     --seccomp / --no-seccomp   Enable/disable seccomp syscall filter (Linux, default: on)
@@ -41,6 +42,7 @@ pub struct CliArgs {
     pub command: Vec<String>,
     pub rw_maps: Vec<PathBuf>,
     pub ro_maps: Vec<PathBuf>,
+    pub hide_dotdirs: Vec<String>,
     pub lockdown: Option<bool>,
     pub landlock: Option<bool>,
     pub seccomp: Option<bool>,
@@ -83,6 +85,21 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 let val: PathBuf =
                     parser.value().map_err(|e| e.to_string())?.into();
                 args.ro_maps.push(val);
+            }
+            Long("hide-dotdir") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let s = val.to_string_lossy().into_owned();
+                if s.is_empty() {
+                    return Err(
+                        "--hide-dotdir requires a non-empty value".into()
+                    );
+                }
+                let normalized = if s.starts_with('.') {
+                    s
+                } else {
+                    format!(".{}", s)
+                };
+                args.hide_dotdirs.push(normalized);
             }
             Long("lockdown") => args.lockdown = Some(true),
             Long("no-lockdown") => args.lockdown = Some(false),
@@ -342,6 +359,66 @@ mod tests {
         assert_eq!(args.ro_maps, vec![PathBuf::from("/opt/c")]);
     }
 
+    // ── Hide dotdir tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_hide_dotdir() {
+        let args =
+            parse_test(&["--hide-dotdir", ".my_secrets", "bash"]).unwrap();
+        assert_eq!(args.hide_dotdirs, vec![".my_secrets"]);
+    }
+
+    #[test]
+    fn parse_multiple_hide_dotdirs() {
+        let args = parse_test(&[
+            "--hide-dotdir",
+            ".my_secrets",
+            "--hide-dotdir",
+            ".proton",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.hide_dotdirs, vec![".my_secrets", ".proton"]);
+    }
+
+    #[test]
+    fn parse_hide_dotdir_with_maps() {
+        let args = parse_test(&[
+            "--hide-dotdir",
+            ".aws",
+            "--rw-map",
+            "/tmp/test",
+            "--map",
+            "/opt/data",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.hide_dotdirs, vec![".aws"]);
+        assert_eq!(args.rw_maps, vec![PathBuf::from("/tmp/test")]);
+        assert_eq!(args.ro_maps, vec![PathBuf::from("/opt/data")]);
+    }
+
+    #[test]
+    fn parse_hide_dotdir_normalizes_no_dot() {
+        let args =
+            parse_test(&["--hide-dotdir", "my_secrets", "bash"]).unwrap();
+        assert_eq!(args.hide_dotdirs, vec![".my_secrets"]);
+    }
+
+    #[test]
+    fn parse_hide_dotdir_keeps_existing_dot() {
+        let args =
+            parse_test(&["--hide-dotdir", ".my_secrets", "bash"]).unwrap();
+        assert_eq!(args.hide_dotdirs, vec![".my_secrets"]);
+    }
+
+    #[test]
+    fn parse_hide_dotdir_empty_errors() {
+        let result = parse_test(&["--hide-dotdir", "", "bash"]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-empty"));
+    }
+
     // ── Combined flags ─────────────────────────────────────────
 
     #[test]
@@ -405,6 +482,12 @@ mod tests {
     #[test]
     fn parse_rw_map_missing_value_errors() {
         let result = parse_test(&["--rw-map"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_hide_dotdir_missing_value_errors() {
+        let result = parse_test(&["--hide-dotdir"]);
         assert!(result.is_err());
     }
 
