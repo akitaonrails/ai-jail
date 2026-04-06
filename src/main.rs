@@ -40,6 +40,14 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     // the filter.
     sandbox::apply_seccomp(&config, cli.verbose)?;
 
+    // Apply NPROC here, inside the sandbox, after bwrap has finished
+    // setting up namespaces. RLIMIT_NPROC counts all processes owned
+    // by the real UID system-wide, so setting it on the outer ai-jail
+    // before bwrap's clone() calls would cause EAGAIN when Chrome or
+    // other heavy applications are running.
+    #[cfg(target_os = "linux")]
+    sandbox::rlimits::apply_nproc(&config, cli.verbose);
+
     // Replace this process with the real command
     let err = std::process::Command::new(&cli.command[0])
         .args(&cli.command[1..])
@@ -171,8 +179,10 @@ fn run() -> Result<i32, String> {
     // sandbox after bwrap finishes mount namespace setup.
     let mut cmd = sandbox::build(&guard, &config, &project_dir, cli.verbose)?;
 
-    // Apply resource limits before spawning. Limits are inherited
-    // by the child across fork+exec.
+    // Apply NOFILE and CORE limits on the parent (inherited by child
+    // across fork+exec). NPROC is applied inside the sandbox instead
+    // — see run_landlock_exec() — to avoid EAGAIN during bwrap's
+    // internal clone() calls for namespace creation.
     sandbox::rlimits::apply(&config, cli.verbose);
 
     let exit_code = if use_status_bar {

@@ -39,21 +39,6 @@ fn limits_for(config: &Config) -> Vec<Limit> {
         },
     ];
 
-    // RLIMIT_NPROC is not exposed by nix on macOS
-    #[cfg(target_os = "linux")]
-    limits.insert(
-        0,
-        Limit {
-            resource: Resource::RLIMIT_NPROC,
-            soft: if lockdown {
-                NPROC_LOCKDOWN
-            } else {
-                NPROC_NORMAL
-            },
-            name: "NPROC",
-        },
-    );
-
     limits
 }
 
@@ -87,6 +72,35 @@ pub fn apply(config: &Config, verbose: bool) {
                 lim.name, effective, hard
             ));
         }
+    }
+}
+
+/// Apply RLIMIT_NPROC in the current process. Must be called inside
+/// the bwrap sandbox (from --landlock-exec), not on the bwrap parent:
+/// bwrap uses clone() for namespace creation, which counts against
+/// RLIMIT_NPROC system-wide. Applying the limit before bwrap's clone()
+/// causes EAGAIN when other user processes (e.g. Chrome) are running.
+#[cfg(target_os = "linux")]
+pub fn apply_nproc(config: &Config, verbose: bool) {
+    if !config.rlimits_enabled() {
+        return;
+    }
+    let soft = if config.lockdown_enabled() {
+        NPROC_LOCKDOWN
+    } else {
+        NPROC_NORMAL
+    };
+    let Ok((_, hard)) = getrlimit(Resource::RLIMIT_NPROC) else {
+        return;
+    };
+    let effective = soft.min(hard);
+    if let Err(e) = setrlimit(Resource::RLIMIT_NPROC, effective, hard) {
+        output::warn(&format!("Failed to set RLIMIT_NPROC: {e}"));
+    } else if verbose {
+        output::verbose(&format!(
+            "RLIMIT_NPROC: {} (hard: {})",
+            effective, hard
+        ));
     }
 }
 
