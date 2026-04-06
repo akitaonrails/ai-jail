@@ -94,12 +94,15 @@ pub fn apply_nproc(config: &Config, verbose: bool) {
         return;
     };
     let effective = soft.min(hard);
-    if let Err(e) = setrlimit(Resource::RLIMIT_NPROC, effective, hard) {
+    // Set hard == soft so the sandboxed process cannot raise the
+    // limit back up. Lowering the hard limit is irreversible for
+    // unprivileged processes.
+    if let Err(e) = setrlimit(Resource::RLIMIT_NPROC, effective, effective) {
         output::warn(&format!("Failed to set RLIMIT_NPROC: {e}"));
     } else if verbose {
         output::verbose(&format!(
             "RLIMIT_NPROC: {} (hard: {})",
-            effective, hard
+            effective, effective
         ));
     }
 }
