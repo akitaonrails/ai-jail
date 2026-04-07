@@ -414,7 +414,7 @@ fn collect_normal_paths(
     // .ssh, .gnupg are denied entirely (never bind-mounted by
     // bwrap, so Landlock allowing them is moot — but we still
     // skip them for defense-in-depth). Everything else is ro.
-    collect_home_paths(&home, &mut ro, &mut rw, verbose);
+    collect_home_paths(&home, &config.hide_dotdirs, &mut ro, &mut rw, verbose);
 
     // $HOME/.local: read-write — mise, pipx, and other tools
     // store binaries and state here.
@@ -532,14 +532,15 @@ fn collect_normal_paths(
 
 /// Classify home dotdirs into read-only or read-write.
 ///
-/// Sensitive dirs (DOTDIR_DENY: .ssh, .gnupg, etc.) are skipped
-/// entirely — bwrap never bind-mounts them, so they are invisible
-/// inside the sandbox. Writable dirs (DOTDIR_RW: .cargo, .npm,
-/// .cache, etc.) are tool caches that agents legitimately modify.
+/// Sensitive dirs (DOTDIR_DENY: .ssh, .gnupg, etc.) and user-specified
+/// hide_dotdirs are skipped entirely — bwrap never bind-mounts them, so
+/// they are invisible inside the sandbox. Writable dirs (DOTDIR_RW: .cargo,
+/// .npm, .cache, etc.) are tool caches that agents legitimately modify.
 /// Everything else defaults to read-only (safe to read config
 /// from but not modify).
 fn collect_home_paths(
     home: &Path,
+    hide_dotdirs: &[String],
     ro: &mut Vec<PathBuf>,
     rw: &mut Vec<PathBuf>,
     verbose: bool,
@@ -561,7 +562,7 @@ fn collect_home_paths(
             continue;
         }
 
-        if super::DOTDIR_DENY.contains(&name_str.as_ref()) {
+        if super::is_dotdir_denied(&name_str, hide_dotdirs) {
             continue;
         }
 

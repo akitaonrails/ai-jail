@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub ro_maps: Vec<PathBuf>,
     #[serde(default)]
+    pub hide_dotdirs: Vec<String>,
+    #[serde(default)]
     pub no_gpu: Option<bool>,
     #[serde(default)]
     pub no_docker: Option<bool>,
@@ -139,6 +141,8 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     dedup_paths(&mut c.rw_maps);
     c.ro_maps.extend(local.ro_maps);
     dedup_paths(&mut c.ro_maps);
+    c.hide_dotdirs.extend(local.hide_dotdirs);
+    dedup_strings(&mut c.hide_dotdirs);
     if local.no_gpu.is_some() {
         c.no_gpu = local.no_gpu;
     }
@@ -285,6 +289,11 @@ fn dedup_paths(paths: &mut Vec<PathBuf>) {
     paths.retain(|p| seen.insert(p.clone()));
 }
 
+fn dedup_strings(strings: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    strings.retain(|s| seen.insert(s.clone()));
+}
+
 pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     let mut config = existing;
 
@@ -299,6 +308,10 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
 
     config.ro_maps.extend(cli.ro_maps.iter().cloned());
     dedup_paths(&mut config.ro_maps);
+
+    // hide_dotdirs: CLI values appended, deduplicated
+    config.hide_dotdirs.extend(cli.hide_dotdirs.iter().cloned());
+    dedup_strings(&mut config.hide_dotdirs);
 
     // Boolean flags: CLI overrides config (--no-gpu => no_gpu=Some(true), --gpu => no_gpu=Some(false))
     if let Some(v) = cli.gpu {
@@ -376,6 +389,12 @@ pub fn display_status(config: &Config) {
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
+        );
+    }
+    if !config.hide_dotdirs.is_empty() {
+        output::status_header(
+            "  Hide dotdirs",
+            &config.hide_dotdirs.join(", "),
         );
     }
 
@@ -633,6 +652,26 @@ no_rlimits = false
     }
 
     #[test]
+    fn regression_v0_6_0_config_without_hide_dotdirs() {
+        // v0.6.0 configs don't have hide_dotdirs field.
+        // They must still parse and default to empty.
+        let toml = r#"
+command = ["claude"]
+rw_maps = []
+ro_maps = []
+no_gpu = false
+no_docker = false
+lockdown = false
+no_landlock = false
+no_status_bar = false
+no_seccomp = false
+no_rlimits = false
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert!(cfg.hide_dotdirs.is_empty());
+    }
+
+    #[test]
     fn regression_empty_config_file() {
         // An empty .ai-jail file must not crash
         let cfg = parse_toml("").unwrap();
@@ -654,6 +693,7 @@ no_rlimits = false
             command: vec!["claude".into()],
             rw_maps: vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
             ro_maps: vec![PathBuf::from("/opt/data")],
+            hide_dotdirs: vec![".my_secrets".into(), ".proton".into()],
             no_gpu: Some(true),
             no_docker: None,
             no_display: Some(false),
@@ -671,6 +711,7 @@ no_rlimits = false
         assert_eq!(deserialized.command, config.command);
         assert_eq!(deserialized.rw_maps, config.rw_maps);
         assert_eq!(deserialized.ro_maps, config.ro_maps);
+        assert_eq!(deserialized.hide_dotdirs, config.hide_dotdirs);
         assert_eq!(deserialized.no_gpu, config.no_gpu);
         assert_eq!(deserialized.no_docker, config.no_docker);
         assert_eq!(deserialized.no_display, config.no_display);
@@ -744,6 +785,36 @@ no_rlimits = false
         assert_eq!(
             merged.ro_maps,
             vec![PathBuf::from("/opt/x"), PathBuf::from("/opt/y")]
+        );
+    }
+
+    #[test]
+    fn merge_hide_dotdirs_appended_and_deduplicated() {
+        let existing = Config {
+            hide_dotdirs: vec![".my_secrets".into(), ".proton".into()],
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            hide_dotdirs: vec![".proton".into(), ".password-store".into()],
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(
+            merged.hide_dotdirs,
+            vec![".my_secrets", ".proton", ".password-store"]
+        );
+    }
+
+    #[test]
+    fn parse_hide_dotdirs() {
+        let toml = r#"
+command = ["claude"]
+hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(
+            cfg.hide_dotdirs,
+            vec![".my_secrets", ".proton", ".password-store"]
         );
     }
 
@@ -925,6 +996,26 @@ allow_tcp_ports = [32000, 8080]
         let mut paths: Vec<PathBuf> = vec![];
         dedup_paths(&mut paths);
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn dedup_strings_removes_duplicates_preserves_order() {
+        let mut strings = vec![
+            ".my_secrets".into(),
+            ".proton".into(),
+            ".my_secrets".into(),
+            ".aws".into(),
+            ".proton".into(),
+        ];
+        dedup_strings(&mut strings);
+        assert_eq!(strings, vec![".my_secrets", ".proton", ".aws"]);
+    }
+
+    #[test]
+    fn dedup_strings_empty() {
+        let mut strings: Vec<String> = vec![];
+        dedup_strings(&mut strings);
+        assert!(strings.is_empty());
     }
 
     // ── Accessor method tests ─────────────────────────────────
@@ -1226,6 +1317,7 @@ allow_tcp_ports = [32000, 8080]
             command: vec!["codex".into()],
             rw_maps: vec![PathBuf::from("/tmp/shared")],
             ro_maps: vec![],
+            hide_dotdirs: vec![],
             no_gpu: Some(true),
             no_docker: None,
             no_display: None,

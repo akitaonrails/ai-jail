@@ -759,7 +759,11 @@ fn discover_mounts(
     MountSet {
         base: discover_base(hosts_file, resolv_mount),
         sys_masks: discover_sys_masks(lockdown),
-        home_dotfiles: discover_home_dotfiles(lockdown, verbose),
+        home_dotfiles: discover_home_dotfiles(
+            lockdown,
+            &config.hide_dotdirs,
+            verbose,
+        ),
         config_hide: if lockdown {
             vec![]
         } else {
@@ -876,7 +880,11 @@ fn discover_base(
     mounts
 }
 
-fn discover_home_dotfiles(lockdown: bool, verbose: bool) -> Vec<Mount> {
+fn discover_home_dotfiles(
+    lockdown: bool,
+    hide_dotdirs: &[String],
+    verbose: bool,
+) -> Vec<Mount> {
     let home = super::home_dir();
     let mut mounts = vec![Mount::Tmpfs { dest: home.clone() }];
 
@@ -904,7 +912,7 @@ fn discover_home_dotfiles(lockdown: bool, verbose: bool) -> Vec<Mount> {
             continue;
         }
 
-        if super::DOTDIR_DENY.contains(&name_str.as_ref()) {
+        if super::is_dotdir_denied(&name_str, hide_dotdirs) {
             if verbose {
                 output::verbose(&format!("deny: {}", path.display()));
             }
@@ -1392,7 +1400,7 @@ mod tests {
 
     #[test]
     fn lockdown_skips_host_home_dotfiles() {
-        let mounts = discover_home_dotfiles(true, false);
+        let mounts = discover_home_dotfiles(true, &[], false);
         assert_eq!(mounts.len(), 1, "lockdown should only mount tmpfs home");
         match &mounts[0] {
             Mount::Tmpfs { .. } => {}

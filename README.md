@@ -236,6 +236,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 |------|-------------|
 | `--rw-map <PATH>` | Mount PATH read-write (repeatable) |
 | `--map <PATH>` | Mount PATH read-only (repeatable) |
+| `--hide-dotdir <NAME>` | Never bind-mount the named home dotdir into the sandbox (e.g. `.my_secrets`). Leading dot is optional. Repeatable. Cannot hide dotdirs required for tool operation (`.cargo`, `.config`, `.cache`, etc.) — those emit a warning and stay visible. |
 | `--lockdown` / `--no-lockdown` | Enable/disable strict read-only lockdown mode |
 | `--landlock` / `--no-landlock` | Enable/disable Landlock LSM (Linux 5.13+, default: on) |
 | `--seccomp` / `--no-seccomp` | Enable/disable seccomp syscall filter (Linux, default: on) |
