@@ -28,6 +28,12 @@ pub fn platform_notes(config: &Config) {
             "--no-display has no effect on macOS (Cocoa is system-level)",
         );
     }
+    if !config.allow_tcp_ports().is_empty() && config.lockdown_enabled() {
+        output::warn(
+            "--allow-tcp-port has no effect on macOS \
+             lockdown (seatbelt blocks all network)",
+        );
+    }
 }
 
 pub fn build(config: &Config, project_dir: &Path, verbose: bool) -> Command {
