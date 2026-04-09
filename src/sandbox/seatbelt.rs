@@ -28,6 +28,12 @@ pub fn platform_notes(config: &Config) {
             "--no-display has no effect on macOS (Cocoa is system-level)",
         );
     }
+    if !config.allow_tcp_ports().is_empty() && config.lockdown_enabled() {
+        output::warn(
+            "--allow-tcp-port has no effect on macOS \
+             lockdown (seatbelt blocks all network)",
+        );
+    }
 }
 
 pub fn build(config: &Config, project_dir: &Path, verbose: bool) -> Command {
@@ -127,7 +133,7 @@ fn generate_sbpl_profile(
     enable_docker: bool,
     lockdown: bool,
 ) -> String {
-    let deny_paths = macos_read_deny_paths();
+    let deny_paths = macos_read_deny_paths(&config.hide_dotdirs);
     let writable_paths = macos_writable_paths(project_dir, config, lockdown);
 
     let mut profile = String::new();
@@ -283,12 +289,11 @@ fn format_dry_run_macos(command_line: &str, profile: &str) -> String {
     out
 }
 
-fn macos_read_deny_paths() -> Vec<PathBuf> {
+fn macos_read_deny_paths(hide_dotdirs: &[String]) -> Vec<PathBuf> {
     let home = super::home_dir();
 
-    let mut candidates: Vec<PathBuf> = super::DOTDIR_DENY
-        .iter()
-        .map(|name| home.join(name))
+    let mut candidates: Vec<PathBuf> = super::denied_dotdirs(hide_dotdirs)
+        .map(|name| home.join(format!(".{}", name)))
         .collect();
 
     candidates.extend([

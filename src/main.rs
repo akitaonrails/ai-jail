@@ -40,6 +40,14 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     // the filter.
     sandbox::apply_seccomp(&config, cli.verbose)?;
 
+    // Apply NPROC here, inside the sandbox, after bwrap has finished
+    // setting up namespaces. RLIMIT_NPROC counts all processes owned
+    // by the real UID system-wide, so setting it on the outer ai-jail
+    // before bwrap's clone() calls would cause EAGAIN when Chrome or
+    // other heavy applications are running.
+    #[cfg(target_os = "linux")]
+    sandbox::rlimits::apply_nproc(&config, cli.verbose);
+
     // Replace this process with the real command
     let err = std::process::Command::new(&cli.command[0])
         .args(&cli.command[1..])
@@ -73,6 +81,12 @@ fn run() -> Result<i32, String> {
         config::load()
     };
     let existing = config::merge_with_global(global, local);
+    // Capture the stored project command before the CLI command
+    // merges on top of it. The auto-save path below restores this
+    // so that `ai-jail codex` after `ai-jail claude` does not
+    // rewrite the project's stored default to codex. Use `--init`
+    // to explicitly change the stored command. See #20.
+    let stored_command = existing.command.clone();
     let config = config::merge(&cli, existing);
 
     // Handle status command
@@ -113,8 +127,18 @@ fn run() -> Result<i32, String> {
 
     // Save config in normal mode. In lockdown mode avoid host writes unless user
     // explicitly requested persistence via --init.
+    //
+    // A CLI-passed command is NOT persisted when the project already
+    // has a stored command — multi-agent users run `ai-jail claude`
+    // and `ai-jail codex` on the same project and the stored default
+    // should not flip under them. First-run bootstrap (no stored
+    // command yet) still persists the CLI command as the new default.
     if !config.lockdown_enabled() {
-        config::save(&config);
+        let mut to_save = config.clone();
+        if !stored_command.is_empty() && !cli.command.is_empty() {
+            to_save.command = stored_command;
+        }
+        config::save(&to_save);
     }
 
     // Handle dry run
@@ -171,8 +195,10 @@ fn run() -> Result<i32, String> {
     // sandbox after bwrap finishes mount namespace setup.
     let mut cmd = sandbox::build(&guard, &config, &project_dir, cli.verbose)?;
 
-    // Apply resource limits before spawning. Limits are inherited
-    // by the child across fork+exec.
+    // Apply NOFILE and CORE limits on the parent (inherited by child
+    // across fork+exec). NPROC is applied inside the sandbox instead
+    // — see run_landlock_exec() — to avoid EAGAIN during bwrap's
+    // internal clone() calls for namespace creation.
     sandbox::rlimits::apply(&config, cli.verbose);
 
     let exit_code = if use_status_bar {

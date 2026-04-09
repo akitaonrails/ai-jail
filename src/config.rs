@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub ro_maps: Vec<PathBuf>,
     #[serde(default)]
+    pub hide_dotdirs: Vec<String>,
+    #[serde(default)]
     pub no_gpu: Option<bool>,
     #[serde(default)]
     pub no_docker: Option<bool>,
@@ -35,6 +37,8 @@ pub struct Config {
     pub no_seccomp: Option<bool>,
     #[serde(default)]
     pub no_rlimits: Option<bool>,
+    #[serde(default)]
+    pub allow_tcp_ports: Vec<u16>,
 }
 
 impl Config {
@@ -62,6 +66,7 @@ impl Config {
     pub fn status_bar_style(&self) -> &str {
         match self.status_bar_style.as_deref() {
             Some("light") => "light",
+            Some("pastel") => "pastel",
             _ => "dark",
         }
     }
@@ -70,6 +75,9 @@ impl Config {
     }
     pub fn rlimits_enabled(&self) -> bool {
         self.no_rlimits != Some(true)
+    }
+    pub fn allow_tcp_ports(&self) -> &[u16] {
+        &self.allow_tcp_ports
     }
 }
 
@@ -134,6 +142,8 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     dedup_paths(&mut c.rw_maps);
     c.ro_maps.extend(local.ro_maps);
     dedup_paths(&mut c.ro_maps);
+    c.hide_dotdirs.extend(local.hide_dotdirs);
+    dedup_strings(&mut c.hide_dotdirs);
     if local.no_gpu.is_some() {
         c.no_gpu = local.no_gpu;
     }
@@ -158,6 +168,9 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     if local.no_rlimits.is_some() {
         c.no_rlimits = local.no_rlimits;
     }
+    c.allow_tcp_ports.extend(local.allow_tcp_ports);
+    c.allow_tcp_ports.sort_unstable();
+    c.allow_tcp_ports.dedup();
     // Status bar stays from global — local should not override
     c
 }
@@ -277,6 +290,11 @@ fn dedup_paths(paths: &mut Vec<PathBuf>) {
     paths.retain(|p| seen.insert(p.clone()));
 }
 
+fn dedup_strings(strings: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    strings.retain(|s| seen.insert(s.clone()));
+}
+
 pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     let mut config = existing;
 
@@ -291,6 +309,10 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
 
     config.ro_maps.extend(cli.ro_maps.iter().cloned());
     dedup_paths(&mut config.ro_maps);
+
+    // hide_dotdirs: CLI values appended, deduplicated
+    config.hide_dotdirs.extend(cli.hide_dotdirs.iter().cloned());
+    dedup_strings(&mut config.hide_dotdirs);
 
     // Boolean flags: CLI overrides config (--no-gpu => no_gpu=Some(true), --gpu => no_gpu=Some(false))
     if let Some(v) = cli.gpu {
@@ -323,6 +345,12 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     if let Some(ref style) = cli.status_bar_style {
         config.status_bar_style = Some(style.clone());
     }
+
+    config
+        .allow_tcp_ports
+        .extend(cli.allow_tcp_ports.iter().copied());
+    config.allow_tcp_ports.sort_unstable();
+    config.allow_tcp_ports.dedup();
 
     config
 }
@@ -364,6 +392,12 @@ pub fn display_status(config: &Config) {
                 .join(", "),
         );
     }
+    if !config.hide_dotdirs.is_empty() {
+        output::status_header(
+            "  Hide dotdirs",
+            &config.hide_dotdirs.join(", "),
+        );
+    }
 
     let bool_opt = |name: &str, val: Option<bool>| match val {
         Some(true) => output::status_header(&format!("  {name}"), "disabled"),
@@ -379,6 +413,22 @@ pub fn display_status(config: &Config) {
     bool_opt("Seccomp", config.no_seccomp);
     bool_opt("Rlimits", config.no_rlimits);
     bool_opt("Lockdown", config.lockdown.map(|v| !v));
+    if !config.allow_tcp_ports.is_empty() {
+        let ports: Vec<String> = config
+            .allow_tcp_ports
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        let note = if config.lockdown_enabled() {
+            ""
+        } else {
+            " (only effective in lockdown mode)"
+        };
+        output::status_header(
+            "  Allow TCP ports",
+            &format!("{}{note}", ports.join(", ")),
+        );
+    }
     match config.no_status_bar {
         Some(true) => output::status_header("  Status bar", "disabled"),
         Some(false) => output::status_header("  Status bar", "enabled"),
@@ -524,6 +574,7 @@ another_removed_field = true
         assert_eq!(cfg.no_status_bar, None);
         assert_eq!(cfg.no_seccomp, None);
         assert_eq!(cfg.no_rlimits, None);
+        assert!(cfg.allow_tcp_ports.is_empty());
     }
 
     #[test]
@@ -583,6 +634,45 @@ no_status_bar = false
     }
 
     #[test]
+    fn regression_v0_6_0_config_without_allow_tcp_ports() {
+        let toml = r#"
+command = ["claude"]
+rw_maps = []
+ro_maps = []
+no_gpu = false
+no_docker = false
+lockdown = true
+no_landlock = false
+no_status_bar = false
+no_seccomp = false
+no_rlimits = false
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert!(cfg.allow_tcp_ports.is_empty());
+        assert_eq!(cfg.lockdown, Some(true));
+    }
+
+    #[test]
+    fn regression_v0_6_0_config_without_hide_dotdirs() {
+        // v0.6.0 configs don't have hide_dotdirs field.
+        // They must still parse and default to empty.
+        let toml = r#"
+command = ["claude"]
+rw_maps = []
+ro_maps = []
+no_gpu = false
+no_docker = false
+lockdown = false
+no_landlock = false
+no_status_bar = false
+no_seccomp = false
+no_rlimits = false
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert!(cfg.hide_dotdirs.is_empty());
+    }
+
+    #[test]
     fn regression_empty_config_file() {
         // An empty .ai-jail file must not crash
         let cfg = parse_toml("").unwrap();
@@ -604,6 +694,7 @@ no_status_bar = false
             command: vec!["claude".into()],
             rw_maps: vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
             ro_maps: vec![PathBuf::from("/opt/data")],
+            hide_dotdirs: vec![".my_secrets".into(), ".proton".into()],
             no_gpu: Some(true),
             no_docker: None,
             no_display: Some(false),
@@ -614,12 +705,14 @@ no_status_bar = false
             status_bar_style: None,
             no_seccomp: None,
             no_rlimits: None,
+            allow_tcp_ports: vec![32000, 8080],
         };
         let serialized = serialize_config(&config).unwrap();
         let deserialized = parse_toml(&serialized).unwrap();
         assert_eq!(deserialized.command, config.command);
         assert_eq!(deserialized.rw_maps, config.rw_maps);
         assert_eq!(deserialized.ro_maps, config.ro_maps);
+        assert_eq!(deserialized.hide_dotdirs, config.hide_dotdirs);
         assert_eq!(deserialized.no_gpu, config.no_gpu);
         assert_eq!(deserialized.no_docker, config.no_docker);
         assert_eq!(deserialized.no_display, config.no_display);
@@ -628,6 +721,7 @@ no_status_bar = false
         assert_eq!(deserialized.no_landlock, config.no_landlock);
         assert_eq!(deserialized.no_seccomp, config.no_seccomp);
         assert_eq!(deserialized.no_rlimits, config.no_rlimits);
+        assert_eq!(deserialized.allow_tcp_ports, config.allow_tcp_ports);
     }
 
     // ── Merge tests ────────────────────────────────────────────
@@ -692,6 +786,36 @@ no_status_bar = false
         assert_eq!(
             merged.ro_maps,
             vec![PathBuf::from("/opt/x"), PathBuf::from("/opt/y")]
+        );
+    }
+
+    #[test]
+    fn merge_hide_dotdirs_appended_and_deduplicated() {
+        let existing = Config {
+            hide_dotdirs: vec![".my_secrets".into(), ".proton".into()],
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            hide_dotdirs: vec![".proton".into(), ".password-store".into()],
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(
+            merged.hide_dotdirs,
+            vec![".my_secrets", ".proton", ".password-store"]
+        );
+    }
+
+    #[test]
+    fn parse_hide_dotdirs() {
+        let toml = r#"
+command = ["claude"]
+hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(
+            cfg.hide_dotdirs,
+            vec![".my_secrets", ".proton", ".password-store"]
         );
     }
 
@@ -784,6 +908,55 @@ no_status_bar = false
     }
 
     #[test]
+    fn merge_allow_tcp_ports_from_cli() {
+        let existing = Config {
+            allow_tcp_ports: vec![32000],
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            allow_tcp_ports: vec![8080, 32000],
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(merged.allow_tcp_ports, vec![8080, 32000]);
+    }
+
+    #[test]
+    fn merge_allow_tcp_ports_with_global() {
+        let global = Config {
+            allow_tcp_ports: vec![443],
+            ..Config::default()
+        };
+        let local = Config {
+            allow_tcp_ports: vec![32000, 443],
+            ..Config::default()
+        };
+        let merged = merge_with_global(global, local);
+        assert_eq!(merged.allow_tcp_ports, vec![443, 32000]);
+    }
+
+    #[test]
+    fn allow_tcp_ports_accessor() {
+        let cfg = Config {
+            allow_tcp_ports: vec![32000, 8080],
+            ..Config::default()
+        };
+        assert_eq!(cfg.allow_tcp_ports(), &[32000, 8080]);
+        assert_eq!(Config::default().allow_tcp_ports(), &[] as &[u16]);
+    }
+
+    #[test]
+    fn parse_config_with_allow_tcp_ports() {
+        let toml = r#"
+command = ["opencode"]
+lockdown = true
+allow_tcp_ports = [32000, 8080]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.allow_tcp_ports, vec![32000, 8080]);
+    }
+
+    #[test]
     fn merge_lockdown_flag_overrides() {
         let existing = Config {
             lockdown: Some(true),
@@ -824,6 +997,26 @@ no_status_bar = false
         let mut paths: Vec<PathBuf> = vec![];
         dedup_paths(&mut paths);
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn dedup_strings_removes_duplicates_preserves_order() {
+        let mut strings = vec![
+            ".my_secrets".into(),
+            ".proton".into(),
+            ".my_secrets".into(),
+            ".aws".into(),
+            ".proton".into(),
+        ];
+        dedup_strings(&mut strings);
+        assert_eq!(strings, vec![".my_secrets", ".proton", ".aws"]);
+    }
+
+    #[test]
+    fn dedup_strings_empty() {
+        let mut strings: Vec<String> = vec![];
+        dedup_strings(&mut strings);
+        assert!(strings.is_empty());
     }
 
     // ── Accessor method tests ─────────────────────────────────
@@ -1125,6 +1318,7 @@ no_status_bar = false
             command: vec!["codex".into()],
             rw_maps: vec![PathBuf::from("/tmp/shared")],
             ro_maps: vec![],
+            hide_dotdirs: vec![],
             no_gpu: Some(true),
             no_docker: None,
             no_display: None,
@@ -1135,6 +1329,7 @@ no_status_bar = false
             status_bar_style: None,
             no_seccomp: None,
             no_rlimits: None,
+            allow_tcp_ports: vec![32000],
         };
         save(&config);
 
@@ -1143,6 +1338,7 @@ no_status_bar = false
         assert_eq!(loaded.rw_maps, vec![PathBuf::from("/tmp/shared")]);
         assert_eq!(loaded.no_gpu, Some(true));
         assert_eq!(loaded.lockdown, Some(false));
+        assert_eq!(loaded.allow_tcp_ports, vec![32000]);
 
         // Cleanup
         std::env::set_current_dir(&original_dir).unwrap();

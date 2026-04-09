@@ -16,6 +16,7 @@ COMMANDS (positional):
 OPTIONS:
     --rw-map <PATH>         Mount PATH read-write inside sandbox (repeatable)
     --map <PATH>            Mount PATH read-only inside sandbox (repeatable)
+    --hide-dotdir <NAME>    Never mount dotdir NAME (e.g., .my_secrets) (repeatable)
     --lockdown / --no-lockdown Enable/disable strict read-only lockdown mode
     --landlock / --no-landlock Enable/disable Landlock LSM (Linux 5.13+, default: on)
     --seccomp / --no-seccomp   Enable/disable seccomp syscall filter (Linux, default: on)
@@ -24,9 +25,11 @@ OPTIONS:
     --no-docker / --docker  Disable/enable Docker socket passthrough
     --no-display / --display Disable/enable X11/Wayland passthrough (Linux only)
     --no-mise / --mise      Disable/enable mise integration
-    -s, --status-bar[=light] Set status line theme (default on, dark unless =light)
+    -s, --status-bar[=STYLE] Set status line theme (dark | light | pastel; default dark)
+                            Pastel picks a random pastel palette per session
     --no-status-bar          Disable persistent status line
     --exec                   Direct execution mode (no PTY proxy, no status bar)
+    --allow-tcp-port <PORT> Allow outbound TCP to PORT in lockdown (repeatable)
     --clean                 Ignore existing .ai-jail config, start fresh
     --dry-run               Print the sandbox command without executing
     --init                  Create/update .ai-jail config and exit
@@ -41,6 +44,7 @@ pub struct CliArgs {
     pub command: Vec<String>,
     pub rw_maps: Vec<PathBuf>,
     pub ro_maps: Vec<PathBuf>,
+    pub hide_dotdirs: Vec<String>,
     pub lockdown: Option<bool>,
     pub landlock: Option<bool>,
     pub seccomp: Option<bool>,
@@ -51,6 +55,7 @@ pub struct CliArgs {
     pub mise: Option<bool>,
     pub status_bar: Option<bool>,
     pub status_bar_style: Option<String>,
+    pub allow_tcp_ports: Vec<u16>,
     pub exec: bool,
     pub clean: bool,
     pub dry_run: bool,
@@ -84,6 +89,21 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     parser.value().map_err(|e| e.to_string())?.into();
                 args.ro_maps.push(val);
             }
+            Long("hide-dotdir") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let s = val.to_string_lossy().into_owned();
+                if s.is_empty() {
+                    return Err(
+                        "--hide-dotdir requires a non-empty value".into()
+                    );
+                }
+                let normalized = if s.starts_with('.') {
+                    s
+                } else {
+                    format!(".{}", s)
+                };
+                args.hide_dotdirs.push(normalized);
+            }
             Long("lockdown") => args.lockdown = Some(true),
             Long("no-lockdown") => args.lockdown = Some(false),
             Long("landlock") => args.landlock = Some(true),
@@ -92,6 +112,17 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long("no-seccomp") => args.seccomp = Some(false),
             Long("rlimits") => args.rlimits = Some(true),
             Long("no-rlimits") => args.rlimits = Some(false),
+            Long("allow-tcp-port") => {
+                let val: String = parser
+                    .value()
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .into_owned();
+                let port: u16 = val
+                    .parse()
+                    .map_err(|_| format!("invalid port number: {val}"))?;
+                args.allow_tcp_ports.push(port);
+            }
             Long("gpu") => args.gpu = Some(true),
             Long("no-gpu") => args.gpu = Some(false),
             Long("docker") => args.docker = Some(true),
@@ -104,13 +135,13 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 if let Some(val) = parser.optional_value() {
                     let s = val.to_string_lossy();
                     match s.as_ref() {
-                        "dark" | "light" => {
+                        "dark" | "light" | "pastel" => {
                             args.status_bar_style = Some(s.into_owned())
                         }
                         _ => {
                             return Err(format!(
                                 "invalid status bar style: \
-                                 {s} (expected 'dark' or 'light')"
+                                 {s} (expected 'dark', 'light', or 'pastel')"
                             ));
                         }
                     }
@@ -342,6 +373,66 @@ mod tests {
         assert_eq!(args.ro_maps, vec![PathBuf::from("/opt/c")]);
     }
 
+    // ── Hide dotdir tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_hide_dotdir() {
+        let args =
+            parse_test(&["--hide-dotdir", ".my_secrets", "bash"]).unwrap();
+        assert_eq!(args.hide_dotdirs, vec![".my_secrets"]);
+    }
+
+    #[test]
+    fn parse_multiple_hide_dotdirs() {
+        let args = parse_test(&[
+            "--hide-dotdir",
+            ".my_secrets",
+            "--hide-dotdir",
+            ".proton",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.hide_dotdirs, vec![".my_secrets", ".proton"]);
+    }
+
+    #[test]
+    fn parse_hide_dotdir_with_maps() {
+        let args = parse_test(&[
+            "--hide-dotdir",
+            ".aws",
+            "--rw-map",
+            "/tmp/test",
+            "--map",
+            "/opt/data",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.hide_dotdirs, vec![".aws"]);
+        assert_eq!(args.rw_maps, vec![PathBuf::from("/tmp/test")]);
+        assert_eq!(args.ro_maps, vec![PathBuf::from("/opt/data")]);
+    }
+
+    #[test]
+    fn parse_hide_dotdir_normalizes_no_dot() {
+        let args =
+            parse_test(&["--hide-dotdir", "my_secrets", "bash"]).unwrap();
+        assert_eq!(args.hide_dotdirs, vec![".my_secrets"]);
+    }
+
+    #[test]
+    fn parse_hide_dotdir_keeps_existing_dot() {
+        let args =
+            parse_test(&["--hide-dotdir", ".my_secrets", "bash"]).unwrap();
+        assert_eq!(args.hide_dotdirs, vec![".my_secrets"]);
+    }
+
+    #[test]
+    fn parse_hide_dotdir_empty_errors() {
+        let result = parse_test(&["--hide-dotdir", "", "bash"]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-empty"));
+    }
+
     // ── Combined flags ─────────────────────────────────────────
 
     #[test]
@@ -405,6 +496,12 @@ mod tests {
     #[test]
     fn parse_rw_map_missing_value_errors() {
         let result = parse_test(&["--rw-map"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_hide_dotdir_missing_value_errors() {
+        let result = parse_test(&["--hide-dotdir"]);
         assert!(result.is_err());
     }
 
@@ -519,6 +616,56 @@ mod tests {
     fn parse_status_bar_eq_invalid() {
         let result = parse_test(&["--status-bar=neon", "bash"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_allow_tcp_port_single() {
+        let args =
+            parse_test(&["--lockdown", "--allow-tcp-port", "32000", "bash"])
+                .unwrap();
+        assert_eq!(args.allow_tcp_ports, vec![32000]);
+        assert_eq!(args.lockdown, Some(true));
+    }
+
+    #[test]
+    fn parse_allow_tcp_port_multiple() {
+        let args = parse_test(&[
+            "--allow-tcp-port",
+            "32000",
+            "--allow-tcp-port",
+            "8080",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.allow_tcp_ports, vec![32000, 8080]);
+    }
+
+    #[test]
+    fn parse_allow_tcp_port_boundary_values() {
+        let args = parse_test(&[
+            "--allow-tcp-port",
+            "0",
+            "--allow-tcp-port",
+            "65535",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.allow_tcp_ports, vec![0, 65535]);
+    }
+
+    #[test]
+    fn parse_allow_tcp_port_overflow() {
+        assert!(parse_test(&["--allow-tcp-port", "65536"]).is_err());
+    }
+
+    #[test]
+    fn parse_allow_tcp_port_invalid() {
+        assert!(parse_test(&["--allow-tcp-port", "abc"]).is_err());
+    }
+
+    #[test]
+    fn parse_allow_tcp_port_missing_value() {
+        assert!(parse_test(&["--allow-tcp-port"]).is_err());
     }
 
     #[test]

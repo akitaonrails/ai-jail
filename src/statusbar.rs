@@ -11,7 +11,28 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STYLE_DARK: AtomicBool = AtomicBool::new(true);
+static STYLE_PASTEL: AtomicBool = AtomicBool::new(false);
 static DIRTY: AtomicBool = AtomicBool::new(false);
+
+// SGR sequence for the active pastel palette, picked at setup().
+// Form: "\x1b[38;5;{fg};48;5;{bg}m" — at most ~20 bytes.
+const MAX_PASTEL_SGR: usize = 32;
+static mut PASTEL_SGR_BUF: [u8; MAX_PASTEL_SGR] = [0u8; MAX_PASTEL_SGR];
+static PASTEL_SGR_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Pastel (bg, fg) pairs in xterm-256 indices. Each background is a
+/// soft pastel and the matching foreground is a deep tone of the same
+/// hue family — contrast is high enough to read on every entry.
+const PASTEL_PALETTE: &[(u8, u8)] = &[
+    (224, 52),  // mistyrose / dark red
+    (223, 94),  // wheat / dark orange
+    (230, 94),  // cornsilk / dark orange
+    (194, 22),  // honeydew / dark green
+    (195, 23),  // lightcyan / dark teal
+    (189, 54),  // lavender / dark purple
+    (218, 53),  // pink / dark magenta
+    (255, 235), // off-white / near-black
+];
 
 const MAX_DIR: usize = 4096;
 static mut DIR_BUF: [u8; MAX_DIR] = [0u8; MAX_DIR];
@@ -55,6 +76,49 @@ fn term_size() -> Option<(u16, u16)> {
         Some((ws.ws_row, ws.ws_col))
     } else {
         None
+    }
+}
+
+/// Pick a random pastel palette entry and serialize its SGR escape
+/// into PASTEL_SGR_BUF. Called once per session from setup(), so the
+/// color stays stable for the whole run but rotates between sessions.
+fn pick_pastel_palette() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0);
+    let (bg, fg) = PASTEL_PALETTE[nanos % PASTEL_PALETTE.len()];
+
+    // Format: "\x1b[38;5;{fg};48;5;{bg}m"
+    let mut buf = [0u8; MAX_PASTEL_SGR];
+    let mut pos = 0;
+    let prefix = b"\x1b[38;5;";
+    buf[pos..pos + prefix.len()].copy_from_slice(prefix);
+    pos += prefix.len();
+    pos += write_u16(fg as u16, &mut buf[pos..]);
+    let mid = b";48;5;";
+    buf[pos..pos + mid.len()].copy_from_slice(mid);
+    pos += mid.len();
+    pos += write_u16(bg as u16, &mut buf[pos..]);
+    buf[pos] = b'm';
+    pos += 1;
+
+    unsafe {
+        PASTEL_SGR_BUF[..pos].copy_from_slice(&buf[..pos]);
+    }
+    PASTEL_SGR_LEN.store(pos, Ordering::SeqCst);
+}
+
+/// Return the active SGR sequence for the status bar background.
+/// Async-signal-safe.
+fn style_sgr() -> &'static [u8] {
+    if STYLE_PASTEL.load(Ordering::SeqCst) {
+        let len = PASTEL_SGR_LEN.load(Ordering::SeqCst);
+        unsafe { &PASTEL_SGR_BUF[..len] }
+    } else if STYLE_DARK.load(Ordering::SeqCst) {
+        b"\x1b[37;40m"
+    } else {
+        b"\x1b[90;107m"
     }
 }
 
@@ -128,11 +192,16 @@ pub fn update_terminal_state(screen: &vt100::Screen) {
 }
 
 /// Set up the status bar. Call before spawning the child.
-/// `style` must be `"dark"` or `"light"`.
+/// `style` must be `"dark"`, `"light"`, or `"pastel"`.
 pub fn setup(project_dir: &std::path::Path, command: &[String], style: &str) {
     use std::os::unix::ffi::OsStrExt;
 
-    STYLE_DARK.store(style != "light", Ordering::SeqCst);
+    STYLE_DARK.store(style == "dark", Ordering::SeqCst);
+    let pastel = style == "pastel";
+    STYLE_PASTEL.store(pastel, Ordering::SeqCst);
+    if pastel {
+        pick_pastel_palette();
+    }
 
     let dir_bytes = project_dir.as_os_str().as_bytes();
     let len = dir_bytes.len().min(MAX_DIR);
@@ -283,7 +352,7 @@ fn draw(rows: u16, cols: u16) {
     let dir_len = DIR_LEN.load(Ordering::SeqCst);
     let cmd_len = CMD_LEN.load(Ordering::SeqCst);
     let has_update = UPDATE_AVAILABLE.load(Ordering::SeqCst);
-    let dark = STYLE_DARK.load(Ordering::SeqCst);
+    let style_seq = style_sgr();
     let cols = cols as usize;
     let usable_cols = cols.saturating_sub(1);
 
@@ -305,12 +374,8 @@ fn draw(rows: u16, cols: u16) {
     put!(b";1H");
     put!(b"\x1b[2K");
 
-    // Style (softer than previous bold variants)
-    if dark {
-        put!(b"\x1b[37;40m"); // white on black
-    } else {
-        put!(b"\x1b[90;107m"); // dark gray on bright white
-    }
+    // Status-bar background style (dark / light / pastel).
+    put!(style_seq);
 
     // 5. Compute layout widths
     let ver = VERSION.as_bytes();
@@ -431,11 +496,7 @@ fn draw(rows: u16, cols: u16) {
         if has_update {
             put!(b" \x1b[32m"); // space + green
             put!(&UP_ARROW);
-            if dark {
-                put!(b"\x1b[37;40m");
-            } else {
-                put!(b"\x1b[90;107m");
-            }
+            put!(style_seq);
             vis += 2;
         }
     }

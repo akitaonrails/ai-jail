@@ -236,6 +236,8 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 |------|-------------|
 | `--rw-map <PATH>` | Mount PATH read-write (repeatable) |
 | `--map <PATH>` | Mount PATH read-only (repeatable) |
+| `--hide-dotdir <NAME>` | Never bind-mount the named home dotdir into the sandbox (e.g. `.my_secrets`). Leading dot is optional. Repeatable. Cannot hide dotdirs required for tool operation (`.cargo`, `.config`, `.cache`, etc.) — those emit a warning and stay visible. |
+| `--allow-tcp-port <PORT>` | Permit outbound TCP to PORT in lockdown mode (repeatable). Skips `--unshare-net` and uses Landlock V4 `NetPort` rules to deny everything else. Requires Linux ≥ 6.5; hard-fails otherwise. No effect outside lockdown or on macOS. |
 | `--lockdown` / `--no-lockdown` | Enable/disable strict read-only lockdown mode |
 | `--landlock` / `--no-landlock` | Enable/disable Landlock LSM (Linux 5.13+, default: on) |
 | `--seccomp` / `--no-seccomp` | Enable/disable seccomp syscall filter (Linux, default: on) |
@@ -244,7 +246,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--docker` / `--no-docker` | Enable/disable Docker socket |
 | `--display` / `--no-display` | Enable/disable X11/Wayland |
 | `--mise` / `--no-mise` | Enable/disable mise integration |
-| `-s`, `--status-bar[=light]` | Enable persistent status line (dark or light theme) |
+| `-s`, `--status-bar[=STYLE]` | Enable persistent status line. `STYLE` is `dark` (default), `light`, or `pastel` (random pastel palette per session — use `=dark` / `=light` to switch back) |
 | `--no-status-bar` | Disable persistent status line |
 | `--exec` | Direct execution mode (no PTY proxy, no status bar) |
 | `--clean` | Ignore existing config, start fresh |
@@ -305,7 +307,7 @@ lockdown = true
 
 When CLI flags and an existing config are both present:
 
-- `command`: CLI replaces config
+- `command`: CLI replaces config for the current run, but a CLI-passed command is **not** auto-persisted when the project already has a stored command — so `ai-jail codex` after `ai-jail claude` runs codex for that session without rewriting `.ai-jail`'s stored default. Use `ai-jail --init <command>` to explicitly change the stored command. First-run bootstrap (no stored command yet) still persists the CLI command as the new default.
 - `rw_maps` / `ro_maps`: CLI values are appended (duplicates removed)
 - Boolean flags: CLI overrides config (`--no-gpu` sets `no_gpu = true`)
 - Config is updated after merge in normal mode; lockdown skips auto-save
@@ -314,7 +316,7 @@ When CLI flags and an existing config are both present:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `command` | string array | `["bash"]` | Command to run inside sandbox |
+| `command` | string array | `["bash"]` | Default command to run inside sandbox. Set by first run or by `--init`; not overwritten when a different command is passed on the CLI. |
 | `rw_maps` | path array | `[]` | Extra read-write mounts |
 | `ro_maps` | path array | `[]` | Extra read-only mounts |
 | `no_gpu` | bool | not set (auto) | `true` disables GPU passthrough |
@@ -326,7 +328,7 @@ When CLI flags and an existing config are both present:
 | `no_rlimits` | bool | not set (auto) | `true` disables resource limits |
 | `lockdown` | bool | not set (disabled) | `true` enables strict read-only lockdown mode |
 
-Status bar preferences (`no_status_bar`, `status_bar_style`) are stored in `$HOME/.ai-jail` (global user config), not in per-project `.ai-jail` files.
+Status bar preferences (`no_status_bar`, `status_bar_style`) are stored in `$HOME/.ai-jail` (global user config), not in per-project `.ai-jail` files. `status_bar_style` accepts `"dark"`, `"light"`, or `"pastel"` — pastel rotates through a curated set of soft pastel palettes (with high-contrast foreground), picking a new one at random for each session. Set it back to `"dark"` or `"light"` to disable the rotation.
 
 When a boolean field is not set, the feature is enabled if the resource exists on the host.
 

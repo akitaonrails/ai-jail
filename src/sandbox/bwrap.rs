@@ -111,6 +111,7 @@ impl MountSet {
         &self,
         project_dir: &Path,
         lockdown: bool,
+        allow_tcp_ports: &[u16],
     ) -> Vec<String> {
         let mut args = vec![
             "--chdir".into(),
@@ -128,7 +129,9 @@ impl MountSet {
         }
 
         if lockdown {
-            args.push("--unshare-net".into());
+            if allow_tcp_ports.is_empty() {
+                args.push("--unshare-net".into());
+            }
             args.push("--clearenv".into());
 
             args.extend([
@@ -517,6 +520,11 @@ fn landlock_wrapper_args(config: &Config, verbose: bool) -> Vec<String> {
         "--no-display".into()
     });
 
+    for port in config.allow_tcp_ports() {
+        args.push("--allow-tcp-port".into());
+        args.push(port.to_string());
+    }
+
     for path in &config.rw_maps {
         args.push("--rw-map".into());
         args.push(path.display().to_string());
@@ -573,7 +581,11 @@ pub fn build(
         }
     }
 
-    for arg in mount_set.isolation_args(project_dir, lockdown) {
+    for arg in mount_set.isolation_args(
+        project_dir,
+        lockdown,
+        config.allow_tcp_ports(),
+    ) {
         cmd.arg(arg);
     }
 
@@ -641,7 +653,11 @@ fn build_dry_run_args(
         args.extend(m.to_args());
     }
 
-    args.extend(mount_set.isolation_args(project_dir, lockdown));
+    args.extend(mount_set.isolation_args(
+        project_dir,
+        lockdown,
+        config.allow_tcp_ports(),
+    ));
 
     args.push("--".into());
 
@@ -743,7 +759,11 @@ fn discover_mounts(
     MountSet {
         base: discover_base(hosts_file, resolv_mount),
         sys_masks: discover_sys_masks(lockdown),
-        home_dotfiles: discover_home_dotfiles(lockdown, verbose),
+        home_dotfiles: discover_home_dotfiles(
+            lockdown,
+            &config.hide_dotdirs,
+            verbose,
+        ),
         config_hide: if lockdown {
             vec![]
         } else {
@@ -860,7 +880,11 @@ fn discover_base(
     mounts
 }
 
-fn discover_home_dotfiles(lockdown: bool, verbose: bool) -> Vec<Mount> {
+fn discover_home_dotfiles(
+    lockdown: bool,
+    hide_dotdirs: &[String],
+    verbose: bool,
+) -> Vec<Mount> {
     let home = super::home_dir();
     let mut mounts = vec![Mount::Tmpfs { dest: home.clone() }];
 
@@ -888,7 +912,7 @@ fn discover_home_dotfiles(lockdown: bool, verbose: bool) -> Vec<Mount> {
             continue;
         }
 
-        if super::DOTDIR_DENY.contains(&name_str.as_ref()) {
+        if super::is_dotdir_denied(&name_str, hide_dotdirs) {
             if verbose {
                 output::verbose(&format!("deny: {}", path.display()));
             }
@@ -1312,8 +1336,71 @@ mod tests {
     }
 
     #[test]
+    fn lockdown_with_allowed_ports_skips_unshare_net() {
+        let mut config = minimal_test_config();
+        config.lockdown = Some(true);
+        config.allow_tcp_ports = vec![32000];
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let project = PathBuf::from("/home/user/project");
+
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            !args.contains(&"--unshare-net".to_string()),
+            "lockdown with allowed ports must skip --unshare-net"
+        );
+        assert!(args.contains(&"--clearenv".to_string()));
+    }
+
+    #[test]
+    fn lockdown_without_allowed_ports_keeps_unshare_net() {
+        let mut config = minimal_test_config();
+        config.lockdown = Some(true);
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let project = PathBuf::from("/home/user/project");
+
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            args.contains(&"--unshare-net".to_string()),
+            "lockdown without allowed ports must keep --unshare-net"
+        );
+    }
+
+    #[test]
+    fn lockdown_wrapper_forwards_allowed_ports() {
+        let mut config = minimal_test_config();
+        config.lockdown = Some(true);
+        config.allow_tcp_ports = vec![32000, 8080];
+
+        let wrapper_args = landlock_wrapper_args(&config, false);
+        let port_args: Vec<_> = wrapper_args
+            .windows(2)
+            .filter(|w| w[0] == "--allow-tcp-port")
+            .map(|w| w[1].clone())
+            .collect();
+        assert_eq!(port_args, vec!["32000", "8080"]);
+    }
+
+    #[test]
     fn lockdown_skips_host_home_dotfiles() {
-        let mounts = discover_home_dotfiles(true, false);
+        let mounts = discover_home_dotfiles(true, &[], false);
         assert_eq!(mounts.len(), 1, "lockdown should only mount tmpfs home");
         match &mounts[0] {
             Mount::Tmpfs { .. } => {}
