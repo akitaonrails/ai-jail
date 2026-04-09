@@ -26,6 +26,8 @@ pub struct Config {
     #[serde(default)]
     pub no_mise: Option<bool>,
     #[serde(default)]
+    pub no_save_config: Option<bool>,
+    #[serde(default)]
     pub lockdown: Option<bool>,
     #[serde(default)]
     pub no_landlock: Option<bool>,
@@ -56,6 +58,9 @@ impl Config {
     }
     pub fn lockdown_enabled(&self) -> bool {
         self.lockdown == Some(true)
+    }
+    pub fn save_config_enabled(&self) -> bool {
+        self.no_save_config != Some(true)
     }
     pub fn landlock_enabled(&self) -> bool {
         self.no_landlock != Some(true)
@@ -155,6 +160,9 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     }
     if local.no_mise.is_some() {
         c.no_mise = local.no_mise;
+    }
+    if local.no_save_config.is_some() {
+        c.no_save_config = local.no_save_config;
     }
     if local.lockdown.is_some() {
         c.lockdown = local.lockdown;
@@ -327,6 +335,9 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     if let Some(v) = cli.mise {
         config.no_mise = Some(!v);
     }
+    if let Some(v) = cli.save_config {
+        config.no_save_config = Some(!v);
+    }
     if let Some(v) = cli.lockdown {
         config.lockdown = Some(v);
     }
@@ -409,6 +420,11 @@ pub fn display_status(config: &Config) {
     bool_opt("Docker", config.no_docker);
     bool_opt("Display", config.no_display);
     bool_opt("Mise", config.no_mise);
+    match config.no_save_config {
+        Some(true) => output::status_header("  Save config", "disabled"),
+        Some(false) => output::status_header("  Save config", "enabled"),
+        None => output::status_header("  Save config", "enabled (default)"),
+    }
     bool_opt("Landlock", config.no_landlock);
     bool_opt("Seccomp", config.no_seccomp);
     bool_opt("Rlimits", config.no_rlimits);
@@ -463,6 +479,7 @@ mod tests {
         assert!(cfg.rw_maps.is_empty());
         assert!(cfg.ro_maps.is_empty());
         assert_eq!(cfg.no_gpu, None);
+        assert_eq!(cfg.no_save_config, None);
         assert_eq!(cfg.lockdown, None);
     }
 
@@ -476,6 +493,7 @@ no_gpu = true
 no_docker = false
 no_display = true
 no_mise = false
+no_save_config = true
 lockdown = true
 "#;
         let cfg = parse_toml(toml).unwrap();
@@ -486,6 +504,7 @@ lockdown = true
         assert_eq!(cfg.no_docker, Some(false));
         assert_eq!(cfg.no_display, Some(true));
         assert_eq!(cfg.no_mise, Some(false));
+        assert_eq!(cfg.no_save_config, Some(true));
         assert_eq!(cfg.lockdown, Some(true));
     }
 
@@ -496,6 +515,18 @@ lockdown = true
         assert_eq!(cfg.command, vec!["bash"]);
         assert!(cfg.rw_maps.is_empty());
         assert_eq!(cfg.no_gpu, None);
+    }
+
+    #[test]
+    fn parse_no_save_config_false() {
+        let cfg = parse_toml("no_save_config = false").unwrap();
+        assert_eq!(cfg.no_save_config, Some(false));
+    }
+
+    #[test]
+    fn parse_no_save_config_true() {
+        let cfg = parse_toml("no_save_config = true").unwrap();
+        assert_eq!(cfg.no_save_config, Some(true));
     }
 
     #[test]
@@ -569,6 +600,7 @@ another_removed_field = true
         assert_eq!(cfg.no_docker, None);
         assert_eq!(cfg.no_display, None);
         assert_eq!(cfg.no_mise, None);
+        assert_eq!(cfg.no_save_config, None);
         assert_eq!(cfg.lockdown, None);
         assert_eq!(cfg.no_landlock, None);
         assert_eq!(cfg.no_status_bar, None);
@@ -699,6 +731,7 @@ no_rlimits = false
             no_docker: None,
             no_display: Some(false),
             no_mise: None,
+            no_save_config: Some(true),
             lockdown: Some(true),
             no_landlock: Some(false),
             no_status_bar: None,
@@ -717,6 +750,7 @@ no_rlimits = false
         assert_eq!(deserialized.no_docker, config.no_docker);
         assert_eq!(deserialized.no_display, config.no_display);
         assert_eq!(deserialized.no_mise, config.no_mise);
+        assert_eq!(deserialized.no_save_config, config.no_save_config);
         assert_eq!(deserialized.lockdown, config.lockdown);
         assert_eq!(deserialized.no_landlock, config.no_landlock);
         assert_eq!(deserialized.no_seccomp, config.no_seccomp);
@@ -850,6 +884,7 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
             no_docker: Some(false),
             no_display: None,
             no_mise: Some(true),
+            no_save_config: Some(true),
             lockdown: Some(true),
             no_landlock: Some(true),
             ..Config::default()
@@ -860,6 +895,7 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
         assert_eq!(merged.no_docker, Some(false));
         assert_eq!(merged.no_display, None);
         assert_eq!(merged.no_mise, Some(true));
+        assert_eq!(merged.no_save_config, Some(true));
         assert_eq!(merged.lockdown, Some(true));
         assert_eq!(merged.no_landlock, Some(true));
     }
@@ -868,11 +904,12 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
     fn merge_all_boolean_flags() {
         let existing = Config::default();
         let cli = CliArgs {
-            gpu: Some(false),     // --no-gpu
-            docker: Some(false),  // --no-docker
-            display: Some(true),  // --display
-            mise: Some(true),     // --mise
-            lockdown: Some(true), // --lockdown
+            gpu: Some(false),         // --no-gpu
+            docker: Some(false),      // --no-docker
+            display: Some(true),      // --display
+            mise: Some(true),         // --mise
+            save_config: Some(false), // --no-save-config
+            lockdown: Some(true),     // --lockdown
             ..CliArgs::default()
         };
         let merged = merge(&cli, existing);
@@ -880,6 +917,7 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
         assert_eq!(merged.no_docker, Some(true));
         assert_eq!(merged.no_display, Some(false));
         assert_eq!(merged.no_mise, Some(false));
+        assert_eq!(merged.no_save_config, Some(true));
         assert_eq!(merged.lockdown, Some(true));
     }
 
@@ -968,6 +1006,62 @@ allow_tcp_ports = [32000, 8080]
         };
         let merged = merge(&cli, existing);
         assert_eq!(merged.lockdown, Some(false));
+    }
+
+    #[test]
+    fn merge_with_global_local_no_save_config_wins_false() {
+        let global = Config {
+            no_save_config: Some(true),
+            ..Config::default()
+        };
+        let local = Config {
+            no_save_config: Some(false),
+            ..Config::default()
+        };
+        let merged = merge_with_global(global, local);
+        assert_eq!(merged.no_save_config, Some(false));
+    }
+
+    #[test]
+    fn merge_with_global_local_no_save_config_wins_true() {
+        let global = Config {
+            no_save_config: Some(false),
+            ..Config::default()
+        };
+        let local = Config {
+            no_save_config: Some(true),
+            ..Config::default()
+        };
+        let merged = merge_with_global(global, local);
+        assert_eq!(merged.no_save_config, Some(true));
+    }
+
+    #[test]
+    fn merge_cli_save_config_overrides_config() {
+        let existing = Config {
+            no_save_config: Some(true),
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            save_config: Some(true),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(merged.no_save_config, Some(false));
+    }
+
+    #[test]
+    fn merge_cli_no_save_config_overrides_config() {
+        let existing = Config {
+            no_save_config: Some(false),
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            save_config: Some(false),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(merged.no_save_config, Some(true));
     }
 
     // ── Dedup tests ────────────────────────────────────────────
@@ -1118,6 +1212,31 @@ allow_tcp_ports = [32000, 8080]
                 ..Config::default()
             }
             .mise_enabled()
+        );
+    }
+
+    #[test]
+    fn save_config_enabled_accessor() {
+        assert!(
+            Config {
+                no_save_config: None,
+                ..Config::default()
+            }
+            .save_config_enabled()
+        );
+        assert!(
+            !Config {
+                no_save_config: Some(true),
+                ..Config::default()
+            }
+            .save_config_enabled()
+        );
+        assert!(
+            Config {
+                no_save_config: Some(false),
+                ..Config::default()
+            }
+            .save_config_enabled()
         );
     }
 
@@ -1323,6 +1442,7 @@ allow_tcp_ports = [32000, 8080]
             no_docker: None,
             no_display: None,
             no_mise: None,
+            no_save_config: Some(true),
             lockdown: Some(false),
             no_landlock: None,
             no_status_bar: None,

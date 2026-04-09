@@ -78,7 +78,7 @@ ai-jail bash
 ai-jail --dry-run claude
 ```
 
-On first run, `ai-jail` creates a `.ai-jail` config file in the current directory. Subsequent runs reuse that config. Commit `.ai-jail` to your repo so the sandbox settings follow the project.
+On first run, `ai-jail` creates a `.ai-jail` config file in the current directory by default. Subsequent runs reuse that config. Commit `.ai-jail` to your repo so the sandbox settings follow the project. Use `--no-save-config` for ephemeral runs without creating or updating the project config.
 
 ## Security notes
 
@@ -137,6 +137,8 @@ This:
 - macOS: clears env to minimal allowlist, strips network and file-write rules from SBPL profile.
 
 Persistence: `--lockdown` alone doesn't write `.ai-jail` (keeps runs ephemeral). Persist it with `ai-jail --init --lockdown`. Undo with `--no-lockdown`.
+
+`--init` always writes config, so it cannot be combined with `--no-save-config`.
 
 ## What gets sandboxed
 
@@ -246,6 +248,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--docker` / `--no-docker` | Enable/disable Docker socket |
 | `--display` / `--no-display` | Enable/disable X11/Wayland |
 | `--mise` / `--no-mise` | Enable/disable mise integration |
+| `--save-config` / `--no-save-config` | Enable/disable automatic `.ai-jail` writes |
 | `-s`, `--status-bar[=STYLE]` | Enable persistent status line. `STYLE` is `dark` (default), `light`, or `pastel` (random pastel palette per session — use `=dark` / `=light` to switch back) |
 | `--no-status-bar` | Disable persistent status line |
 | `--exec` | Direct execution mode (no PTY proxy, no status bar) |
@@ -281,6 +284,9 @@ ai-jail --dry-run --verbose claude
 # Create config without running
 ai-jail --init --no-docker claude
 
+# Run without creating/updating .ai-jail
+ai-jail --no-save-config claude
+
 # Regenerate config from scratch
 ai-jail --clean --init claude
 
@@ -300,6 +306,7 @@ command = ["claude"]
 rw_maps = ["/home/user/Projects/shared-lib"]
 ro_maps = []
 no_gpu = true
+no_save_config = true
 lockdown = true
 ```
 
@@ -310,7 +317,8 @@ When CLI flags and an existing config are both present:
 - `command`: CLI replaces config for the current run, but a CLI-passed command is **not** auto-persisted when the project already has a stored command — so `ai-jail codex` after `ai-jail claude` runs codex for that session without rewriting `.ai-jail`'s stored default. Use `ai-jail --init <command>` to explicitly change the stored command. First-run bootstrap (no stored command yet) still persists the CLI command as the new default.
 - `rw_maps` / `ro_maps`: CLI values are appended (duplicates removed)
 - Boolean flags: CLI overrides config (`--no-gpu` sets `no_gpu = true`)
-- Config is updated after merge in normal mode; lockdown skips auto-save
+- `--save-config` / `--no-save-config` override `no_save_config`
+- Config is updated after merge in normal mode when config saving is enabled; lockdown skips auto-save
 
 ### Available fields
 
@@ -323,6 +331,7 @@ When CLI flags and an existing config are both present:
 | `no_docker` | bool | not set (auto) | `true` disables Docker socket |
 | `no_display` | bool | not set (auto) | `true` disables X11/Wayland |
 | `no_mise` | bool | not set (auto) | `true` disables mise integration |
+| `no_save_config` | bool | not set (enabled) | `true` disables automatic `.ai-jail` writes |
 | `no_landlock` | bool | not set (auto) | `true` disables Landlock LSM (Linux only) |
 | `no_seccomp` | bool | not set (auto) | `true` disables seccomp syscall filter (Linux only) |
 | `no_rlimits` | bool | not set (auto) | `true` disables resource limits |
@@ -330,7 +339,7 @@ When CLI flags and an existing config are both present:
 
 Status bar preferences (`no_status_bar`, `status_bar_style`) are stored in `$HOME/.ai-jail` (global user config), not in per-project `.ai-jail` files. `status_bar_style` accepts `"dark"`, `"light"`, or `"pastel"` — pastel rotates through a curated set of soft pastel palettes (with high-contrast foreground), picking a new one at random for each session. Set it back to `"dark"` or `"light"` to disable the rotation.
 
-When a boolean field is not set, the feature is enabled if the resource exists on the host.
+When a boolean field is not set, the feature is enabled if the resource exists on the host. `no_save_config` is the exception: when unset, config auto-save is enabled in normal mode.
 
 ## Windows
 

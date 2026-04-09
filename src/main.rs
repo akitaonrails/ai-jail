@@ -56,8 +56,16 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     Err(format!("Failed to exec {}: {err}", cli.command[0]))
 }
 
+fn validate_write_flags(cli: &cli::CliArgs) -> Result<(), String> {
+    if cli.init && cli.save_config == Some(false) {
+        return Err("--init conflicts with --no-save-config".into());
+    }
+    Ok(())
+}
+
 fn run() -> Result<i32, String> {
     let cli = cli::parse()?;
+    validate_write_flags(&cli)?;
 
     // Suppress info/warn output in --exec mode for clean stdout
     if cli.exec {
@@ -133,7 +141,7 @@ fn run() -> Result<i32, String> {
     // and `ai-jail codex` on the same project and the stored default
     // should not flip under them. First-run bootstrap (no stored
     // command yet) still persists the CLI command as the new default.
-    if !config.lockdown_enabled() {
+    if !config.lockdown_enabled() && config.save_config_enabled() {
         let mut to_save = config.clone();
         if !stored_command.is_empty() && !cli.command.is_empty() {
             to_save.command = stored_command;
@@ -246,7 +254,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::command_needs_direct_tty;
+    use super::{command_needs_direct_tty, validate_write_flags};
+    use crate::cli::CliArgs;
 
     #[test]
     fn crush_requires_direct_tty() {
@@ -259,5 +268,43 @@ mod tests {
         assert!(!command_needs_direct_tty(&[]));
         assert!(!command_needs_direct_tty(&["codex".into()]));
         assert!(!command_needs_direct_tty(&["/usr/bin/bash".into()]));
+    }
+
+    #[test]
+    fn validate_write_flags_rejects_init_with_no_save_config() {
+        let cli = CliArgs {
+            init: true,
+            save_config: Some(false),
+            ..CliArgs::default()
+        };
+        assert!(validate_write_flags(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_write_flags_allows_init_alone() {
+        let cli = CliArgs {
+            init: true,
+            ..CliArgs::default()
+        };
+        assert!(validate_write_flags(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_write_flags_allows_init_with_save_config() {
+        let cli = CliArgs {
+            init: true,
+            save_config: Some(true),
+            ..CliArgs::default()
+        };
+        assert!(validate_write_flags(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_write_flags_allows_no_save_config_alone() {
+        let cli = CliArgs {
+            save_config: Some(false),
+            ..CliArgs::default()
+        };
+        assert!(validate_write_flags(&cli).is_ok());
     }
 }

@@ -25,6 +25,7 @@ OPTIONS:
     --no-docker / --docker  Disable/enable Docker socket passthrough
     --no-display / --display Disable/enable X11/Wayland passthrough (Linux only)
     --no-mise / --mise      Disable/enable mise integration
+    --save-config / --no-save-config Enable/disable automatic .ai-jail writes
     -s, --status-bar[=STYLE] Set status line theme (dark | light | pastel; default dark)
                             Pastel picks a random pastel palette per session
     --no-status-bar          Disable persistent status line
@@ -53,6 +54,7 @@ pub struct CliArgs {
     pub docker: Option<bool>,
     pub display: Option<bool>,
     pub mise: Option<bool>,
+    pub save_config: Option<bool>,
     pub status_bar: Option<bool>,
     pub status_bar_style: Option<String>,
     pub allow_tcp_ports: Vec<u16>,
@@ -131,6 +133,8 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long("no-display") => args.display = Some(false),
             Long("mise") => args.mise = Some(true),
             Long("no-mise") => args.mise = Some(false),
+            Long("save-config") => args.save_config = Some(true),
+            Long("no-save-config") => args.save_config = Some(false),
             Long("status-bar") | Short('s') => {
                 if let Some(val) = parser.optional_value() {
                     let s = val.to_string_lossy();
@@ -343,6 +347,18 @@ mod tests {
     fn parse_mise() {
         let args = parse_test(&["--mise", "bash"]).unwrap();
         assert_eq!(args.mise, Some(true));
+    }
+
+    #[test]
+    fn parse_save_config() {
+        let args = parse_test(&["--save-config", "bash"]).unwrap();
+        assert_eq!(args.save_config, Some(true));
+    }
+
+    #[test]
+    fn parse_no_save_config() {
+        let args = parse_test(&["--no-save-config", "bash"]).unwrap();
+        assert_eq!(args.save_config, Some(false));
     }
 
     // ── Map flags ──────────────────────────────────────────────
@@ -678,5 +694,19 @@ mod tests {
     fn parse_last_wins_docker() {
         let args = parse_test(&["--docker", "--no-docker", "bash"]).unwrap();
         assert_eq!(args.docker, Some(false));
+    }
+
+    #[test]
+    fn parse_last_wins_save_config_enabled() {
+        let args =
+            parse_test(&["--no-save-config", "--save-config", "bash"]).unwrap();
+        assert_eq!(args.save_config, Some(true));
+    }
+
+    #[test]
+    fn parse_last_wins_save_config_disabled() {
+        let args =
+            parse_test(&["--save-config", "--no-save-config", "bash"]).unwrap();
+        assert_eq!(args.save_config, Some(false));
     }
 }
