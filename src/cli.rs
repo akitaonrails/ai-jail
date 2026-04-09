@@ -14,29 +14,31 @@ COMMANDS (positional):
     Any other string                       Passed through as the command
 
 OPTIONS:
-    --rw-map <PATH>         Mount PATH read-write inside sandbox (repeatable)
-    --map <PATH>            Mount PATH read-only inside sandbox (repeatable)
-    --hide-dotdir <NAME>    Never mount dotdir NAME (e.g., .my_secrets) (repeatable)
-    --lockdown / --no-lockdown Enable/disable strict read-only lockdown mode
-    --landlock / --no-landlock Enable/disable Landlock LSM (Linux 5.13+, default: on)
-    --seccomp / --no-seccomp   Enable/disable seccomp syscall filter (Linux, default: on)
-    --rlimits / --no-rlimits   Enable/disable resource limits (default: on)
-    --no-gpu / --gpu        Disable/enable GPU device passthrough (Linux only)
-    --no-docker / --docker  Disable/enable Docker socket passthrough
-    --no-display / --display Disable/enable X11/Wayland passthrough (Linux only)
-    --no-mise / --mise      Disable/enable mise integration
-    -s, --status-bar[=STYLE] Set status line theme (dark | light | pastel; default dark)
-                            Pastel picks a random pastel palette per session
-    --no-status-bar          Disable persistent status line
-    --exec                   Direct execution mode (no PTY proxy, no status bar)
-    --allow-tcp-port <PORT> Allow outbound TCP to PORT in lockdown (repeatable)
-    --clean                 Ignore existing .ai-jail config, start fresh
-    --dry-run               Print the sandbox command without executing
-    --init                  Create/update .ai-jail config and exit
-    --bootstrap             Generate smart permission configs for AI tools
-    -v, --verbose           Show detailed mount info
-    -h, --help              Show help
-    -V, --version           Show version
+    --rw-map <PATH>                Mount PATH read-write inside sandbox (repeatable)
+    --map <PATH>                   Mount PATH read-only inside sandbox (repeatable)
+    --hide-dotdir <NAME>           Never mount dotdir NAME (e.g., .my_secrets) (repeatable)
+    --lockdown / --no-lockdown     Enable/disable strict read-only lockdown mode
+    --landlock / --no-landlock     Enable/disable Landlock LSM (Linux 5.13+, default: on)
+    --seccomp / --no-seccomp       Enable/disable seccomp syscall filter (Linux, default: on)
+    --rlimits / --no-rlimits       Enable/disable resource limits (default: on)
+    --no-gpu / --gpu               Disable/enable GPU device passthrough (Linux only)
+    --no-docker / --docker         Disable/enable Docker socket passthrough
+    --no-display / --display       Disable/enable X11/Wayland passthrough (Linux only)
+    --no-mise / --mise             Disable/enable mise integration
+    --save-config / --no-save-config
+                                   Enable/disable automatic .ai-jail writes
+    -s, --status-bar[=STYLE]       Set status line theme (dark | light | pastel; default dark)
+                                   Pastel picks a random pastel palette per session
+    --no-status-bar                Disable persistent status line
+    --exec                         Direct execution mode (no PTY proxy, no status bar)
+    --allow-tcp-port <PORT>        Allow outbound TCP to PORT in lockdown (repeatable)
+    --clean                        Ignore existing .ai-jail config, start fresh
+    --dry-run                      Print the sandbox command without executing
+    --init                         Create/update .ai-jail config and exit
+    --bootstrap                    Generate smart permission configs for AI tools
+    -v, --verbose                  Show detailed mount info
+    -h, --help                     Show help
+    -V, --version                  Show version
 ";
 
 #[derive(Debug, Default)]
@@ -53,6 +55,7 @@ pub struct CliArgs {
     pub docker: Option<bool>,
     pub display: Option<bool>,
     pub mise: Option<bool>,
+    pub save_config: Option<bool>,
     pub status_bar: Option<bool>,
     pub status_bar_style: Option<String>,
     pub allow_tcp_ports: Vec<u16>,
@@ -131,6 +134,8 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long("no-display") => args.display = Some(false),
             Long("mise") => args.mise = Some(true),
             Long("no-mise") => args.mise = Some(false),
+            Long("save-config") => args.save_config = Some(true),
+            Long("no-save-config") => args.save_config = Some(false),
             Long("status-bar") | Short('s') => {
                 if let Some(val) = parser.optional_value() {
                     let s = val.to_string_lossy();
@@ -343,6 +348,18 @@ mod tests {
     fn parse_mise() {
         let args = parse_test(&["--mise", "bash"]).unwrap();
         assert_eq!(args.mise, Some(true));
+    }
+
+    #[test]
+    fn parse_save_config() {
+        let args = parse_test(&["--save-config", "bash"]).unwrap();
+        assert_eq!(args.save_config, Some(true));
+    }
+
+    #[test]
+    fn parse_no_save_config() {
+        let args = parse_test(&["--no-save-config", "bash"]).unwrap();
+        assert_eq!(args.save_config, Some(false));
     }
 
     // ── Map flags ──────────────────────────────────────────────
@@ -678,5 +695,19 @@ mod tests {
     fn parse_last_wins_docker() {
         let args = parse_test(&["--docker", "--no-docker", "bash"]).unwrap();
         assert_eq!(args.docker, Some(false));
+    }
+
+    #[test]
+    fn parse_last_wins_save_config_enabled() {
+        let args =
+            parse_test(&["--no-save-config", "--save-config", "bash"]).unwrap();
+        assert_eq!(args.save_config, Some(true));
+    }
+
+    #[test]
+    fn parse_last_wins_save_config_disabled() {
+        let args =
+            parse_test(&["--save-config", "--no-save-config", "bash"]).unwrap();
+        assert_eq!(args.save_config, Some(false));
     }
 }
