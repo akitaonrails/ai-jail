@@ -14,30 +14,31 @@ COMMANDS (positional):
     Any other string                       Passed through as the command
 
 OPTIONS:
-    --rw-map <PATH>         Mount PATH read-write inside sandbox (repeatable)
-    --map <PATH>            Mount PATH read-only inside sandbox (repeatable)
-    --hide-dotdir <NAME>    Never mount dotdir NAME (e.g., .my_secrets) (repeatable)
-    --lockdown / --no-lockdown Enable/disable strict read-only lockdown mode
-    --landlock / --no-landlock Enable/disable Landlock LSM (Linux 5.13+, default: on)
-    --seccomp / --no-seccomp   Enable/disable seccomp syscall filter (Linux, default: on)
-    --rlimits / --no-rlimits   Enable/disable resource limits (default: on)
-    --no-gpu / --gpu        Disable/enable GPU device passthrough (Linux only)
-    --no-docker / --docker  Disable/enable Docker socket passthrough
-    --no-display / --display Disable/enable X11/Wayland passthrough (Linux only)
-    --no-mise / --mise      Disable/enable mise integration
-    --save-config / --no-save-config Enable/disable automatic .ai-jail writes
-    -s, --status-bar[=STYLE] Set status line theme (dark | light | pastel; default dark)
-                            Pastel picks a random pastel palette per session
-    --no-status-bar          Disable persistent status line
-    --exec                   Direct execution mode (no PTY proxy, no status bar)
-    --allow-tcp-port <PORT> Allow outbound TCP to PORT in lockdown (repeatable)
-    --clean                 Ignore existing .ai-jail config, start fresh
-    --dry-run               Print the sandbox command without executing
-    --init                  Create/update .ai-jail config and exit
-    --bootstrap             Generate smart permission configs for AI tools
-    -v, --verbose           Show detailed mount info
-    -h, --help              Show help
-    -V, --version           Show version
+    --rw-map <PATH>                Mount PATH read-write inside sandbox (repeatable)
+    --map <PATH>                   Mount PATH read-only inside sandbox (repeatable)
+    --hide-dotdir <NAME>           Never mount dotdir NAME (e.g., .my_secrets) (repeatable)
+    --lockdown / --no-lockdown     Enable/disable strict read-only lockdown mode
+    --landlock / --no-landlock     Enable/disable Landlock LSM (Linux 5.13+, default: on)
+    --seccomp / --no-seccomp       Enable/disable seccomp syscall filter (Linux, default: on)
+    --rlimits / --no-rlimits       Enable/disable resource limits (default: on)
+    --no-gpu / --gpu               Disable/enable GPU device passthrough (Linux only)
+    --no-docker / --docker         Disable/enable Docker socket passthrough
+    --no-display / --display       Disable/enable X11/Wayland passthrough (Linux only)
+    --no-mise / --mise             Disable/enable mise integration
+    --save-config / --no-save-config
+                                   Enable/disable automatic .ai-jail writes
+    -s, --status-bar[=STYLE]       Set status line theme (dark | light | pastel; default dark)
+                                   Pastel picks a random pastel palette per session
+    --no-status-bar                Disable persistent status line
+    --exec                         Direct execution mode (no PTY proxy, no status bar)
+    --allow-tcp-port <PORT>        Allow outbound TCP to PORT in lockdown (repeatable)
+    --clean                        Ignore existing .ai-jail config, start fresh
+    --dry-run                      Print the sandbox command without executing
+    --init                         Create/update .ai-jail config and exit
+    --bootstrap                    Generate smart permission configs for AI tools
+    -v, --verbose                  Show detailed mount info
+    -h, --help                     Show help
+    -V, --version                  Show version
 ";
 
 #[derive(Debug, Default)]
