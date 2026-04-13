@@ -29,6 +29,7 @@ const ALLOW: &[&str] = &[
     "Bash(ls *)",
     "Bash(find *)",
     "Bash(grep *)",
+    "Bash(rg *)",
     "Bash(cat *)",
     "Bash(head *)",
     "Bash(tail *)",
@@ -614,6 +615,7 @@ mod tests {
 
         let allow = obj["allow"].as_array().unwrap();
         assert!(allow.iter().any(|v| v == "Bash(git status *)"));
+        assert!(allow.iter().any(|v| v == "Bash(rg *)"));
         assert!(allow.iter().any(|v| v == "WebSearch"));
 
         let deny = obj["deny"].as_array().unwrap();
