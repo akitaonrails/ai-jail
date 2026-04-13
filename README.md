@@ -80,6 +80,8 @@ ai-jail --dry-run claude
 
 On first run, `ai-jail` creates a `.ai-jail` config file in the current directory by default. Subsequent runs reuse that config. Commit `.ai-jail` to your repo so the sandbox settings follow the project. Use `--no-save-config` for ephemeral runs without creating or updating the project config.
 
+If you run `ai-jail` from a linked Git worktree, it auto-detects the worktree's external Git admin directories and exposes them safely inside the sandbox so `git status`, `git commit`, and similar commands keep working. Disable this with `--no-worktree` or `no_worktree = true`.
+
 ## Security notes
 
 The default mode favors usability over maximum lockdown. These are intentionally open by default:
@@ -145,6 +147,7 @@ This:
 - Disables GPU, Docker, display passthrough, and mise.
 - Ignores `--rw-map` and `--map` flags.
 - Mounts `$HOME` as bare tmpfs (no host dotfiles).
+- Still exposes validated linked Git worktree metadata read-only when needed, so read-only Git operations can work from linked worktrees.
 - Linux: `--clearenv` with minimal allowlist, `--unshare-net`, `--new-session`.
 - macOS: clears env to minimal allowlist, strips network and file-write rules from SBPL profile.
 
@@ -163,12 +166,13 @@ Persistence: `--lockdown` alone doesn't write `.ai-jail` (keeps runs ephemeral).
 | `/tmp`, `/run` | tmpfs | Fresh temp dirs per session |
 | `$HOME` | tmpfs | Empty home, then dotfiles layered on top |
 | Project directory (pwd) | **read-write** | The whole point |
+| Linked Git worktree metadata | auto passthrough | Validated `.git` gitfile targets are mounted when the current directory is a linked worktree |
 | GPU devices (`/dev/nvidia*`, `/dev/dri`) | device | For GPU-accelerated tools |
 | Docker socket | read-write | If `/var/run/docker.sock` exists |
 | X11/Wayland | passthrough | Display server access |
 | `/dev/shm` | device | Shared memory (Chromium needs this) |
 
-In `--lockdown`, project is mounted read-only and host write mounts are removed.
+In `--lockdown`, project is mounted read-only and host write mounts are removed. For linked Git worktrees, validated external Git metadata is still exposed read-only unless disabled with `--no-worktree`.
 
 ### Home directory handling
 
@@ -189,6 +193,7 @@ Your real `$HOME` is replaced with a tmpfs. Dotfiles and dotdirs are selectively
 **Explicit file mounts:**
 - `~/.gitconfig` (read-only)
 - `~/.claude.json` (read-write)
+- Validated linked Git worktree admin dirs outside the project tree (auto, same-path passthrough)
 
 **Local overrides (read-write):**
 - `~/.local/state`
@@ -205,7 +210,7 @@ On Linux 5.13+, ai-jail applies [Landlock](https://landlock.io/) restrictions as
 
 - Uses ABI V3 (Linux 6.2+) for filesystem rules with best-effort degradation to V1 on 5.13+ or no-op on older kernels.
 - On Linux 6.5+, a second V4 ruleset adds network restrictions: lockdown mode denies all TCP bind/connect (defense-in-depth alongside `--unshare-net`).
-- Applied in the parent process before spawning bwrap, so restrictions inherit through fork+exec.
+- Applied after bwrap namespace setup via an internal wrapper, so Landlock sees the final sandbox mount layout.
 - In `--lockdown`, Landlock rules are stricter: project is read-only, no home dotdirs, only `/tmp` is writable, no network.
 - Disable with `--no-landlock` if it causes issues with specific tools.
 
@@ -281,6 +286,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--gpu` / `--no-gpu` | Enable/disable GPU passthrough |
 | `--docker` / `--no-docker` | Enable/disable Docker socket |
 | `--display` / `--no-display` | Enable/disable X11/Wayland |
+| `--worktree` / `--no-worktree` | Enable/disable linked Git worktree metadata passthrough (default: on) |
 | `--mise` / `--no-mise` | Enable/disable mise integration |
 | `--ssh` / `--no-ssh` | Share `~/.ssh` read-only + forward `SSH_AUTH_SOCK` (default: off) |
 | `--pictures` / `--no-pictures` | Share `~/Pictures` read-only (default: off) |
@@ -307,6 +313,9 @@ ai-jail --map /opt/datasets claude
 
 # No GPU, no Docker, just the basics
 ai-jail --no-gpu --no-docker claude
+
+# Disable linked Git worktree passthrough for this run
+ai-jail --no-worktree claude
 
 # Run a one-shot command and capture its output
 result=$(ai-jail --exec -- my-script.sh --flag1 --flag2)
@@ -379,6 +388,7 @@ When CLI flags and an existing config are both present:
 | `no_gpu` | bool | not set (auto) | `true` disables GPU passthrough |
 | `no_docker` | bool | not set (auto) | `true` disables Docker socket |
 | `no_display` | bool | not set (auto) | `true` disables X11/Wayland |
+| `no_worktree` | bool | not set (auto) | `true` disables linked Git worktree metadata passthrough |
 | `no_mise` | bool | not set (auto) | `true` disables mise integration |
 | `ssh` | bool | not set (off) | `true` shares `~/.ssh` read-only + forwards `SSH_AUTH_SOCK` |
 | `pictures` | bool | not set (off) | `true` shares `~/Pictures` read-only |
@@ -390,7 +400,7 @@ When CLI flags and an existing config are both present:
 
 Status bar preferences (`no_status_bar`, `status_bar_style`, `resize_redraw_key`) are stored in `$HOME/.ai-jail` (global user config), not in per-project `.ai-jail` files. `status_bar_style` accepts `"dark"`, `"light"`, or `"pastel"` — pastel rotates through a curated set of soft pastel palettes (with high-contrast foreground), picking a new one at random for each session. Set it back to `"dark"` or `"light"` to disable the rotation. `resize_redraw_key` is used only by the PTY/status-bar path on terminal resize; accepted values are `ctrl-l`, `ctrl-shift-l` (same wire encoding as `ctrl-l`), or `disabled`. If unset, `codex` gets the `ctrl-shift-l` default and other commands stay off.
 
-When a boolean field is not set, the feature is enabled if the resource exists on the host. `no_save_config` is the exception: when unset, config auto-save is enabled in normal mode.
+When a boolean field is not set, the feature is in auto mode. For resource passthroughs, that means enabled if the resource exists on the host. For Git worktrees, that means enabled only when the current directory is a validated linked worktree. `no_save_config` is exception: when unset, config auto-save is enabled in normal mode.
 
 ## Windows
 
