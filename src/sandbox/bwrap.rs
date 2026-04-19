@@ -129,7 +129,7 @@ impl MountSet {
             "ai-sandbox".into(),
         ];
 
-        if should_use_new_session() {
+        if lockdown || should_use_new_session() {
             args.push("--new-session".into());
         }
 
@@ -1363,6 +1363,33 @@ mod tests {
                 && w[2] == "/home/user/project"
         });
         assert!(has_project_ro);
+    }
+
+    #[test]
+    fn lockdown_forces_new_session() {
+        // --new-session must be present in lockdown mode regardless of
+        // whether stdin is a terminal. The README documents lockdown as
+        // enabling --new-session unconditionally; should_use_new_session()
+        // alone is TTY-dependent, so lockdown needs its own short-circuit.
+        let mut config = minimal_test_config();
+        config.lockdown = Some(true);
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let project = PathBuf::from("/home/user/project");
+
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            args.contains(&"--new-session".to_string()),
+            "--new-session must be present in lockdown mode regardless of stdin"
+        );
     }
 
     #[test]
