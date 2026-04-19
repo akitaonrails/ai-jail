@@ -1,6 +1,6 @@
 [package]
 name = "ai-jail"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2024"
 description = "Sandbox for AI coding agents (bubblewrap on Linux, sandbox-exec on macOS)"
 license = "GPL-3.0-only"

@@ -1206,9 +1206,13 @@ fn discover_display(verbose: bool) -> (Vec<Mount>, Vec<(String, String)>) {
 fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
     let mut mounts = Vec::new();
 
-    for path in rw_maps {
+    // Apply ro-maps first, then rw-maps on top. This lets a
+    // rw-subdirectory override an ro-parent, e.g.:
+    //   --map ~/Projects --rw-map ~/Projects/ai-jail
+    // makes ~/Projects read-only except the ai-jail subdir.
+    for path in ro_maps {
         if super::path_exists(path) {
-            mounts.push(Mount::Bind {
+            mounts.push(Mount::RoBind {
                 src: path.clone(),
                 dest: path.clone(),
             });
@@ -1220,9 +1224,9 @@ fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
         }
     }
 
-    for path in ro_maps {
+    for path in rw_maps {
         if super::path_exists(path) {
-            mounts.push(Mount::RoBind {
+            mounts.push(Mount::Bind {
                 src: path.clone(),
                 dest: path.clone(),
             });
@@ -1285,6 +1289,29 @@ mod tests {
             dest: "/tmp".into(),
         };
         assert_eq!(m.to_args(), vec!["--bind", "/tmp", "/tmp"]);
+    }
+
+    #[test]
+    fn extra_mounts_rw_child_overrides_ro_parent() {
+        // Use /usr and /usr/bin which always exist. The order
+        // of returned mounts must be: ro first, rw after — so a
+        // rw subdirectory can overlay its ro parent.
+        let ro = vec![PathBuf::from("/usr")];
+        let rw = vec![PathBuf::from("/usr/bin")];
+        let mounts = extra_mounts(&rw, &ro);
+        assert_eq!(mounts.len(), 2);
+        match &mounts[0] {
+            Mount::RoBind { src, .. } => {
+                assert_eq!(src, &PathBuf::from("/usr"));
+            }
+            _ => panic!("first mount must be RoBind of the ro-parent"),
+        }
+        match &mounts[1] {
+            Mount::Bind { src, .. } => {
+                assert_eq!(src, &PathBuf::from("/usr/bin"));
+            }
+            _ => panic!("second mount must be Bind of the rw-child"),
+        }
     }
 
     #[test]
