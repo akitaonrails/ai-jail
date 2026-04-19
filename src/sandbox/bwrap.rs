@@ -1333,7 +1333,12 @@ mod tests {
         assert!(args.contains(&"--unshare-pid".to_string()));
         assert!(args.contains(&"--unshare-uts".to_string()));
         assert!(args.contains(&"--unshare-ipc".to_string()));
-        assert!(args.contains(&"--new-session".to_string()));
+        // --new-session is environment-dependent; see should_use_new_session.
+        if should_use_new_session() {
+            assert!(args.contains(&"--new-session".to_string()));
+        } else {
+            assert!(!args.contains(&"--new-session".to_string()));
+        }
     }
 
     #[test]
