@@ -78,6 +78,8 @@ pub struct Config {
     pub no_rlimits: Option<bool>,
     #[serde(default)]
     pub allow_tcp_ports: Vec<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -256,6 +258,9 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     c.allow_tcp_ports.extend(local.allow_tcp_ports);
     c.allow_tcp_ports.sort_unstable();
     c.allow_tcp_ports.dedup();
+    if local.claude_dir.is_some() {
+        c.claude_dir = local.claude_dir;
+    }
     // Status bar + resize redraw key stay from global — local should
     // not override user-level preferences.
     c
@@ -493,6 +498,13 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     config.allow_tcp_ports.sort_unstable();
     config.allow_tcp_ports.dedup();
 
+    if let Some(p) = cli.claude_dir.clone() {
+        config.claude_dir = Some(p);
+    }
+    if let Some(p) = config.claude_dir.take() {
+        config.claude_dir = Some(expand_tilde(p));
+    }
+
     // Expand ~ / ~/ in all user-provided path fields. Config
     // files are TOML (no shell expansion); CLI args are shell-
     // expanded already but harmless to re-run. Only leading
@@ -625,6 +637,9 @@ pub fn display_status(config: &Config) {
     }
     if let Some(key) = config.resize_redraw_key.as_deref() {
         output::status_header("  Resize redraw", key);
+    }
+    if let Some(dir) = &config.claude_dir {
+        output::status_header("  Claude dir", &dir.display().to_string());
     }
 }
 
@@ -791,6 +806,7 @@ another_removed_field = true
         assert_eq!(cfg.no_seccomp, None);
         assert_eq!(cfg.no_rlimits, None);
         assert!(cfg.allow_tcp_ports.is_empty());
+        assert_eq!(cfg.claude_dir, None);
     }
 
     #[test]
@@ -983,6 +999,7 @@ allow_tcp_ports = []
             no_seccomp: None,
             no_rlimits: None,
             allow_tcp_ports: vec![32000, 8080],
+            claude_dir: None,
         };
         let serialized = serialize_config(&config).unwrap();
         let deserialized = parse_toml(&serialized).unwrap();
@@ -1004,6 +1021,7 @@ allow_tcp_ports = []
         assert_eq!(deserialized.no_seccomp, config.no_seccomp);
         assert_eq!(deserialized.no_rlimits, config.no_rlimits);
         assert_eq!(deserialized.allow_tcp_ports, config.allow_tcp_ports);
+        assert_eq!(deserialized.claude_dir, config.claude_dir);
     }
 
     // ── Merge tests ────────────────────────────────────────────
@@ -1826,6 +1844,7 @@ allow_tcp_ports = [32000, 8080]
             no_seccomp: None,
             no_rlimits: None,
             allow_tcp_ports: vec![32000],
+            claude_dir: None,
         };
         save(&config);
 
@@ -1837,6 +1856,7 @@ allow_tcp_ports = [32000, 8080]
         assert_eq!(loaded.allow_tcp_ports, vec![32000]);
         assert_eq!(loaded.resize_redraw_key, None);
         assert_eq!(loaded.browser_profile.as_deref(), Some("hard"));
+        assert_eq!(loaded.claude_dir, None);
 
         // Cleanup
         std::env::set_current_dir(&original_dir).unwrap();
@@ -1960,5 +1980,127 @@ allow_tcp_ports = [32000, 8080]
                 std::env::set_var("HOME", v);
             }
         }
+    }
+
+    // ── claude_dir tests ──────────────────────────────────────
+
+    #[test]
+    fn regression_v0_9_0_config_without_claude_dir() {
+        let toml = r#"
+command = ["claude"]
+rw_maps = []
+ro_maps = []
+no_gpu = false
+no_docker = false
+lockdown = false
+no_landlock = false
+no_status_bar = false
+no_seccomp = false
+no_rlimits = false
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.claude_dir, None);
+    }
+
+    #[test]
+    fn parse_claude_dir_from_toml() {
+        let toml = r#"
+command = ["claude"]
+claude_dir = "/home/user/.claude-example"
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(
+            cfg.claude_dir,
+            Some(PathBuf::from("/home/user/.claude-example"))
+        );
+    }
+
+    #[test]
+    fn merge_claude_dir_from_cli() {
+        let existing = Config::default();
+        let cli = CliArgs {
+            claude_dir: Some(PathBuf::from("/home/user/.claude-example")),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(
+            merged.claude_dir,
+            Some(PathBuf::from("/home/user/.claude-example"))
+        );
+    }
+
+    #[test]
+    fn merge_claude_dir_expands_tilde() {
+        let _env = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("HOME", "/home/testuser") };
+
+        let existing = Config::default();
+        let cli = CliArgs {
+            claude_dir: Some(PathBuf::from("~/.claude-example")),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(
+            merged.claude_dir,
+            Some(PathBuf::from("/home/testuser/.claude-example"))
+        );
+
+        unsafe { std::env::remove_var("HOME") };
+    }
+
+    #[test]
+    fn merge_cli_no_claude_dir_preserves_config_claude_dir() {
+        let existing = Config {
+            claude_dir: Some(PathBuf::from("/home/user/.claude-example")),
+            ..Config::default()
+        };
+        let cli = CliArgs::default();
+        let merged = merge(&cli, existing);
+        assert_eq!(
+            merged.claude_dir,
+            Some(PathBuf::from("/home/user/.claude-example"))
+        );
+    }
+
+    #[test]
+    fn merge_expands_tilde_from_config_file() {
+        let _env = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("HOME", "/home/testuser") };
+
+        let existing = Config {
+            claude_dir: Some(PathBuf::from("~/.claude-example")),
+            ..Config::default()
+        };
+        let cli = CliArgs::default();
+        let merged = merge(&cli, existing);
+        assert_eq!(
+            merged.claude_dir,
+            Some(PathBuf::from("/home/testuser/.claude-example"))
+        );
+
+        unsafe { std::env::remove_var("HOME") };
+    }
+
+    #[test]
+    fn roundtrip_claude_dir() {
+        let config = Config {
+            command: vec!["claude".into()],
+            claude_dir: Some(PathBuf::from("/home/user/.claude-example")),
+            ..Config::default()
+        };
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized = parse_toml(&serialized).unwrap();
+        assert_eq!(deserialized.claude_dir, config.claude_dir);
+    }
+
+    #[test]
+    fn roundtrip_claude_dir_none_not_written() {
+        let config = Config {
+            command: vec!["claude".into()],
+            claude_dir: None,
+            ..Config::default()
+        };
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(!serialized.contains("claude_dir"));
     }
 }
