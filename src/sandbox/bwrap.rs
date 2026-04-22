@@ -78,6 +78,7 @@ struct MountSet {
     display_env: Vec<(String, String)>,
     ssh_agent: Vec<Mount>,
     ssh_env: Vec<(String, String)>,
+    claude_env: Vec<(String, String)>,
     pictures: Vec<Mount>,
     browser_state: Vec<Mount>,
     extra: Vec<Mount>,
@@ -181,6 +182,13 @@ impl MountSet {
                 args.push(key.clone());
                 args.push(val.clone());
             }
+        }
+
+        // Claude config dir env (always, even in lockdown)
+        for (key, val) in &self.claude_env {
+            args.push("--setenv".into());
+            args.push(key.clone());
+            args.push(val.clone());
         }
 
         args.extend([
@@ -621,6 +629,10 @@ fn landlock_wrapper_args(config: &Config, verbose: bool) -> Vec<String> {
         args.push("--mask".into());
         args.push(path.display().to_string());
     }
+    if let Some(dir) = &config.claude_dir {
+        args.push("--claude-dir".into());
+        args.push(dir.display().to_string());
+    }
 
     if verbose {
         args.push("--verbose".into());
@@ -896,6 +908,14 @@ fn discover_mounts(
             (vec![], vec![])
         };
 
+    // Claude config dir env var
+    let claude_env: Vec<(String, String)> =
+        if let Some(dir) = &config.claude_dir {
+            vec![("CLAUDE_CONFIG_DIR".into(), dir.display().to_string())]
+        } else {
+            vec![]
+        };
+
     // Mask: replace each path with an empty tempfile (or tmpfs
     // for directories). Paths are resolved absolutely; relative
     // paths resolve against project_dir.
@@ -921,15 +941,29 @@ fn discover_mounts(
     let browser_state_mount =
         discover_browser_state_mount(config, browser_profile, verbose);
 
+    let mut home_dotfiles = discover_home_dotfiles(
+        private_home,
+        &config.hide_dotdirs,
+        &exempt,
+        verbose,
+    );
+    if !lockdown
+        && let Some(dir) = &config.claude_dir
+        && super::path_exists(dir)
+    {
+        if verbose {
+            output::verbose(&format!("claude-dir: {}", dir.display()));
+        }
+        home_dotfiles.push(Mount::Bind {
+            src: dir.clone(),
+            dest: dir.clone(),
+        });
+    }
+
     MountSet {
         base: discover_base(hosts_file, resolv_mount),
         sys_masks: discover_sys_masks(lockdown),
-        home_dotfiles: discover_home_dotfiles(
-            private_home,
-            &config.hide_dotdirs,
-            &exempt,
-            verbose,
-        ),
+        home_dotfiles,
         config_hide: if private_home {
             vec![]
         } else {
@@ -961,6 +995,7 @@ fn discover_mounts(
         display_env,
         ssh_agent: ssh_agent_mount,
         ssh_env,
+        claude_env,
         pictures: pictures_mount,
         browser_state: browser_state_mount,
         extra: if lockdown || browser_mode {
@@ -2361,6 +2396,85 @@ mod tests {
         assert_eq!(
             selected.file_name().and_then(|s| s.to_str()),
             Some("bwrap")
+        );
+    }
+
+    #[test]
+    fn claude_dir_produces_bind_mount_and_setenv() {
+        let tmp_root = std::env::temp_dir()
+            .join(format!("ai-jail-bwrap-claude-{}", std::process::id()));
+        let claude_dir = tmp_root.join(".claude-example");
+        let _ = std::fs::create_dir_all(&claude_dir);
+
+        let config = Config {
+            command: vec!["claude".into()],
+            claude_dir: Some(claude_dir.clone()),
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            no_display: Some(true),
+            ..Config::default()
+        };
+        let project = PathBuf::from("/tmp/project");
+
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            Path::new("/tmp/hosts"),
+            None,
+            Path::new("/tmp/empty"),
+            false,
+        )
+        .unwrap();
+
+        let bind_pos = args.windows(3).position(|w| {
+            w[0] == "--bind"
+                && w[1] == claude_dir.display().to_string()
+                && w[2] == claude_dir.display().to_string()
+        });
+        assert!(
+            bind_pos.is_some(),
+            "--bind for claude_dir not found in argv: {args:?}"
+        );
+
+        let setenv_pos = args.windows(3).position(|w| {
+            w[0] == "--setenv"
+                && w[1] == "CLAUDE_CONFIG_DIR"
+                && w[2] == claude_dir.display().to_string()
+        });
+        assert!(
+            setenv_pos.is_some(),
+            "--setenv CLAUDE_CONFIG_DIR not found in argv: \
+             {args:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn no_claude_dir_no_setenv() {
+        let config = Config {
+            command: vec!["claude".into()],
+            claude_dir: None,
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            no_display: Some(true),
+            ..Config::default()
+        };
+        let project = PathBuf::from("/tmp/project");
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            Path::new("/tmp/hosts"),
+            None,
+            Path::new("/tmp/empty"),
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            !args.iter().any(|a| a == "CLAUDE_CONFIG_DIR"),
+            "CLAUDE_CONFIG_DIR must not appear when \
+             claude_dir is None"
         );
     }
 }
