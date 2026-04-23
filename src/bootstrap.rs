@@ -134,6 +134,7 @@ const ASK: &[&str] = &[
 pub fn run(verbose: bool) -> Result<(), String> {
     output::info("Bootstrapping AI tool configs...");
 
+    bootstrap_gemini(verbose)?;
     bootstrap_claude(verbose)?;
     bootstrap_codex(verbose)?;
     bootstrap_opencode(verbose)?;
@@ -226,6 +227,103 @@ fn backup_file(path: &Path) -> Result<bool, String> {
     fs::copy(path, &bak_path)
         .map_err(|e| format!("Failed to backup {}: {e}", path.display()))?;
     Ok(true)
+}
+
+// ── Gemini ───────────────────────────────────────────────────────
+
+fn gemini_policy_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home)
+        .join(".gemini")
+        .join("policies")
+        .join("ai-jail.toml")
+}
+
+fn build_gemini_policy() -> String {
+    let mut toml =
+        String::from("# ai-jail bootstrap policy for Gemini CLI\n\n");
+
+    let mut process_tool = |source: &str, tool_name: &str| {
+        if ALLOW.contains(&source) {
+            toml.push_str(&format!("[[rule]]\ntoolName = \"{}\"\ndecision = \"allow\"\npriority = 100\n\n", tool_name));
+        } else if ASK.contains(&source) {
+            toml.push_str(&format!("[[rule]]\ntoolName = \"{}\"\ndecision = \"ask_user\"\npriority = 100\n\n", tool_name));
+        }
+    };
+
+    process_tool("WebSearch", "google_web_search");
+    process_tool("WebFetch", "web_fetch");
+
+    let native_tools = [
+        "list_directory",
+        "read_file",
+        "grep_search",
+        "glob",
+        "codebase_investigator",
+        "write_file",
+        "replace",
+    ];
+    for t in native_tools {
+        toml.push_str(&format!("[[rule]]\ntoolName = \"{}\"\ndecision = \"allow\"\npriority = 100\n\n", t));
+    }
+
+    let parse_prefixes = |list: &[&str]| -> Vec<String> {
+        let mut prefixes = Vec::new();
+        for &cmd in list {
+            if let Some(inner) = cmd.strip_prefix("Bash(") {
+                if let Some(prefix) = inner.strip_suffix(" *)") {
+                    prefixes.push(prefix.to_string());
+                } else if let Some(exact) = inner.strip_suffix(")") {
+                    prefixes.push(exact.to_string());
+                }
+            }
+        }
+        prefixes
+    };
+
+    let allow_prefixes = parse_prefixes(ALLOW);
+    if !allow_prefixes.is_empty() {
+        toml.push_str("[[rule]]\ntoolName = \"run_shell_command\"\ndecision = \"allow\"\npriority = 110\ncommandPrefix = [\n");
+        for p in allow_prefixes {
+            toml.push_str(&format!("    \"{}\",\n", p));
+        }
+        toml.push_str("]\n\n");
+    }
+
+    let ask_prefixes = parse_prefixes(ASK);
+    if !ask_prefixes.is_empty() {
+        toml.push_str("[[rule]]\ntoolName = \"run_shell_command\"\ndecision = \"ask_user\"\npriority = 120\ncommandPrefix = [\n");
+        for p in ask_prefixes {
+            toml.push_str(&format!("    \"{}\",\n", p));
+        }
+        toml.push_str("]\n\n");
+    }
+
+    let deny_prefixes = parse_prefixes(DENY);
+    if !deny_prefixes.is_empty() {
+        toml.push_str("[[rule]]\ntoolName = \"run_shell_command\"\ndecision = \"deny\"\npriority = 900\ncommandPrefix = [\n");
+        for p in deny_prefixes {
+            toml.push_str(&format!("    \"{}\",\n", p));
+        }
+        toml.push_str("]\n\n");
+    }
+
+    toml
+}
+
+fn bootstrap_gemini(verbose: bool) -> Result<(), String> {
+    let path = gemini_policy_path();
+    ensure_regular_file_or_absent(&path)?;
+
+    if path.exists() && backup_file(&path)? && verbose {
+        output::verbose(&format!("Backed up {}", path.display()));
+    }
+
+    let content = build_gemini_policy();
+    write_atomic(&path, &content)?;
+
+    output::ok(&format!("Gemini: {}", path.display()));
+    Ok(())
 }
 
 // ── Claude ───────────────────────────────────────────────────────
@@ -412,6 +510,19 @@ fn bootstrap_crush(verbose: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Gemini TOML policy generation ─────────────────────────
+
+    #[test]
+    fn gemini_policy_generation() {
+        let policy = build_gemini_policy();
+        assert!(policy.contains("[[rule]]"));
+        assert!(policy.contains("toolName = \"run_shell_command\""));
+        assert!(policy.contains("toolName = \"google_web_search\""));
+        assert!(policy.contains("decision = \"ask_user\""));
+        assert!(policy.contains("\"git status\","));
+        assert!(policy.contains("\"sudo\","));
+    }
     use std::env;
     use std::fs;
 

@@ -100,6 +100,7 @@ pub fn denied_dotdirs<'a>(
 
 // Dotdirs requiring read-write access
 const DOTDIR_RW: &[&str] = &[
+    ".gemini",
     ".claude",
     ".crush",
     ".codex",
@@ -597,7 +598,7 @@ mod tests {
 
     #[test]
     fn rw_list_contains_ai_tool_dirs() {
-        for name in &[".claude", ".crush", ".codex", ".aider"] {
+        for name in &[".gemini", ".claude", ".crush", ".codex", ".aider"] {
             assert!(DOTDIR_RW.contains(name), "{name} should be in rw list");
         }
     }
@@ -667,7 +668,7 @@ mod tests {
 
     #[test]
     fn cannot_deny_rw_required_dirs() {
-        for name in &[".cargo", ".cache", ".config", ".claude"] {
+        for name in &[".cargo", ".cache", ".config", ".claude", ".gemini"] {
             let extra = vec![name.to_string()];
             assert!(
                 !is_dotdir_denied(name, &extra, &[]),
