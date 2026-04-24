@@ -22,6 +22,21 @@ fn command_needs_direct_tty(command: &[String]) -> bool {
     command_basename(command) == Some("crush")
 }
 
+/// Detect a terminal multiplexer around the current process. Nested
+/// PTYs (tmux/zellij PTY → ai-jail vt100 PTY → child) conflict over
+/// resize, keyboard protocol, and status-bar drawing, so we auto-skip
+/// the ai-jail PTY proxy in these environments unless the user has
+/// explicitly opted in.
+fn running_inside_multiplexer() -> Option<&'static str> {
+    if std::env::var_os("TMUX").is_some() {
+        Some("tmux")
+    } else if std::env::var_os("ZELLIJ").is_some() {
+        Some("zellij")
+    } else {
+        None
+    }
+}
+
 fn default_resize_redraw_key(command: &[String]) -> Option<&'static str> {
     match command_basename(command) {
         Some("codex") => Some("ctrl-shift-l"),
@@ -176,17 +191,30 @@ fn run() -> Result<i32, String> {
     let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let needs_direct_tty = command_needs_direct_tty(&config.command);
+    let multiplexer = running_inside_multiplexer();
+    // Auto-skip the ai-jail status bar / PTY proxy inside a
+    // multiplexer unless the user explicitly opted in via -s,
+    // --status-bar=..., or `no_status_bar = false` in config.
+    let explicit_status_bar =
+        cli.status_bar_style.is_some() || config.no_status_bar == Some(false);
+    let multiplexer_skip = multiplexer.is_some() && !explicit_status_bar;
     let use_status_bar = config.status_bar_enabled()
         && stdout_is_tty
         && stdin_is_tty
         && !cli.exec
-        && !needs_direct_tty;
+        && !needs_direct_tty
+        && !multiplexer_skip;
     if cli.verbose {
         if config.status_bar_enabled() {
             if needs_direct_tty {
                 output::verbose(
                     "Status bar: skipped (crush requires direct terminal passthrough)",
                 );
+            } else if multiplexer_skip {
+                output::verbose(&format!(
+                    "Status bar: auto-disabled ({} detected; pass -s to force-enable)",
+                    multiplexer.unwrap()
+                ));
             } else if stdout_is_tty && stdin_is_tty {
                 output::verbose("Status bar: enabled");
             } else {
@@ -300,13 +328,81 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_needs_direct_tty, validate_write_flags};
+    use super::{
+        command_needs_direct_tty, running_inside_multiplexer,
+        validate_write_flags,
+    };
     use crate::cli::CliArgs;
+
+    // Serialize tests that mutate process-global env vars.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn crush_requires_direct_tty() {
         assert!(command_needs_direct_tty(&["crush".into()]));
         assert!(command_needs_direct_tty(&["/usr/bin/crush".into()]));
+    }
+
+    #[test]
+    fn multiplexer_detects_tmux() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved_tmux = std::env::var_os("TMUX");
+        let saved_zellij = std::env::var_os("ZELLIJ");
+        unsafe {
+            std::env::remove_var("ZELLIJ");
+            std::env::set_var("TMUX", "/tmp/fake");
+        }
+        assert_eq!(running_inside_multiplexer(), Some("tmux"));
+        unsafe {
+            std::env::remove_var("TMUX");
+            if let Some(v) = saved_tmux {
+                std::env::set_var("TMUX", v);
+            }
+            if let Some(v) = saved_zellij {
+                std::env::set_var("ZELLIJ", v);
+            }
+        }
+    }
+
+    #[test]
+    fn multiplexer_detects_zellij() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved_tmux = std::env::var_os("TMUX");
+        let saved_zellij = std::env::var_os("ZELLIJ");
+        unsafe {
+            std::env::remove_var("TMUX");
+            std::env::set_var("ZELLIJ", "session-name");
+        }
+        assert_eq!(running_inside_multiplexer(), Some("zellij"));
+        unsafe {
+            std::env::remove_var("ZELLIJ");
+            if let Some(v) = saved_tmux {
+                std::env::set_var("TMUX", v);
+            }
+            if let Some(v) = saved_zellij {
+                std::env::set_var("ZELLIJ", v);
+            }
+        }
+    }
+
+    #[test]
+    fn multiplexer_none_when_neither_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved_tmux = std::env::var_os("TMUX");
+        let saved_zellij = std::env::var_os("ZELLIJ");
+        unsafe {
+            std::env::remove_var("TMUX");
+            std::env::remove_var("ZELLIJ");
+        }
+        assert_eq!(running_inside_multiplexer(), None);
+        unsafe {
+            if let Some(v) = saved_tmux {
+                std::env::set_var("TMUX", v);
+            }
+            if let Some(v) = saved_zellij {
+                std::env::set_var("ZELLIJ", v);
+            }
+        }
     }
 
     #[test]

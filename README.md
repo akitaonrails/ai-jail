@@ -222,13 +222,7 @@ The bar shows the project path, running command, ai-jail version, and a green `â
 
 **Why it exists**: when you run several AI CLI agents in parallel (one per terminal window / split), it's easy to lose track of which window is bound to which project. The status bar keeps the project path and the running command visible at all times so you can't accidentally paste the wrong context into the wrong agent.
 
-**Disable it if you use tmux, zellij, or a similar multiplexer.** Those tools already render a persistent status line and already own the terminal; ai-jail's PTY proxy is redundant and causes conflicts (nested PTYs, resize flicker, lost keyboard-protocol sequences, no Secure Input propagation). Turn ai-jail's bar off and let the multiplexer handle it:
-
-```bash
-ai-jail --no-status-bar claude
-# or permanently in ~/.ai-jail:
-#   no_status_bar = true
-```
+**Auto-disabled inside tmux and zellij.** Those tools already render a persistent status line and already own the terminal; ai-jail's PTY proxy is redundant and causes conflicts (nested PTYs, resize flicker, lost keyboard-protocol sequences, no Secure Input propagation). When ai-jail detects `$TMUX` or `$ZELLIJ` in the environment it silently skips the status bar and takes the direct-spawn path, letting the multiplexer drive the terminal. To force the ai-jail bar on anyway, pass `-s` explicitly or set `no_status_bar = false` in `~/.ai-jail`.
 
 When running `codex` through the PTY proxy, ai-jail also injects a redraw key on terminal resize to force the app to repaint at the new width. The default is `ctrl-shift-l` for codex sessions. In practice, terminals collapse shifted control letters, so `ctrl-shift-l` and `ctrl-l` send the same control byte to the app.
 
