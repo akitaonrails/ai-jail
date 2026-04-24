@@ -144,7 +144,7 @@ fn do_apply(
     let access_read = AccessFs::from_read(ABI_VERSION);
 
     let (ro_paths, rw_paths) = if config.lockdown_enabled() {
-        collect_lockdown_paths(project_dir, verbose)
+        collect_lockdown_paths(config, project_dir, verbose)
     } else {
         collect_normal_paths(config, project_dir, verbose)
     };
@@ -277,6 +277,7 @@ fn apply_net_rules(config: &Config, verbose: bool) -> Result<(), String> {
 /// from writing anywhere except /tmp, so it cannot persist
 /// backdoors, modify configs, or exfiltrate data to disk.
 fn collect_lockdown_paths(
+    config: &Config,
     project_dir: &Path,
     verbose: bool,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
@@ -326,6 +327,20 @@ fn collect_lockdown_paths(
             "Landlock lockdown: {} ro",
             project_dir.display()
         ));
+    }
+
+    if let Some(paths) =
+        super::discover_git_worktree_paths(config, project_dir, verbose)
+    {
+        for path in paths.unique_paths() {
+            if verbose {
+                output::verbose(&format!(
+                    "Landlock lockdown: git worktree {} ro",
+                    path.display()
+                ));
+            }
+            ro.push(path);
+        }
     }
 
     (ro, rw)
@@ -483,6 +498,20 @@ fn collect_normal_paths(
             output::verbose("Landlock: ~/.gitconfig ro");
         }
         ro.push(gitconfig);
+    }
+
+    if let Some(paths) =
+        super::discover_git_worktree_paths(config, project_dir, verbose)
+    {
+        for path in paths.unique_paths() {
+            if verbose {
+                output::verbose(&format!(
+                    "Landlock: git worktree {} rw",
+                    path.display()
+                ));
+            }
+            rw.push(path);
+        }
     }
 
     // Extra user mounts: --rw-map and --ro-map from CLI/config.
@@ -655,6 +684,52 @@ fn collect_gpu_paths(rw: &mut Vec<PathBuf>, verbose: bool) {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct LinkedWorktreeFixture {
+        root: PathBuf,
+        project_dir: PathBuf,
+        git_dir: PathBuf,
+        common_dir: PathBuf,
+    }
+
+    impl Drop for LinkedWorktreeFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn create_linked_worktree_fixture() -> LinkedWorktreeFixture {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-landlock-worktree-{}-{nonce}",
+            std::process::id()
+        ));
+        let project_dir = root.join("project");
+        let common_dir = root.join("common/.git");
+        let git_dir = common_dir.join("worktrees/wt1");
+
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            project_dir.join(".git"),
+            "gitdir: ../common/.git/worktrees/wt1\n",
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("gitdir"), "../../../../project/.git\n")
+            .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+
+        LinkedWorktreeFixture {
+            root,
+            project_dir,
+            git_dir,
+            common_dir,
+        }
+    }
 
     // Tests mutating process-global env vars must hold this lock.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -701,20 +776,29 @@ mod tests {
     #[test]
     fn lockdown_paths_project_is_readonly() {
         let project = PathBuf::from("/home/user/project");
-        let (ro, rw) = collect_lockdown_paths(&project, false);
+        let (ro, rw) =
+            collect_lockdown_paths(&Config::default(), &project, false);
         assert!(ro.contains(&project), "project must be in ro list");
         assert!(!rw.contains(&project), "project must not be in rw list");
     }
 
     #[test]
     fn lockdown_paths_tmp_is_writable() {
-        let (_, rw) = collect_lockdown_paths(Path::new("/tmp/proj"), false);
+        let (_, rw) = collect_lockdown_paths(
+            &Config::default(),
+            Path::new("/tmp/proj"),
+            false,
+        );
         assert!(rw.contains(&PathBuf::from("/tmp")));
     }
 
     #[test]
     fn lockdown_paths_dev_is_writable() {
-        let (ro, rw) = collect_lockdown_paths(Path::new("/tmp/proj"), false);
+        let (ro, rw) = collect_lockdown_paths(
+            &Config::default(),
+            Path::new("/tmp/proj"),
+            false,
+        );
         assert!(rw.contains(&PathBuf::from("/dev")));
         assert!(!ro.contains(&PathBuf::from("/dev")));
     }
@@ -747,7 +831,11 @@ mod tests {
 
     #[test]
     fn lockdown_paths_root_is_readable() {
-        let (ro, _) = collect_lockdown_paths(Path::new("/tmp/proj"), false);
+        let (ro, _) = collect_lockdown_paths(
+            &Config::default(),
+            Path::new("/tmp/proj"),
+            false,
+        );
         assert!(
             ro.contains(&PathBuf::from("/")),
             "/ must be in ro list so bwrap can set up mount namespaces"
@@ -876,5 +964,68 @@ mod tests {
         // Empty ports → same as no ports → best-effort V4 or
         // fallback to --unshare-net only.
         let _ = apply_net_rules(&config, true);
+    }
+
+    #[test]
+    fn normal_paths_include_linked_worktree_git_dirs() {
+        let fixture = create_linked_worktree_fixture();
+        let config = Config {
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            ..Config::default()
+        };
+
+        let (_, rw) =
+            collect_normal_paths(&config, &fixture.project_dir, false);
+        assert!(rw.iter().any(|path| super::super::paths_equivalent(
+            path,
+            &fixture.git_dir
+        )));
+        assert!(rw.iter().any(|path| {
+            super::super::paths_equivalent(path, &fixture.common_dir)
+        }));
+    }
+
+    #[test]
+    fn lockdown_paths_include_linked_worktree_git_dirs_read_only() {
+        let fixture = create_linked_worktree_fixture();
+        let config = Config {
+            lockdown: Some(true),
+            ..Config::default()
+        };
+
+        let (ro, rw) =
+            collect_lockdown_paths(&config, &fixture.project_dir, false);
+        assert!(ro.iter().any(|path| super::super::paths_equivalent(
+            path,
+            &fixture.git_dir
+        )));
+        assert!(ro.iter().any(|path| {
+            super::super::paths_equivalent(path, &fixture.common_dir)
+        }));
+        assert!(!rw.iter().any(|path| super::super::paths_equivalent(
+            path,
+            &fixture.git_dir
+        )));
+    }
+
+    #[test]
+    fn disabled_worktree_passthrough_skips_landlock_paths() {
+        let fixture = create_linked_worktree_fixture();
+        let config = Config {
+            no_worktree: Some(true),
+            ..Config::default()
+        };
+
+        let (_, rw) =
+            collect_normal_paths(&config, &fixture.project_dir, false);
+        assert!(!rw.iter().any(|path| super::super::paths_equivalent(
+            path,
+            &fixture.git_dir
+        )));
+        assert!(!rw.iter().any(|path| super::super::paths_equivalent(
+            path,
+            &fixture.common_dir
+        )));
     }
 }

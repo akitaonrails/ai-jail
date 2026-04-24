@@ -26,6 +26,8 @@ pub struct Config {
     #[serde(default)]
     pub no_display: Option<bool>,
     #[serde(default)]
+    pub no_worktree: Option<bool>,
+    #[serde(default)]
     pub no_mise: Option<bool>,
     #[serde(default)]
     pub no_save_config: Option<bool>,
@@ -63,6 +65,9 @@ impl Config {
     }
     pub fn mise_enabled(&self) -> bool {
         self.no_mise != Some(true)
+    }
+    pub fn worktree_enabled(&self) -> bool {
+        self.no_worktree != Some(true)
     }
     pub fn lockdown_enabled(&self) -> bool {
         self.lockdown == Some(true)
@@ -176,6 +181,9 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     }
     if local.no_mise.is_some() {
         c.no_mise = local.no_mise;
+    }
+    if local.no_worktree.is_some() {
+        c.no_worktree = local.no_worktree;
     }
     if local.no_save_config.is_some() {
         c.no_save_config = local.no_save_config;
@@ -371,6 +379,9 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     if let Some(v) = cli.pictures {
         config.pictures = Some(v);
     }
+    if let Some(v) = cli.worktree {
+        config.no_worktree = Some(!v);
+    }
     if let Some(v) = cli.lockdown {
         config.lockdown = Some(v);
     }
@@ -463,6 +474,7 @@ pub fn display_status(config: &Config) {
     bool_opt("GPU", config.no_gpu);
     bool_opt("Docker", config.no_docker);
     bool_opt("Display", config.no_display);
+    bool_opt("Git worktree", config.no_worktree);
     bool_opt("Mise", config.no_mise);
     match config.no_save_config {
         Some(true) => output::status_header("  Save config", "disabled"),
@@ -558,6 +570,7 @@ lockdown = true
         assert_eq!(cfg.no_gpu, Some(true));
         assert_eq!(cfg.no_docker, Some(false));
         assert_eq!(cfg.no_display, Some(true));
+        assert_eq!(cfg.no_worktree, None);
         assert_eq!(cfg.no_mise, Some(false));
         assert_eq!(cfg.no_save_config, Some(true));
         assert_eq!(cfg.lockdown, Some(true));
@@ -654,6 +667,7 @@ another_removed_field = true
         assert_eq!(cfg.no_gpu, None);
         assert_eq!(cfg.no_docker, None);
         assert_eq!(cfg.no_display, None);
+        assert_eq!(cfg.no_worktree, None);
         assert_eq!(cfg.no_mise, None);
         assert_eq!(cfg.no_save_config, None);
         assert_eq!(cfg.lockdown, None);
@@ -761,6 +775,30 @@ no_rlimits = false
     }
 
     #[test]
+    fn regression_v0_8_0_config_without_no_worktree() {
+        let toml = r#"
+command = ["claude"]
+rw_maps = []
+ro_maps = []
+hide_dotdirs = []
+no_gpu = false
+no_docker = false
+no_display = false
+no_mise = false
+lockdown = false
+no_landlock = false
+no_status_bar = false
+status_bar_style = "dark"
+no_seccomp = false
+no_rlimits = false
+allow_tcp_ports = []
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.no_worktree, None);
+        assert!(cfg.worktree_enabled());
+    }
+
+    #[test]
     fn regression_empty_config_file() {
         // An empty .ai-jail file must not crash
         let cfg = parse_toml("").unwrap();
@@ -787,6 +825,7 @@ no_rlimits = false
             no_gpu: Some(true),
             no_docker: None,
             no_display: Some(false),
+            no_worktree: Some(false),
             no_mise: None,
             no_save_config: Some(true),
             ssh: Some(true),
@@ -809,6 +848,7 @@ no_rlimits = false
         assert_eq!(deserialized.no_gpu, config.no_gpu);
         assert_eq!(deserialized.no_docker, config.no_docker);
         assert_eq!(deserialized.no_display, config.no_display);
+        assert_eq!(deserialized.no_worktree, config.no_worktree);
         assert_eq!(deserialized.no_mise, config.no_mise);
         assert_eq!(deserialized.no_save_config, config.no_save_config);
         assert_eq!(deserialized.lockdown, config.lockdown);
@@ -902,6 +942,17 @@ no_rlimits = false
     }
 
     #[test]
+    fn parse_config_with_no_worktree() {
+        let toml = r#"
+command = ["claude"]
+no_worktree = true
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.no_worktree, Some(true));
+        assert!(!cfg.worktree_enabled());
+    }
+
+    #[test]
     fn parse_hide_dotdirs() {
         let toml = r#"
 command = ["claude"]
@@ -944,6 +995,7 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
             no_gpu: Some(true),
             no_docker: Some(false),
             no_display: None,
+            no_worktree: Some(true),
             no_mise: Some(true),
             no_save_config: Some(true),
             lockdown: Some(true),
@@ -955,6 +1007,7 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
         assert_eq!(merged.no_gpu, Some(true));
         assert_eq!(merged.no_docker, Some(false));
         assert_eq!(merged.no_display, None);
+        assert_eq!(merged.no_worktree, Some(true));
         assert_eq!(merged.no_mise, Some(true));
         assert_eq!(merged.no_save_config, Some(true));
         assert_eq!(merged.lockdown, Some(true));
@@ -968,6 +1021,7 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
             gpu: Some(false),         // --no-gpu
             docker: Some(false),      // --no-docker
             display: Some(true),      // --display
+            worktree: Some(false),    // --no-worktree
             mise: Some(true),         // --mise
             save_config: Some(false), // --no-save-config
             lockdown: Some(true),     // --lockdown
@@ -977,6 +1031,7 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
         assert_eq!(merged.no_gpu, Some(true));
         assert_eq!(merged.no_docker, Some(true));
         assert_eq!(merged.no_display, Some(false));
+        assert_eq!(merged.no_worktree, Some(true));
         assert_eq!(merged.no_mise, Some(false));
         assert_eq!(merged.no_save_config, Some(true));
         assert_eq!(merged.lockdown, Some(true));
@@ -1004,6 +1059,28 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
         };
         let merged = merge(&cli, existing);
         assert_eq!(merged.no_landlock, Some(true));
+    }
+
+    #[test]
+    fn merge_worktree_flag_overrides() {
+        let existing = Config {
+            no_worktree: None,
+            ..Config::default()
+        };
+
+        let cli = CliArgs {
+            worktree: Some(true),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing.clone());
+        assert_eq!(merged.no_worktree, Some(false));
+
+        let cli = CliArgs {
+            worktree: Some(false),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(merged.no_worktree, Some(true));
     }
 
     #[test]
@@ -1248,6 +1325,31 @@ allow_tcp_ports = [32000, 8080]
                 ..Config::default()
             }
             .display_enabled()
+        );
+    }
+
+    #[test]
+    fn worktree_enabled_accessor() {
+        assert!(
+            Config {
+                no_worktree: None,
+                ..Config::default()
+            }
+            .worktree_enabled()
+        );
+        assert!(
+            !Config {
+                no_worktree: Some(true),
+                ..Config::default()
+            }
+            .worktree_enabled()
+        );
+        assert!(
+            Config {
+                no_worktree: Some(false),
+                ..Config::default()
+            }
+            .worktree_enabled()
         );
     }
 
@@ -1506,6 +1608,7 @@ allow_tcp_ports = [32000, 8080]
             no_gpu: Some(true),
             no_docker: None,
             no_display: None,
+            no_worktree: None,
             no_mise: None,
             no_save_config: Some(true),
             ssh: None,

@@ -195,7 +195,7 @@ fn generate_sbpl_profile(
 
     if lockdown {
         profile.push_str("; File reads: lockdown allow-list\n");
-        for rd_path in macos_lockdown_read_paths(project_dir) {
+        for rd_path in macos_lockdown_read_paths(config, project_dir) {
             let canonical = canonicalize_or_keep(&rd_path);
             let escaped = sbpl_escape(canonical.to_string_lossy().as_ref());
             if canonical.is_dir() || !canonical.exists() {
@@ -337,6 +337,12 @@ fn macos_writable_paths(
 
     paths.push(project_dir.to_path_buf());
 
+    if let Some(worktree) =
+        super::discover_git_worktree_paths(config, project_dir, false)
+    {
+        paths.extend(worktree.unique_paths());
+    }
+
     for name in super::DOTDIR_RW {
         let p = home.join(name);
         if super::path_exists(&p) {
@@ -391,7 +397,10 @@ fn macos_docker_socket() -> Option<PathBuf> {
     candidates.into_iter().find(|p| super::path_exists(p))
 }
 
-fn macos_lockdown_read_paths(project_dir: &Path) -> Vec<PathBuf> {
+fn macos_lockdown_read_paths(
+    config: &Config,
+    project_dir: &Path,
+) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut push_unique = |p: PathBuf| {
         if !paths.contains(&p) {
@@ -401,6 +410,14 @@ fn macos_lockdown_read_paths(project_dir: &Path) -> Vec<PathBuf> {
 
     // Always allow reading the project tree.
     push_unique(canonicalize_or_keep(project_dir));
+
+    if let Some(worktree) =
+        super::discover_git_worktree_paths(config, project_dir, false)
+    {
+        for path in worktree.unique_paths() {
+            push_unique(canonicalize_or_keep(&path));
+        }
+    }
 
     // Core runtime and toolchain locations needed to execute binaries
     // and resolve dynamic libraries on macOS.
@@ -439,6 +456,52 @@ fn macos_lockdown_read_paths(project_dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct LinkedWorktreeFixture {
+        root: PathBuf,
+        project_dir: PathBuf,
+        git_dir: PathBuf,
+        common_dir: PathBuf,
+    }
+
+    impl Drop for LinkedWorktreeFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn create_linked_worktree_fixture() -> LinkedWorktreeFixture {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-seatbelt-worktree-{}-{nonce}",
+            std::process::id()
+        ));
+        let project_dir = root.join("project");
+        let common_dir = root.join("common/.git");
+        let git_dir = common_dir.join("worktrees/wt1");
+
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            project_dir.join(".git"),
+            "gitdir: ../common/.git/worktrees/wt1\n",
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("gitdir"), "../../../../project/.git\n")
+            .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+
+        LinkedWorktreeFixture {
+            root,
+            project_dir,
+            git_dir,
+            common_dir,
+        }
+    }
 
     #[test]
     fn sbpl_profile_has_deny_default() {
@@ -519,7 +582,39 @@ mod tests {
     #[test]
     fn lockdown_read_paths_include_project() {
         let project = PathBuf::from("/tmp/test-project");
-        let paths = macos_lockdown_read_paths(&project);
+        let paths = macos_lockdown_read_paths(&Config::default(), &project);
         assert!(paths.contains(&project));
+    }
+
+    #[test]
+    fn writable_paths_include_linked_worktree_git_dirs() {
+        let fixture = create_linked_worktree_fixture();
+        let config = Config {
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let paths = macos_writable_paths(&fixture.project_dir, &config, false);
+        assert!(paths.iter().any(|path| path == &fixture.git_dir));
+        assert!(paths.iter().any(|path| path == &fixture.common_dir));
+    }
+
+    #[test]
+    fn lockdown_read_paths_include_linked_worktree_git_dirs() {
+        let fixture = create_linked_worktree_fixture();
+        let config = Config {
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        let paths = macos_lockdown_read_paths(&config, &fixture.project_dir);
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == &canonicalize_or_keep(&fixture.git_dir))
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == &canonicalize_or_keep(&fixture.common_dir))
+        );
     }
 }

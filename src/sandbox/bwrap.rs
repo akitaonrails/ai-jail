@@ -70,6 +70,7 @@ struct MountSet {
     config_hide: Vec<Mount>,
     cache_hide: Vec<Mount>,
     local_overrides: Vec<Mount>,
+    git_worktree: Vec<Mount>,
     gpu: Vec<Mount>,
     docker: Vec<Mount>,
     shm: Vec<Mount>,
@@ -84,7 +85,7 @@ struct MountSet {
 }
 
 impl MountSet {
-    fn ordered_mounts(&self) -> [&[Mount]; 15] {
+    fn ordered_mounts(&self) -> [&[Mount]; 16] {
         [
             &self.base,
             &self.sys_masks,
@@ -96,6 +97,7 @@ impl MountSet {
             &self.config_hide,
             &self.cache_hide,
             &self.local_overrides,
+            &self.git_worktree,
             &self.ssh_agent,
             &self.pictures,
             &self.extra,
@@ -578,6 +580,13 @@ fn landlock_wrapper_args(config: &Config, verbose: bool) -> Vec<String> {
     } else {
         "--no-display".into()
     });
+    if let Some(enabled) = config.no_worktree.map(|value| !value) {
+        args.push(if enabled {
+            "--worktree".into()
+        } else {
+            "--no-worktree".into()
+        });
+    }
     if config.ssh_enabled() {
         args.push("--ssh".into());
     }
@@ -910,6 +919,7 @@ fn discover_mounts(
         } else {
             discover_local_overrides()
         },
+        git_worktree: git_worktree_mounts(config, project_dir, verbose),
         gpu: if enable_gpu {
             discover_gpu(verbose)
         } else {
@@ -1314,6 +1324,37 @@ fn discover_display(verbose: bool) -> (Vec<Mount>, Vec<(String, String)>) {
     (mounts, env)
 }
 
+fn git_worktree_mounts(
+    config: &Config,
+    project_dir: &Path,
+    verbose: bool,
+) -> Vec<Mount> {
+    let Some(paths) =
+        super::discover_git_worktree_paths(config, project_dir, verbose)
+    else {
+        return vec![];
+    };
+
+    let readonly = config.lockdown_enabled();
+    paths
+        .unique_paths()
+        .into_iter()
+        .map(|path| {
+            if readonly {
+                Mount::RoBind {
+                    src: path.clone(),
+                    dest: path,
+                }
+            } else {
+                Mount::Bind {
+                    src: path.clone(),
+                    dest: path,
+                }
+            }
+        })
+        .collect()
+}
+
 fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
     let mut mounts = Vec::new();
 
@@ -1369,6 +1410,52 @@ fn project_mount(project_dir: &Path, readonly: bool) -> Vec<Mount> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct LinkedWorktreeFixture {
+        root: PathBuf,
+        project_dir: PathBuf,
+        git_dir: PathBuf,
+        common_dir: PathBuf,
+    }
+
+    impl Drop for LinkedWorktreeFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn create_linked_worktree_fixture() -> LinkedWorktreeFixture {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-bwrap-worktree-{}-{nonce}",
+            std::process::id()
+        ));
+        let project_dir = root.join("project");
+        let common_dir = root.join("common/.git");
+        let git_dir = common_dir.join("worktrees/wt1");
+
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            project_dir.join(".git"),
+            "gitdir: ../common/.git/worktrees/wt1\n",
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("gitdir"), "../../../../project/.git\n")
+            .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+
+        LinkedWorktreeFixture {
+            root,
+            project_dir,
+            git_dir,
+            common_dir,
+        }
+    }
 
     // Tests that mutate process-global env vars must hold this lock.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1656,6 +1743,141 @@ mod tests {
             .windows(3)
             .any(|w| w[0] == "--bind" && w[1] == "/tmp" && w[2] == "/tmp");
         assert!(!has_tmp_bind);
+    }
+
+    #[test]
+    fn linked_worktree_paths_are_rw_in_normal_mode() {
+        let fixture = create_linked_worktree_fixture();
+        let config = minimal_test_config();
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+
+        let args = build_dry_run_args(
+            &config,
+            &fixture.project_dir,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--bind"
+                && super::super::paths_equivalent(
+                    Path::new(&w[1]),
+                    &fixture.git_dir,
+                )
+                && super::super::paths_equivalent(
+                    Path::new(&w[2]),
+                    &fixture.git_dir,
+                )
+        }));
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--bind"
+                && super::super::paths_equivalent(
+                    Path::new(&w[1]),
+                    &fixture.common_dir,
+                )
+                && super::super::paths_equivalent(
+                    Path::new(&w[2]),
+                    &fixture.common_dir,
+                )
+        }));
+    }
+
+    #[test]
+    fn linked_worktree_paths_are_ro_in_lockdown() {
+        let fixture = create_linked_worktree_fixture();
+        let mut config = minimal_test_config();
+        config.lockdown = Some(true);
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+
+        let args = build_dry_run_args(
+            &config,
+            &fixture.project_dir,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--ro-bind"
+                && super::super::paths_equivalent(
+                    Path::new(&w[1]),
+                    &fixture.git_dir,
+                )
+                && super::super::paths_equivalent(
+                    Path::new(&w[2]),
+                    &fixture.git_dir,
+                )
+        }));
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--ro-bind"
+                && super::super::paths_equivalent(
+                    Path::new(&w[1]),
+                    &fixture.common_dir,
+                )
+                && super::super::paths_equivalent(
+                    Path::new(&w[2]),
+                    &fixture.common_dir,
+                )
+        }));
+    }
+
+    #[test]
+    fn invalid_linked_worktree_layout_is_ignored() {
+        let fixture = create_linked_worktree_fixture();
+        std::fs::remove_file(fixture.git_dir.join("commondir")).unwrap();
+        let config = minimal_test_config();
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+
+        let args = build_dry_run_args(
+            &config,
+            &fixture.project_dir,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        assert!(!args.iter().any(|arg| {
+            super::super::paths_equivalent(Path::new(arg), &fixture.git_dir)
+        }));
+        assert!(!args.iter().any(|arg| {
+            super::super::paths_equivalent(Path::new(arg), &fixture.common_dir)
+        }));
+    }
+
+    #[test]
+    fn disabled_worktree_passthrough_skips_mounts() {
+        let fixture = create_linked_worktree_fixture();
+        let mut config = minimal_test_config();
+        config.no_worktree = Some(true);
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+
+        let args = build_dry_run_args(
+            &config,
+            &fixture.project_dir,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        assert!(!args.iter().any(|arg| {
+            super::super::paths_equivalent(Path::new(arg), &fixture.git_dir)
+        }));
+        assert!(!args.iter().any(|arg| {
+            super::super::paths_equivalent(Path::new(arg), &fixture.common_dir)
+        }));
     }
 
     #[test]

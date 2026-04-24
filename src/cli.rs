@@ -25,6 +25,7 @@ OPTIONS:
     --no-gpu / --gpu               Disable/enable GPU device passthrough (Linux only)
     --no-docker / --docker         Disable/enable Docker socket passthrough
     --no-display / --display       Disable/enable X11/Wayland passthrough (Linux only)
+    --worktree / --no-worktree     Enable/disable linked Git worktree metadata passthrough
     --no-mise / --mise             Disable/enable mise integration
     --ssh / --no-ssh               Share ~/.ssh read-only + forward SSH_AUTH_SOCK (default: off)
     --pictures / --no-pictures     Share ~/Pictures read-only (default: off)
@@ -58,6 +59,7 @@ pub struct CliArgs {
     pub gpu: Option<bool>,
     pub docker: Option<bool>,
     pub display: Option<bool>,
+    pub worktree: Option<bool>,
     pub mise: Option<bool>,
     pub save_config: Option<bool>,
     pub ssh: Option<bool>,
@@ -146,6 +148,8 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long("no-docker") => args.docker = Some(false),
             Long("display") => args.display = Some(true),
             Long("no-display") => args.display = Some(false),
+            Long("worktree") => args.worktree = Some(true),
+            Long("no-worktree") => args.worktree = Some(false),
             Long("mise") => args.mise = Some(true),
             Long("no-mise") => args.mise = Some(false),
             Long("save-config") => args.save_config = Some(true),
@@ -363,6 +367,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_worktree() {
+        let args = parse_test(&["--worktree", "bash"]).unwrap();
+        assert_eq!(args.worktree, Some(true));
+    }
+
+    #[test]
+    fn parse_no_worktree() {
+        let args = parse_test(&["--no-worktree", "bash"]).unwrap();
+        assert_eq!(args.worktree, Some(false));
+    }
+
+    #[test]
     fn parse_mise() {
         let args = parse_test(&["--mise", "bash"]).unwrap();
         assert_eq!(args.mise, Some(true));
@@ -530,6 +546,7 @@ mod tests {
             "--verbose",
             "--no-gpu",
             "--no-docker",
+            "--worktree",
             "--rw-map",
             "/tmp/test",
             "claude",
@@ -539,6 +556,7 @@ mod tests {
         assert!(args.verbose);
         assert_eq!(args.gpu, Some(false));
         assert_eq!(args.docker, Some(false));
+        assert_eq!(args.worktree, Some(true));
         assert_eq!(args.rw_maps, vec![PathBuf::from("/tmp/test")]);
         assert_eq!(args.command, vec!["claude"]);
     }

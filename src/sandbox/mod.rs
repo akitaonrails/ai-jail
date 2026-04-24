@@ -149,6 +149,154 @@ fn path_exists(p: &Path) -> bool {
     p.exists() || p.symlink_metadata().is_ok()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitWorktreePaths {
+    pub git_dir: PathBuf,
+    pub common_dir: PathBuf,
+}
+
+impl GitWorktreePaths {
+    pub(crate) fn unique_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for path in [self.git_dir.clone(), self.common_dir.clone()] {
+            if !paths
+                .iter()
+                .any(|existing| paths_equivalent(existing, &path))
+            {
+                paths.push(path);
+            }
+        }
+        paths
+    }
+}
+
+pub(crate) fn discover_git_worktree_paths(
+    config: &Config,
+    project_dir: &Path,
+    verbose: bool,
+) -> Option<GitWorktreePaths> {
+    if !config.worktree_enabled() {
+        if verbose {
+            crate::output::verbose("Git worktree: disabled");
+        }
+        return None;
+    }
+
+    match validate_linked_git_worktree(project_dir) {
+        Ok(Some(paths)) => {
+            if verbose {
+                crate::output::verbose(&format!(
+                    "Git worktree: exposing {}",
+                    paths
+                        .unique_paths()
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            Some(paths)
+        }
+        Ok(None) => {
+            if verbose {
+                crate::output::verbose(
+                    "Git worktree: not a linked worktree root",
+                );
+            }
+            None
+        }
+        Err(reason) => {
+            if verbose {
+                crate::output::verbose(&format!(
+                    "Git worktree: skipped ({reason})"
+                ));
+            }
+            None
+        }
+    }
+}
+
+fn validate_linked_git_worktree(
+    project_dir: &Path,
+) -> Result<Option<GitWorktreePaths>, String> {
+    let project_git = project_dir.join(".git");
+    if project_git.is_dir() {
+        return Ok(None);
+    }
+    if !project_git.is_file() {
+        return Ok(None);
+    }
+
+    let git_dir = parse_gitfile_target(&project_git)?;
+    if !git_dir.is_dir() {
+        return Err(format!(
+            "gitdir target {} is not a directory",
+            git_dir.display()
+        ));
+    }
+
+    let reverse_gitdir = read_resolved_path_file(&git_dir.join("gitdir"))?;
+    if !paths_equivalent(&reverse_gitdir, &project_git) {
+        return Err(format!(
+            "{} does not point back to {}",
+            git_dir.join("gitdir").display(),
+            project_git.display()
+        ));
+    }
+
+    let common_dir = read_resolved_path_file(&git_dir.join("commondir"))?;
+    if !common_dir.is_dir() {
+        return Err(format!(
+            "commondir target {} is not a directory",
+            common_dir.display()
+        ));
+    }
+
+    Ok(Some(GitWorktreePaths {
+        git_dir,
+        common_dir,
+    }))
+}
+
+fn parse_gitfile_target(gitfile: &Path) -> Result<PathBuf, String> {
+    let contents = std::fs::read_to_string(gitfile)
+        .map_err(|e| format!("cannot read {}: {e}", gitfile.display()))?;
+    let line = contents.trim();
+    let raw = line
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!("{} is not a valid gitfile", gitfile.display())
+        })?;
+    Ok(resolve_path_from_file(gitfile, Path::new(raw)))
+}
+
+fn read_resolved_path_file(path: &Path) -> Result<PathBuf, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let raw = contents.trim();
+    if raw.is_empty() {
+        return Err(format!("{} is empty", path.display()));
+    }
+    Ok(resolve_path_from_file(path, Path::new(raw)))
+}
+
+fn resolve_path_from_file(file: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        file.parent().unwrap_or_else(|| Path::new(".")).join(path)
+    }
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => left == right,
+    }
+}
+
 fn mise_bin() -> Option<PathBuf> {
     std::env::var("PATH").ok().and_then(|paths| {
         paths.split(':').find_map(|dir| {
@@ -309,6 +457,55 @@ pub fn dry_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct LinkedWorktreeFixture {
+        root: PathBuf,
+        project_dir: PathBuf,
+        git_dir: PathBuf,
+        common_dir: PathBuf,
+    }
+
+    impl Drop for LinkedWorktreeFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir()
+            .join(format!("ai-jail-{prefix}-{}-{nonce}", std::process::id()))
+    }
+
+    fn create_linked_worktree_fixture() -> LinkedWorktreeFixture {
+        let root = temp_test_dir("worktree");
+        let project_dir = root.join("project");
+        let common_dir = root.join("common/.git");
+        let git_dir = common_dir.join("worktrees/wt1");
+
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        std::fs::write(
+            project_dir.join(".git"),
+            "gitdir: ../common/.git/worktrees/wt1\n",
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("gitdir"), "../../../../project/.git\n")
+            .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+
+        LinkedWorktreeFixture {
+            root,
+            project_dir,
+            git_dir,
+            common_dir,
+        }
+    }
 
     #[test]
     fn default_launch_is_bash() {
@@ -497,5 +694,75 @@ mod tests {
         assert!(denied.contains(&"aws".to_string()));
         assert!(denied.contains(&"my_secrets".to_string()));
         assert!(denied.contains(&"proton".to_string()));
+    }
+
+    #[test]
+    fn validate_linked_git_worktree_skips_normal_repo_root() {
+        let root = temp_test_dir("normal-repo");
+        let project_dir = root.join("project");
+        std::fs::create_dir_all(project_dir.join(".git")).unwrap();
+
+        assert!(
+            validate_linked_git_worktree(&project_dir)
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_linked_git_worktree_discovers_valid_layout() {
+        let fixture = create_linked_worktree_fixture();
+
+        let paths = validate_linked_git_worktree(&fixture.project_dir)
+            .unwrap()
+            .unwrap();
+
+        assert!(paths_equivalent(&paths.git_dir, &fixture.git_dir));
+        assert!(paths_equivalent(&paths.common_dir, &fixture.common_dir));
+        assert_eq!(paths.unique_paths().len(), 2);
+    }
+
+    #[test]
+    fn validate_linked_git_worktree_rejects_malformed_gitfile() {
+        let root = temp_test_dir("bad-gitfile");
+        let project_dir = root.join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join(".git"), "definitely not a gitfile\n")
+            .unwrap();
+
+        let err = validate_linked_git_worktree(&project_dir).unwrap_err();
+        assert!(err.contains("valid gitfile"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_linked_git_worktree_rejects_mismatched_reverse_link() {
+        let fixture = create_linked_worktree_fixture();
+        std::fs::write(
+            fixture.git_dir.join("gitdir"),
+            "../../../../other/.git\n",
+        )
+        .unwrap();
+
+        let err =
+            validate_linked_git_worktree(&fixture.project_dir).unwrap_err();
+        assert!(err.contains("does not point back"));
+    }
+
+    #[test]
+    fn discover_git_worktree_paths_respects_disabled_config() {
+        let fixture = create_linked_worktree_fixture();
+        let config = Config {
+            no_worktree: Some(true),
+            ..Config::default()
+        };
+
+        assert!(
+            discover_git_worktree_paths(&config, &fixture.project_dir, false)
+                .is_none()
+        );
     }
 }
