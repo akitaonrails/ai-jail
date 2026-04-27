@@ -123,6 +123,30 @@ fn sbpl_escape(input: &str) -> String {
     out
 }
 
+/// Escape a literal path for use as an SBPL regex pattern.
+/// Escapes both regex metacharacters and SBPL string characters.
+fn sbpl_regex_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 2);
+    for c in input.chars() {
+        match c {
+            // Regex metacharacters
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{'
+            | '}' | '^' | '$' | '|' => {
+                out.push('\\');
+                out.push(c);
+            }
+            // SBPL string escaping (must come after regex escaping)
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn sbpl_path(p: &Path) -> String {
     sbpl_escape(canonicalize_or_keep(p).to_string_lossy().as_ref())
 }
@@ -253,14 +277,22 @@ fn generate_sbpl_profile(
         profile.push_str("; File writes: allow specific paths\n");
         for wr_path in &writable_paths {
             let canonical = canonicalize_or_keep(wr_path);
-            let escaped = sbpl_escape(canonical.to_string_lossy().as_ref());
             if canonical.is_dir() || !canonical.exists() {
+                let escaped =
+                    sbpl_escape(canonical.to_string_lossy().as_ref());
                 profile.push_str(&format!(
                     "(allow file-write* (subpath \"{escaped}\"))\n"
                 ));
             } else {
+                // Use a regex prefix rule so atomic-write temp siblings
+                // (e.g. .claude.json.tmp, .claude.json.12345) are also
+                // covered. A literal rule would deny creating the temp
+                // file in the same directory, causing silent auth
+                // failures.
+                let regex_escaped =
+                    sbpl_regex_escape(canonical.to_string_lossy().as_ref());
                 profile.push_str(&format!(
-                    "(allow file-write* (literal \"{escaped}\"))\n"
+                    "(allow file-write* (regex #\"^{regex_escaped}\"))\n"
                 ));
             }
         }
@@ -612,6 +644,50 @@ mod tests {
     fn regression_sbpl_escape_controls() {
         let escaped = sbpl_escape("line1\nline2\t\\");
         assert_eq!(escaped, "line1\\nline2\\t\\\\");
+    }
+
+    #[test]
+    fn sbpl_regex_escape_dots_and_specials() {
+        // Dots must be escaped so they match literally in the regex
+        let escaped = sbpl_regex_escape("/Users/user/.claude.json");
+        assert_eq!(escaped, "/Users/user/\\.claude\\.json");
+    }
+
+    #[test]
+    fn sbpl_regex_escape_handles_all_metacharacters() {
+        let escaped = sbpl_regex_escape("/a.b*c+d?e(f)g[h]i{j}k^l$m|n");
+        assert_eq!(
+            escaped,
+            "/a\\.b\\*c\\+d\\?e\\(f\\)g\\[h\\]i\\{j\\}k\\^l\\$m\\|n"
+        );
+    }
+
+    #[test]
+    fn file_write_rule_uses_regex_prefix_not_literal() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!(
+            "ai-jail-seatbelt-test-{}.json",
+            std::process::id()
+        ));
+        fs::write(&tmp, "{}").unwrap();
+        let config = Config {
+            rw_maps: vec![tmp.clone()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let profile =
+            generate_sbpl_profile(&config, Path::new("/tmp/proj"), false, false);
+        let canonical = canonicalize_or_keep(&tmp);
+        let path_str = canonical.to_string_lossy();
+        let _ = fs::remove_file(&tmp);
+        assert!(
+            profile.contains(&format!("(allow file-write* (regex #\"^")),
+            "file write rule for a file must use regex prefix"
+        );
+        assert!(
+            !profile.contains(&format!("(allow file-write* (literal \"{path_str}\")")),
+            "file write rule must not use literal for the specific file"
+        );
     }
 
     #[test]
