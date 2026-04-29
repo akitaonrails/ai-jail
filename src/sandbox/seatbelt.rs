@@ -130,8 +130,8 @@ fn sbpl_regex_escape(input: &str) -> String {
     for c in input.chars() {
         match c {
             // Regex metacharacters
-            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{'
-            | '}' | '^' | '$' | '|' => {
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^'
+            | '$' | '|' => {
                 out.push('\\');
                 out.push(c);
             }
@@ -277,22 +277,24 @@ fn generate_sbpl_profile(
         profile.push_str("; File writes: allow specific paths\n");
         for wr_path in &writable_paths {
             let canonical = canonicalize_or_keep(wr_path);
+            let escaped = sbpl_escape(canonical.to_string_lossy().as_ref());
             if canonical.is_dir() || !canonical.exists() {
-                let escaped =
-                    sbpl_escape(canonical.to_string_lossy().as_ref());
                 profile.push_str(&format!(
                     "(allow file-write* (subpath \"{escaped}\"))\n"
                 ));
             } else {
-                // Use a regex prefix rule so atomic-write temp siblings
-                // (e.g. .claude.json.tmp, .claude.json.12345) are also
-                // covered. A literal rule would deny creating the temp
-                // file in the same directory, causing silent auth
-                // failures.
+                profile.push_str(&format!(
+                    "(allow file-write* (literal \"{escaped}\"))\n"
+                ));
+                // Also allow write-atomic temp siblings and lock dir,
+                // bounded — e.g. .tmp.{pid}.{ts} and .lock.
                 let regex_escaped =
                     sbpl_regex_escape(canonical.to_string_lossy().as_ref());
+                let siblings = format!(
+                    "^{regex_escaped}(\\.tmp\\.[0-9]+\\.[0-9]+|\\.lock)$"
+                );
                 profile.push_str(&format!(
-                    "(allow file-write* (regex #\"^{regex_escaped}\"))\n"
+                    "(allow file-write* (regex #\"{siblings}\"))\n"
                 ));
             }
         }
@@ -663,30 +665,48 @@ mod tests {
     }
 
     #[test]
-    fn file_write_rule_uses_regex_prefix_not_literal() {
+    fn file_write_rule_uses_literal_and_bounded_regex() {
         use std::fs;
-        let tmp = std::env::temp_dir().join(format!(
-            "ai-jail-seatbelt-test-{}.json",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir()
+            .join(format!("ai-jail-seatbelt-test-{}.json", std::process::id()));
         fs::write(&tmp, "{}").unwrap();
         let config = Config {
             rw_maps: vec![tmp.clone()],
             no_mise: Some(true),
             ..Config::default()
         };
-        let profile =
-            generate_sbpl_profile(&config, Path::new("/tmp/proj"), false, false);
+        let profile = generate_sbpl_profile(
+            &config,
+            Path::new("/tmp/proj"),
+            false,
+            false,
+        );
         let canonical = canonicalize_or_keep(&tmp);
         let path_str = canonical.to_string_lossy();
+        let regex_escaped = sbpl_regex_escape(&path_str);
         let _ = fs::remove_file(&tmp);
+
         assert!(
-            profile.contains(&format!("(allow file-write* (regex #\"^")),
-            "file write rule for a file must use regex prefix"
+            profile.contains(&format!(
+                "(allow file-write* (literal \"{path_str}\"))"
+            )),
+            "file write rule must include a literal for the file"
+        );
+        let expected_regex = format!(
+            "(allow file-write* (regex #\"^{regex_escaped}\
+             (\\.tmp\\.[0-9]+\\.[0-9]+|\\.lock)$\"))"
         );
         assert!(
-            !profile.contains(&format!("(allow file-write* (literal \"{path_str}\")")),
-            "file write rule must not use literal for the specific file"
+            profile.contains(&expected_regex),
+            "file write rule must include a bounded regex for temp siblings"
+        );
+        // Unbounded prefix regex would grant access to unrelated paths
+        // like .claude.json.bak — must not be present.
+        assert!(
+            !profile.contains(&format!(
+                "(allow file-write* (regex #\"^{regex_escaped}\"))"
+            )),
+            "regex must not be an unbounded prefix"
         );
     }
 
