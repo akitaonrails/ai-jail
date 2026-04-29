@@ -150,7 +150,18 @@ jobs:
             echo "::warning::Skipping crates.io publish — no CARGO_REGISTRY_TOKEN secret set"
             exit 0
           fi
-          cargo publish
+          set +e
+          cargo publish 2>&1 | tee cargo-publish.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+          if grep -q "crate ai-jail@.* already exists on crates.io index" cargo-publish.log; then
+            echo "::warning::Skipping crates.io publish — ${GITHUB_REF_NAME#v} already exists"
+            exit 0
+          fi
+          exit "$status"
 
   homebrew:
     needs: release
