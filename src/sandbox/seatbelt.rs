@@ -123,6 +123,30 @@ fn sbpl_escape(input: &str) -> String {
     out
 }
 
+/// Escape a literal path for use as an SBPL regex pattern.
+/// Escapes both regex metacharacters and SBPL string characters.
+fn sbpl_regex_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 2);
+    for c in input.chars() {
+        match c {
+            // Regex metacharacters
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^'
+            | '$' | '|' => {
+                out.push('\\');
+                out.push(c);
+            }
+            // SBPL string escaping (must come after regex escaping)
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn sbpl_path(p: &Path) -> String {
     sbpl_escape(canonicalize_or_keep(p).to_string_lossy().as_ref())
 }
@@ -148,6 +172,7 @@ fn generate_sbpl_profile(
         deny_paths.push(abs);
     }
     let writable_paths = macos_writable_paths(project_dir, config, lockdown);
+    let atomic_paths = macos_atomic_write_paths(config);
 
     let mut profile = String::new();
     profile.push_str("(version 1)\n");
@@ -261,6 +286,27 @@ fn generate_sbpl_profile(
             } else {
                 profile.push_str(&format!(
                     "(allow file-write* (literal \"{escaped}\"))\n"
+                ));
+            }
+        }
+        if !atomic_paths.is_empty() {
+            profile.push('\n');
+            profile.push_str(
+                "; Atomic-write paths (literal + bounded temp siblings)\n",
+            );
+            for ap in &atomic_paths {
+                let canonical = canonicalize_or_keep(ap);
+                let path_str = canonical.to_string_lossy();
+                let escaped = sbpl_escape(&path_str);
+                profile.push_str(&format!(
+                    "(allow file-write* (literal \"{escaped}\"))\n"
+                ));
+                let regex_escaped = sbpl_regex_escape(&path_str);
+                let siblings = format!(
+                    "^{regex_escaped}(\\.tmp\\.[0-9]+\\.[0-9]+|\\.lock)$"
+                );
+                profile.push_str(&format!(
+                    "(allow file-write* (regex #\"{siblings}\"))\n"
                 ));
             }
         }
@@ -379,11 +425,6 @@ fn macos_writable_paths(
         if super::path_exists(&local) {
             paths.push(local);
         }
-
-        let claude_json = home.join(".claude.json");
-        if claude_json.is_file() {
-            paths.push(claude_json);
-        }
     }
 
     paths.push(PathBuf::from("/tmp"));
@@ -415,6 +456,18 @@ fn macos_writable_paths(
     }
 
     paths
+}
+
+fn macos_atomic_write_paths(config: &Config) -> Vec<PathBuf> {
+    if config.private_home_enabled() || config.lockdown_enabled() {
+        return Vec::new();
+    }
+    let claude_json = super::home_dir().join(".claude.json");
+    if claude_json.is_file() {
+        vec![claude_json]
+    } else {
+        Vec::new()
+    }
 }
 
 fn macos_docker_socket() -> Option<PathBuf> {
@@ -612,6 +665,82 @@ mod tests {
     fn regression_sbpl_escape_controls() {
         let escaped = sbpl_escape("line1\nline2\t\\");
         assert_eq!(escaped, "line1\\nline2\\t\\\\");
+    }
+
+    #[test]
+    fn sbpl_regex_escape_dots_and_specials() {
+        // Dots must be escaped so they match literally in the regex
+        let escaped = sbpl_regex_escape("/Users/user/.claude.json");
+        assert_eq!(escaped, "/Users/user/\\.claude\\.json");
+    }
+
+    #[test]
+    fn sbpl_regex_escape_handles_all_metacharacters() {
+        let escaped = sbpl_regex_escape("/a.b*c+d?e(f)g[h]i{j}k^l$m|n");
+        assert_eq!(
+            escaped,
+            "/a\\.b\\*c\\+d\\?e\\(f\\)g\\[h\\]i\\{j\\}k\\^l\\$m\\|n"
+        );
+    }
+
+    #[test]
+    fn atomic_paths_gets_bounded_atomic_write_rules() {
+        let _env = ENV_LOCK.lock().unwrap();
+        use std::fs;
+        let saved_home = std::env::var_os("HOME");
+        let fake_home = std::env::temp_dir()
+            .join(format!("ai-jail-seatbelt-atomic-{}", std::process::id()));
+        fs::create_dir_all(&fake_home).unwrap();
+        let claude_json = fake_home.join(".claude.json");
+        fs::write(&claude_json, "{}").unwrap();
+        unsafe { std::env::set_var("HOME", &fake_home) };
+
+        let config = Config {
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile(
+            &config,
+            Path::new("/tmp/proj"),
+            false,
+            false,
+        );
+
+        let canonical = canonicalize_or_keep(&claude_json);
+        let path_str = canonical.to_string_lossy();
+        let regex_escaped = sbpl_regex_escape(&path_str);
+
+        unsafe {
+            if let Some(value) = saved_home {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+        let _ = fs::remove_dir_all(&fake_home);
+
+        assert!(
+            profile.contains(&format!(
+                "(allow file-write* (literal \"{path_str}\"))"
+            )),
+            ".claude.json must have a literal write rule"
+        );
+        let bounded = format!(
+            "(allow file-write* (regex #\"^{regex_escaped}\
+             (\\.tmp\\.[0-9]+\\.[0-9]+|\\.lock)$\"))"
+        );
+        assert!(
+            profile.contains(&bounded),
+            ".claude.json must have a bounded temp-sibling regex rule"
+        );
+        // Unbounded prefix would grant access to unrelated paths like
+        // .claude.json.bak — the regex must be anchored at both ends.
+        assert!(
+            !profile.contains(&format!(
+                "(allow file-write* (regex #\"^{regex_escaped}\"))"
+            )),
+            "regex must not be an unbounded prefix"
+        );
     }
 
     #[test]
