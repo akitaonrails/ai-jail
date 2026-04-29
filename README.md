@@ -210,7 +210,7 @@ Your real `$HOME` is replaced with a tmpfs. Dotfiles and dotdirs are selectively
 - `.gnupg`, `.aws`, `.ssh`, `.mozilla`, `.basilisk-dev`, `.sparrow`
 
 **Mounted read-write (AI tools and build caches):**
-- `.claude`, `.crush`, `.codex`, `.aider`, `.config`, `.cargo`, `.cache`, `.docker`
+- `.gemini`, `.claude`, `.crush`, `.codex`, `.aider`, `.config`, `.cargo`, `.cache`, `.docker`
 
 **Everything else:** mounted read-only.
 
