@@ -172,6 +172,7 @@ fn generate_sbpl_profile(
         deny_paths.push(abs);
     }
     let writable_paths = macos_writable_paths(project_dir, config, lockdown);
+    let atomic_paths = macos_atomic_write_paths(config);
 
     let mut profile = String::new();
     profile.push_str("(version 1)\n");
@@ -286,10 +287,21 @@ fn generate_sbpl_profile(
                 profile.push_str(&format!(
                     "(allow file-write* (literal \"{escaped}\"))\n"
                 ));
-                // Also allow write-atomic temp siblings and lock dir,
-                // bounded — e.g. .tmp.{pid}.{ts} and .lock.
-                let regex_escaped =
-                    sbpl_regex_escape(canonical.to_string_lossy().as_ref());
+            }
+        }
+        if !atomic_paths.is_empty() {
+            profile.push('\n');
+            profile.push_str(
+                "; Atomic-write paths (literal + bounded temp siblings)\n",
+            );
+            for ap in &atomic_paths {
+                let canonical = canonicalize_or_keep(ap);
+                let path_str = canonical.to_string_lossy();
+                let escaped = sbpl_escape(&path_str);
+                profile.push_str(&format!(
+                    "(allow file-write* (literal \"{escaped}\"))\n"
+                ));
+                let regex_escaped = sbpl_regex_escape(&path_str);
                 let siblings = format!(
                     "^{regex_escaped}(\\.tmp\\.[0-9]+\\.[0-9]+|\\.lock)$"
                 );
@@ -413,11 +425,6 @@ fn macos_writable_paths(
         if super::path_exists(&local) {
             paths.push(local);
         }
-
-        let claude_json = home.join(".claude.json");
-        if claude_json.is_file() {
-            paths.push(claude_json);
-        }
     }
 
     paths.push(PathBuf::from("/tmp"));
@@ -449,6 +456,18 @@ fn macos_writable_paths(
     }
 
     paths
+}
+
+fn macos_atomic_write_paths(config: &Config) -> Vec<PathBuf> {
+    if config.private_home_enabled() || config.lockdown_enabled() {
+        return Vec::new();
+    }
+    let claude_json = super::home_dir().join(".claude.json");
+    if claude_json.is_file() {
+        vec![claude_json]
+    } else {
+        Vec::new()
+    }
 }
 
 fn macos_docker_socket() -> Option<PathBuf> {
@@ -665,13 +684,18 @@ mod tests {
     }
 
     #[test]
-    fn file_write_rule_uses_literal_and_bounded_regex() {
+    fn atomic_paths_gets_bounded_atomic_write_rules() {
+        let _env = ENV_LOCK.lock().unwrap();
         use std::fs;
-        let tmp = std::env::temp_dir()
-            .join(format!("ai-jail-seatbelt-test-{}.json", std::process::id()));
-        fs::write(&tmp, "{}").unwrap();
+        let saved_home = std::env::var_os("HOME");
+        let fake_home = std::env::temp_dir()
+            .join(format!("ai-jail-seatbelt-atomic-{}", std::process::id()));
+        fs::create_dir_all(&fake_home).unwrap();
+        let claude_json = fake_home.join(".claude.json");
+        fs::write(&claude_json, "{}").unwrap();
+        unsafe { std::env::set_var("HOME", &fake_home) };
+
         let config = Config {
-            rw_maps: vec![tmp.clone()],
             no_mise: Some(true),
             ..Config::default()
         };
@@ -681,27 +705,36 @@ mod tests {
             false,
             false,
         );
-        let canonical = canonicalize_or_keep(&tmp);
+
+        let canonical = canonicalize_or_keep(&claude_json);
         let path_str = canonical.to_string_lossy();
         let regex_escaped = sbpl_regex_escape(&path_str);
-        let _ = fs::remove_file(&tmp);
+
+        unsafe {
+            if let Some(value) = saved_home {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+        let _ = fs::remove_dir_all(&fake_home);
 
         assert!(
             profile.contains(&format!(
                 "(allow file-write* (literal \"{path_str}\"))"
             )),
-            "file write rule must include a literal for the file"
+            ".claude.json must have a literal write rule"
         );
-        let expected_regex = format!(
+        let bounded = format!(
             "(allow file-write* (regex #\"^{regex_escaped}\
              (\\.tmp\\.[0-9]+\\.[0-9]+|\\.lock)$\"))"
         );
         assert!(
-            profile.contains(&expected_regex),
-            "file write rule must include a bounded regex for temp siblings"
+            profile.contains(&bounded),
+            ".claude.json must have a bounded temp-sibling regex rule"
         );
-        // Unbounded prefix regex would grant access to unrelated paths
-        // like .claude.json.bak — must not be present.
+        // Unbounded prefix would grant access to unrelated paths like
+        // .claude.json.bak — the regex must be anchored at both ends.
         assert!(
             !profile.contains(&format!(
                 "(allow file-write* (regex #\"^{regex_escaped}\"))"
