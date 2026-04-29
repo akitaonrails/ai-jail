@@ -566,6 +566,9 @@ fn landlock_wrapper_args(config: &Config, verbose: bool) -> Vec<String> {
     if config.lockdown_enabled() {
         args.push("--lockdown".into());
     }
+    if config.private_home_enabled() {
+        args.push("--private-home".into());
+    }
 
     args.push(if config.gpu_enabled() {
         "--gpu".into()
@@ -843,7 +846,8 @@ fn discover_mounts(
     let lockdown = config.lockdown_enabled();
     let browser_profile = config.browser_profile();
     let browser_mode = browser_profile.is_some();
-    let private_home = lockdown || browser_mode;
+    let private_home =
+        lockdown || browser_mode || config.private_home_enabled();
     let enable_gpu = !lockdown && config.gpu_enabled();
     let enable_docker = !lockdown && config.docker_enabled();
     let enable_display = !lockdown && config.display_enabled();
@@ -864,6 +868,13 @@ fn discover_mounts(
                 dest: "/etc/ssh/ssh_config.d".into(),
             }];
             let mut env = vec![];
+            let ssh_dir = super::home_dir().join(".ssh");
+            if private_home && ssh_dir.is_dir() {
+                mounts.push(Mount::RoBind {
+                    src: ssh_dir.clone(),
+                    dest: ssh_dir,
+                });
+            }
             if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
                 let sock_path = PathBuf::from(&sock);
                 if sock_path.exists() {
@@ -1748,6 +1759,63 @@ mod tests {
             }),
             "browser profiles ignore extra rw maps"
         );
+    }
+
+    #[test]
+    fn private_home_hides_host_dotdirs_but_keeps_normal_mounts() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let saved_home = std::env::var_os("HOME");
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-private-home-{}", std::process::id()));
+        let extra = home.join("extra");
+        let project = home.join("project");
+        let _ = std::fs::create_dir_all(home.join(".config"));
+        let _ = std::fs::create_dir_all(home.join(".cache"));
+        let _ = std::fs::create_dir_all(&extra);
+        let _ = std::fs::create_dir_all(&project);
+        unsafe { std::env::set_var("HOME", &home) };
+
+        let mut config = minimal_test_config();
+        config.private_home = Some(true);
+        config.rw_maps = vec![extra.clone()];
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        let home_s = home.display().to_string();
+        let project_s = project.display().to_string();
+        let extra_s = extra.display().to_string();
+        assert!(args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == home_s));
+        assert!(!args.windows(3).any(|w| {
+            (w[0] == "--bind" || w[0] == "--ro-bind")
+                && (w[1] == home.join(".config").display().to_string()
+                    || w[1] == home.join(".cache").display().to_string())
+        }));
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--bind" && w[1] == project_s && w[2] == project_s
+        }));
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--bind" && w[1] == extra_s && w[2] == extra_s
+        }));
+        assert!(!args.contains(&"--unshare-net".to_string()));
+
+        unsafe {
+            if let Some(value) = saved_home {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

@@ -18,6 +18,8 @@ OPTIONS:
     --map <PATH>                   Mount PATH read-only inside sandbox (repeatable)
     --hide-dotdir <NAME>           Never mount dotdir NAME (e.g., .my_secrets) (repeatable)
     --mask <PATH>                  Replace PATH with an empty file inside sandbox (repeatable)
+    --private-home / --no-private-home
+                                   Disable/enable automatic host home dotdir passthrough
     --lockdown / --no-lockdown     Enable/disable strict read-only lockdown mode
     --landlock / --no-landlock     Enable/disable Landlock LSM (Linux 5.13+, default: on)
     --seccomp / --no-seccomp       Enable/disable seccomp syscall filter (Linux, default: on)
@@ -54,6 +56,7 @@ pub struct CliArgs {
     pub ro_maps: Vec<PathBuf>,
     pub hide_dotdirs: Vec<String>,
     pub mask: Vec<PathBuf>,
+    pub private_home: Option<bool>,
     pub lockdown: Option<bool>,
     pub landlock: Option<bool>,
     pub seccomp: Option<bool>,
@@ -128,6 +131,8 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long("lockdown") => args.lockdown = Some(true),
             Long("no-lockdown") => args.lockdown = Some(false),
+            Long("private-home") => args.private_home = Some(true),
+            Long("no-private-home") => args.private_home = Some(false),
             Long("landlock") => args.landlock = Some(true),
             Long("no-landlock") => args.landlock = Some(false),
             Long("seccomp") => args.seccomp = Some(true),
@@ -331,6 +336,18 @@ mod tests {
     fn parse_lockdown() {
         let args = parse_test(&["--lockdown", "bash"]).unwrap();
         assert_eq!(args.lockdown, Some(true));
+    }
+
+    #[test]
+    fn parse_private_home() {
+        let args = parse_test(&["--private-home", "bash"]).unwrap();
+        assert_eq!(args.private_home, Some(true));
+    }
+
+    #[test]
+    fn parse_no_private_home() {
+        let args = parse_test(&["--no-private-home", "bash"]).unwrap();
+        assert_eq!(args.private_home, Some(false));
     }
 
     #[test]

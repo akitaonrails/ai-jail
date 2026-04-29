@@ -61,6 +61,8 @@ pub struct Config {
     #[serde(default)]
     pub browser_profile: Option<String>,
     #[serde(default)]
+    pub private_home: Option<bool>,
+    #[serde(default)]
     pub lockdown: Option<bool>,
     #[serde(default)]
     pub no_landlock: Option<bool>,
@@ -116,6 +118,9 @@ impl Config {
             self.browser_profile.as_deref(),
             Some("off" | "none" | "disabled")
         )
+    }
+    pub fn private_home_enabled(&self) -> bool {
+        self.private_home == Some(true)
     }
     pub fn landlock_enabled(&self) -> bool {
         self.no_landlock != Some(true)
@@ -232,6 +237,9 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     }
     if local.browser_profile.is_some() {
         c.browser_profile = local.browser_profile;
+    }
+    if local.private_home.is_some() {
+        c.private_home = local.private_home;
     }
     if local.lockdown.is_some() {
         c.lockdown = local.lockdown;
@@ -450,6 +458,9 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     if let Some(ref profile) = cli.browser_profile {
         config.browser_profile = Some(profile.clone());
     }
+    if let Some(v) = cli.private_home {
+        config.private_home = Some(v);
+    }
     if let Some(v) = cli.worktree {
         config.no_worktree = Some(!v);
     }
@@ -575,6 +586,11 @@ pub fn display_status(config: &Config) {
         Some(value) => output::status_header("  Browser profile", value),
         None => output::status_header("  Browser profile", "auto"),
     }
+    match config.private_home {
+        Some(true) => output::status_header("  Private home", "enabled"),
+        Some(false) => output::status_header("  Private home", "disabled"),
+        None => output::status_header("  Private home", "auto"),
+    }
     bool_opt("Landlock", config.no_landlock);
     bool_opt("Seccomp", config.no_seccomp);
     bool_opt("Rlimits", config.no_rlimits);
@@ -648,6 +664,7 @@ no_display = true
 no_mise = false
 no_save_config = true
 browser_profile = "soft"
+private_home = true
 lockdown = true
 "#;
         let cfg = parse_toml(toml).unwrap();
@@ -662,6 +679,8 @@ lockdown = true
         assert_eq!(cfg.no_save_config, Some(true));
         assert_eq!(cfg.browser_profile.as_deref(), Some("soft"));
         assert_eq!(cfg.browser_profile(), Some(BrowserProfile::Soft));
+        assert_eq!(cfg.private_home, Some(true));
+        assert!(cfg.private_home_enabled());
         assert_eq!(cfg.lockdown, Some(true));
     }
 
@@ -764,6 +783,7 @@ another_removed_field = true
         assert_eq!(cfg.no_status_bar, None);
         assert_eq!(cfg.resize_redraw_key, None);
         assert_eq!(cfg.browser_profile, None);
+        assert_eq!(cfg.private_home, None);
         assert_eq!(cfg.no_seccomp, None);
         assert_eq!(cfg.no_rlimits, None);
         assert!(cfg.allow_tcp_ports.is_empty());
@@ -889,6 +909,35 @@ allow_tcp_ports = []
     }
 
     #[test]
+    fn regression_v0_10_0_config_without_private_home() {
+        let toml = r#"
+command = ["claude"]
+rw_maps = []
+ro_maps = []
+hide_dotdirs = []
+mask = []
+no_gpu = false
+no_docker = false
+no_display = false
+no_worktree = false
+no_mise = false
+no_save_config = false
+browser_profile = "off"
+lockdown = false
+no_landlock = false
+no_status_bar = false
+status_bar_style = "pastel"
+resize_redraw_key = "ctrl-shift-l"
+no_seccomp = false
+no_rlimits = false
+allow_tcp_ports = []
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.private_home, None);
+        assert!(!cfg.private_home_enabled());
+    }
+
+    #[test]
     fn regression_empty_config_file() {
         // An empty .ai-jail file must not crash
         let cfg = parse_toml("").unwrap();
@@ -921,6 +970,7 @@ allow_tcp_ports = []
             ssh: Some(true),
             pictures: None,
             browser_profile: Some("soft".into()),
+            private_home: Some(true),
             lockdown: Some(true),
             no_landlock: Some(false),
             no_status_bar: None,
@@ -943,6 +993,7 @@ allow_tcp_ports = []
         assert_eq!(deserialized.no_mise, config.no_mise);
         assert_eq!(deserialized.no_save_config, config.no_save_config);
         assert_eq!(deserialized.browser_profile, config.browser_profile);
+        assert_eq!(deserialized.private_home, config.private_home);
         assert_eq!(deserialized.lockdown, config.lockdown);
         assert_eq!(deserialized.no_landlock, config.no_landlock);
         assert_eq!(deserialized.resize_redraw_key, config.resize_redraw_key);
@@ -1116,6 +1167,7 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
             worktree: Some(false),    // --no-worktree
             mise: Some(true),         // --mise
             save_config: Some(false), // --no-save-config
+            private_home: Some(true), // --private-home
             lockdown: Some(true),     // --lockdown
             ..CliArgs::default()
         };
@@ -1126,6 +1178,7 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
         assert_eq!(merged.no_worktree, Some(true));
         assert_eq!(merged.no_mise, Some(false));
         assert_eq!(merged.no_save_config, Some(true));
+        assert_eq!(merged.private_home, Some(true));
         assert_eq!(merged.lockdown, Some(true));
     }
 
@@ -1185,6 +1238,35 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
         let merged = merge(&cli, existing);
         assert_eq!(merged.browser_profile.as_deref(), Some("soft"));
         assert_eq!(merged.browser_profile(), Some(BrowserProfile::Soft));
+    }
+
+    #[test]
+    fn merge_private_home_from_cli() {
+        let existing = Config {
+            private_home: Some(false),
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            private_home: Some(true),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(merged.private_home, Some(true));
+        assert!(merged.private_home_enabled());
+    }
+
+    #[test]
+    fn merge_with_global_local_private_home_wins() {
+        let global = Config {
+            private_home: Some(true),
+            ..Config::default()
+        };
+        let local = Config {
+            private_home: Some(false),
+            ..Config::default()
+        };
+        let merged = merge_with_global(global, local);
+        assert_eq!(merged.private_home, Some(false));
     }
 
     #[test]
@@ -1736,6 +1818,7 @@ allow_tcp_ports = [32000, 8080]
             ssh: None,
             pictures: Some(true),
             browser_profile: Some("hard".into()),
+            private_home: Some(true),
             lockdown: Some(false),
             no_landlock: None,
             no_status_bar: None,

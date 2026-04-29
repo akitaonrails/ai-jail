@@ -365,6 +365,7 @@ fn collect_normal_paths(
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let home = super::home_dir();
     let browser_mode = config.browser_profile().is_some();
+    let private_home = browser_mode || config.private_home_enabled();
     let mut ro = Vec::new();
     let mut rw = Vec::new();
 
@@ -437,7 +438,7 @@ fn collect_normal_paths(
     // .ssh, .gnupg are denied entirely (never bind-mounted by
     // bwrap, so Landlock allowing them is moot — but we still
     // skip them for defense-in-depth). Everything else is ro.
-    if !browser_mode {
+    if !private_home {
         let exempt = super::dotdir_exemptions(config);
         collect_home_paths(
             &home,
@@ -488,11 +489,20 @@ fn collect_normal_paths(
             }
         }
     }
+    if private_home && !browser_mode && config.ssh_enabled() {
+        let ssh_dir = home.join(".ssh");
+        if ssh_dir.is_dir() {
+            if verbose {
+                output::verbose("Landlock: ~/.ssh ro");
+            }
+            ro.push(ssh_dir);
+        }
+    }
 
     // $HOME/.local: read-write — mise, pipx, and other tools
     // store binaries and state here.
     let dot_local = home.join(".local");
-    if dot_local.is_dir() {
+    if !private_home && dot_local.is_dir() {
         if verbose {
             output::verbose("Landlock: ~/.local rw");
         }
@@ -503,7 +513,7 @@ fn collect_normal_paths(
     // auth token and settings here. Must be writable so the
     // agent can update its own config during bootstrap.
     let claude_json = home.join(".claude.json");
-    if claude_json.is_file() {
+    if !private_home && claude_json.is_file() {
         if verbose {
             output::verbose("Landlock: ~/.claude.json rw");
         }
@@ -514,7 +524,7 @@ fn collect_normal_paths(
     // user.email for commits, but the agent must not modify
     // the user's git identity or credential helpers.
     let gitconfig = home.join(".gitconfig");
-    if gitconfig.is_file() {
+    if !private_home && gitconfig.is_file() {
         if verbose {
             output::verbose("Landlock: ~/.gitconfig ro");
         }
@@ -938,6 +948,54 @@ mod tests {
 
         let _ = std::fs::remove_file(&ro_extra);
         let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn private_home_skips_host_dotdirs_but_keeps_project_and_extra_maps() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let saved_home = std::env::var_os("HOME");
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-landlock-private-home-{}",
+            std::process::id()
+        ));
+        let project = home.join("project");
+        let extra = home.join("extra");
+        let _ = std::fs::create_dir_all(home.join(".config"));
+        let _ = std::fs::create_dir_all(home.join(".local"));
+        let _ = std::fs::create_dir_all(&project);
+        let _ = std::fs::create_dir_all(&extra);
+        unsafe { std::env::set_var("HOME", &home) };
+
+        let config = Config {
+            private_home: Some(true),
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            rw_maps: vec![extra.clone()],
+            ..Config::default()
+        };
+        let (ro, rw) = collect_normal_paths(&config, &project, false);
+
+        assert!(rw.contains(&project), "project stays writable");
+        assert!(rw.contains(&extra), "explicit rw maps still apply");
+        assert!(
+            !rw.contains(&home.join(".config"))
+                && !ro.contains(&home.join(".config")),
+            "host .config must not be allowed"
+        );
+        assert!(
+            !rw.contains(&home.join(".local"))
+                && !ro.contains(&home.join(".local")),
+            "host .local must not be allowed"
+        );
+
+        unsafe {
+            if let Some(value) = saved_home {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
