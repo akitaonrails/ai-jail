@@ -216,6 +216,46 @@ Expected Chromium terminal noise: D-Bus, systemd, UPower, Google Cloud Messaging
 
 This is useful for testing suspect extensions or websites without giving them read-write access to your normal home directory or browser profile. It is not an anonymity feature: the browser still has network access, sites can fingerprint it, and anything you log into can identify you.
 
+### Desktop launcher
+
+Linux desktop environments can launch Chromium through ai-jail with a normal `.desktop` file. A ready-to-copy example lives at `dist/desktop/ai-jail-chromium.desktop`:
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=Chromium (ai-jail)
+GenericName=Sandboxed Web Browser
+Comment=Run Chromium inside ai-jail with an isolated persistent browser profile
+Exec=ai-jail-chromium %U
+Icon=chromium
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+Keywords=ai-jail;sandbox;chromium;browser;private;
+StartupNotify=true
+StartupWMClass=chromium
+```
+
+Install it for your user:
+
+```bash
+mkdir -p ~/.local/bin
+cp dist/desktop/ai-jail-chromium ~/.local/bin/
+chmod +x ~/.local/bin/ai-jail-chromium
+
+mkdir -p ~/.local/share/applications
+cp dist/desktop/ai-jail-chromium.desktop ~/.local/share/applications/
+chmod +x ~/.local/share/applications/ai-jail-chromium.desktop
+desktop-file-edit --set-key=Exec \
+  --set-value="$HOME/.local/bin/ai-jail-chromium %U" \
+  ~/.local/share/applications/ai-jail-chromium.desktop
+update-desktop-database ~/.local/share/applications
+```
+
+The wrapper adds `~/.local/share/mise/shims` to `PATH`, so it works when ai-jail is installed through mise and the desktop launcher does not inherit your interactive shell environment. It also launches from `~/.local/share/ai-jail/browser-launcher-cwd` so ai-jail does not treat your whole home directory as the browser's project directory.
+
+Change the wrapper command to `exec ai-jail --browser=hard chromium "$@"` if you want every desktop-launched Chromium session to be throwaway. If your launcher caches applications, restart it after installing; on Omarchy/Walker, run `omarchy-restart-walker` or log out and back in.
+
 ## What gets sandboxed
 
 ### Default behavior (no flags needed)

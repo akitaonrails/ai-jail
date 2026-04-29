@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+data_home="${XDG_DATA_HOME:-"$HOME/.local/share"}"
+launcher_cwd="${AI_JAIL_BROWSER_CWD:-"$data_home/ai-jail/browser-launcher-cwd"}"
+
+mkdir -p "$launcher_cwd"
+cd "$launcher_cwd"
+
+# Desktop launchers usually do not inherit the interactive shell PATH. Include
+# mise shims explicitly so mise-installed ai-jail resolves correctly.
+export PATH="$data_home/mise/shims:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
+
+if command -v ai-jail >/dev/null 2>&1; then
+  exec ai-jail --browser=soft chromium "$@"
+fi
+
+echo "ai-jail not found. Install it with 'cargo install ai-jail' or 'mise use -g ubi:akitaonrails/ai-jail'." >&2
+exit 127

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Chromium (ai-jail)
+GenericName=Sandboxed Web Browser
+Comment=Run Chromium inside ai-jail with an isolated persistent browser profile
+Exec=ai-jail-chromium %U
+Icon=chromium
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+Keywords=ai-jail;sandbox;chromium;browser;private;
+StartupNotify=true
+StartupWMClass=chromium
