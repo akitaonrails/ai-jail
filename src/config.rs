@@ -287,7 +287,7 @@ pub fn save_global(config: &Config) {
 }
 
 fn save_global_to_path(path: &Path, config: &Config) {
-    let mut global = load_from_path(&path);
+    let mut global = load_from_path(path);
     if config.no_status_bar.is_some() {
         global.no_status_bar = config.no_status_bar;
     }
