@@ -130,6 +130,8 @@ Or persist the list in `.ai-jail`:
 mask = [".env", ".env.local", "credentials.json"]
 ```
 
+**Hiding the sandbox policy itself**: by default, ai-jail auto-masks the project's own `.ai-jail` config file inside the sandbox so the agent can't read its own policy and craft workarounds. Pass `--no-hide-config` (or set `no_hide_config = true`) if you need the file visible to the sandboxed process for some reason. The user's global `~/.ai-jail` is never mounted into the sandbox.
+
 **Private home mode**: use `--private-home` when you want the project writable
 but do not want normal host dotdirs like `~/.config`, `~/.cache`, `~/.local`,
 or AI tool state mounted into the sandbox. Explicit mounts still apply.
@@ -395,6 +397,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--pictures` / `--no-pictures` | Share `~/Pictures` read-only (default: off) |
 | `--browser[=PROFILE]` / `--no-browser` | Enable/disable browser isolation profile. `PROFILE` is `hard` (ephemeral, default) or `soft` (persistent under `~/.local/share/ai-jail/browsers/<browser>`). Common browser commands auto-enable `hard` unless disabled. |
 | `--save-config` / `--no-save-config` | Enable/disable automatic `.ai-jail` writes |
+| `--hide-config` / `--no-hide-config` | Auto-mask the project's `.ai-jail` file inside the sandbox so the agent can't read its own sandbox policy (default: on). Pass `--no-hide-config` to make it visible. |
 | `--claude-dir <PATH>` | Use `PATH` as Claude Code's config directory (sets `CLAUDE_CONFIG_DIR`). Enables multiple independent profiles (e.g. `~/.claude` for work, `~/.claude-personal` for a separate account). Path is bind-mounted read-write inside the sandbox. Leading `~/` is expanded against `$HOME`. |
 | `-s`, `--status-bar[=STYLE]` | Enable persistent status line. `STYLE` is `pastel` (default, random palette per session), `dark`, or `light` |
 | `--no-status-bar` | Disable persistent status line |
@@ -514,6 +517,7 @@ When CLI flags and an existing config are both present:
 | `pictures` | bool | not set (off) | `true` shares `~/Pictures` read-only |
 | `browser_profile` | string | not set (auto) | Browser isolation profile: `"hard"` for ephemeral state, `"soft"` for persistent ai-jail-only state, or `"off"` to disable browser auto-detection |
 | `no_save_config` | bool | not set (enabled) | `true` disables automatic `.ai-jail` writes |
+| `no_hide_config` | bool | not set (enabled) | `true` keeps the project's `.ai-jail` file visible to the agent. Default is to auto-mask it as an empty file (see security notes). |
 | `claude_dir` | path | not set | Custom Claude Code config directory (sets `CLAUDE_CONFIG_DIR`). Bind-mounted read-write. Use for multiple Claude profiles per project. Leading `~/` expanded against `$HOME`. |
 | `no_landlock` | bool | not set (auto) | `true` disables Landlock LSM (Linux only) |
 | `no_seccomp` | bool | not set (auto) | `true` disables seccomp syscall filter (Linux only) |

@@ -919,8 +919,27 @@ fn discover_mounts(
     // Mask: replace each path with an empty tempfile (or tmpfs
     // for directories). Paths are resolved absolutely; relative
     // paths resolve against project_dir.
+    //
+    // By default, also auto-mask the project's .ai-jail file so
+    // the sandboxed agent can't read its own sandbox policy and
+    // craft workarounds (issue #41). Opt out with --no-hide-config.
+    let mut effective_mask: Vec<PathBuf> = config.mask.clone();
+    if config.hide_config_enabled() {
+        let local_config = project_dir.join(".ai-jail");
+        let already_masked = config.mask.iter().any(|p| {
+            let resolved = if p.is_absolute() {
+                p.clone()
+            } else {
+                project_dir.join(p)
+            };
+            resolved == local_config
+        });
+        if !already_masked && super::path_exists(&local_config) {
+            effective_mask.push(local_config);
+        }
+    }
     let mask_mounts =
-        build_mask_mounts(&config.mask, project_dir, empty_path, verbose);
+        build_mask_mounts(&effective_mask, project_dir, empty_path, verbose);
 
     // Pictures: read-only bind of $HOME/Pictures when enabled
     let pictures_mount =
@@ -1653,6 +1672,81 @@ mod tests {
 
         assert!(mounts.is_empty());
         let _ = std::fs::remove_file(&empty);
+    }
+
+    #[test]
+    fn hide_config_auto_masks_project_ai_jail_by_default() {
+        use std::io::Write;
+        let project = std::env::temp_dir()
+            .join(format!("ai-jail-hide-config-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&project);
+        let cfg = project.join(".ai-jail");
+        let mut f = std::fs::File::create(&cfg).unwrap();
+        f.write_all(b"command = [\"bash\"]\n").unwrap();
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+
+        let config = minimal_test_config();
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        // The mask mount group puts the .ai-jail file under --ro-bind
+        // from the empty tempfile. Find a `--ro-bind <empty> <cfg>` triple.
+        let cfg_str = cfg.display().to_string();
+        let empty_str = guard.empty_path().display().to_string();
+        let found = args.windows(3).any(|w| {
+            w[0] == "--ro-bind" && w[1] == empty_str && w[2] == cfg_str
+        });
+        assert!(
+            found,
+            "default behavior must auto-mask .ai-jail with the empty tempfile; args: {args:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn no_hide_config_opts_out_of_auto_mask() {
+        use std::io::Write;
+        let project = std::env::temp_dir()
+            .join(format!("ai-jail-no-hide-config-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&project);
+        let cfg = project.join(".ai-jail");
+        let mut f = std::fs::File::create(&cfg).unwrap();
+        f.write_all(b"command = [\"bash\"]\n").unwrap();
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+
+        let mut config = minimal_test_config();
+        config.no_hide_config = Some(true);
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        let cfg_str = cfg.display().to_string();
+        let empty_str = guard.empty_path().display().to_string();
+        let found = args.windows(3).any(|w| {
+            w[0] == "--ro-bind" && w[1] == empty_str && w[2] == cfg_str
+        });
+        assert!(
+            !found,
+            "no_hide_config=true must skip the auto-mask of .ai-jail; args: {args:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]

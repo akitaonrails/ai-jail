@@ -55,6 +55,8 @@ pub struct Config {
     #[serde(default)]
     pub no_save_config: Option<bool>,
     #[serde(default)]
+    pub no_hide_config: Option<bool>,
+    #[serde(default)]
     pub ssh: Option<bool>,
     #[serde(default)]
     pub pictures: Option<bool>,
@@ -103,6 +105,12 @@ impl Config {
     }
     pub fn save_config_enabled(&self) -> bool {
         self.no_save_config != Some(true)
+    }
+    /// Whether to automatically mask the project's `.ai-jail` file
+    /// from the sandbox (default on). Opt-out via `--no-hide-config`
+    /// or `no_hide_config = true` in the config file.
+    pub fn hide_config_enabled(&self) -> bool {
+        self.no_hide_config != Some(true)
     }
     pub fn ssh_enabled(&self) -> bool {
         self.ssh == Some(true)
@@ -230,6 +238,9 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     }
     if local.no_save_config.is_some() {
         c.no_save_config = local.no_save_config;
+    }
+    if local.no_hide_config.is_some() {
+        c.no_hide_config = local.no_hide_config;
     }
     if local.ssh.is_some() {
         c.ssh = local.ssh;
@@ -458,6 +469,9 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     if let Some(v) = cli.save_config {
         config.no_save_config = Some(!v);
     }
+    if let Some(v) = cli.hide_config {
+        config.no_hide_config = Some(!v);
+    }
     if let Some(v) = cli.ssh {
         config.ssh = Some(v);
     }
@@ -586,6 +600,11 @@ pub fn display_status(config: &Config) {
         Some(true) => output::status_header("  Save config", "disabled"),
         Some(false) => output::status_header("  Save config", "enabled"),
         None => output::status_header("  Save config", "enabled (default)"),
+    }
+    match config.no_hide_config {
+        Some(true) => output::status_header("  Hide .ai-jail", "disabled"),
+        Some(false) => output::status_header("  Hide .ai-jail", "enabled"),
+        None => output::status_header("  Hide .ai-jail", "enabled (default)"),
     }
     match config.ssh {
         Some(true) => output::status_header("  SSH keys", "shared (read-only)"),
@@ -987,6 +1006,7 @@ allow_tcp_ports = []
             no_worktree: Some(false),
             no_mise: None,
             no_save_config: Some(true),
+            no_hide_config: Some(false),
             ssh: Some(true),
             pictures: None,
             browser_profile: Some("soft".into()),
@@ -1630,6 +1650,58 @@ allow_tcp_ports = [32000, 8080]
     }
 
     #[test]
+    fn hide_config_enabled_accessor() {
+        // Default: hidden
+        assert!(Config::default().hide_config_enabled());
+        // Explicit on
+        assert!(
+            Config {
+                no_hide_config: Some(false),
+                ..Config::default()
+            }
+            .hide_config_enabled()
+        );
+        // Opt-out
+        assert!(
+            !Config {
+                no_hide_config: Some(true),
+                ..Config::default()
+            }
+            .hide_config_enabled()
+        );
+    }
+
+    #[test]
+    fn merge_cli_no_hide_config_overrides_config() {
+        let existing = Config {
+            no_hide_config: Some(false),
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            hide_config: Some(false),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(merged.no_hide_config, Some(true));
+        assert!(!merged.hide_config_enabled());
+    }
+
+    #[test]
+    fn merge_cli_hide_config_overrides_config() {
+        let existing = Config {
+            no_hide_config: Some(true),
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            hide_config: Some(true),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(merged.no_hide_config, Some(false));
+        assert!(merged.hide_config_enabled());
+    }
+
+    #[test]
     fn landlock_enabled_accessor() {
         assert!(
             Config {
@@ -1832,6 +1904,7 @@ allow_tcp_ports = [32000, 8080]
             no_worktree: None,
             no_mise: None,
             no_save_config: Some(true),
+            no_hide_config: None,
             ssh: None,
             pictures: Some(true),
             browser_profile: Some("hard".into()),

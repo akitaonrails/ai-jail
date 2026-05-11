@@ -35,6 +35,8 @@ OPTIONS:
     --no-browser                   Disable browser auto-detection/profile
     --save-config / --no-save-config
                                    Enable/disable automatic .ai-jail writes
+    --hide-config / --no-hide-config
+                                   Mask the project .ai-jail file from the agent (default: on)
     -s, --status-bar[=STYLE]       Set status line theme (pastel | dark | light; default pastel)
                                    Pastel picks a random pastel palette per session
     --no-status-bar                Disable persistent status line
@@ -68,6 +70,7 @@ pub struct CliArgs {
     pub worktree: Option<bool>,
     pub mise: Option<bool>,
     pub save_config: Option<bool>,
+    pub hide_config: Option<bool>,
     pub ssh: Option<bool>,
     pub pictures: Option<bool>,
     pub browser_profile: Option<String>,
@@ -169,6 +172,8 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long("no-mise") => args.mise = Some(false),
             Long("save-config") => args.save_config = Some(true),
             Long("no-save-config") => args.save_config = Some(false),
+            Long("hide-config") => args.hide_config = Some(true),
+            Long("no-hide-config") => args.hide_config = Some(false),
             Long("ssh") => args.ssh = Some(true),
             Long("no-ssh") => args.ssh = Some(false),
             Long("pictures") => args.pictures = Some(true),
@@ -489,6 +494,18 @@ mod tests {
     fn parse_no_save_config() {
         let args = parse_test(&["--no-save-config", "bash"]).unwrap();
         assert_eq!(args.save_config, Some(false));
+    }
+
+    #[test]
+    fn parse_hide_config() {
+        let args = parse_test(&["--hide-config", "bash"]).unwrap();
+        assert_eq!(args.hide_config, Some(true));
+    }
+
+    #[test]
+    fn parse_no_hide_config() {
+        let args = parse_test(&["--no-hide-config", "bash"]).unwrap();
+        assert_eq!(args.hide_config, Some(false));
     }
 
     // ── Map flags ──────────────────────────────────────────────
