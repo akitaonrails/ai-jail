@@ -395,6 +395,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--pictures` / `--no-pictures` | Share `~/Pictures` read-only (default: off) |
 | `--browser[=PROFILE]` / `--no-browser` | Enable/disable browser isolation profile. `PROFILE` is `hard` (ephemeral, default) or `soft` (persistent under `~/.local/share/ai-jail/browsers/<browser>`). Common browser commands auto-enable `hard` unless disabled. |
 | `--save-config` / `--no-save-config` | Enable/disable automatic `.ai-jail` writes |
+| `--claude-dir <PATH>` | Use `PATH` as Claude Code's config directory (sets `CLAUDE_CONFIG_DIR`). Enables multiple independent profiles (e.g. `~/.claude` for work, `~/.claude-personal` for a separate account). Path is bind-mounted read-write inside the sandbox. Leading `~/` is expanded against `$HOME`. |
 | `-s`, `--status-bar[=STYLE]` | Enable persistent status line. `STYLE` is `pastel` (default, random palette per session), `dark`, or `light` |
 | `--no-status-bar` | Disable persistent status line |
 | `--exec` | Direct execution mode (no PTY proxy, no status bar) |
@@ -450,6 +451,10 @@ ai-jail --browser=soft firefox
 
 # Hide .env and other secrets from the agent
 ai-jail --mask .env --mask .env.local claude
+
+# Use a separate Claude profile (e.g. work vs personal account)
+ai-jail --claude-dir ~/.claude-work --init claude
+ai-jail claude   # subsequent runs reuse ~/.claude-work via .ai-jail
 
 # Run without creating/updating .ai-jail
 ai-jail --no-save-config claude
@@ -509,6 +514,7 @@ When CLI flags and an existing config are both present:
 | `pictures` | bool | not set (off) | `true` shares `~/Pictures` read-only |
 | `browser_profile` | string | not set (auto) | Browser isolation profile: `"hard"` for ephemeral state, `"soft"` for persistent ai-jail-only state, or `"off"` to disable browser auto-detection |
 | `no_save_config` | bool | not set (enabled) | `true` disables automatic `.ai-jail` writes |
+| `claude_dir` | path | not set | Custom Claude Code config directory (sets `CLAUDE_CONFIG_DIR`). Bind-mounted read-write. Use for multiple Claude profiles per project. Leading `~/` expanded against `$HOME`. |
 | `no_landlock` | bool | not set (auto) | `true` disables Landlock LSM (Linux only) |
 | `no_seccomp` | bool | not set (auto) | `true` disables seccomp syscall filter (Linux only) |
 | `no_rlimits` | bool | not set (auto) | `true` disables resource limits |
