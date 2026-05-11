@@ -9,7 +9,7 @@ USAGE:
     ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 
 COMMANDS (positional):
-    gemini, claude, codex, opencode, crush, bash   Known AI tool presets
+    gemini, claude, codex, opencode, crush, soulforge, bash   Known AI tool presets
     status                                 Show current .ai-jail config
     Any other string                       Passed through as the command
 

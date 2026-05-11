@@ -105,6 +105,8 @@ const DOTDIR_RW: &[&str] = &[
     ".crush",
     ".codex",
     ".aider",
+    ".soulforge",
+    ".agents",
     ".config",
     ".cargo",
     ".cache",
@@ -808,7 +810,15 @@ mod tests {
 
     #[test]
     fn rw_list_contains_ai_tool_dirs() {
-        for name in &[".gemini", ".claude", ".crush", ".codex", ".aider"] {
+        for name in &[
+            ".gemini",
+            ".claude",
+            ".crush",
+            ".codex",
+            ".aider",
+            ".soulforge",
+            ".agents",
+        ] {
             assert!(DOTDIR_RW.contains(name), "{name} should be in rw list");
         }
     }

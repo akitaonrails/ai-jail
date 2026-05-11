@@ -270,6 +270,7 @@ const LOCAL_SHARE_RW: &[&str] = &[
     "zoxide",
     "crush",
     "opencode",
+    "soulforge",
     "atuin",
     "mise",
     "yarn",
