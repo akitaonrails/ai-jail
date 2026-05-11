@@ -445,9 +445,13 @@ fn io_loop(
         }
     }
 
-    // Clean up: reset scroll region so terminal is in a
-    // known state after ai-jail exits.
-    write_all_raw(stdout, b"\x1b[r");
+    // Clean up: defensive terminal-mode reset. Children that crash
+    // or skip their own cleanup can leave mouse tracking, bracketed
+    // paste, alt-screen, or kitty keyboard protocol on — handing the
+    // user back a terminal where mouse movement spews escape sequences
+    // (see issue #40). Emit the full reset sequence here, then let the
+    // raw-mode guard restore termios on its Drop.
+    crate::output::terminal_reset();
 }
 
 /// Scan child output for kitty keyboard protocol sequences and

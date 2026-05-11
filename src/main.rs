@@ -357,6 +357,11 @@ fn run() -> Result<i32, String> {
 
         let code = signals::wait_child(pid);
         std::mem::forget(child);
+        // Defensive terminal reset — see issue #40. The child may
+        // have left mouse tracking, alt-screen, etc. on. The PTY path
+        // does its own reset in pty::run; here we cover the
+        // no-status-bar / multiplexer-detected / crush paths.
+        output::terminal_reset();
         code
     };
 
