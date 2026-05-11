@@ -192,7 +192,7 @@ fn run() -> Result<i32, String> {
 
     // Handle --bootstrap: generate AI tool configs and exit
     if cli.bootstrap {
-        bootstrap::run(cli.verbose)?;
+        bootstrap::run(cli.verbose, config.claude_dir.as_deref())?;
         return Ok(0);
     }
 

@@ -131,11 +131,11 @@ const ASK: &[&str] = &[
 
 // ── Public entry point ───────────────────────────────────────────
 
-pub fn run(verbose: bool) -> Result<(), String> {
+pub fn run(verbose: bool, claude_dir: Option<&Path>) -> Result<(), String> {
     output::info("Bootstrapping AI tool configs...");
 
     bootstrap_gemini(verbose)?;
-    bootstrap_claude(verbose)?;
+    bootstrap_claude(verbose, claude_dir)?;
     bootstrap_codex(verbose)?;
     bootstrap_opencode(verbose)?;
     bootstrap_crush(verbose)?;
@@ -365,9 +365,14 @@ fn bootstrap_gemini(verbose: bool) -> Result<(), String> {
 
 // ── Claude ───────────────────────────────────────────────────────
 
-fn claude_config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".claude").join("settings.json")
+fn claude_config_path(claude_dir: Option<&Path>) -> PathBuf {
+    match claude_dir {
+        Some(dir) => dir.join("settings.json"),
+        None => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            PathBuf::from(home).join(".claude").join("settings.json")
+        }
+    }
 }
 
 fn build_claude_permissions() -> serde_json::Value {
@@ -392,8 +397,11 @@ fn build_claude_permissions() -> serde_json::Value {
     })
 }
 
-fn bootstrap_claude(verbose: bool) -> Result<(), String> {
-    let path = claude_config_path();
+fn bootstrap_claude(
+    verbose: bool,
+    claude_dir: Option<&Path>,
+) -> Result<(), String> {
+    let path = claude_config_path(claude_dir);
     ensure_regular_file_or_absent(&path)?;
 
     let mut root = if path.exists() {
@@ -608,6 +616,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicU32, Ordering};
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_dir() -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -939,5 +948,26 @@ sandbox_mode = "full"
         assert!(result.contains_key("mcpServers"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── claude_config_path with custom dir ─────────────────────
+
+    #[test]
+    fn claude_config_path_uses_custom_dir() {
+        let custom = PathBuf::from("/home/user/.claude-example");
+        let path = claude_config_path(Some(&custom));
+        assert_eq!(
+            path,
+            PathBuf::from("/home/user/.claude-example/settings.json")
+        );
+    }
+
+    #[test]
+    fn claude_config_path_defaults_to_dot_claude() {
+        let _env = ENV_LOCK.lock().unwrap();
+        unsafe { env::set_var("HOME", "/home/testuser") };
+        let path = claude_config_path(None);
+        assert_eq!(path, PathBuf::from("/home/testuser/.claude/settings.json"));
+        unsafe { env::remove_var("HOME") };
     }
 }

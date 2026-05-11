@@ -520,6 +520,22 @@ fn collect_normal_paths(
         rw.push(claude_json);
     }
 
+    // claude_dir: read-write — custom directory for Claude Code
+    // configuration (CLAUDE.md, settings, etc.). Specified via
+    // --claude-dir flag or config. Must be writable so the
+    // agent can read/write its configuration files.
+    if let Some(dir) = &config.claude_dir
+        && super::path_exists(dir)
+    {
+        if verbose {
+            output::verbose(&format!(
+                "Landlock: claude-dir {} rw",
+                dir.display()
+            ));
+        }
+        rw.push(dir.clone());
+    }
+
     // $HOME/.gitconfig: read-only — git needs user.name and
     // user.email for commits, but the agent must not modify
     // the user's git identity or credential helpers.
@@ -1157,5 +1173,63 @@ mod tests {
             path,
             &fixture.common_dir
         )));
+    }
+
+    #[test]
+    fn normal_paths_claude_dir_is_writable() {
+        let tmp_root = std::env::temp_dir()
+            .join(format!("ai-jail-landlock-claude-{}", std::process::id()));
+        let claude_dir = tmp_root.join(".claude-example");
+        let _ = std::fs::create_dir_all(&claude_dir);
+
+        let config = Config {
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            claude_dir: Some(claude_dir.clone()),
+            ..Config::default()
+        };
+        let (_, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
+        assert!(
+            rw.contains(&claude_dir),
+            "claude_dir must be in Landlock rw paths"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn normal_paths_no_claude_dir_unchanged() {
+        let tmp_root = std::env::temp_dir()
+            .join(format!("ai-jail-landlock-neg-{}", std::process::id()));
+        let claude_dir = tmp_root.join(".claude-neg");
+        let _ = std::fs::create_dir_all(&claude_dir);
+
+        let without = Config {
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            claude_dir: None,
+            ..Config::default()
+        };
+        let (_, rw_without) =
+            collect_normal_paths(&without, Path::new("/tmp"), false);
+        assert!(
+            !rw_without.contains(&claude_dir),
+            "claude_dir must not appear when None"
+        );
+
+        let with = Config {
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            claude_dir: Some(claude_dir.clone()),
+            ..Config::default()
+        };
+        let (_, rw_with) =
+            collect_normal_paths(&with, Path::new("/tmp"), false);
+        assert!(
+            rw_with.contains(&claude_dir),
+            "claude_dir must appear when set"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 }

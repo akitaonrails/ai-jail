@@ -69,6 +69,10 @@ pub fn build(config: &Config, project_dir: &Path, verbose: bool) -> Command {
     cmd.env("PS1", "(jail) \\w \\$ ");
     cmd.env("_ZO_DOCTOR", "0");
 
+    if let Some(dir) = &config.claude_dir {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
+
     cmd
 }
 
@@ -424,6 +428,12 @@ fn macos_writable_paths(
         let local = home.join(".local");
         if super::path_exists(&local) {
             paths.push(local);
+        }
+    }
+
+    if let Some(dir) = &config.claude_dir {
+        if super::path_exists(dir) {
+            paths.push(dir.clone());
         }
     }
 
