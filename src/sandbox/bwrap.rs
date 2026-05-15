@@ -1748,6 +1748,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&project);
     }
 
+    /// If the user already has `.ai-jail` in their `mask`, the auto-
+    /// append from `hide_config_enabled` must not produce a duplicate
+    /// `--ro-bind <empty> <cfg>` triple. Otherwise bwrap would either
+    /// emit a warning or mount the same path twice — pointless and
+    /// suggests the dedup logic broke. Tests `discover_mask_mounts`
+    /// through the full dry-run pipeline.
+    #[test]
+    fn hide_config_does_not_duplicate_when_user_already_masks_ai_jail() {
+        use std::io::Write;
+        let project = std::env::temp_dir()
+            .join(format!("ai-jail-hide-config-dedup-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&project);
+        let cfg = project.join(".ai-jail");
+        let mut f = std::fs::File::create(&cfg).unwrap();
+        f.write_all(b"command = [\"bash\"]\n").unwrap();
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+
+        // User explicitly listed `.ai-jail` as a mask path. The
+        // hide_config auto-add must notice that and skip.
+        let mut config = minimal_test_config();
+        config.mask = vec![PathBuf::from(".ai-jail")];
+        // hide_config_enabled() defaults to true; leave it set.
+
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        let cfg_str = cfg.display().to_string();
+        let empty_str = guard.empty_path().display().to_string();
+        let occurrences = args
+            .windows(3)
+            .filter(|w| {
+                w[0] == "--ro-bind" && w[1] == empty_str && w[2] == cfg_str
+            })
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "Exactly one --ro-bind for .ai-jail expected, got {occurrences}.\n\
+             Auto-mask dedup is broken — full args: {args:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
     #[test]
     fn extra_mounts_rw_child_overrides_ro_parent() {
         // Use /usr and /usr/bin which always exist. The order
