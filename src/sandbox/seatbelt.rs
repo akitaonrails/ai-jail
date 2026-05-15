@@ -168,7 +168,6 @@ fn generate_sbpl_profile(
     let restricted_files = lockdown || browser_mode || private_home;
     let exempt = super::dotdir_exemptions(config);
     let mut deny_paths = macos_read_deny_paths(&config.hide_dotdirs, &exempt);
-    // Extend deny list with user-specified mask paths
     for p in &config.mask {
         let abs = if p.is_absolute() {
             p.clone()
@@ -184,6 +183,45 @@ fn generate_sbpl_profile(
     profile.push_str("(version 1)\n");
     profile.push_str("(deny default)\n\n");
 
+    push_static_sections(&mut profile);
+    push_network_section(&mut profile, lockdown);
+    push_file_read_section(
+        &mut profile,
+        config,
+        project_dir,
+        restricted_files,
+        &deny_paths,
+    );
+    push_file_write_section(
+        &mut profile,
+        lockdown,
+        &writable_paths,
+        &atomic_paths,
+    );
+    push_docker_section(&mut profile, lockdown, enable_docker);
+
+    profile
+}
+
+/// Emit an allow/deny rule for a single host path. Uses `subpath` if
+/// the path is (or will be) a directory, otherwise `literal`. This is
+/// the helper that used to be open-coded four times inside
+/// generate_sbpl_profile.
+fn push_path_rule(profile: &mut String, verb: &str, action: &str, path: &Path) {
+    let canonical = canonicalize_or_keep(path);
+    let escaped = sbpl_escape(canonical.to_string_lossy().as_ref());
+    let pattern = if canonical.is_dir() || !canonical.exists() {
+        "subpath"
+    } else {
+        "literal"
+    };
+    profile.push_str(&format!("({verb} {action} ({pattern} \"{escaped}\"))\n"));
+}
+
+/// Sections that don't depend on config — process, IPC, ptys,
+/// devices, IOKit. Always emitted first so the file structure is
+/// predictable across modes.
+fn push_static_sections(profile: &mut String) {
     profile.push_str("; Process operations\n");
     profile.push_str("(allow process-exec)\n");
     profile.push_str("(allow process-fork)\n");
@@ -218,119 +256,97 @@ fn generate_sbpl_profile(
 
     profile.push_str("; IOKit (power management, hardware queries)\n");
     profile.push_str("(allow iokit-open)\n\n");
+}
 
-    if !lockdown {
-        profile.push_str("; Network\n");
-        profile.push_str("(allow network-outbound)\n");
-        profile.push_str("(allow network-inbound)\n");
-        profile.push_str("(allow network-bind)\n");
-        profile.push_str("(allow system-socket)\n\n");
+fn push_network_section(profile: &mut String, lockdown: bool) {
+    if lockdown {
+        return;
     }
+    profile.push_str("; Network\n");
+    profile.push_str("(allow network-outbound)\n");
+    profile.push_str("(allow network-inbound)\n");
+    profile.push_str("(allow network-bind)\n");
+    profile.push_str("(allow system-socket)\n\n");
+}
 
+fn push_file_read_section(
+    profile: &mut String,
+    config: &Config,
+    project_dir: &Path,
+    restricted_files: bool,
+    deny_paths: &[PathBuf],
+) {
     if restricted_files {
         profile.push_str("; File reads: restricted allow-list\n");
         for rd_path in macos_lockdown_read_paths(config, project_dir) {
-            let canonical = canonicalize_or_keep(&rd_path);
-            let escaped = sbpl_escape(canonical.to_string_lossy().as_ref());
-            if canonical.is_dir() || !canonical.exists() {
-                profile.push_str(&format!(
-                    "(allow file-read* (subpath \"{escaped}\"))\n"
-                ));
-            } else {
-                profile.push_str(&format!(
-                    "(allow file-read* (literal \"{escaped}\"))\n"
-                ));
-            }
+            push_path_rule(profile, "allow", "file-read*", &rd_path);
         }
         profile.push('\n');
-
         profile.push_str("; Deny sensitive home paths explicitly\n");
-        for deny_path in &deny_paths {
-            let escaped = sbpl_path(deny_path);
-            if canonicalize_or_keep(deny_path).is_dir() {
-                profile.push_str(&format!(
-                    "(deny file-read* (subpath \"{escaped}\"))\n"
-                ));
-            } else {
-                profile.push_str(&format!(
-                    "(deny file-read* (literal \"{escaped}\"))\n"
-                ));
-            }
-        }
-        profile.push('\n');
     } else {
         profile
             .push_str("; File reads: allow globally, deny sensitive paths\n");
         profile.push_str("(allow file-read*)\n");
-
-        for deny_path in &deny_paths {
-            let escaped = sbpl_path(deny_path);
-            if canonicalize_or_keep(deny_path).is_dir() {
-                profile.push_str(&format!(
-                    "(deny file-read* (subpath \"{escaped}\"))\n"
-                ));
-            } else {
-                profile.push_str(&format!(
-                    "(deny file-read* (literal \"{escaped}\"))\n"
-                ));
-            }
-        }
-        profile.push('\n');
     }
+    for deny_path in deny_paths {
+        push_path_rule(profile, "deny", "file-read*", deny_path);
+    }
+    profile.push('\n');
+}
 
+fn push_file_write_section(
+    profile: &mut String,
+    lockdown: bool,
+    writable_paths: &[PathBuf],
+    atomic_paths: &[PathBuf],
+) {
     if lockdown {
         profile.push_str("; Lockdown: no host file-write allowances\n\n");
-    } else {
-        profile.push_str("; File writes: allow specific paths\n");
-        for wr_path in &writable_paths {
-            let canonical = canonicalize_or_keep(wr_path);
-            let escaped = sbpl_escape(canonical.to_string_lossy().as_ref());
-            if canonical.is_dir() || !canonical.exists() {
-                profile.push_str(&format!(
-                    "(allow file-write* (subpath \"{escaped}\"))\n"
-                ));
-            } else {
-                profile.push_str(&format!(
-                    "(allow file-write* (literal \"{escaped}\"))\n"
-                ));
-            }
-        }
-        if !atomic_paths.is_empty() {
-            profile.push('\n');
-            profile.push_str(
-                "; Atomic-write paths (literal + bounded temp siblings)\n",
-            );
-            for ap in &atomic_paths {
-                let canonical = canonicalize_or_keep(ap);
-                let path_str = canonical.to_string_lossy();
-                let escaped = sbpl_escape(&path_str);
-                profile.push_str(&format!(
-                    "(allow file-write* (literal \"{escaped}\"))\n"
-                ));
-                let regex_escaped = sbpl_regex_escape(&path_str);
-                let siblings = format!(
-                    "^{regex_escaped}(\\.tmp\\.[0-9]+\\.[0-9a-f]+|\\.lock)$"
-                );
-                profile.push_str(&format!(
-                    "(allow file-write* (regex #\"{siblings}\"))\n"
-                ));
-            }
-        }
-        profile.push('\n');
+        return;
     }
-
-    if !lockdown && enable_docker {
-        if let Some(sock) = macos_docker_socket() {
-            let escaped = sbpl_path(&sock);
-            profile.push_str("; Docker socket\n");
+    profile.push_str("; File writes: allow specific paths\n");
+    for wr_path in writable_paths {
+        push_path_rule(profile, "allow", "file-write*", wr_path);
+    }
+    if !atomic_paths.is_empty() {
+        profile.push('\n');
+        profile.push_str(
+            "; Atomic-write paths (literal + bounded temp siblings)\n",
+        );
+        for ap in atomic_paths {
+            let canonical = canonicalize_or_keep(ap);
+            let path_str = canonical.to_string_lossy();
+            let escaped = sbpl_escape(&path_str);
             profile.push_str(&format!(
                 "(allow file-write* (literal \"{escaped}\"))\n"
             ));
-            profile.push('\n');
+            let regex_escaped = sbpl_regex_escape(&path_str);
+            let siblings = format!(
+                "^{regex_escaped}(\\.tmp\\.[0-9]+\\.[0-9a-f]+|\\.lock)$"
+            );
+            profile.push_str(&format!(
+                "(allow file-write* (regex #\"{siblings}\"))\n"
+            ));
         }
     }
+    profile.push('\n');
+}
 
-    profile
+fn push_docker_section(
+    profile: &mut String,
+    lockdown: bool,
+    enable_docker: bool,
+) {
+    if lockdown || !enable_docker {
+        return;
+    }
+    let Some(sock) = macos_docker_socket() else {
+        return;
+    };
+    let escaped = sbpl_path(&sock);
+    profile.push_str("; Docker socket\n");
+    profile.push_str(&format!("(allow file-write* (literal \"{escaped}\"))\n"));
+    profile.push('\n');
 }
 
 fn quote_arg(arg: &str) -> String {
