@@ -307,7 +307,7 @@ fn generate_sbpl_profile(
                 ));
                 let regex_escaped = sbpl_regex_escape(&path_str);
                 let siblings = format!(
-                    "^{regex_escaped}(\\.tmp\\.[0-9]+\\.[0-9]+|\\.lock)$"
+                    "^{regex_escaped}(\\.tmp\\.[0-9]+\\.[0-9a-f]+|\\.lock)$"
                 );
                 profile.push_str(&format!(
                     "(allow file-write* (regex #\"{siblings}\"))\n"
@@ -737,7 +737,7 @@ mod tests {
         );
         let bounded = format!(
             "(allow file-write* (regex #\"^{regex_escaped}\
-             (\\.tmp\\.[0-9]+\\.[0-9]+|\\.lock)$\"))"
+             (\\.tmp\\.[0-9]+\\.[0-9a-f]+|\\.lock)$\"))"
         );
         assert!(
             profile.contains(&bounded),
