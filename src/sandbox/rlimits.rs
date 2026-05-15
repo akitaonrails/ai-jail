@@ -151,4 +151,40 @@ mod tests {
             );
         }
     }
+
+    /// `apply_nproc` is the post-#21/#22 fix that moves NPROC
+    /// enforcement inside the sandbox. The key invariant is that
+    /// the hard limit is pinned equal to the soft limit so a
+    /// compromised child can't raise NPROC back up. Verify that
+    /// invariant directly.
+    ///
+    /// Note: this test permanently lowers the test binary's
+    /// RLIMIT_NPROC to NPROC_NORMAL (4096). That's still plenty
+    /// of headroom for the remainder of the test suite.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_nproc_pins_hard_equal_to_soft() {
+        // Skip if the current hard limit is already below
+        // NPROC_NORMAL — apply_nproc would clamp to whatever's
+        // currently in effect, so the post-condition is then
+        // soft == hard == previous-hard. Still asserts the
+        // pin invariant.
+        let (_, hard_before) =
+            getrlimit(Resource::RLIMIT_NPROC).expect("getrlimit");
+
+        let config = Config::default();
+        apply_nproc(&config, false);
+
+        let (soft_after, hard_after) =
+            getrlimit(Resource::RLIMIT_NPROC).expect("getrlimit");
+        assert_eq!(
+            soft_after, hard_after,
+            "apply_nproc must pin hard == soft so the sandbox can't raise it"
+        );
+        let expected = NPROC_NORMAL.min(hard_before);
+        assert_eq!(
+            soft_after, expected,
+            "soft limit should match NPROC_NORMAL clamped to current hard"
+        );
+    }
 }
