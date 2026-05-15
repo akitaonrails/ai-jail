@@ -871,114 +871,22 @@ fn discover_mounts(
     } else {
         (vec![], vec![])
     };
-
-    // SSH: agent socket + tmpfs over /etc/ssh/ssh_config.d to
-    // prevent "bad owner or permissions" errors (bwrap's user
-    // namespace remaps root-owned config files to nobody).
     let (ssh_agent_mount, ssh_env) =
-        if !lockdown && !browser_mode && config.ssh_enabled() {
-            let mut mounts = vec![Mount::Tmpfs {
-                dest: "/etc/ssh/ssh_config.d".into(),
-            }];
-            let mut env = vec![];
-            let ssh_dir = super::home_dir().join(".ssh");
-            if private_home && ssh_dir.is_dir() {
-                mounts.push(Mount::RoBind {
-                    src: ssh_dir.clone(),
-                    dest: ssh_dir,
-                });
-            }
-            if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
-                let sock_path = PathBuf::from(&sock);
-                if sock_path.exists() {
-                    if verbose {
-                        output::verbose(&format!(
-                            "SSH agent: {}",
-                            sock_path.display()
-                        ));
-                    }
-                    mounts.push(Mount::Bind {
-                        src: sock_path.clone(),
-                        dest: sock_path,
-                    });
-                    env.push(("SSH_AUTH_SOCK".into(), sock));
-                }
-            }
-            (mounts, env)
-        } else {
-            (vec![], vec![])
-        };
-
-    // Claude config dir env var
-    let claude_env: Vec<(String, String)> =
-        if let Some(dir) = &config.claude_dir {
-            vec![("CLAUDE_CONFIG_DIR".into(), dir.display().to_string())]
-        } else {
-            vec![]
-        };
-
-    // Mask: replace each path with an empty tempfile (or tmpfs
-    // for directories). Paths are resolved absolutely; relative
-    // paths resolve against project_dir.
-    //
-    // By default, also auto-mask the project's .ai-jail file so
-    // the sandboxed agent can't read its own sandbox policy and
-    // craft workarounds (issue #41). Opt out with --no-hide-config.
-    let mut effective_mask: Vec<PathBuf> = config.mask.clone();
-    if config.hide_config_enabled() {
-        let local_config = project_dir.join(".ai-jail");
-        let already_masked = config.mask.iter().any(|p| {
-            let resolved = if p.is_absolute() {
-                p.clone()
-            } else {
-                project_dir.join(p)
-            };
-            resolved == local_config
-        });
-        if !already_masked && super::path_exists(&local_config) {
-            effective_mask.push(local_config);
-        }
-    }
+        discover_ssh(config, lockdown, browser_mode, private_home, verbose);
+    let claude_env = discover_claude_env(config);
     let mask_mounts =
-        build_mask_mounts(&effective_mask, project_dir, empty_path, verbose);
-
-    // Pictures: read-only bind of $HOME/Pictures when enabled
+        discover_mask_mounts(config, project_dir, empty_path, verbose);
     let pictures_mount =
-        if !lockdown && !browser_mode && config.pictures_enabled() {
-            let p = super::home_dir().join("Pictures");
-            if p.is_dir() {
-                vec![Mount::RoBind {
-                    src: p.clone(),
-                    dest: p,
-                }]
-            } else {
-                vec![]
-            }
-        } else {
-            vec![]
-        };
-
+        discover_pictures_mount(config, lockdown, browser_mode);
     let browser_state_mount =
         discover_browser_state_mount(config, browser_profile, verbose);
-
-    let mut home_dotfiles = discover_home_dotfiles(
+    let home_dotfiles = discover_home_dotfiles_full(
+        config,
         private_home,
-        &config.hide_dotdirs,
         &exempt,
+        lockdown,
         verbose,
     );
-    if !lockdown
-        && let Some(dir) = &config.claude_dir
-        && super::path_exists(dir)
-    {
-        if verbose {
-            output::verbose(&format!("claude-dir: {}", dir.display()));
-        }
-        home_dotfiles.push(Mount::Bind {
-            src: dir.clone(),
-            dest: dir.clone(),
-        });
-    }
 
     MountSet {
         base: discover_base(hosts_file, resolv_mount),
@@ -1026,6 +934,136 @@ fn discover_mounts(
         project: project_mount(project_dir, lockdown || browser_mode),
         mask: mask_mounts,
     }
+}
+
+/// SSH agent socket + ~/.ssh + tmpfs over /etc/ssh/ssh_config.d.
+/// The tmpfs prevents "bad owner or permissions" errors caused by
+/// bwrap's user namespace remapping root-owned ssh config files to
+/// nobody. Returns the mount list and any env vars (`SSH_AUTH_SOCK`)
+/// to propagate into the sandbox.
+fn discover_ssh(
+    config: &Config,
+    lockdown: bool,
+    browser_mode: bool,
+    private_home: bool,
+    verbose: bool,
+) -> (Vec<Mount>, Vec<(String, String)>) {
+    if lockdown || browser_mode || !config.ssh_enabled() {
+        return (vec![], vec![]);
+    }
+    let mut mounts = vec![Mount::Tmpfs {
+        dest: "/etc/ssh/ssh_config.d".into(),
+    }];
+    let mut env = vec![];
+    let ssh_dir = super::home_dir().join(".ssh");
+    if private_home && ssh_dir.is_dir() {
+        mounts.push(Mount::RoBind {
+            src: ssh_dir.clone(),
+            dest: ssh_dir,
+        });
+    }
+    if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
+        let sock_path = PathBuf::from(&sock);
+        if sock_path.exists() {
+            if verbose {
+                output::verbose(&format!("SSH agent: {}", sock_path.display()));
+            }
+            mounts.push(Mount::Bind {
+                src: sock_path.clone(),
+                dest: sock_path,
+            });
+            env.push(("SSH_AUTH_SOCK".into(), sock));
+        }
+    }
+    (mounts, env)
+}
+
+/// `CLAUDE_CONFIG_DIR` env if --claude-dir is set, else empty.
+fn discover_claude_env(config: &Config) -> Vec<(String, String)> {
+    config
+        .claude_dir
+        .as_ref()
+        .map(|dir| {
+            vec![("CLAUDE_CONFIG_DIR".into(), dir.display().to_string())]
+        })
+        .unwrap_or_default()
+}
+
+/// Mask mounts: user-specified `mask` list, plus the project's own
+/// .ai-jail file when `hide_config_enabled()` (issue #41). The latter
+/// is deduped against the user list so we don't double-mount the
+/// same path.
+fn discover_mask_mounts(
+    config: &Config,
+    project_dir: &Path,
+    empty_path: &Path,
+    verbose: bool,
+) -> Vec<Mount> {
+    let mut effective: Vec<PathBuf> = config.mask.clone();
+    if config.hide_config_enabled() {
+        let local_config = project_dir.join(".ai-jail");
+        let already_masked = config.mask.iter().any(|p| {
+            let resolved = if p.is_absolute() {
+                p.clone()
+            } else {
+                project_dir.join(p)
+            };
+            resolved == local_config
+        });
+        if !already_masked && super::path_exists(&local_config) {
+            effective.push(local_config);
+        }
+    }
+    build_mask_mounts(&effective, project_dir, empty_path, verbose)
+}
+
+fn discover_pictures_mount(
+    config: &Config,
+    lockdown: bool,
+    browser_mode: bool,
+) -> Vec<Mount> {
+    if lockdown || browser_mode || !config.pictures_enabled() {
+        return vec![];
+    }
+    let p = super::home_dir().join("Pictures");
+    if p.is_dir() {
+        vec![Mount::RoBind {
+            src: p.clone(),
+            dest: p,
+        }]
+    } else {
+        vec![]
+    }
+}
+
+/// `discover_home_dotfiles` plus the post-fix append of an explicit
+/// `--claude-dir` bind mount when applicable.
+fn discover_home_dotfiles_full(
+    config: &Config,
+    private_home: bool,
+    exempt: &[&str],
+    lockdown: bool,
+    verbose: bool,
+) -> Vec<Mount> {
+    let mut mounts = discover_home_dotfiles(
+        private_home,
+        &config.hide_dotdirs,
+        exempt,
+        verbose,
+    );
+    if !lockdown
+        && let Some(dir) = &config.claude_dir
+        && super::path_exists(dir)
+    {
+        if verbose {
+            output::verbose(&format!("claude-dir: {}", dir.display()));
+        }
+        mounts.push(Mount::Bind {
+            src: dir.clone(),
+            dest: dir.clone(),
+        });
+    }
+    mounts
 }
 
 fn discover_browser_state_mount(
