@@ -1748,6 +1748,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&project);
     }
 
+    /// `--browser=soft` must produce a persistent rw bind at the
+    /// per-browser state dir under `~/.local/share/ai-jail/browsers/`,
+    /// and the dir must be created on disk so bwrap's bind has
+    /// something to point at.
+    #[test]
+    fn browser_soft_profile_emits_persistent_state_mount() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let saved_home = std::env::var_os("HOME");
+        let fake_home = std::env::temp_dir()
+            .join(format!("ai-jail-browser-soft-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(&fake_home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+        }
+
+        let config = Config {
+            command: vec!["chromium".into()],
+            browser_profile: Some("soft".into()),
+            ..Config::default()
+        };
+        let mounts = discover_browser_state_mount(
+            &config,
+            Some(crate::config::BrowserProfile::Soft),
+            false,
+        );
+
+        let expected = fake_home.join(".local/share/ai-jail/browsers/chromium");
+        let bind_present = mounts.iter().any(|m| matches!(
+            m,
+            Mount::Bind { src, dest } if src == &expected && dest == &expected
+        ));
+        assert!(
+            bind_present,
+            "soft profile should produce a Bind mount at {} — got {mounts:?}",
+            expected.display()
+        );
+        assert!(
+            expected.is_dir(),
+            "soft profile should pre-create the state dir on disk"
+        );
+
+        unsafe {
+            if let Some(v) = saved_home {
+                std::env::set_var("HOME", v);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// Hard profile is ephemeral; no persistent bind mount should be
+    /// emitted regardless of browser command.
+    #[test]
+    fn browser_hard_profile_emits_no_persistent_state_mount() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let saved_home = std::env::var_os("HOME");
+        let fake_home = std::env::temp_dir()
+            .join(format!("ai-jail-browser-hard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(&fake_home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+        }
+
+        let config = Config {
+            command: vec!["chromium".into()],
+            browser_profile: Some("hard".into()),
+            ..Config::default()
+        };
+        let mounts = discover_browser_state_mount(
+            &config,
+            Some(crate::config::BrowserProfile::Hard),
+            false,
+        );
+        assert!(
+            mounts.is_empty(),
+            "hard profile must not emit any persistent state mount: {mounts:?}"
+        );
+
+        unsafe {
+            if let Some(v) = saved_home {
+                std::env::set_var("HOME", v);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
     /// If the user already has `.ai-jail` in their `mask`, the auto-
     /// append from `hide_config_enabled` must not produce a duplicate
     /// `--ro-bind <empty> <cfg>` triple. Otherwise bwrap would either
