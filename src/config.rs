@@ -432,57 +432,50 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     dedup_paths(&mut config.mask);
 
     // Boolean flags: CLI overrides config (--no-gpu => no_gpu=Some(true), --gpu => no_gpu=Some(false))
-    if let Some(v) = cli.gpu {
-        config.no_gpu = Some(!v);
+    // Three macros for the three patterns the CLI uses:
+    //  invert!: CLI positive flag flips a `no_*` config field
+    //           (e.g. `--no-gpu` sets `cli.gpu=Some(false)` → `no_gpu=Some(true)`)
+    //  direct!: CLI flag maps straight onto a same-named config field
+    //  clone_into!: same as direct! but for non-Copy types (String, PathBuf)
+    macro_rules! invert {
+        ($cli_field:ident, $config_field:ident) => {
+            if let Some(v) = cli.$cli_field {
+                config.$config_field = Some(!v);
+            }
+        };
     }
-    if let Some(v) = cli.docker {
-        config.no_docker = Some(!v);
+    macro_rules! direct {
+        ($field:ident) => {
+            if let Some(v) = cli.$field {
+                config.$field = Some(v);
+            }
+        };
     }
-    if let Some(v) = cli.display {
-        config.no_display = Some(!v);
+    macro_rules! clone_into {
+        ($field:ident) => {
+            if let Some(ref v) = cli.$field {
+                config.$field = Some(v.clone());
+            }
+        };
     }
-    if let Some(v) = cli.mise {
-        config.no_mise = Some(!v);
-    }
-    if let Some(v) = cli.save_config {
-        config.no_save_config = Some(!v);
-    }
-    if let Some(v) = cli.hide_config {
-        config.no_hide_config = Some(!v);
-    }
-    if let Some(v) = cli.ssh {
-        config.ssh = Some(v);
-    }
-    if let Some(v) = cli.pictures {
-        config.pictures = Some(v);
-    }
-    if let Some(ref profile) = cli.browser_profile {
-        config.browser_profile = Some(profile.clone());
-    }
-    if let Some(v) = cli.private_home {
-        config.private_home = Some(v);
-    }
-    if let Some(v) = cli.worktree {
-        config.no_worktree = Some(!v);
-    }
-    if let Some(v) = cli.lockdown {
-        config.lockdown = Some(v);
-    }
-    if let Some(v) = cli.landlock {
-        config.no_landlock = Some(!v);
-    }
-    if let Some(v) = cli.seccomp {
-        config.no_seccomp = Some(!v);
-    }
-    if let Some(v) = cli.rlimits {
-        config.no_rlimits = Some(!v);
-    }
-    if let Some(v) = cli.status_bar {
-        config.no_status_bar = Some(!v);
-    }
-    if let Some(ref style) = cli.status_bar_style {
-        config.status_bar_style = Some(style.clone());
-    }
+
+    invert!(gpu, no_gpu);
+    invert!(docker, no_docker);
+    invert!(display, no_display);
+    invert!(mise, no_mise);
+    invert!(save_config, no_save_config);
+    invert!(hide_config, no_hide_config);
+    direct!(ssh);
+    direct!(pictures);
+    clone_into!(browser_profile);
+    direct!(private_home);
+    invert!(worktree, no_worktree);
+    direct!(lockdown);
+    invert!(landlock, no_landlock);
+    invert!(seccomp, no_seccomp);
+    invert!(rlimits, no_rlimits);
+    invert!(status_bar, no_status_bar);
+    clone_into!(status_bar_style);
 
     config
         .allow_tcp_ports
