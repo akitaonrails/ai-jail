@@ -507,121 +507,31 @@ pub fn display_status(config: &Config) {
         output::info("No .ai-jail config file found in current directory.");
         return;
     }
-
     output::info(&format!("Config: {}", path.display()));
 
-    if config.command.is_empty() {
-        output::status_header("  Command", "(default: bash)");
-    } else {
-        output::status_header("  Command", &config.command.join(" "));
-    }
+    print_command(config);
+    print_path_list("  RW maps", &config.rw_maps);
+    print_path_list("  RO maps", &config.ro_maps);
+    print_string_list("  Hide dotdirs", &config.hide_dotdirs);
+    print_path_list("  Masked files", &config.mask);
 
-    if !config.rw_maps.is_empty() {
-        output::status_header(
-            "  RW maps",
-            &config
-                .rw_maps
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-    }
-    if !config.ro_maps.is_empty() {
-        output::status_header(
-            "  RO maps",
-            &config
-                .ro_maps
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-    }
-    if !config.hide_dotdirs.is_empty() {
-        output::status_header(
-            "  Hide dotdirs",
-            &config.hide_dotdirs.join(", "),
-        );
-    }
-    if !config.mask.is_empty() {
-        output::status_header(
-            "  Masked files",
-            &config
-                .mask
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-    }
-
-    let bool_opt = |name: &str, val: Option<bool>| match val {
-        Some(true) => output::status_header(&format!("  {name}"), "disabled"),
-        Some(false) => output::status_header(&format!("  {name}"), "enabled"),
-        None => output::status_header(&format!("  {name}"), "auto"),
-    };
-
-    bool_opt("GPU", config.no_gpu);
-    bool_opt("Docker", config.no_docker);
-    bool_opt("Display", config.no_display);
-    bool_opt("Git worktree", config.no_worktree);
-    bool_opt("Mise", config.no_mise);
-    match config.no_save_config {
-        Some(true) => output::status_header("  Save config", "disabled"),
-        Some(false) => output::status_header("  Save config", "enabled"),
-        None => output::status_header("  Save config", "enabled (default)"),
-    }
-    match config.no_hide_config {
-        Some(true) => output::status_header("  Hide .ai-jail", "disabled"),
-        Some(false) => output::status_header("  Hide .ai-jail", "enabled"),
-        None => output::status_header("  Hide .ai-jail", "enabled (default)"),
-    }
-    match config.ssh {
-        Some(true) => output::status_header("  SSH keys", "shared (read-only)"),
-        _ => output::status_header("  SSH keys", "hidden"),
-    }
-    match config.pictures {
-        Some(true) => output::status_header("  Pictures", "shared (read-only)"),
-        _ => output::status_header("  Pictures", "hidden"),
-    }
-    match config.browser_profile.as_deref() {
-        Some("off" | "none" | "disabled") => {
-            output::status_header("  Browser profile", "disabled")
-        }
-        Some(value) => output::status_header("  Browser profile", value),
-        None => output::status_header("  Browser profile", "auto"),
-    }
-    match config.private_home {
-        Some(true) => output::status_header("  Private home", "enabled"),
-        Some(false) => output::status_header("  Private home", "disabled"),
-        None => output::status_header("  Private home", "auto"),
-    }
-    bool_opt("Landlock", config.no_landlock);
-    bool_opt("Seccomp", config.no_seccomp);
-    bool_opt("Rlimits", config.no_rlimits);
-    bool_opt("Lockdown", config.lockdown.map(|v| !v));
-    if !config.allow_tcp_ports.is_empty() {
-        let ports: Vec<String> = config
-            .allow_tcp_ports
-            .iter()
-            .map(|p| p.to_string())
-            .collect();
-        let note = if config.lockdown_enabled() {
-            ""
-        } else {
-            " (only effective in lockdown mode)"
-        };
-        output::status_header(
-            "  Allow TCP ports",
-            &format!("{}{note}", ports.join(", ")),
-        );
-    }
-    match config.no_status_bar {
-        Some(true) => output::status_header("  Status bar", "disabled"),
-        Some(false) => output::status_header("  Status bar", "enabled"),
-        None => output::status_header("  Status bar", "enabled (default)"),
-    }
+    print_auto_tristate("  GPU", config.no_gpu);
+    print_auto_tristate("  Docker", config.no_docker);
+    print_auto_tristate("  Display", config.no_display);
+    print_auto_tristate("  Git worktree", config.no_worktree);
+    print_auto_tristate("  Mise", config.no_mise);
+    print_default_on_tristate("  Save config", config.no_save_config);
+    print_default_on_tristate("  Hide .ai-jail", config.no_hide_config);
+    print_shared_or_hidden("  SSH keys", config.ssh);
+    print_shared_or_hidden("  Pictures", config.pictures);
+    print_browser_profile(config.browser_profile.as_deref());
+    print_private_home(config.private_home);
+    print_auto_tristate("  Landlock", config.no_landlock);
+    print_auto_tristate("  Seccomp", config.no_seccomp);
+    print_auto_tristate("  Rlimits", config.no_rlimits);
+    print_auto_tristate("  Lockdown", config.lockdown.map(|v| !v));
+    print_allow_tcp_ports(&config.allow_tcp_ports, config.lockdown_enabled());
+    print_default_on_tristate("  Status bar", config.no_status_bar);
     if config.status_bar_enabled() {
         output::status_header("  Style", config.status_bar_style());
     }
@@ -631,6 +541,100 @@ pub fn display_status(config: &Config) {
     if let Some(dir) = &config.claude_dir {
         output::status_header("  Claude dir", &dir.display().to_string());
     }
+}
+
+fn print_command(config: &Config) {
+    if config.command.is_empty() {
+        output::status_header("  Command", "(default: bash)");
+    } else {
+        output::status_header("  Command", &config.command.join(" "));
+    }
+}
+
+fn print_path_list(label: &str, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    let joined = paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    output::status_header(label, &joined);
+}
+
+fn print_string_list(label: &str, strings: &[String]) {
+    if strings.is_empty() {
+        return;
+    }
+    output::status_header(label, &strings.join(", "));
+}
+
+/// Render a `no_*` field with the default-off convention:
+/// Some(true) → "disabled", Some(false) → "enabled", None → "auto".
+fn print_auto_tristate(label: &str, val: Option<bool>) {
+    let v = match val {
+        Some(true) => "disabled",
+        Some(false) => "enabled",
+        None => "auto",
+    };
+    output::status_header(label, v);
+}
+
+/// Render a `no_*` field with the default-on convention:
+/// Some(true) → "disabled", Some(false) → "enabled", None → "enabled (default)".
+fn print_default_on_tristate(label: &str, val: Option<bool>) {
+    let v = match val {
+        Some(true) => "disabled",
+        Some(false) => "enabled",
+        None => "enabled (default)",
+    };
+    output::status_header(label, v);
+}
+
+/// For ssh/pictures: explicit-on shares the dir, anything else hides it.
+fn print_shared_or_hidden(label: &str, val: Option<bool>) {
+    let v = if val == Some(true) {
+        "shared (read-only)"
+    } else {
+        "hidden"
+    };
+    output::status_header(label, v);
+}
+
+fn print_browser_profile(profile: Option<&str>) {
+    let v = match profile {
+        Some("off" | "none" | "disabled") => "disabled",
+        Some(value) => value,
+        None => "auto",
+    };
+    output::status_header("  Browser profile", v);
+}
+
+fn print_private_home(val: Option<bool>) {
+    let v = match val {
+        Some(true) => "enabled",
+        Some(false) => "disabled",
+        None => "auto",
+    };
+    output::status_header("  Private home", v);
+}
+
+fn print_allow_tcp_ports(ports: &[u16], lockdown: bool) {
+    if ports.is_empty() {
+        return;
+    }
+    let joined = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let note = if lockdown {
+        ""
+    } else {
+        " (only effective in lockdown mode)"
+    };
+    output::status_header("  Allow TCP ports", &format!("{joined}{note}"));
 }
 
 #[cfg(test)]
