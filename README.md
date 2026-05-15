@@ -110,6 +110,8 @@ On first run, `ai-jail` creates a `.ai-jail` config file in the current director
 
 If you run `ai-jail` from a linked Git worktree, it auto-detects the worktree's external Git admin directories and exposes them safely inside the sandbox so `git status`, `git commit`, and similar commands keep working. Disable this with `--no-worktree` or `no_worktree = true`.
 
+> ⚠️ **The agent can only persist writes to your current project directory.** Everything else inside the sandbox (parent directories, sibling directories, `$HOME`, `/tmp`) lives in a tmpfs and is wiped when ai-jail exits. If you ask the agent to create files outside the project — for example a sibling scaffold folder, a clone in your home, or anything under `~/.cache` — those writes go to RAM and disappear on exit. Push to a remote, copy back into the project dir, or expose extra writable paths with `--rw-map ~/path` before relying on them. The agent has no way to detect this from inside the sandbox; it sees a fully-writable filesystem.
+
 ## Security notes
 
 The default mode favors usability over maximum lockdown. These are intentionally open by default:
