@@ -64,3 +64,59 @@ pub fn wait_child(pid: i32) -> i32 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // CHILD_PID is process-global, so serialise the few tests that
+    // mutate it. Otherwise parallel test execution can swap it under
+    // each other and produce ghost failures.
+    static PID_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn set_child_pid_round_trips() {
+        let _guard = PID_LOCK.lock().unwrap();
+        let saved = CHILD_PID.load(Ordering::SeqCst);
+        set_child_pid(424242);
+        assert_eq!(CHILD_PID.load(Ordering::SeqCst), 424242);
+        set_child_pid(0);
+        assert_eq!(CHILD_PID.load(Ordering::SeqCst), 0);
+        CHILD_PID.store(saved, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn install_handlers_does_not_panic() {
+        // Best we can do from userland: the call has to succeed
+        // without aborting the test binary. The actual handler-
+        // installation is verified indirectly by every integration
+        // test that runs through pty::run.
+        install_handlers();
+    }
+
+    #[test]
+    fn forward_signal_sigwinch_defers_to_pty() {
+        // SIGWINCH must NOT call libc::kill — it should only set
+        // the PTY's pending flag. We verify by clearing the flag,
+        // calling the handler, then checking the flag flipped on.
+        let _drain = crate::pty::take_sigwinch_pending_for_test();
+        forward_signal(nix::libc::SIGWINCH);
+        assert!(crate::pty::take_sigwinch_pending_for_test());
+    }
+
+    #[test]
+    fn forward_signal_with_zero_child_pid_is_noop() {
+        // CHILD_PID == 0 means there's nothing to forward to.
+        // `libc::kill(0, sig)` would send to the entire process
+        // group, which would terminate the test runner. Verify
+        // the guard at line `if pid > 0` actually prevents the
+        // kill by setting PID to zero and sending SIGTERM. If
+        // the guard were missing the test process would die.
+        let _guard = PID_LOCK.lock().unwrap();
+        let saved = CHILD_PID.load(Ordering::SeqCst);
+        CHILD_PID.store(0, Ordering::SeqCst);
+        forward_signal(nix::libc::SIGTERM);
+        // If we got here, the guard works.
+        CHILD_PID.store(saved, Ordering::SeqCst);
+    }
+}

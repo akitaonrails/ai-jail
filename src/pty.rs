@@ -35,6 +35,14 @@ pub fn set_sigwinch_pending() {
     SIGWINCH_PENDING.store(true, Ordering::SeqCst);
 }
 
+/// Read-and-clear the SIGWINCH pending flag. Test-only — production
+/// callers do this implicitly via `SIGWINCH_PENDING.swap(false, ...)`
+/// inside the IO loop's `handle_sigwinch` method.
+#[cfg(test)]
+pub(crate) fn take_sigwinch_pending_for_test() -> bool {
+    SIGWINCH_PENDING.swap(false, Ordering::SeqCst)
+}
+
 /// Resize the PTY slave to match the real terminal (minus one row
 /// for the status bar). Async-signal-safe: only uses ioctl + atomics.
 pub fn resize_pty() {
