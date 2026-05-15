@@ -221,57 +221,35 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     dedup_strings(&mut c.hide_dotdirs);
     c.mask.extend(local.mask);
     dedup_paths(&mut c.mask);
-    if local.no_gpu.is_some() {
-        c.no_gpu = local.no_gpu;
+    // Each Option-typed field follows the same pattern: local
+    // overrides global iff local explicitly set it. The macro is
+    // local to the function so it stays scoped to this single use.
+    macro_rules! take {
+        ($field:ident) => {
+            if local.$field.is_some() {
+                c.$field = local.$field;
+            }
+        };
     }
-    if local.no_docker.is_some() {
-        c.no_docker = local.no_docker;
-    }
-    if local.no_display.is_some() {
-        c.no_display = local.no_display;
-    }
-    if local.no_mise.is_some() {
-        c.no_mise = local.no_mise;
-    }
-    if local.no_worktree.is_some() {
-        c.no_worktree = local.no_worktree;
-    }
-    if local.no_save_config.is_some() {
-        c.no_save_config = local.no_save_config;
-    }
-    if local.no_hide_config.is_some() {
-        c.no_hide_config = local.no_hide_config;
-    }
-    if local.ssh.is_some() {
-        c.ssh = local.ssh;
-    }
-    if local.pictures.is_some() {
-        c.pictures = local.pictures;
-    }
-    if local.browser_profile.is_some() {
-        c.browser_profile = local.browser_profile;
-    }
-    if local.private_home.is_some() {
-        c.private_home = local.private_home;
-    }
-    if local.lockdown.is_some() {
-        c.lockdown = local.lockdown;
-    }
-    if local.no_landlock.is_some() {
-        c.no_landlock = local.no_landlock;
-    }
-    if local.no_seccomp.is_some() {
-        c.no_seccomp = local.no_seccomp;
-    }
-    if local.no_rlimits.is_some() {
-        c.no_rlimits = local.no_rlimits;
-    }
+    take!(no_gpu);
+    take!(no_docker);
+    take!(no_display);
+    take!(no_mise);
+    take!(no_worktree);
+    take!(no_save_config);
+    take!(no_hide_config);
+    take!(ssh);
+    take!(pictures);
+    take!(browser_profile);
+    take!(private_home);
+    take!(lockdown);
+    take!(no_landlock);
+    take!(no_seccomp);
+    take!(no_rlimits);
     c.allow_tcp_ports.extend(local.allow_tcp_ports);
     c.allow_tcp_ports.sort_unstable();
     c.allow_tcp_ports.dedup();
-    if local.claude_dir.is_some() {
-        c.claude_dir = local.claude_dir;
-    }
+    take!(claude_dir);
     // Status bar + resize redraw key stay from global — local should
     // not override user-level preferences.
     c
