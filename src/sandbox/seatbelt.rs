@@ -112,17 +112,24 @@ fn canonicalize_or_keep(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Append one character to an SBPL-string-escaped output. Shared
+/// between `sbpl_escape` (plain literal) and `sbpl_regex_escape`
+/// (regex literal — adds metacharacter escaping on top).
+fn push_sbpl_escaped(c: char, out: &mut String) {
+    match c {
+        '\\' => out.push_str("\\\\"),
+        '"' => out.push_str("\\\""),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        _ => out.push(c),
+    }
+}
+
 fn sbpl_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(c),
-        }
+        push_sbpl_escaped(c, &mut out);
     }
     out
 }
@@ -133,19 +140,14 @@ fn sbpl_regex_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len() * 2);
     for c in input.chars() {
         match c {
-            // Regex metacharacters
+            // Regex metacharacters get a single backslash; the SBPL
+            // string-escape pass below then escapes that backslash again.
             '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^'
             | '$' | '|' => {
                 out.push('\\');
                 out.push(c);
             }
-            // SBPL string escaping (must come after regex escaping)
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(c),
+            _ => push_sbpl_escaped(c, &mut out),
         }
     }
     out
