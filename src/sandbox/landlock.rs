@@ -1060,6 +1060,34 @@ mod tests {
         let _ = apply_net_rules(&config, true);
     }
 
+    /// Documents the failure-mode contract for the V4-unavailable +
+    /// lockdown + --allow-tcp-port combination.
+    ///
+    /// We can't synthetically trigger "V4 unavailable" on a host
+    /// where V4 *is* available without bypassing the Landlock crate
+    /// entirely, so this test only fires its assertion when the
+    /// runtime happens to return Err. On modern kernels with V4
+    /// support that's never; on older kernels it's the documented
+    /// hard-fail. Either way the wording is pinned: a future
+    /// refactor that loses the "refusing to start" hint or the
+    /// reference to `--unshare-net` would fail this test on the
+    /// CI matrix entry that hits the Err branch.
+    #[test]
+    fn apply_net_rules_v4_unavailable_hard_fails_with_documented_wording() {
+        let config = Config {
+            lockdown: Some(true),
+            allow_tcp_ports: vec![32000],
+            ..Config::default()
+        };
+        if let Err(msg) = apply_net_rules(&config, false) {
+            assert!(
+                msg.contains("Landlock V4")
+                    && msg.contains("refusing to start"),
+                "Hard-fail error message lost its anchor phrases: {msg}"
+            );
+        }
+    }
+
     #[test]
     fn apply_net_rules_lockdown_empty_ports() {
         let config = Config {
