@@ -134,16 +134,21 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 };
                 args.hide_dotdirs.push(normalized);
             }
-            Long("lockdown") => args.lockdown = Some(true),
-            Long("no-lockdown") => args.lockdown = Some(false),
-            Long("private-home") => args.private_home = Some(true),
-            Long("no-private-home") => args.private_home = Some(false),
-            Long("landlock") => args.landlock = Some(true),
-            Long("no-landlock") => args.landlock = Some(false),
-            Long("seccomp") => args.seccomp = Some(true),
-            Long("no-seccomp") => args.seccomp = Some(false),
-            Long("rlimits") => args.rlimits = Some(true),
-            Long("no-rlimits") => args.rlimits = Some(false),
+            Long(s @ ("lockdown" | "no-lockdown")) => {
+                args.lockdown = Some(s == "lockdown");
+            }
+            Long(s @ ("private-home" | "no-private-home")) => {
+                args.private_home = Some(s == "private-home");
+            }
+            Long(s @ ("landlock" | "no-landlock")) => {
+                args.landlock = Some(s == "landlock");
+            }
+            Long(s @ ("seccomp" | "no-seccomp")) => {
+                args.seccomp = Some(s == "seccomp");
+            }
+            Long(s @ ("rlimits" | "no-rlimits")) => {
+                args.rlimits = Some(s == "rlimits");
+            }
             Long("allow-tcp-port") => {
                 let val: String = parser
                     .value()
@@ -160,24 +165,33 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 args.claude_dir =
                     Some(PathBuf::from(val.to_string_lossy().into_owned()));
             }
-            Long("gpu") => args.gpu = Some(true),
-            Long("no-gpu") => args.gpu = Some(false),
-            Long("docker") => args.docker = Some(true),
-            Long("no-docker") => args.docker = Some(false),
-            Long("display") => args.display = Some(true),
-            Long("no-display") => args.display = Some(false),
-            Long("worktree") => args.worktree = Some(true),
-            Long("no-worktree") => args.worktree = Some(false),
-            Long("mise") => args.mise = Some(true),
-            Long("no-mise") => args.mise = Some(false),
-            Long("save-config") => args.save_config = Some(true),
-            Long("no-save-config") => args.save_config = Some(false),
-            Long("hide-config") => args.hide_config = Some(true),
-            Long("no-hide-config") => args.hide_config = Some(false),
-            Long("ssh") => args.ssh = Some(true),
-            Long("no-ssh") => args.ssh = Some(false),
-            Long("pictures") => args.pictures = Some(true),
-            Long("no-pictures") => args.pictures = Some(false),
+            Long(s @ ("gpu" | "no-gpu")) => {
+                args.gpu = Some(s == "gpu");
+            }
+            Long(s @ ("docker" | "no-docker")) => {
+                args.docker = Some(s == "docker");
+            }
+            Long(s @ ("display" | "no-display")) => {
+                args.display = Some(s == "display");
+            }
+            Long(s @ ("worktree" | "no-worktree")) => {
+                args.worktree = Some(s == "worktree");
+            }
+            Long(s @ ("mise" | "no-mise")) => {
+                args.mise = Some(s == "mise");
+            }
+            Long(s @ ("save-config" | "no-save-config")) => {
+                args.save_config = Some(s == "save-config");
+            }
+            Long(s @ ("hide-config" | "no-hide-config")) => {
+                args.hide_config = Some(s == "hide-config");
+            }
+            Long(s @ ("ssh" | "no-ssh")) => {
+                args.ssh = Some(s == "ssh");
+            }
+            Long(s @ ("pictures" | "no-pictures")) => {
+                args.pictures = Some(s == "pictures");
+            }
             Long("browser") => {
                 let profile = if let Some(val) = parser.optional_value() {
                     let s = val.to_string_lossy();
