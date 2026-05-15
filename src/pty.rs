@@ -175,6 +175,238 @@ pub fn parse_resize_redraw_key(spec: &str) -> Result<Option<Vec<u8>>, String> {
     Ok(Some(vec![key & 0x1f]))
 }
 
+/// Mutable state shared across one run of the PTY IO loop.
+///
+/// Bundled into one struct so the per-section helpers can take a
+/// single `&mut IoLoop<'_>` instead of half a dozen mutable refs.
+struct IoLoop<'a> {
+    parser: vt100::Parser,
+    prev_screen: vt100::Screen,
+    content_rows: u16,
+    content_cols: u16,
+    pending_redraw: bool,
+    pending_resize_redraw_at: Option<Instant>,
+    was_alt_screen: bool,
+    /// Raw stdout fd. Owned by the process; we just use it for writes.
+    stdout: i32,
+    /// PTY master fd. Lifetime tied to the parent `pty::run` scope.
+    master_raw: i32,
+    /// Initial terminal size. Used as fallback when `real_term_size()`
+    /// fails inside a SIGWINCH handler.
+    init_rows: u16,
+    init_cols: u16,
+    /// Optional control sequence to inject after the child has had a
+    /// chance to process SIGWINCH. None when disabled.
+    resize_redraw_key: Option<&'a [u8]>,
+}
+
+impl<'a> IoLoop<'a> {
+    fn new(
+        master_raw: i32,
+        init_rows: u16,
+        init_cols: u16,
+        resize_redraw_key: Option<&'a [u8]>,
+    ) -> Self {
+        let content_rows = init_rows - 1;
+        let content_cols = init_cols;
+        let parser = vt100::Parser::new(content_rows, content_cols, 0);
+        let prev_screen = parser.screen().clone();
+        Self {
+            parser,
+            prev_screen,
+            content_rows,
+            content_cols,
+            pending_redraw: false,
+            pending_resize_redraw_at: None,
+            was_alt_screen: false,
+            stdout: nix::libc::STDOUT_FILENO,
+            master_raw,
+            init_rows,
+            init_cols,
+            resize_redraw_key,
+        }
+    }
+
+    /// Push existing terminal content into scrollback, clear the
+    /// visible area, and set the scroll region so the status bar
+    /// row stays untouched by child output.
+    fn prime_terminal(&self) {
+        let pos = format!("\x1b[{};1H", self.init_rows);
+        write_all_raw(self.stdout, pos.as_bytes());
+        for _ in 0..self.content_rows {
+            write_all_raw(self.stdout, b"\n");
+        }
+        write_all_raw(self.stdout, b"\x1b[H\x1b[J");
+        set_scroll_region(self.stdout, self.content_rows);
+    }
+
+    /// Drain a pending SIGWINCH: resize vt100 first, repaint the
+    /// real terminal, then resize the PTY and forward SIGWINCH to
+    /// the child. Doing it in this order avoids a ghost status-bar
+    /// row when the user maximises and avoids a blank flash on the
+    /// primary screen.
+    fn handle_sigwinch(&mut self) {
+        if !SIGWINCH_PENDING.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let (rows, cols) =
+            real_term_size().unwrap_or((self.init_rows, self.init_cols));
+        if rows < 2 {
+            return;
+        }
+        let old_content_rows = self.content_rows;
+        self.content_rows = rows - 1;
+        self.content_cols = cols;
+        self.parser
+            .screen_mut()
+            .set_size(self.content_rows, self.content_cols);
+
+        let screen = self.parser.screen();
+        let on_alt = screen.alternate_screen();
+        if on_alt {
+            // Alt screen: full clear + repaint from vt100 so
+            // prev_screen matches the real terminal for subsequent
+            // state_diff rendering.
+            write_all_raw(self.stdout, b"\x1b[r\x1b[H\x1b[J");
+            let output = screen.state_formatted();
+            write_all_raw(self.stdout, &output);
+        } else {
+            // Primary screen: preserve visible content (avoid a blank
+            // flash on maximize). Reset the scroll region and clean up
+            // the old status-bar ghost row, then let the child repaint
+            // on its own after SIGWINCH.
+            write_all_raw(self.stdout, b"\x1b[r");
+            if old_content_rows < self.content_rows {
+                let seq = format!("\x1b[{};1H\x1b[2K", old_content_rows + 1);
+                write_all_raw(self.stdout, seq.as_bytes());
+            }
+            set_scroll_region(self.stdout, self.content_rows);
+            let (row, col) = screen.cursor_position();
+            let seq = format!("\x1b[{};{}H", row + 1, col + 1);
+            write_all_raw(self.stdout, seq.as_bytes());
+        }
+
+        self.prev_screen = screen.clone();
+        self.was_alt_screen = on_alt;
+        crate::statusbar::update_terminal_state(screen);
+        crate::statusbar::redraw();
+        resize_pty();
+        forward_sigwinch();
+        if !on_alt && self.resize_redraw_key.is_some() {
+            // Let the child process SIGWINCH first, then nudge it to
+            // repaint once the terminal goes quiet.
+            self.pending_resize_redraw_at =
+                Some(Instant::now() + RESIZE_REDRAW_DELAY);
+        }
+        let _ = crate::statusbar::take_requests();
+        self.pending_redraw = false;
+    }
+
+    /// One read from the PTY master: hybrid rendering depending on
+    /// alt-screen state and screen transitions. Returns
+    /// `ControlFlow::Break(())` when the loop should exit (child
+    /// closed the PTY).
+    fn handle_master_read(&mut self, buf: &[u8]) -> std::ops::ControlFlow<()> {
+        self.parser.process(buf);
+        let screen = self.parser.screen();
+        let now_alt = screen.alternate_screen();
+
+        // Forward kitty keyboard protocol sequences that vt100
+        // silently drops. Only needed on alt screen paths — the
+        // primary screen uses raw pass-through anyway.
+        if now_alt || now_alt != self.was_alt_screen {
+            forward_keyboard_protocol(self.stdout, buf);
+        }
+
+        if now_alt != self.was_alt_screen {
+            // Alt screen transition: full re-render.
+            if now_alt {
+                write_all_raw(self.stdout, b"\x1b[r");
+            } else {
+                set_scroll_region(self.stdout, self.content_rows);
+            }
+            write_all_raw(self.stdout, b"\x1b[H\x1b[J");
+            let output = screen.state_formatted();
+            write_all_raw(self.stdout, &output);
+            self.was_alt_screen = now_alt;
+        } else if now_alt {
+            // Alt screen: cursor-addressed diff.
+            let diff = screen.state_diff(&self.prev_screen);
+            write_all_raw(self.stdout, &diff);
+        } else {
+            // Primary screen: raw pass-through for natural scrollback.
+            write_all_raw(self.stdout, buf);
+            // Re-establish scroll region in case child output contained
+            // a reset. Only inject when the output ends at ground state
+            // — otherwise our escapes corrupt an in-progress CSI/OSC.
+            // DECSTBM (\x1b[1;Nr) moves the cursor home as a side
+            // effect; restore via absolute CUP, NOT DECSC/DECRC (which
+            // on macOS also save/restore scroll margins and would undo
+            // the repair).
+            if ends_at_ground_state(buf) {
+                let (row, col) = self.parser.screen().cursor_position();
+                set_scroll_region(self.stdout, self.content_rows);
+                let seq = format!("\x1b[{};{}H", row + 1, col + 1);
+                write_all_raw(self.stdout, seq.as_bytes());
+            }
+        }
+
+        self.prev_screen = screen.clone();
+        crate::statusbar::update_terminal_state(screen);
+        self.pending_redraw = true;
+        if self.resize_redraw_key.is_some()
+            && self.pending_resize_redraw_at.is_some()
+        {
+            // Child is still talking — push the redraw-key injection
+            // out so we don't fire while the screen is actively
+            // changing.
+            self.pending_resize_redraw_at =
+                Some(Instant::now() + RESIZE_REDRAW_DELAY);
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    /// Drain any remaining bytes on POLLHUP/POLLERR, render the final
+    /// state, and reset the scroll region. The loop exits after this.
+    fn drain_on_hup(&mut self, buf: &mut [u8]) {
+        loop {
+            match nix::unistd::read(self.master_raw, buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    self.parser.process(&buf[..n]);
+                }
+            }
+        }
+        let screen = self.parser.screen();
+        let diff = screen.state_diff(&self.prev_screen);
+        write_all_raw(self.stdout, &diff);
+        write_all_raw(self.stdout, b"\x1b[r");
+        crate::statusbar::redraw();
+    }
+
+    /// Status bar / pending redraw-key flush, run when the child is
+    /// quiet (no POLLIN on master).
+    fn flush_when_idle(&mut self) {
+        if self.pending_redraw {
+            crate::statusbar::redraw();
+            self.pending_redraw = false;
+        }
+        self.maybe_inject_resize_key();
+    }
+
+    /// Fire the pending resize-redraw key if its deadline has passed.
+    fn maybe_inject_resize_key(&mut self) {
+        if let Some(deadline) = self.pending_resize_redraw_at
+            && Instant::now() >= deadline
+        {
+            if let Some(key) = self.resize_redraw_key {
+                write_all_raw(self.master_raw, key);
+            }
+            self.pending_resize_redraw_at = None;
+        }
+    }
+}
+
 fn io_loop(
     master: &OwnedFd,
     init_rows: u16,
@@ -186,120 +418,26 @@ fn io_loop(
     let stdin_bfd = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
     let master_bfd = unsafe { BorrowedFd::borrow_raw(master_raw) };
     let mut buf = [0u8; 8192];
-    let stdout = nix::libc::STDOUT_FILENO;
 
-    // Track content area size (updated on SIGWINCH)
-    let mut content_rows = init_rows - 1;
-    let mut content_cols = init_cols;
-
-    // Virtual terminal for resize recovery and alt-screen
-    // diff rendering. Scrollback of 0 is fine — the real
-    // terminal handles scrollback via raw pass-through.
-    let mut parser = vt100::Parser::new(content_rows, content_cols, 0);
-    let mut prev_screen = parser.screen().clone();
-    let mut pending_redraw = false;
-    let mut pending_resize_redraw_at: Option<Instant> = None;
-    let mut was_alt_screen = false;
-    crate::statusbar::update_terminal_state(parser.screen());
-
-    // Push existing terminal content into scrollback so the
-    // child starts on a clean canvas without losing history.
-    // Move cursor to bottom of screen and emit newlines.
-    let pos = format!("\x1b[{};1H", init_rows);
-    write_all_raw(stdout, pos.as_bytes());
-    for _ in 0..content_rows {
-        write_all_raw(stdout, b"\n");
-    }
-    // Clear visible area and set scroll region
-    write_all_raw(stdout, b"\x1b[H\x1b[J");
-    set_scroll_region(stdout, content_rows);
+    let mut state =
+        IoLoop::new(master_raw, init_rows, init_cols, resize_redraw_key);
+    crate::statusbar::update_terminal_state(state.parser.screen());
+    state.prime_terminal();
 
     loop {
-        // Handle pending SIGWINCH before anything else.
-        // Order: resize vt100 FIRST, then re-render, then
-        // resize PTY (which delivers SIGWINCH to child).
-        if SIGWINCH_PENDING.swap(false, Ordering::SeqCst) {
-            let (rows, cols) =
-                real_term_size().unwrap_or((init_rows, init_cols));
-            if rows >= 2 {
-                let old_content_rows = content_rows;
-                content_rows = rows - 1;
-                content_cols = cols;
-                parser.screen_mut().set_size(content_rows, content_cols);
-
-                let screen = parser.screen();
-                let on_alt = screen.alternate_screen();
-
-                if on_alt {
-                    // Alt screen: full clear + repaint from vt100.
-                    // Needed so prev_screen matches the real terminal
-                    // for subsequent state_diff rendering.
-                    write_all_raw(stdout, b"\x1b[r\x1b[H\x1b[J");
-                    let output = screen.state_formatted();
-                    write_all_raw(stdout, &output);
-                } else {
-                    // Primary screen: preserve visible content to
-                    // avoid a blank flash on maximize. Reset the
-                    // scroll region and clean up the old status bar
-                    // ghost, then let the child repaint after
-                    // SIGWINCH.
-                    write_all_raw(stdout, b"\x1b[r");
-                    // Clear old status bar row if still in view
-                    if old_content_rows < content_rows {
-                        let seq =
-                            format!("\x1b[{};1H\x1b[2K", old_content_rows + 1);
-                        write_all_raw(stdout, seq.as_bytes());
-                    }
-                    set_scroll_region(stdout, content_rows);
-                    let (row, col) = screen.cursor_position();
-                    let seq = format!("\x1b[{};{}H", row + 1, col + 1);
-                    write_all_raw(stdout, seq.as_bytes());
-                }
-
-                prev_screen = screen.clone();
-                was_alt_screen = on_alt;
-                crate::statusbar::update_terminal_state(screen);
-
-                // Redraw status bar, then notify child
-                crate::statusbar::redraw();
-                resize_pty();
-                forward_sigwinch();
-                if !on_alt && resize_redraw_key.is_some() {
-                    // Let the child process SIGWINCH first, then
-                    // nudge it to repaint once the terminal is
-                    // quiet.
-                    pending_resize_redraw_at =
-                        Some(Instant::now() + RESIZE_REDRAW_DELAY);
-                }
-
-                let _ = crate::statusbar::take_requests();
-                pending_redraw = false;
-            }
-        }
+        state.handle_sigwinch();
 
         let mut fds = [
             PollFd::new(stdin_bfd, PollFlags::POLLIN),
             PollFd::new(master_bfd, PollFlags::POLLIN),
         ];
-
         if crate::statusbar::take_requests() {
-            pending_redraw = true;
+            state.pending_redraw = true;
         }
 
         match poll(&mut fds, PollTimeout::from(100_u16)) {
             Ok(0) => {
-                if pending_redraw {
-                    crate::statusbar::redraw();
-                    pending_redraw = false;
-                }
-                if let Some(deadline) = pending_resize_redraw_at
-                    && Instant::now() >= deadline
-                {
-                    if let Some(key) = resize_redraw_key {
-                        write_all_raw(master_raw, key);
-                    }
-                    pending_resize_redraw_at = None;
-                }
+                state.flush_when_idle();
                 continue;
             }
             Err(nix::errno::Errno::EINTR) => continue,
@@ -307,150 +445,58 @@ fn io_loop(
             Ok(_) => {}
         }
 
-        // Check master (child output) first for responsiveness
+        // Check master (child output) first for responsiveness.
+        let mut should_break = false;
         if let Some(revents) = fds[1].revents() {
             if revents.contains(PollFlags::POLLIN) {
                 match nix::unistd::read(master_raw, &mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        should_break = true;
+                    }
                     Ok(n) => {
-                        // Always process through vt100 for resize
-                        // recovery and alt-screen tracking.
-                        parser.process(&buf[..n]);
-                        let screen = parser.screen();
-                        let now_alt = screen.alternate_screen();
-
-                        // Forward kitty keyboard protocol
-                        // sequences that vt100 silently drops.
-                        // Only needed on alt screen paths —
-                        // primary screen uses raw pass-through.
-                        if now_alt || now_alt != was_alt_screen {
-                            forward_keyboard_protocol(stdout, &buf[..n]);
-                        }
-
-                        if now_alt != was_alt_screen {
-                            // Alt screen transition: full re-render
-                            if now_alt {
-                                // Entering alt: remove scroll region
-                                write_all_raw(stdout, b"\x1b[r");
-                            } else {
-                                // Leaving alt: restore scroll region
-                                set_scroll_region(stdout, content_rows);
-                            }
-                            write_all_raw(stdout, b"\x1b[H\x1b[J");
-                            let output = screen.state_formatted();
-                            write_all_raw(stdout, &output);
-                            was_alt_screen = now_alt;
-                        } else if now_alt {
-                            // Alt screen: cursor-addressed diff
-                            let diff = screen.state_diff(&prev_screen);
-                            write_all_raw(stdout, &diff);
-                        } else {
-                            // Primary screen: raw pass-through
-                            // for natural scrollback.
-                            write_all_raw(stdout, &buf[..n]);
-                            // Re-establish scroll region in case
-                            // child output contained a reset.
-                            // Only inject when the output ends at
-                            // ground state — if we're mid-escape
-                            // sequence, our injected escapes would
-                            // corrupt the child's incomplete CSI
-                            // (causes color bleeding).
-                            //
-                            // DECSTBM (\x1b[1;Nr) moves the cursor
-                            // to home as a side effect. Restore it
-                            // via absolute CUP (\x1b[row;colH) using
-                            // the position tracked by the vt100
-                            // model — avoids DECSC/DECRC (\x1b7/\x1b8)
-                            // which on macOS terminals also saves/
-                            // restores scroll margins, undoing the
-                            // repair we just applied.
-                            if ends_at_ground_state(&buf[..n]) {
-                                let (row, col) =
-                                    parser.screen().cursor_position();
-                                set_scroll_region(stdout, content_rows);
-                                let seq =
-                                    format!("\x1b[{};{}H", row + 1, col + 1);
-                                write_all_raw(stdout, seq.as_bytes());
-                            }
-                        }
-
-                        prev_screen = screen.clone();
-                        crate::statusbar::update_terminal_state(screen);
-                        pending_redraw = true;
-                        if resize_redraw_key.is_some()
-                            && pending_resize_redraw_at.is_some()
-                        {
-                            pending_resize_redraw_at =
-                                Some(Instant::now() + RESIZE_REDRAW_DELAY);
-                        }
+                        let _ = state.handle_master_read(&buf[..n]);
                     }
                     Err(nix::errno::Errno::EINTR) => {}
-                    Err(nix::errno::Errno::EIO) => break,
-                    Err(_) => break,
+                    Err(nix::errno::Errno::EIO) => should_break = true,
+                    Err(_) => should_break = true,
                 }
             }
-            if revents.contains(PollFlags::POLLHUP)
-                || revents.contains(PollFlags::POLLERR)
+            if !should_break
+                && (revents.contains(PollFlags::POLLHUP)
+                    || revents.contains(PollFlags::POLLERR))
             {
-                loop {
-                    match nix::unistd::read(master_raw, &mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            parser.process(&buf[..n]);
-                        }
-                    }
-                }
-                let screen = parser.screen();
-                let diff = screen.state_diff(&prev_screen);
-                write_all_raw(stdout, &diff);
-                // Reset scroll region before exit
-                write_all_raw(stdout, b"\x1b[r");
-                crate::statusbar::redraw();
-                break;
+                state.drain_on_hup(&mut buf);
+                should_break = true;
             }
         }
+        if should_break {
+            break;
+        }
 
-        // Redraw status bar / inject resize key when child is quiet
+        // Status bar / resize-key flush when child is quiet.
         let child_quiet = !matches!(
             fds[1].revents(),
             Some(r) if r.contains(PollFlags::POLLIN)
         );
         if child_quiet {
-            if pending_redraw {
-                crate::statusbar::redraw();
-                pending_redraw = false;
-            }
-            if let Some(deadline) = pending_resize_redraw_at
-                && Instant::now() >= deadline
-            {
-                if let Some(key) = resize_redraw_key {
-                    write_all_raw(master_raw, key);
-                }
-                pending_resize_redraw_at = None;
-            }
+            state.flush_when_idle();
         }
 
-        // Check stdin (user input) — forward directly to PTY
+        // stdin (user input) → PTY master.
         if let Some(revents) = fds[0].revents()
             && revents.contains(PollFlags::POLLIN)
         {
             match nix::unistd::read(stdin_fd, &mut buf) {
                 Ok(0) => break,
-                Ok(n) => {
-                    write_all_raw(master_raw, &buf[..n]);
-                }
+                Ok(n) => write_all_raw(master_raw, &buf[..n]),
                 Err(nix::errno::Errno::EINTR) => {}
                 Err(_) => break,
             }
         }
     }
 
-    // Clean up: defensive terminal-mode reset. Children that crash
-    // or skip their own cleanup can leave mouse tracking, bracketed
-    // paste, alt-screen, or kitty keyboard protocol on — handing the
-    // user back a terminal where mouse movement spews escape sequences
-    // (see issue #40). Emit the full reset sequence here, then let the
-    // raw-mode guard restore termios on its Drop.
+    // Defensive terminal-mode reset (issue #40). The raw-mode guard
+    // restores termios separately on Drop.
     crate::output::terminal_reset();
 }
 
