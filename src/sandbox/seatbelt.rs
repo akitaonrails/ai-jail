@@ -578,53 +578,13 @@ fn macos_lockdown_read_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::sandbox::test_support::linked_worktree_fixture;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    struct LinkedWorktreeFixture {
-        root: PathBuf,
-        project_dir: PathBuf,
-        git_dir: PathBuf,
-        common_dir: PathBuf,
-    }
-
-    impl Drop for LinkedWorktreeFixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn create_linked_worktree_fixture() -> LinkedWorktreeFixture {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let root = std::env::temp_dir().join(format!(
-            "ai-jail-seatbelt-worktree-{}-{nonce}",
-            std::process::id()
-        ));
-        let project_dir = root.join("project");
-        let common_dir = root.join("common/.git");
-        let git_dir = common_dir.join("worktrees/wt1");
-
-        std::fs::create_dir_all(&project_dir).unwrap();
-        std::fs::create_dir_all(&git_dir).unwrap();
-        std::fs::write(
-            project_dir.join(".git"),
-            "gitdir: ../common/.git/worktrees/wt1\n",
-        )
-        .unwrap();
-        std::fs::write(git_dir.join("gitdir"), "../../../../project/.git\n")
-            .unwrap();
-        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
-
-        LinkedWorktreeFixture {
-            root,
-            project_dir,
-            git_dir,
-            common_dir,
-        }
+    fn create_linked_worktree_fixture()
+    -> crate::sandbox::test_support::LinkedWorktreeFixture {
+        linked_worktree_fixture("seatbelt-worktree")
     }
 
     #[test]

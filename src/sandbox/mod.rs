@@ -13,6 +13,9 @@ mod seccomp;
 
 pub(crate) mod rlimits;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 #[cfg(target_os = "linux")]
 pub use bwrap::SandboxGuard;
 #[cfg(target_os = "macos")]
@@ -591,18 +594,7 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    struct LinkedWorktreeFixture {
-        root: PathBuf,
-        project_dir: PathBuf,
-        git_dir: PathBuf,
-        common_dir: PathBuf,
-    }
-
-    impl Drop for LinkedWorktreeFixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
-    }
+    use super::test_support::linked_worktree_fixture;
 
     fn temp_test_dir(prefix: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -611,32 +603,6 @@ mod tests {
             .unwrap_or(0);
         std::env::temp_dir()
             .join(format!("ai-jail-{prefix}-{}-{nonce}", std::process::id()))
-    }
-
-    fn create_linked_worktree_fixture() -> LinkedWorktreeFixture {
-        let root = temp_test_dir("worktree");
-        let project_dir = root.join("project");
-        let common_dir = root.join("common/.git");
-        let git_dir = common_dir.join("worktrees/wt1");
-
-        std::fs::create_dir_all(&project_dir).unwrap();
-        std::fs::create_dir_all(&git_dir).unwrap();
-
-        std::fs::write(
-            project_dir.join(".git"),
-            "gitdir: ../common/.git/worktrees/wt1\n",
-        )
-        .unwrap();
-        std::fs::write(git_dir.join("gitdir"), "../../../../project/.git\n")
-            .unwrap();
-        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
-
-        LinkedWorktreeFixture {
-            root,
-            project_dir,
-            git_dir,
-            common_dir,
-        }
     }
 
     #[test]
@@ -934,7 +900,7 @@ mod tests {
 
     #[test]
     fn validate_linked_git_worktree_discovers_valid_layout() {
-        let fixture = create_linked_worktree_fixture();
+        let fixture = linked_worktree_fixture("worktree");
 
         let paths = validate_linked_git_worktree(&fixture.project_dir)
             .unwrap()
@@ -961,7 +927,7 @@ mod tests {
 
     #[test]
     fn validate_linked_git_worktree_rejects_mismatched_reverse_link() {
-        let fixture = create_linked_worktree_fixture();
+        let fixture = linked_worktree_fixture("worktree");
         std::fs::write(
             fixture.git_dir.join("gitdir"),
             "../../../../other/.git\n",
@@ -975,7 +941,7 @@ mod tests {
 
     #[test]
     fn discover_git_worktree_paths_respects_disabled_config() {
-        let fixture = create_linked_worktree_fixture();
+        let fixture = linked_worktree_fixture("worktree");
         let config = Config {
             no_worktree: Some(true),
             ..Config::default()
