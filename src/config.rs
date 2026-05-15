@@ -486,17 +486,17 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     if let Some(p) = cli.claude_dir.clone() {
         config.claude_dir = Some(p);
     }
-    if let Some(p) = config.claude_dir.take() {
-        config.claude_dir = Some(expand_tilde(p));
-    }
 
-    // Expand ~ / ~/ in all user-provided path fields. Config
-    // files are TOML (no shell expansion); CLI args are shell-
-    // expanded already but harmless to re-run. Only leading
+    // Expand ~ / ~/ in every user-provided path field in one pass.
+    // Config files are TOML (no shell expansion); CLI args are
+    // shell-expanded already but harmless to re-run. Only leading
     // tilde is recognized; `~user` is left alone.
     expand_tilde_vec(&mut config.rw_maps);
     expand_tilde_vec(&mut config.ro_maps);
     expand_tilde_vec(&mut config.mask);
+    if let Some(p) = config.claude_dir.take() {
+        config.claude_dir = Some(expand_tilde(p));
+    }
 
     config
 }
