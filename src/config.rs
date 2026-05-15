@@ -343,8 +343,7 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
         .unwrap_or("ai-jail");
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     let tmp_path =
         parent.join(format!(".{stem}.tmp.{}.{}", std::process::id(), nonce));
 

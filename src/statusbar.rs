@@ -131,7 +131,7 @@ fn raw_write(bytes: &[u8]) {
         let n = unsafe {
             nix::libc::write(
                 nix::libc::STDOUT_FILENO,
-                bytes[off..].as_ptr() as *const nix::libc::c_void,
+                bytes[off..].as_ptr().cast::<nix::libc::c_void>(),
                 bytes.len() - off,
             )
         };
@@ -335,7 +335,7 @@ pub fn teardown() {
     ACTIVE.store(false, Ordering::SeqCst);
     DIRTY.store(false, Ordering::SeqCst);
 
-    let rows = term_size().map(|(r, _)| r).unwrap_or(24);
+    let rows = term_size().map_or(24, |(r, _)| r);
 
     // Just clear the last row where the status bar was drawn.
     let mut buf = [0u8; 32];

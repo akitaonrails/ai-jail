@@ -365,8 +365,7 @@ fn new_hosts_file() -> Result<(PathBuf, std::fs::File), String> {
     for attempt in 0..128_u32 {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         let name =
             format!("bwrap-hosts.{}.{}.{}", std::process::id(), nonce, attempt);
         let path = tmp.join(name);
@@ -435,8 +434,7 @@ fn new_empty_file() -> Result<PathBuf, String> {
     for attempt in 0..128_u32 {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         let name = format!(
             "ai-jail-empty.{}.{}.{}",
             std::process::id(),
@@ -502,8 +500,7 @@ fn new_resolv_file() -> (Option<PathBuf>, Option<PathBuf>) {
     let tmp = std::env::temp_dir();
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     let name = format!("bwrap-resolv.{}.{}", std::process::id(), nonce);
     let path = tmp.join(name);
 

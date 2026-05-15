@@ -130,7 +130,7 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 let normalized = if s.starts_with('.') {
                     s
                 } else {
-                    format!(".{}", s)
+                    format!(".{s}")
                 };
                 args.hide_dotdirs.push(normalized);
             }
@@ -215,7 +215,7 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     let s = val.to_string_lossy();
                     match s.as_ref() {
                         "dark" | "light" | "pastel" => {
-                            args.status_bar_style = Some(s.into_owned())
+                            args.status_bar_style = Some(s.into_owned());
                         }
                         _ => {
                             return Err(format!(

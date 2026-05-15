@@ -199,7 +199,7 @@ fn apply_net_rules(config: &Config, verbose: bool) -> Result<(), String> {
 
     let result = Ruleset::default()
         .handle_access(net_access)
-        .and_then(|r| r.create())
+        .and_then(landlock::Ruleset::create)
         .and_then(|r| {
             let mut created = r;
             for &port in allowed {

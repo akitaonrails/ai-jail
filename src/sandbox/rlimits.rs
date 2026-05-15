@@ -101,8 +101,7 @@ pub fn apply_nproc(config: &Config, verbose: bool) {
         output::warn(&format!("Failed to set RLIMIT_NPROC: {e}"));
     } else if verbose {
         output::verbose(&format!(
-            "RLIMIT_NPROC: {} (hard: {})",
-            effective, effective
+            "RLIMIT_NPROC: {effective} (hard: {effective})"
         ));
     }
 }

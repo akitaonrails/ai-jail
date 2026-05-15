@@ -132,7 +132,7 @@ fn set_initial_size(fd: &OwnedFd, rows: u16, cols: u16) {
 /// Set terminal scroll region to rows 1..content_rows (1-based).
 /// Status bar lives on row content_rows+1, outside the region.
 fn set_scroll_region(fd: i32, content_rows: u16) {
-    let seq = format!("\x1b[1;{}r", content_rows);
+    let seq = format!("\x1b[1;{content_rows}r");
     write_all_raw(fd, seq.as_bytes());
 }
 
@@ -601,7 +601,7 @@ fn write_all_raw(fd: i32, data: &[u8]) {
         let n = unsafe {
             nix::libc::write(
                 fd,
-                data[off..].as_ptr() as *const nix::libc::c_void,
+                data[off..].as_ptr().cast::<nix::libc::c_void>(),
                 data.len() - off,
             )
         };

@@ -186,8 +186,7 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
         .unwrap_or("bootstrap");
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     let tmp_path =
         parent.join(format!(".{stem}.tmp.{}.{}", std::process::id(), nonce));
 
@@ -366,12 +365,11 @@ fn bootstrap_gemini(verbose: bool) -> Result<(), String> {
 // ── Claude ───────────────────────────────────────────────────────
 
 fn claude_config_path(claude_dir: Option<&Path>) -> PathBuf {
-    match claude_dir {
-        Some(dir) => dir.join("settings.json"),
-        None => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".claude").join("settings.json")
-        }
+    if let Some(dir) = claude_dir {
+        dir.join("settings.json")
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(home).join(".claude").join("settings.json")
     }
 }
 
