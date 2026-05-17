@@ -359,7 +359,7 @@ fn mise_wrapper_command(
     user_cmd: LaunchCommand,
 ) -> LaunchCommand {
     // Command argv is passed via "$@" to avoid shell interpretation of user arguments.
-    let script = "MISE=\"$1\"; shift; \"$MISE\" trust && eval \"$($MISE activate bash)\" && eval \"$($MISE env)\" && exec \"$@\"";
+    let script = "MISE=\"$1\"; shift; \"$MISE\" trust -q && eval \"$($MISE activate bash)\" && eval \"$($MISE env)\" && exec \"$@\"";
     let mut args = vec![
         "-lc".into(),
         script.into(),
