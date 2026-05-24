@@ -2,7 +2,7 @@
 
 State: ai-jail at v0.10.3 + `d8f40b6` (post-#43 docs commit). 12 603 LOC across 14 source files. 343 unit tests + 5 resize integration tests + 15 sandbox-escape integration tests on Linux.
 
-Findings sorted by **impact**, not file. Each item is a one-line action you can lift directly into a TODO. Nothing here is a release blocker — it's "what to polish if we want 1.0 to feel like 1.0."
+Findings sorted by **impact**, not file. Each item is written as a TODO. Nothing here blocks release; this is the polish list for making 1.0 feel finished.
 
 ## Tier 1 — worth doing before 1.0
 
@@ -10,7 +10,7 @@ Findings sorted by **impact**, not file. Each item is a one-line action you can 
 
 | Function | Lines | File | What to do |
 |---|---|---|---|
-| `pty::io_loop` | 277 | `src/pty.rs:178` | Split: SIGWINCH handling, master-read branch, stdin-read branch, status-bar redraw. The current single function juggles 5 mutable state machines. |
+| `pty::io_loop` | 277 | `src/pty.rs:178` | Split: SIGWINCH handling, master-read branch, stdin-read branch, status-bar redraw. The current function juggles 5 mutable state machines. |
 | `sandbox::bwrap::discover_mounts` | 178 | `src/sandbox/bwrap.rs:851` | Each `let foo_mount = if … { … }` block (ssh_agent, pictures, mask, browser_state, home_dotfiles + claude_dir, …) is a candidate for its own `fn discover_X`. |
 | `sandbox::seatbelt::generate_sbpl_profile` | 174 | `src/sandbox/seatbelt.rs:158` | Six logically distinct sections (process, IPC, network, reads, writes, atomic). Extract per-section emit helpers; the function then reads as policy structure. |
 | `config::display_status` | 130 | `src/config.rs` | Mostly `match` + `bool_opt` calls. Lift each block into a small printer helper to make the output schema obvious. |
@@ -50,7 +50,7 @@ Findings sorted by **impact**, not file. Each item is a one-line action you can 
 ### Specific micro-issues worth fixing
 
 - **`config::expand_tilde` doesn't handle `~user/`** (other-user home). The function's docstring says "leaves `~user` alone" but the behaviour is fine — just confusing to read. Either remove the comment or add a test that pins the behaviour.
-- **`statusbar.rs` redraw key parsing** (`pty::parse_resize_redraw_key`) accepts `ctrl-l`, `ctrl-shift-l`, `disabled`. The error message says "must be ctrl-X or ctrl-shift-X" but doesn't show what the user gave. Include the offending input in the error.
+- **`statusbar.rs` redraw key parsing** (`pty::parse_resize_redraw_key`) accepts `ctrl-l`, `ctrl-shift-l`, `disabled`. The error message says "must be ctrl-X or ctrl-shift-X" but doesn't show the bad value. Include it in the error.
 - **`unwrap` / `expect` count: 215 outside tests.** Most are in places where panicking is correct (e.g. string-only-ASCII assumptions in vt100 helpers). Two worth re-examining: `src/output.rs` writes to stderr with `let _ = writeln!(...)` (correct, can't do better), and the `pty::io_loop` uses `.as_raw_fd()` ifs that are infallible by construction. Not a blocker — flag for a one-evening grep pass.
 
 ### Dead code
@@ -72,4 +72,4 @@ Findings sorted by **impact**, not file. Each item is a one-line action you can 
 4. **Add the `signals.rs` and `rlimits.rs` unit tests.** ~45 min — they're the only "zero-test" surfaces left.
 5. **Lift `discover_mounts` and `generate_sbpl_profile` into smaller helpers.** ~1 h. Less urgent than `io_loop` since they're pure value-builders without IO.
 
-After that the codebase looks like a 1.0.
+After that, the codebase is ready for 1.0.

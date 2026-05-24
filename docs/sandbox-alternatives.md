@@ -16,9 +16,9 @@ ai-jail wraps AI coding agents (Claude Code, Codex, OpenCode, Crush) so they can
 
 ## Why bwrap wins
 
-bwrap runs unprivileged via `CLONE_NEWUSER`. No setuid, no root. Flatpak uses it for every sandboxed desktop app on Linux, so it gets real-world testing at scale. It's a single static binary (~50KB, ~4K lines of C), maintained by the GNOME/Flatpak team. It handles PID/UTS/IPC/net namespaces, bind mounts, tmpfs, symlinks, env control, and `--die-with-parent`. Every major distro packages it.
+bwrap runs unprivileged via `CLONE_NEWUSER`. No setuid, no root. Flatpak uses it for sandboxed desktop apps on Linux, so it is heavily exercised in the real world. It's a single static binary (~50KB, ~4K lines of C), maintained by the GNOME/Flatpak team. It handles PID/UTS/IPC/net namespaces, bind mounts, tmpfs, symlinks, env control, and `--die-with-parent`. Every major distro packages it.
 
-There isn't a serious competitor for this specific use case.
+For this use case, nothing else fits as well.
 
 ## What else we looked at
 
@@ -36,9 +36,9 @@ There isn't a serious competitor for this specific use case.
 | Custom hostname / /etc/hosts | No |
 | macOS | No |
 
-Can't replace bwrap, but would make a good second barrier. If bwrap's namespace setup ever has a bug, Landlock provides kernel-level enforcement on top. About 50 lines of Rust to add, and it degrades gracefully on older kernels. Worth doing eventually.
+It cannot replace bwrap, but it makes a good second barrier. If bwrap's namespace setup ever has a bug, Landlock still gives kernel-level enforcement. About 50 lines of Rust to add, and it degrades cleanly on older kernels. Worth doing eventually.
 
-**Birdcage** (`birdcage` crate, Phylum) -- wraps Landlock on Linux and sandbox-exec on macOS behind a unified API. The cross-platform angle is appealing, but it's designed for restricting the calling process, not for launching a child in an isolated environment with custom mounts. Doesn't fit our execution model.
+**Birdcage** (`birdcage` crate, Phylum) -- wraps Landlock on Linux and sandbox-exec on macOS behind one API. The cross-platform part is appealing, but it's designed for restricting the calling process, not for launching a child in an isolated environment with custom mounts. Doesn't fit our execution model.
 
 | Capability | Support |
 |---|---|
@@ -55,13 +55,13 @@ Can't replace bwrap, but would make a good second barrier. If bwrap's namespace 
 
 Pros: no external binary, single-binary distribution, full control.
 
-Cons: bwrap handles a lot of edge cases -- UID/GID mapping via `/proc/PID/uid_map`, capability bounding sets, `PR_SET_NO_NEW_PRIVS`, mount propagation flags, cleanup on signal. That's 500+ lines of security-critical code we'd have to maintain ourselves, test across kernel versions and distros, and keep patched. bwrap gets upstream security fixes; ours wouldn't. And the bwrap binary is ~50KB, so the dependency cost is basically nothing.
+Cons: bwrap handles a lot of edge cases -- UID/GID mapping via `/proc/PID/uid_map`, capability bounding sets, `PR_SET_NO_NEW_PRIVS`, mount propagation flags, cleanup on signal. That's 500+ lines of security-sensitive code we'd have to maintain, test across kernel versions and distros, and patch ourselves. bwrap gets upstream security fixes; ours would not. The bwrap binary is ~50KB, so the dependency cost is basically nothing.
 
 Not worth it unless we specifically need to ship a single static binary with zero external deps.
 
 ### External tools
 
-**Firejail** -- has all the capabilities we need, but it's a setuid root binary. Bigger attack surface by design. Multiple CVEs tied to the setuid approach (CVE-2022-31214, etc.). bwrap's unprivileged `CLONE_NEWUSER` model is architecturally safer. Rejected.
+**Firejail** -- has all the capabilities we need, but it's a setuid root binary. Bigger attack surface by design. Multiple CVEs are tied to that approach (CVE-2022-31214, etc.). bwrap's unprivileged `CLONE_NEWUSER` model is safer for this project. Rejected.
 
 **nsjail** (Google) -- capable, but config-file driven (protobuf), designed for server workloads and CTF infrastructure. Overkill for wrapping a CLI process. Less widely packaged.
 
@@ -77,7 +77,7 @@ We use bwrap on Linux and sandbox-exec on macOS.
 
 sandbox-exec is deprecated Apple API, but nothing better exists on macOS without kernel extensions. It works.
 
-If we add anything, it should be Landlock as a defense-in-depth layer: apply restrictions after fork, before exec, limiting the child to only the paths bwrap bind-mounts. Second kernel-enforced barrier, ~50 lines of Rust, degrades gracefully on kernels < 5.13.
+If we add anything, it should be Landlock as a second layer: apply restrictions after fork, before exec, limiting the child to only the paths bwrap bind-mounts. That gives a kernel-enforced barrier in ~50 lines of Rust and degrades cleanly on kernels < 5.13.
 
 ## References
 

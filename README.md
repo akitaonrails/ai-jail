@@ -1,6 +1,6 @@
 # ai-jail
 
-A sandbox wrapper for AI coding agents (Linux: `bwrap`, macOS: `sandbox-exec`). Isolates tools like Claude Code, GPT Codex, OpenCode, and Crush so they can only access what you explicitly allow.
+A sandbox wrapper for AI coding agents (Linux: `bwrap`, macOS: `sandbox-exec`). Run Claude Code, GPT Codex, OpenCode, Crush, and similar tools with access only to the paths you allow.
 
 ## Install
 
@@ -106,11 +106,11 @@ ai-jail bash
 ai-jail --dry-run claude
 ```
 
-On first run, `ai-jail` creates a `.ai-jail` config file in the current directory by default. Subsequent runs reuse that config. Commit `.ai-jail` to your repo so the sandbox settings follow the project. Use `--no-save-config` for ephemeral runs without creating or updating the project config.
+On first run, `ai-jail` creates a `.ai-jail` config file in the current directory by default. Later runs reuse it. Commit `.ai-jail` to your repo if the sandbox policy belongs to the project. Use `--no-save-config` for one-off runs that should not create or update config.
 
 If you run `ai-jail` from a linked Git worktree, it auto-detects the worktree's external Git admin directories and exposes them safely inside the sandbox so `git status`, `git commit`, and similar commands keep working. Disable this with `--no-worktree` or `no_worktree = true`.
 
-> ⚠️ **The agent can only persist writes to your current project directory.** Everything else inside the sandbox (parent directories, sibling directories, `$HOME`, `/tmp`) lives in a tmpfs and is wiped when ai-jail exits. If you ask the agent to create files outside the project — for example a sibling scaffold folder, a clone in your home, or anything under `~/.cache` — those writes go to RAM and disappear on exit. Push to a remote, copy back into the project dir, or expose extra writable paths with `--rw-map ~/path` before relying on them. The agent has no way to detect this from inside the sandbox; it sees a fully-writable filesystem.
+> ⚠️ **Only the current project directory is persistent by default.** Parent directories, sibling directories, `$HOME`, and `/tmp` live in tmpfs and are wiped when ai-jail exits. If the agent creates a sibling scaffold, clones into your home directory, or writes under `~/.cache`, that work disappears unless you push it, copy it back into the project, or expose the path with `--rw-map ~/path`. The agent cannot tell from inside the sandbox; the filesystem looks writable.
 
 ## Security notes
 
@@ -147,7 +147,7 @@ ai-jail --private-home --rw-map ~/Downloads/test-data bash
 
 ### Defense-in-depth layers (Linux)
 
-ai-jail applies multiple overlapping security layers:
+ai-jail uses several security layers:
 
 - **Namespace isolation** (bwrap): PID, UTS, IPC, mount namespaces. Network namespace in lockdown.
 - **Landlock LSM** (V3 filesystem + V4 network): VFS-level access control independent of mount namespaces.
@@ -155,7 +155,7 @@ ai-jail applies multiple overlapping security layers:
 - **Resource limits**: RLIMIT_NPROC (4096/1024 lockdown), RLIMIT_NOFILE (65536/4096 lockdown), RLIMIT_CORE=0. Prevents fork bombs and limits resource abuse.
 - **Sensitive /sys masking**: tmpfs overlays hide `/sys/firmware`, `/sys/kernel/security`, `/sys/kernel/debug`, `/sys/fs/fuse`. Lockdown also masks `/sys/module`, `/sys/devices/virtual/dmi`, `/sys/class/net`.
 
-Each layer can be individually disabled (`--no-seccomp`, `--no-rlimits`, `--no-landlock`) if it causes issues.
+You can disable individual layers (`--no-seccomp`, `--no-rlimits`, `--no-landlock`) if a tool needs it.
 
 For hostile/untrusted workloads, use `--lockdown` (see below).
 
@@ -166,7 +166,7 @@ ai-jail is a thin wrapper around OS-level sandboxing, so its security properties
 - `bwrap` (Linux): namespace + mount sandboxing in userspace, plus Landlock LSM for VFS-level access control (Linux 5.13+).
 - `sandbox-exec` / seatbelt (macOS): legacy policy interface to Apple sandbox rules.
 
-Some things to keep in mind:
+Keep these limits in mind:
 
 - All backends depend on host kernel correctness. Kernel escapes are out of scope.
 - These are process sandboxes, not hardware isolation. A VM runs a separate kernel and gives a stronger boundary.
@@ -174,7 +174,7 @@ Some things to keep in mind:
 - Linux and macOS primitives are not equivalent; cross-platform policy parity is approximate.
 - `sandbox-exec` on macOS is a deprecated interface. It works today but Apple could remove it.
 
-If you need full isolation against unknown malware, use a disposable VM and treat ai-jail as one layer, not the whole story.
+If you are dealing with unknown malware, use a disposable VM. Treat ai-jail as one layer, not the whole boundary.
 
 ## Lockdown mode
 
@@ -200,7 +200,7 @@ Persistence: `--lockdown` alone doesn't write `.ai-jail` (keeps runs ephemeral).
 
 ## Browser profiles
 
-ai-jail can run browsers in a separate locked-down browser profile. Browser commands are auto-detected for Chromium, Chrome, Brave, Firefox, and LibreWolf, or you can opt in explicitly:
+ai-jail can run browsers in an isolated browser profile. Browser commands are auto-detected for Chromium, Chrome, Brave, Firefox, and LibreWolf, or you can opt in explicitly:
 
 ```bash
 ai-jail chromium              # auto: hard browser profile
@@ -209,7 +209,7 @@ ai-jail --browser=soft firefox
 ai-jail --no-browser chromium # disable browser auto-profile
 ```
 
-Both browser profiles avoid the real host browser profiles. They use a private `$HOME`, keep the project mounted read-only, skip SSH keys, Docker, linked worktree metadata, extra maps, mise, config auto-save, and the terminal status bar. Display and network stay enabled so the browser can actually open and navigate sites.
+Both browser profiles avoid your real host browser profiles. They use a private `$HOME`, mount the project read-only, and skip SSH keys, Docker, linked worktree metadata, extra maps, mise, config auto-save, and the terminal status bar. Display and network stay enabled so the browser can open and navigate sites.
 
 - **Hard profile** (`--browser` / `--browser=hard`): all browser config, cache, history, cookies, extension state, and sessions live under sandbox tmpfs paths and disappear when the browser exits.
 - **Soft profile** (`--browser=soft`): browser state survives only under `~/.local/share/ai-jail/browsers/<browser>`, so future ai-jail browser sessions can keep logins and history without touching `~/.config/chromium`, `~/.mozilla`, or other real browser profiles.
@@ -218,11 +218,11 @@ Chromium-family browsers run with Chromium's internal sandbox disabled inside ai
 
 Expected Chromium terminal noise: D-Bus, systemd, UPower, Google Cloud Messaging, and EGL/WebGPU warnings can appear because browser profiles deliberately do not expose the host system bus or full desktop session. These messages are usually harmless if the browser window works. `--gpu` may add EGL/WebGPU capability warnings; omit `--gpu` for the quieter default software path.
 
-This is useful for testing suspect extensions or websites without giving them read-write access to your normal home directory or browser profile. It is not an anonymity feature: the browser still has network access, sites can fingerprint it, and anything you log into can identify you.
+This is meant for testing suspect extensions or websites without giving them read-write access to your normal home directory or browser profile. It is not anonymity: the browser still has network access, sites can fingerprint it, and anything you log into can identify you.
 
 ### Desktop launcher
 
-Linux desktop environments can launch Chromium through ai-jail with a normal `.desktop` file. A ready-to-copy example lives at `dist/desktop/ai-jail-chromium.desktop`:
+Linux desktops can launch Chromium through ai-jail with a normal `.desktop` file. The repo includes a copyable example at `dist/desktop/ai-jail-chromium.desktop`:
 
 ```ini
 [Desktop Entry]
@@ -256,9 +256,9 @@ desktop-file-edit --set-key=Exec \
 update-desktop-database ~/.local/share/applications
 ```
 
-The wrapper adds `~/.local/share/mise/shims` to `PATH`, so it works when ai-jail is installed through mise and the desktop launcher does not inherit your interactive shell environment. It also launches from `~/.local/share/ai-jail/browser-launcher-cwd` so ai-jail does not treat your whole home directory as the browser's project directory.
+The wrapper adds `~/.local/share/mise/shims` to `PATH`, so mise-installed ai-jail works even when the launcher does not inherit your shell environment. It also launches from `~/.local/share/ai-jail/browser-launcher-cwd`; otherwise ai-jail may treat your whole home directory as the browser's project.
 
-Change the wrapper command to `exec ai-jail --browser=hard chromium "$@"` if you want every desktop-launched Chromium session to be throwaway. If your launcher caches applications, restart it after installing; on Omarchy/Walker, run `omarchy-restart-walker` or log out and back in.
+Change the wrapper command to `exec ai-jail --browser=hard chromium "$@"` if desktop-launched Chromium should always be throwaway. If your launcher caches applications, restart it after installing; on Omarchy/Walker, run `omarchy-restart-walker` or log out and back in.
 
 ## What gets sandboxed
 
@@ -317,7 +317,7 @@ PID, UTS, and IPC namespaces are isolated. Hostname inside is `ai-sandbox`. The 
 
 ### Landlock LSM (Linux)
 
-On Linux 5.13+, ai-jail applies [Landlock](https://landlock.io/) restrictions as defense-in-depth on top of bwrap. Landlock controls what the process can do at the VFS level, independent of mount namespaces. This closes attack vectors that bwrap alone doesn't cover: `/proc` escape routes, symlink tricks within allowed mounts, and acts as insurance against namespace bugs.
+On Linux 5.13+, ai-jail applies [Landlock](https://landlock.io/) restrictions on top of bwrap. Landlock controls filesystem access at the VFS level, independent of mount namespaces. It narrows damage from `/proc` escape routes, symlink tricks inside allowed mounts, and namespace bugs.
 
 - Uses ABI V3 (Linux 6.2+) for filesystem rules with best-effort degradation to V1 on 5.13+ or no-op on older kernels.
 - On Linux 6.5+, a second V4 ruleset adds network restrictions: lockdown mode denies all TCP bind/connect (defense-in-depth alongside `--unshare-net`).
@@ -334,9 +334,9 @@ ai-jail -s claude          # dark theme
 ai-jail -s=light claude    # light theme
 ```
 
-The bar shows the project path, running command, ai-jail version, and a green `↑` when an update is available. It uses a PTY proxy to keep the bar visible even when the child application resets the screen. The preference is stored in `$HOME/.ai-jail` and persists across sessions.
+The bar shows the project path, running command, ai-jail version, and a green `↑` when an update is available. It uses a PTY proxy so it can stay visible even when the child application resets the screen. The preference is stored in `$HOME/.ai-jail` and persists across sessions.
 
-**Why it exists**: when you run several AI CLI agents in parallel (one per terminal window / split), it's easy to lose track of which window is bound to which project. The status bar keeps the project path and the running command visible at all times so you can't accidentally paste the wrong context into the wrong agent.
+**Why it exists**: when you run several AI CLI agents in parallel, one per terminal window or split, it's easy to lose track of which window belongs to which project. The status bar keeps the project path and command visible so you don't paste the wrong context into the wrong agent.
 
 **Auto-disabled inside tmux and zellij.** Those tools already render a persistent status line and already own the terminal; ai-jail's PTY proxy is redundant and causes conflicts (nested PTYs, resize flicker, lost keyboard-protocol sequences, no Secure Input propagation). When ai-jail detects `$TMUX` or `$ZELLIJ` in the environment it silently skips the status bar and takes the direct-spawn path, letting the multiplexer drive the terminal. To force the ai-jail bar on anyway, pass `-s` explicitly or set `no_status_bar = false` in `~/.ai-jail`.
 
@@ -407,7 +407,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--clean` | Ignore existing config, start fresh |
 | `--dry-run` | Print the bwrap command without executing |
 | `--init` | Create/update config and exit (don't run) |
-| `--bootstrap` | Generate smart permission configs for AI tools |
+| `--bootstrap` | Generate permission configs for AI tools |
 | `-v`, `--verbose` | Show detailed mount decisions |
 | `-h`, `--help` | Show help |
 | `-V`, `--version` | Show version |

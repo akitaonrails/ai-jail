@@ -1,13 +1,13 @@
 # 1.0 audit execution plan
 
-Goal: ship every Tier 1 + Tier 2 item from `AUDIT_1.0.md` without breaking any of the 363 existing tests, and without altering any user-observable behavior. Tier 3 items stay un-done (they're the "explicitly skip" list — async rewrite, typed error enum, separate test crate).
+Goal: ship every Tier 1 + Tier 2 item from `AUDIT_1.0.md` without breaking any of the 363 existing tests or changing user-visible behavior. Tier 3 items stay undone: async rewrite, typed error enum, separate test crate.
 
 ## Operating rules
 
-1. **Refactor only.** No new features, no CLI/config schema changes, no test removals. Tests are added; existing tests stay green.
+1. **Refactor only.** No new features, no CLI/config schema changes, no test removals. Add tests where needed; keep existing tests green.
 2. **Atomic commits.** Each step is one commit on master with the full `cargo fmt --check && cargo clippy -- -D warnings && cargo test` suite green. If something goes wrong it's bisectable.
-3. **Stop and report at the end of each phase**, not each commit, so you can sanity-check progress without micro-management.
-4. **No version bump** until the audit is finished, then a single `1.0.0` tag at the end.
+3. **Stop and report at the end of each phase**, not each commit, so review happens in useful chunks.
+4. **No version bump** until the audit is finished. Then make one `1.0.0` tag.
 5. If a step turns out to be riskier than the audit predicted, bail and document why in the commit message — don't force a refactor that obscures the original logic.
 
 ## Phase 1 — boilerplate reduction (safest, biggest LOC win)
@@ -23,11 +23,11 @@ Six small commits. None of them change observable behavior; all of them are caug
 | 5 | Lift `LinkedWorktreeFixture` into a shared `tests` submodule in `sandbox/mod.rs` | `src/sandbox/mod.rs`, `seatbelt.rs`, `landlock.rs`, `bwrap.rs` | −60 |
 | 6 | Run all PathBuf fields through `expand_tilde` in one pass in `config::merge` | `src/config.rs` | −5 |
 
-Expected: ~145 LOC removed, zero behavior change. Each commit ends with full suite green.
+Expected: ~145 LOC removed, no behavior change. Each commit ends with the full suite green.
 
 ## Phase 2 — long-function splits (more delicate)
 
-These are pure rearrangements of existing logic. Each split keeps the exact same control flow; only the function boundary moves. Reviewed visually after each split.
+These are rearrangements of existing logic. Each split keeps the same control flow; only function boundaries move. Review visually after each split.
 
 | # | Commit | Function | Approach |
 |---|---|---|---|
@@ -61,7 +61,7 @@ One commit, mechanical. Clippy `-W clippy::pedantic -W clippy::nursery` is the s
 - 4 `format!` append to `String` → `write!`
 - 6 lossy/sign-changing `as` casts → audit each; convert via `From`/`try_into` where safe, leave with a `// SAFETY:` comment where intentional
 
-After this, run `cargo clippy -- -W clippy::pedantic` and see how close we get to zero pedantic warnings. Some (e.g. `module_name_repetitions`) are configured-off; that's fine.
+After this, run `cargo clippy -- -W clippy::pedantic` and see how close we get to zero pedantic warnings. Some warnings, such as `module_name_repetitions`, can stay configured off.
 
 ## Phase 5 — final check before tag
 
@@ -87,7 +87,7 @@ Conservatively, working sequentially with full test cycles between commits:
 | 5 — release | 1 | 15 min |
 | **total** | **17 commits** | **~5 h** |
 
-I'd suggest I run this end-to-end in the background, reporting at the end of each phase (4 reports + a final tag-ready summary). At any phase boundary you can review the master diff and ask me to stop or redo something.
+Suggested workflow: run this end-to-end and report at the end of each phase (4 reports + a final tag-ready summary). At any phase boundary, review the master diff and stop or redo if needed.
 
 ## What I'm explicitly *not* doing
 

@@ -1,14 +1,14 @@
 # 1.0 pre-release security audit
 
-**Scope**: 16 refactor commits between `91e3ce0` (planning-doc commit) and current `HEAD` (the post-Phase-4 state). All commits were intended to be behavior-preserving — same bwrap args, same SBPL profile, same Landlock ruleset, same signal handling, same seccomp filter. This audit verifies that.
+**Scope**: 16 refactor commits between `91e3ce0` (planning-doc commit) and current `HEAD` (the post-Phase-4 state). All commits were meant to preserve behavior: same bwrap args, same SBPL profile, same Landlock ruleset, same signal handling, same seccomp filter. This audit checks that.
 
-**Result: Cleared for 1.0 tag.** No security regressions detected. Surfaces below were re-read against `git diff 91e3ce0..HEAD` and current HEAD.
+**Result: cleared for the 1.0 tag.** No security regressions found. The areas below were checked against `git diff 91e3ce0..HEAD` and current HEAD.
 
 ## A. Confirmed clean
 
-1. **bwrap argument ordering** (`src/sandbox/bwrap.rs`). The `discover_*` helper extractions preserve mount order and type. `discover_mask_mounts` dedup logic against the user list is unchanged. SSH agent socket forwarding stays gated by `lockdown || browser_mode || !config.ssh_enabled()`. `claude_dir` mount is only appended in `discover_home_dotfiles_full` when `!lockdown && path_exists()`. No user-controlled strings escape their argv slot.
+1. **bwrap argument ordering** (`src/sandbox/bwrap.rs`). The `discover_*` helper extractions preserve mount order and type. `discover_mask_mounts` dedup logic against the user list is unchanged. SSH agent socket forwarding stays gated by `lockdown || browser_mode || !config.ssh_enabled()`. `claude_dir` mounts only in `discover_home_dotfiles_full` when `!lockdown && path_exists()`. No user-controlled strings escape their argv slot.
 
-2. **SBPL profile output** (`src/sandbox/seatbelt.rs`). Section order preserved: static → network → read → write → docker. `push_path_rule` consolidates four identical open-coded subpath/literal selectors into one helper without changing the logic. The double-escaping in `sbpl_regex_escape` is preserved: regex metacharacters get a single backslash, which then goes through `push_sbpl_escaped` which escapes the backslash again. The atomic-write regex `^...(\.tmp\.[0-9]+\.[0-9a-f]+|\.lock)$` is byte-identical to the pre-refactor version.
+2. **SBPL profile output** (`src/sandbox/seatbelt.rs`). Section order is preserved: static → network → read → write → docker. `push_path_rule` consolidates four identical open-coded subpath/literal selectors into one helper without changing the logic. The double-escaping in `sbpl_regex_escape` is preserved: regex metacharacters get a single backslash, then `push_sbpl_escaped` escapes that backslash again. The atomic-write regex `^...(\.tmp\.[0-9]+\.[0-9a-f]+|\.lock)$` is byte-identical to the pre-refactor version.
 
 3. **Landlock ruleset** (`src/sandbox/landlock.rs`). Only change is a clippy cast-style fix; no guard logic, port handling, or ABI version touched.
 
@@ -18,7 +18,7 @@
 
 6. **Signal handlers** (`src/signals.rs`). `forward_signal` remains `extern "C"` and async-signal-safe — only atomic loads/stores and one `libc::kill` call. All test additions are `#[cfg(test)]`-gated. The new `take_sigwinch_pending_for_test` is also `#[cfg(test)]`-only.
 
-7. **Test additions**. No `#[ignore]` directives. The `test_support` module is `#[cfg(test)]`-gated at the parent `mod.rs`. The `apply_nproc_pins_hard_equal_to_soft` test does mutate the test binary's RLIMIT_NPROC permanently, but it's documented in-comment and 4096 is plenty of headroom for the rest of the suite.
+7. **Test additions**. No `#[ignore]` directives. The `test_support` module is `#[cfg(test)]`-gated at the parent `mod.rs`. The `apply_nproc_pins_hard_equal_to_soft` test does mutate the test binary's RLIMIT_NPROC permanently, but the comment says so and 4096 leaves enough headroom for the rest of the suite.
 
 8. **No secret leakage**. The new `test_support` module only uses `SystemTime`, `temp_dir`, and `process::id` to generate fixture paths — no env-var logging, no credential exposure, no SSH socket details beyond what was logged before. All fixtures live under `/tmp` and clean up on drop.
 
@@ -34,7 +34,7 @@ The three highest-risk changes were audited specifically:
 
 ## C. Hardening opportunities
 
-None worth taking before 1.0. Both candidates I noticed are nice-to-haves:
+None worth taking before 1.0. Two small follow-ups can wait:
 
 - `test_support::linked_worktree_fixture` could grow a `with_files()` builder if more git-layout variants get tested in future. For now, one fixture shape is enough.
 - The `signals::forward_signal_with_zero_child_pid_is_noop` test pins the zero-PID guard but not the SIGTERM-forwarded-to-stored-PID case. The latter needs a recordable mock or a fork-based test harness; integration tests already cover it indirectly.
@@ -43,4 +43,4 @@ None worth taking before 1.0. Both candidates I noticed are nice-to-haves:
 
 **Cleared for 1.0 tag.**
 
-The 16 commits between `91e3ce0` and HEAD are behaviour-preserving refactors plus four test additions. The audited security surfaces (bwrap, SBPL, Landlock, CLI translation, PTY state machine, signal handler, RLIMIT pinning, test isolation) are functionally identical to their pre-refactor counterparts. Proceed to Phase 5.
+The 16 commits between `91e3ce0` and HEAD are behavior-preserving refactors plus four test additions. The audited surfaces (bwrap, SBPL, Landlock, CLI translation, PTY state machine, signal handler, RLIMIT pinning, test isolation) match their pre-refactor behavior. Proceed to Phase 5.
