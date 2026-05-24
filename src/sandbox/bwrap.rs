@@ -149,8 +149,7 @@ impl MountSet {
             args.extend([
                 "--setenv".into(),
                 "PATH".into(),
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-                    .into(),
+                super::LOCKDOWN_PATH.into(),
             ]);
             args.extend([
                 "--setenv".into(),
@@ -160,9 +159,7 @@ impl MountSet {
             // Pass through terminal-related env vars so child
             // programs can detect capabilities (truecolor, kitty
             // keyboard protocol, etc.).
-            for var in
-                ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"]
-            {
+            for &var in super::TERM_ENV_VARS {
                 if let Ok(val) = std::env::var(var) {
                     args.extend(["--setenv".into(), var.into(), val]);
                 }
@@ -194,7 +191,7 @@ impl MountSet {
         args.extend([
             "--setenv".into(),
             "PS1".into(),
-            "(jail) \\w \\$ ".into(),
+            super::JAIL_PS1.into(),
             "--setenv".into(),
             "_ZO_DOCTOR".into(),
             "0".into(),
@@ -778,24 +775,13 @@ fn build_dry_run_args(
     Ok(args)
 }
 
-fn quote_arg(arg: &str) -> String {
-    if arg.is_empty()
-        || arg.contains(|c: char| {
-            c.is_whitespace() || "'\"\\$`(){}[]|&;<>*!?".contains(c)
-        })
-    {
-        return format!("'{}'", arg.replace('\'', "'\\''"));
-    }
-    arg.to_string()
-}
-
 fn format_dry_run_args(args: &[String]) -> String {
     if args.is_empty() {
         return String::new();
     }
 
     let mut out = String::new();
-    out.push_str(&quote_arg(&args[0]));
+    out.push_str(&super::quote_shell_arg(&args[0]));
     out.push_str(" \\\n");
 
     let mut i = 1;
@@ -808,7 +794,7 @@ fn format_dry_run_args(args: &[String]) -> String {
                 if idx > i + 1 {
                     out.push(' ');
                 }
-                out.push_str(&quote_arg(val));
+                out.push_str(&super::quote_shell_arg(val));
             }
             out.push('\n');
             break;
@@ -823,7 +809,7 @@ fn format_dry_run_args(args: &[String]) -> String {
                 && args[j] != "--"
             {
                 out.push(' ');
-                out.push_str(&quote_arg(&args[j]));
+                out.push_str(&super::quote_shell_arg(&args[j]));
                 j += 1;
             }
             out.push_str(" \\\n");
@@ -836,7 +822,7 @@ fn format_dry_run_args(args: &[String]) -> String {
             if idx > i {
                 out.push(' ');
             }
-            out.push_str(&quote_arg(val));
+            out.push_str(&super::quote_shell_arg(val));
         }
         out.push('\n');
         break;
@@ -1555,14 +1541,12 @@ fn project_mount(project_dir: &Path, readonly: bool) -> Vec<Mount> {
 mod tests {
     use super::*;
     use crate::sandbox::test_support::linked_worktree_fixture;
+    use crate::test_utils::{ENV_LOCK, EnvVarGuard};
 
     fn create_linked_worktree_fixture()
     -> crate::sandbox::test_support::LinkedWorktreeFixture {
         linked_worktree_fixture("bwrap-worktree")
     }
-
-    // Tests that mutate process-global env vars must hold this lock.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn minimal_test_config() -> Config {
         Config {
@@ -1752,14 +1736,11 @@ mod tests {
     #[test]
     fn browser_soft_profile_emits_persistent_state_mount() {
         let _env = ENV_LOCK.lock().unwrap();
-        let saved_home = std::env::var_os("HOME");
         let fake_home = std::env::temp_dir()
             .join(format!("ai-jail-browser-soft-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
-        unsafe {
-            std::env::set_var("HOME", &fake_home);
-        }
+        let _home = EnvVarGuard::set("HOME", fake_home.as_os_str());
 
         let config = Config {
             command: vec!["chromium".into()],
@@ -1787,13 +1768,6 @@ mod tests {
             "soft profile should pre-create the state dir on disk"
         );
 
-        unsafe {
-            if let Some(v) = saved_home {
-                std::env::set_var("HOME", v);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
@@ -1802,14 +1776,11 @@ mod tests {
     #[test]
     fn browser_hard_profile_emits_no_persistent_state_mount() {
         let _env = ENV_LOCK.lock().unwrap();
-        let saved_home = std::env::var_os("HOME");
         let fake_home = std::env::temp_dir()
             .join(format!("ai-jail-browser-hard-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
-        unsafe {
-            std::env::set_var("HOME", &fake_home);
-        }
+        let _home = EnvVarGuard::set("HOME", fake_home.as_os_str());
 
         let config = Config {
             command: vec!["chromium".into()],
@@ -1826,13 +1797,6 @@ mod tests {
             "hard profile must not emit any persistent state mount: {mounts:?}"
         );
 
-        unsafe {
-            if let Some(v) = saved_home {
-                std::env::set_var("HOME", v);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
         let _ = std::fs::remove_dir_all(&fake_home);
     }
 
@@ -2031,7 +1995,6 @@ mod tests {
     #[test]
     fn private_home_hides_host_dotdirs_but_keeps_normal_mounts() {
         let _env = ENV_LOCK.lock().unwrap();
-        let saved_home = std::env::var_os("HOME");
         let home = std::env::temp_dir()
             .join(format!("ai-jail-private-home-{}", std::process::id()));
         let extra = home.join("extra");
@@ -2040,7 +2003,7 @@ mod tests {
         let _ = std::fs::create_dir_all(home.join(".cache"));
         let _ = std::fs::create_dir_all(&extra);
         let _ = std::fs::create_dir_all(&project);
-        unsafe { std::env::set_var("HOME", &home) };
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
 
         let mut config = minimal_test_config();
         config.private_home = Some(true);
@@ -2075,24 +2038,16 @@ mod tests {
         }));
         assert!(!args.contains(&"--unshare-net".to_string()));
 
-        unsafe {
-            if let Some(value) = saved_home {
-                std::env::set_var("HOME", value);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn browser_soft_profile_mounts_only_ai_jail_browser_state() {
         let _env = ENV_LOCK.lock().unwrap();
-        let saved_home = std::env::var_os("HOME");
         let home = std::env::temp_dir()
             .join(format!("ai-jail-browser-home-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&home);
-        unsafe { std::env::set_var("HOME", &home) };
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
 
         let mut config = minimal_test_config();
         config.command = vec!["chromium".into()];
@@ -2119,13 +2074,6 @@ mod tests {
                 && w[2] == state.display().to_string()
         }));
 
-        unsafe {
-            if let Some(value) = saved_home {
-                std::env::set_var("HOME", value);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2606,9 +2554,8 @@ mod tests {
         let bwrap = tmp.join("bwrap");
         std::fs::write(&bwrap, b"#!/bin/sh\n").unwrap();
 
-        unsafe { std::env::set_var(BWRAP_ENV_VAR, &bwrap) };
+        let _bwrap_bin = EnvVarGuard::set(BWRAP_ENV_VAR, bwrap.as_os_str());
         let selected = bwrap_program_for_exec();
-        unsafe { std::env::remove_var(BWRAP_ENV_VAR) };
 
         assert_eq!(selected, bwrap);
         let _ = std::fs::remove_file(&bwrap);
@@ -2618,11 +2565,9 @@ mod tests {
     #[test]
     fn bwrap_bin_env_override_invalid_path_falls_back() {
         let _env = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var(BWRAP_ENV_VAR, "/definitely/not/a/real/bwrap")
-        };
+        let _bwrap_bin =
+            EnvVarGuard::set(BWRAP_ENV_VAR, "/definitely/not/a/real/bwrap");
         let selected = bwrap_program_for_exec();
-        unsafe { std::env::remove_var(BWRAP_ENV_VAR) };
 
         assert!(selected.is_absolute());
         assert_eq!(

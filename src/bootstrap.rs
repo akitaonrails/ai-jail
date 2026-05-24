@@ -1,6 +1,5 @@
 use crate::output;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 // ── Permission lists (shared philosophy) ─────────────────────────
@@ -147,85 +146,15 @@ pub fn run(verbose: bool, claude_dir: Option<&Path>) -> Result<(), String> {
 // ── Safe file helpers ─────────────────────────────────────────────
 
 fn ensure_regular_file_or_absent(path: &Path) -> Result<(), String> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) => {
-            let ft = meta.file_type();
-            if ft.is_symlink() {
-                return Err(format!(
-                    "{} is a symlink — refusing to write",
-                    path.display()
-                ));
-            }
-            if !ft.is_file() {
-                return Err(format!(
-                    "{} exists but is not a regular file",
-                    path.display()
-                ));
-            }
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("Cannot stat {}: {e}", path.display())),
-    }
+    crate::fsutil::ensure_regular_file_or_absent(path)
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if let Err(e) = fs::create_dir_all(parent) {
-        return Err(format!(
-            "Cannot create directory {}: {e}",
-            parent.display()
-        ));
-    }
-
-    let stem = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("bootstrap");
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let tmp_path =
-        parent.join(format!(".{stem}.tmp.{}.{}", std::process::id(), nonce));
-
-    let mut f = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp_path)
-        .map_err(|e| {
-            format!("Failed to create temp file {}: {e}", tmp_path.display())
-        })?;
-
-    if let Err(e) = f.write_all(contents.as_bytes()) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e.to_string());
-    }
-    if let Err(e) = f.sync_all() {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e.to_string());
-    }
-    drop(f);
-
-    fs::rename(&tmp_path, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp_path);
-        format!("Failed to rename temp file to {}: {e}", path.display())
-    })
+    crate::fsutil::write_atomic(path, contents, true, "bootstrap")
 }
 
 fn backup_file(path: &Path) -> Result<bool, String> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    ensure_regular_file_or_absent(path)?;
-    let mut bak = path.as_os_str().to_owned();
-    bak.push(".bak");
-    let bak_path = PathBuf::from(bak);
-    ensure_regular_file_or_absent(&bak_path)?;
-    fs::copy(path, &bak_path)
-        .map_err(|e| format!("Failed to backup {}: {e}", path.display()))?;
-    Ok(true)
+    crate::fsutil::backup_file(path)
 }
 
 // ── Gemini ───────────────────────────────────────────────────────
@@ -612,9 +541,9 @@ mod tests {
     use std::env;
     use std::fs;
 
+    use crate::test_utils::{ENV_LOCK, EnvVarGuard};
     use std::sync::atomic::{AtomicU32, Ordering};
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_dir() -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -963,9 +892,8 @@ sandbox_mode = "full"
     #[test]
     fn claude_config_path_defaults_to_dot_claude() {
         let _env = ENV_LOCK.lock().unwrap();
-        unsafe { env::set_var("HOME", "/home/testuser") };
+        let _home = EnvVarGuard::set("HOME", "/home/testuser");
         let path = claude_config_path(None);
         assert_eq!(path, PathBuf::from("/home/testuser/.claude/settings.json"));
-        unsafe { env::remove_var("HOME") };
     }
 }

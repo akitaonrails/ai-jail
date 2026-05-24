@@ -1,8 +1,6 @@
 use crate::cli::CliArgs;
 use crate::output;
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const CONFIG_FILE: &str = ".ai-jail";
@@ -32,53 +30,53 @@ pub fn parse_browser_profile_spec(value: &str) -> Option<BrowserProfile> {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rw_maps: Vec<PathBuf>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ro_maps: Vec<PathBuf>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hide_dotdirs: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mask: Vec<PathBuf>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_gpu: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_docker: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_display: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_worktree: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_mise: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_save_config: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_hide_config: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pictures: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_profile: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_home: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lockdown: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_landlock: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_status_bar: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_bar_style: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resize_redraw_key: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_seccomp: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_rlimits: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_tcp_ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_dir: Option<PathBuf>,
@@ -109,6 +107,7 @@ impl Config {
     /// Whether to automatically mask the project's `.ai-jail` file
     /// from the sandbox (default on). Opt-out via `--no-hide-config`
     /// or `no_hide_config = true` in the config file.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn hide_config_enabled(&self) -> bool {
         self.no_hide_config != Some(true)
     }
@@ -132,6 +131,7 @@ impl Config {
     pub fn private_home_enabled(&self) -> bool {
         self.private_home == Some(true)
     }
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn landlock_enabled(&self) -> bool {
         self.no_landlock != Some(true)
     }
@@ -145,6 +145,7 @@ impl Config {
             _ => "pastel",
         }
     }
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn seccomp_enabled(&self) -> bool {
         self.no_seccomp != Some(true)
     }
@@ -317,56 +318,11 @@ fn save_to_path(path: &Path, config: &Config) {
 }
 
 fn ensure_regular_target_or_absent(path: &Path) -> Result<(), String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            let ft = meta.file_type();
-            if ft.is_symlink() {
-                return Err("target is a symlink".into());
-            }
-            if !ft.is_file() {
-                return Err("target exists but is not a regular file".into());
-            }
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
+    crate::fsutil::ensure_regular_file_or_absent(path)
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("ai-jail");
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let tmp_path =
-        parent.join(format!(".{stem}.tmp.{}.{}", std::process::id(), nonce));
-
-    let mut f = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp_path)
-        .map_err(|e| e.to_string())?;
-
-    if let Err(e) = f.write_all(contents.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.to_string());
-    }
-    if let Err(e) = f.sync_all() {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.to_string());
-    }
-    drop(f);
-
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        e.to_string()
-    })
+    crate::fsutil::write_atomic(path, contents, false, "ai-jail")
 }
 
 fn dedup_paths(paths: &mut Vec<PathBuf>) {
@@ -640,12 +596,11 @@ fn print_allow_tcp_ports(ports: &[u16], lockdown: bool) {
 mod tests {
     use super::*;
     use crate::cli::CliArgs;
+    use crate::test_utils::{ENV_LOCK, EnvVarGuard};
 
     // Tests that call set_current_dir must hold this lock to avoid
     // racing each other (cwd is process-global).
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // Tests that mutate env vars must hold this lock.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn serialize_config(config: &Config) -> Result<String, String> {
         toml::to_string_pretty(config).map_err(|e| e.to_string())
@@ -1016,6 +971,15 @@ allow_tcp_ports = []
         assert_eq!(deserialized.no_rlimits, config.no_rlimits);
         assert_eq!(deserialized.allow_tcp_ports, config.allow_tcp_ports);
         assert_eq!(deserialized.claude_dir, config.claude_dir);
+    }
+
+    #[test]
+    fn serialize_default_omits_empty_defaults() {
+        let serialized = serialize_config(&Config::default()).unwrap();
+        assert!(
+            serialized.trim().is_empty(),
+            "default config should not write empty/default fields: {serialized:?}"
+        );
     }
 
     // ── Merge tests ────────────────────────────────────────────
@@ -1942,49 +1906,28 @@ allow_tcp_ports = [32000, 8080]
     #[test]
     fn expand_tilde_with_slash() {
         let _env = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", "/home/example") };
+        let _home = EnvVarGuard::set("HOME", "/home/example");
         let out = expand_tilde(PathBuf::from("~/projects/x"));
         assert_eq!(out, PathBuf::from("/home/example/projects/x"));
-        unsafe {
-            std::env::remove_var("HOME");
-            if let Some(v) = saved {
-                std::env::set_var("HOME", v);
-            }
-        }
     }
 
     #[test]
     fn expand_tilde_bare() {
         let _env = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", "/home/bare") };
+        let _home = EnvVarGuard::set("HOME", "/home/bare");
         assert_eq!(
             expand_tilde(PathBuf::from("~")),
             PathBuf::from("/home/bare")
         );
-        unsafe {
-            std::env::remove_var("HOME");
-            if let Some(v) = saved {
-                std::env::set_var("HOME", v);
-            }
-        }
     }
 
     #[test]
     fn expand_tilde_leaves_other_user_home_alone() {
         let _env = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", "/home/me") };
+        let _home = EnvVarGuard::set("HOME", "/home/me");
         // ~otheruser should not be rewritten
         let p = PathBuf::from("~otheruser/file");
         assert_eq!(expand_tilde(p.clone()), p);
-        unsafe {
-            std::env::remove_var("HOME");
-            if let Some(v) = saved {
-                std::env::set_var("HOME", v);
-            }
-        }
     }
 
     #[test]
@@ -1997,8 +1940,7 @@ allow_tcp_ports = [32000, 8080]
     #[test]
     fn merge_expands_tilde_in_ro_and_rw_maps_and_mask() {
         let _env = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", "/home/user") };
+        let _home = EnvVarGuard::set("HOME", "/home/user");
 
         let existing = Config {
             ro_maps: vec![
@@ -2020,13 +1962,6 @@ allow_tcp_ports = [32000, 8080]
         );
         assert_eq!(merged.rw_maps, vec![PathBuf::from("/home/user/work")]);
         assert_eq!(merged.mask, vec![PathBuf::from("/home/user/secret.env")]);
-
-        unsafe {
-            std::env::remove_var("HOME");
-            if let Some(v) = saved {
-                std::env::set_var("HOME", v);
-            }
-        }
     }
 
     // ── claude_dir tests ──────────────────────────────────────
@@ -2079,7 +2014,7 @@ claude_dir = "/home/user/.claude-example"
     #[test]
     fn merge_claude_dir_expands_tilde() {
         let _env = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("HOME", "/home/testuser") };
+        let _home = EnvVarGuard::set("HOME", "/home/testuser");
 
         let existing = Config::default();
         let cli = CliArgs {
@@ -2091,8 +2026,6 @@ claude_dir = "/home/user/.claude-example"
             merged.claude_dir,
             Some(PathBuf::from("/home/testuser/.claude-example"))
         );
-
-        unsafe { std::env::remove_var("HOME") };
     }
 
     #[test]
@@ -2112,7 +2045,7 @@ claude_dir = "/home/user/.claude-example"
     #[test]
     fn merge_expands_tilde_from_config_file() {
         let _env = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("HOME", "/home/testuser") };
+        let _home = EnvVarGuard::set("HOME", "/home/testuser");
 
         let existing = Config {
             claude_dir: Some(PathBuf::from("~/.claude-example")),
@@ -2124,8 +2057,6 @@ claude_dir = "/home/user/.claude-example"
             merged.claude_dir,
             Some(PathBuf::from("/home/testuser/.claude-example"))
         );
-
-        unsafe { std::env::remove_var("HOME") };
     }
 
     #[test]

@@ -4,22 +4,15 @@ compile_error!("ai-jail only supports Linux and macOS");
 mod bootstrap;
 mod cli;
 mod config;
+mod fsutil;
 mod output;
 mod pty;
 mod sandbox;
 mod signals;
 mod statusbar;
 
-const BROWSER_COMMANDS: &[&str] = &[
-    "chromium",
-    "chromium-browser",
-    "google-chrome",
-    "google-chrome-stable",
-    "brave",
-    "brave-browser",
-    "firefox",
-    "librewolf",
-];
+#[cfg(test)]
+mod test_utils;
 
 fn command_basename(command: &[String]) -> Option<&str> {
     command.first().and_then(|cmd| {
@@ -34,8 +27,7 @@ fn command_needs_direct_tty(command: &[String]) -> bool {
 }
 
 fn command_is_browser(command: &[String]) -> bool {
-    command_basename(command)
-        .is_some_and(|name| BROWSER_COMMANDS.contains(&name))
+    command_basename(command).is_some_and(sandbox::is_browser_command_name)
 }
 
 fn resolve_browser_profile(
@@ -390,9 +382,7 @@ mod tests {
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
-
-    // Serialize tests that mutate process-global env vars.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::test_utils::{ENV_LOCK, EnvVarGuard};
 
     #[test]
     fn crush_requires_direct_tty() {
@@ -403,63 +393,25 @@ mod tests {
     #[test]
     fn multiplexer_detects_tmux() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let saved_tmux = std::env::var_os("TMUX");
-        let saved_zellij = std::env::var_os("ZELLIJ");
-        unsafe {
-            std::env::remove_var("ZELLIJ");
-            std::env::set_var("TMUX", "/tmp/fake");
-        }
+        let _zellij = EnvVarGuard::remove("ZELLIJ");
+        let _tmux = EnvVarGuard::set("TMUX", "/tmp/fake");
         assert_eq!(running_inside_multiplexer(), Some("tmux"));
-        unsafe {
-            std::env::remove_var("TMUX");
-            if let Some(v) = saved_tmux {
-                std::env::set_var("TMUX", v);
-            }
-            if let Some(v) = saved_zellij {
-                std::env::set_var("ZELLIJ", v);
-            }
-        }
     }
 
     #[test]
     fn multiplexer_detects_zellij() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let saved_tmux = std::env::var_os("TMUX");
-        let saved_zellij = std::env::var_os("ZELLIJ");
-        unsafe {
-            std::env::remove_var("TMUX");
-            std::env::set_var("ZELLIJ", "session-name");
-        }
+        let _tmux = EnvVarGuard::remove("TMUX");
+        let _zellij = EnvVarGuard::set("ZELLIJ", "session-name");
         assert_eq!(running_inside_multiplexer(), Some("zellij"));
-        unsafe {
-            std::env::remove_var("ZELLIJ");
-            if let Some(v) = saved_tmux {
-                std::env::set_var("TMUX", v);
-            }
-            if let Some(v) = saved_zellij {
-                std::env::set_var("ZELLIJ", v);
-            }
-        }
     }
 
     #[test]
     fn multiplexer_none_when_neither_set() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let saved_tmux = std::env::var_os("TMUX");
-        let saved_zellij = std::env::var_os("ZELLIJ");
-        unsafe {
-            std::env::remove_var("TMUX");
-            std::env::remove_var("ZELLIJ");
-        }
+        let _tmux = EnvVarGuard::remove("TMUX");
+        let _zellij = EnvVarGuard::remove("ZELLIJ");
         assert_eq!(running_inside_multiplexer(), None);
-        unsafe {
-            if let Some(v) = saved_tmux {
-                std::env::set_var("TMUX", v);
-            }
-            if let Some(v) = saved_zellij {
-                std::env::set_var("ZELLIJ", v);
-            }
-        }
     }
 
     #[test]

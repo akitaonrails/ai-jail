@@ -50,23 +50,19 @@ pub fn build(config: &Config, project_dir: &Path, verbose: bool) -> Command {
 
     if lockdown {
         cmd.env_clear();
-        cmd.env(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        );
+        cmd.env("PATH", super::LOCKDOWN_PATH);
         cmd.env("HOME", super::home_dir());
         // Pass through terminal-related env vars so child
         // programs can detect capabilities (truecolor, kitty
         // keyboard protocol, etc.).
-        for var in ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"]
-        {
+        for &var in super::TERM_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
                 cmd.env(var, val);
             }
         }
     }
 
-    cmd.env("PS1", "(jail) \\w \\$ ");
+    cmd.env("PS1", super::JAIL_PS1);
     cmd.env("_ZO_DOCTOR", "0");
 
     if let Some(dir) = &config.claude_dir {
@@ -81,10 +77,10 @@ pub fn dry_run(config: &Config, project_dir: &Path, verbose: bool) -> String {
     let launch = super::build_launch_command(config);
 
     let mut command_line = String::from("sandbox-exec -p '<profile>' -- ");
-    command_line.push_str(&quote_arg(&launch.program));
+    command_line.push_str(&super::quote_shell_arg(&launch.program));
     for arg in &launch.args {
         command_line.push(' ');
-        command_line.push_str(&quote_arg(arg));
+        command_line.push_str(&super::quote_shell_arg(arg));
     }
 
     format_dry_run_macos(&command_line, &profile)
@@ -349,17 +345,6 @@ fn push_docker_section(
     profile.push('\n');
 }
 
-fn quote_arg(arg: &str) -> String {
-    if arg.is_empty()
-        || arg.contains(|c: char| {
-            c.is_whitespace() || "'\"\\$`(){}[]|&;<>*!?".contains(c)
-        })
-    {
-        return format!("'{}'", arg.replace('\'', "'\\''"));
-    }
-    arg.to_string()
-}
-
 fn format_dry_run_macos(command_line: &str, profile: &str) -> String {
     let mut out = String::new();
     out.push_str("# sandbox-exec command:\n");
@@ -595,8 +580,7 @@ fn macos_lockdown_read_paths(
 mod tests {
     use super::*;
     use crate::sandbox::test_support::linked_worktree_fixture;
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::test_utils::{ENV_LOCK, EnvVarGuard};
 
     fn create_linked_worktree_fixture()
     -> crate::sandbox::test_support::LinkedWorktreeFixture {
@@ -675,13 +659,12 @@ mod tests {
     fn atomic_paths_gets_bounded_atomic_write_rules() {
         let _env = ENV_LOCK.lock().unwrap();
         use std::fs;
-        let saved_home = std::env::var_os("HOME");
         let fake_home = std::env::temp_dir()
             .join(format!("ai-jail-seatbelt-atomic-{}", std::process::id()));
         fs::create_dir_all(&fake_home).unwrap();
         let claude_json = fake_home.join(".claude.json");
         fs::write(&claude_json, "{}").unwrap();
-        unsafe { std::env::set_var("HOME", &fake_home) };
+        let _home = EnvVarGuard::set("HOME", fake_home.as_os_str());
 
         let config = Config {
             no_mise: Some(true),
@@ -698,13 +681,6 @@ mod tests {
         let path_str = canonical.to_string_lossy();
         let regex_escaped = sbpl_regex_escape(&path_str);
 
-        unsafe {
-            if let Some(value) = saved_home {
-                std::env::set_var("HOME", value);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
         let _ = fs::remove_dir_all(&fake_home);
 
         assert!(
@@ -758,7 +734,6 @@ mod tests {
     #[test]
     fn private_home_writable_paths_skip_host_home_state() {
         let _env = ENV_LOCK.lock().unwrap();
-        let saved_home = std::env::var_os("HOME");
         let home = std::env::temp_dir().join(format!(
             "ai-jail-seatbelt-private-home-{}",
             std::process::id()
@@ -770,7 +745,7 @@ mod tests {
         std::fs::create_dir_all(home.join("Library/Caches")).unwrap();
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&extra).unwrap();
-        unsafe { std::env::set_var("HOME", &home) };
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
 
         let config = Config {
             private_home: Some(true),
@@ -785,13 +760,6 @@ mod tests {
         assert!(!paths.contains(&home.join(".local")));
         assert!(!paths.contains(&home.join("Library/Caches")));
 
-        unsafe {
-            if let Some(value) = saved_home {
-                std::env::set_var("HOME", value);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
         let _ = std::fs::remove_dir_all(&home);
     }
 

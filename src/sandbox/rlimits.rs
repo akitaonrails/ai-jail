@@ -21,8 +21,7 @@ struct Limit {
 
 fn limits_for(config: &Config) -> Vec<Limit> {
     let lockdown = config.lockdown_enabled();
-    #[allow(unused_mut)]
-    let mut limits = vec![
+    let limits = vec![
         Limit {
             resource: Resource::RLIMIT_NOFILE,
             soft: if lockdown {
@@ -157,12 +156,35 @@ mod tests {
     /// compromised child can't raise NPROC back up. Verify that
     /// invariant directly.
     ///
-    /// Note: this test permanently lowers the test binary's
-    /// RLIMIT_NPROC to NPROC_NORMAL (4096). That's still plenty
-    /// of headroom for the remainder of the test suite.
+    /// Run the assertion in a child test process so the lowered hard
+    /// limit cannot leak into the rest of the test suite.
     #[cfg(target_os = "linux")]
     #[test]
     fn apply_nproc_pins_hard_equal_to_soft() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "sandbox::rlimits::tests::apply_nproc_pins_hard_equal_to_soft_child",
+            )
+            .arg("--ignored")
+            .env("AI_JAIL_RLIMIT_CHILD", "1")
+            .output()
+            .expect("spawn child rlimit test");
+        assert!(
+            output.status.success(),
+            "child rlimit test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn apply_nproc_pins_hard_equal_to_soft_child() {
+        if std::env::var_os("AI_JAIL_RLIMIT_CHILD").is_none() {
+            return;
+        }
         // Skip if the current hard limit is already below
         // NPROC_NORMAL — apply_nproc would clamp to whatever's
         // currently in effect, so the post-condition is then

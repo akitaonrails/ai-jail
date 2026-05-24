@@ -21,6 +21,12 @@ pub use bwrap::SandboxGuard;
 #[cfg(target_os = "macos")]
 pub use seatbelt::SandboxGuard;
 
+pub(crate) const LOCKDOWN_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+pub(crate) const TERM_ENV_VARS: &[&str] =
+    &["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"];
+pub(crate) const JAIL_PS1: &str = "(jail) \\w \\$ ";
+
 // Dotdirs never mounted (sensitive data)
 const DOTDIR_DENY: &[&str] = &[
     ".gnupg",
@@ -137,18 +143,27 @@ pub struct LaunchCommand {
     pub args: Vec<String>,
 }
 
+const BROWSER_COMMANDS: &[&str] = &[
+    "chromium",
+    "chromium-browser",
+    "google-chrome",
+    "google-chrome-stable",
+    "brave",
+    "brave-browser",
+    "firefox",
+    "librewolf",
+];
+
+pub(crate) fn is_browser_command_name(name: &str) -> bool {
+    BROWSER_COMMANDS.contains(&name)
+}
+
 fn browser_basename(program: &str) -> Option<&str> {
     let name = Path::new(program).file_name()?.to_str()?;
-    match name {
-        "chromium"
-        | "chromium-browser"
-        | "google-chrome"
-        | "google-chrome-stable"
-        | "brave"
-        | "brave-browser"
-        | "firefox"
-        | "librewolf" => Some(name),
-        _ => None,
+    if is_browser_command_name(name) {
+        Some(name)
+    } else {
+        None
     }
 }
 
@@ -329,6 +344,17 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => left == right,
     }
+}
+
+pub(crate) fn quote_shell_arg(arg: &str) -> String {
+    if arg.is_empty()
+        || arg.contains(|c: char| {
+            c.is_whitespace() || "'\"\\$`(){}[]|&;<>*!?".contains(c)
+        })
+    {
+        return format!("'{}'", arg.replace('\'', "'\\''"));
+    }
+    arg.to_string()
 }
 
 fn mise_bin() -> Option<PathBuf> {

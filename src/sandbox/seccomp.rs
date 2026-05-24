@@ -188,6 +188,29 @@ pub fn apply(config: &Config, verbose: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    let (bpf, count) = compile_filter(config)?;
+
+    seccompiler::apply_filter(&bpf)
+        .map_err(|e| format!("Seccomp: failed to install filter: {e}"))?;
+
+    if verbose {
+        output::verbose(&format!(
+            "Seccomp: {} syscalls blocked ({})",
+            count,
+            if config.lockdown_enabled() {
+                "lockdown"
+            } else {
+                "normal"
+            }
+        ));
+    }
+
+    Ok(())
+}
+
+fn compile_filter(
+    config: &Config,
+) -> Result<(seccompiler::BpfProgram, usize), String> {
     let lockdown = config.lockdown_enabled();
 
     // Build the syscall → empty rules map (empty vec = match
@@ -207,6 +230,7 @@ pub fn apply(config: &Config, verbose: bool) -> Result<(), String> {
         }
     }
 
+    let count = rules.len();
     let arch: seccompiler::TargetArch =
         std::env::consts::ARCH.try_into().map_err(|_| {
             format!(
@@ -229,21 +253,7 @@ pub fn apply(config: &Config, verbose: bool) -> Result<(), String> {
         .try_into()
         .map_err(|e| format!("Seccomp: failed to compile BPF: {e}"))?;
 
-    seccompiler::apply_filter(&bpf)
-        .map_err(|e| format!("Seccomp: failed to install filter: {e}"))?;
-
-    if verbose {
-        let count = DENY_ALWAYS.len()
-            + DENY_ARCH.len()
-            + if lockdown { DENY_LOCKDOWN.len() } else { 0 };
-        output::verbose(&format!(
-            "Seccomp: {} syscalls blocked ({})",
-            count,
-            if lockdown { "lockdown" } else { "normal" }
-        ));
-    }
-
-    Ok(())
+    Ok((bpf, count))
 }
 
 #[cfg(test)]
@@ -253,8 +263,8 @@ mod tests {
     #[test]
     fn filter_compiles_normal_mode() {
         let config = Config::default();
-        // Just verify it doesn't error
-        apply(&config, true).unwrap();
+        let (_, count) = compile_filter(&config).unwrap();
+        assert!(count >= DENY_ALWAYS.len());
     }
 
     #[test]
@@ -263,7 +273,8 @@ mod tests {
             lockdown: Some(true),
             ..Config::default()
         };
-        apply(&config, true).unwrap();
+        let (_, count) = compile_filter(&config).unwrap();
+        assert!(count >= DENY_ALWAYS.len() + DENY_LOCKDOWN.len());
     }
 
     #[test]

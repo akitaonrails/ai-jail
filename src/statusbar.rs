@@ -264,6 +264,7 @@ pub fn set_update_available() {
 }
 
 /// Whether the status bar is currently active.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn is_active() -> bool {
     ACTIVE.load(Ordering::SeqCst)
 }

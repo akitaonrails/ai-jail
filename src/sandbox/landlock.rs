@@ -735,15 +735,13 @@ fn collect_gpu_paths(rw: &mut Vec<PathBuf>, verbose: bool) {
 mod tests {
     use super::*;
     use crate::sandbox::test_support::linked_worktree_fixture;
+    use crate::test_utils::{ENV_LOCK, EnvVarGuard};
     use std::io::Write;
 
     fn create_linked_worktree_fixture()
     -> crate::sandbox::test_support::LinkedWorktreeFixture {
         linked_worktree_fixture("landlock-worktree")
     }
-
-    // Tests mutating process-global env vars must hold this lock.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn apply_disabled_is_noop() {
@@ -844,13 +842,12 @@ mod tests {
     #[test]
     fn browser_soft_paths_include_persistent_state_rw() {
         let _env = ENV_LOCK.lock().unwrap();
-        let saved_home = std::env::var_os("HOME");
         let home = std::env::temp_dir().join(format!(
             "ai-jail-landlock-browser-home-{}",
             std::process::id()
         ));
         let _ = std::fs::create_dir_all(&home);
-        unsafe { std::env::set_var("HOME", &home) };
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
 
         let config = Config {
             command: vec!["chromium".into()],
@@ -863,13 +860,6 @@ mod tests {
         let (_, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
         assert!(rw.contains(&state));
 
-        unsafe {
-            if let Some(value) = saved_home {
-                std::env::set_var("HOME", value);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -929,7 +919,6 @@ mod tests {
     #[test]
     fn private_home_skips_host_dotdirs_but_keeps_project_and_extra_maps() {
         let _env = ENV_LOCK.lock().unwrap();
-        let saved_home = std::env::var_os("HOME");
         let home = std::env::temp_dir().join(format!(
             "ai-jail-landlock-private-home-{}",
             std::process::id()
@@ -940,7 +929,7 @@ mod tests {
         let _ = std::fs::create_dir_all(home.join(".local"));
         let _ = std::fs::create_dir_all(&project);
         let _ = std::fs::create_dir_all(&extra);
-        unsafe { std::env::set_var("HOME", &home) };
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
 
         let config = Config {
             private_home: Some(true),
@@ -964,13 +953,6 @@ mod tests {
             "host .local must not be allowed"
         );
 
-        unsafe {
-            if let Some(value) = saved_home {
-                std::env::set_var("HOME", value);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -994,7 +976,7 @@ mod tests {
         let tmp_root = std::env::temp_dir()
             .join(format!("ai-jail-landlock-xdg-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp_root);
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &tmp_root) };
+        let _xdg = EnvVarGuard::set("XDG_RUNTIME_DIR", tmp_root.as_os_str());
 
         let config = Config {
             no_gpu: Some(true),
@@ -1005,7 +987,6 @@ mod tests {
         let (_, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
         assert!(rw.contains(&tmp_root));
 
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
         let _ = std::fs::remove_dir_all(&tmp_root);
     }
 

@@ -14,6 +14,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: aarch64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
 
@@ -24,3 +25,4 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo test
+      - run: RUSTFLAGS="-D warnings" cargo check --target aarch64-apple-darwin

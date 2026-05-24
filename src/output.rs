@@ -8,6 +8,7 @@ pub fn set_quiet(q: bool) {
     QUIET.store(q, Ordering::SeqCst);
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn is_quiet() -> bool {
     QUIET.load(Ordering::SeqCst)
 }

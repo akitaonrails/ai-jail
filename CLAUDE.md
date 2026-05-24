@@ -75,8 +75,13 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox.rs` must 
 8. Config hide (tmpfs over sensitive `~/.config/*` subdirs)
 9. Cache hide (tmpfs over sensitive `~/.cache/*` subdirs)
 10. Local overrides (`~/.local/state`, `~/.local/share/*` rw subdirs)
-11. Extra user mounts (`--map`, `--rw-map`)
-12. Project directory (pwd, rw)
+11. Linked Git worktree metadata
+12. SSH agent socket and `~/.ssh` exemption mounts
+13. Pictures mount
+14. Browser profile state mount
+15. Extra user mounts (`--map`, `--rw-map`)
+16. Project directory (pwd, rw or ro depending on mode)
+17. Mask overlays (`--mask` and hidden project `.ai-jail`)
 
 Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts.
 
