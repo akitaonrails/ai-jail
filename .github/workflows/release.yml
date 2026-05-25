@@ -121,7 +121,7 @@ jobs:
           echo "cargo install ai-jail" >> body.md
           echo "" >> body.md
           echo "# mise" >> body.md
-          echo "mise use -g ubi:akitaonrails/ai-jail" >> body.md
+          echo "mise use -g github:akitaonrails/ai-jail" >> body.md
           echo '```' >> body.md
 
       - name: Create GitHub Release

@@ -19,7 +19,19 @@ cargo install ai-jail
 ### mise
 
 ```bash
+# Install the latest release globally
 mise use -g github:akitaonrails/ai-jail
+
+# Pin an exact release globally
+mise use -g github:akitaonrails/ai-jail@1.2.0
+```
+
+Use the version as mise reports it (`1.2.0`), not the Git tag shorthand (`v1.2`). If a just-published release does not appear yet, clear mise's GitHub release cache first:
+
+```bash
+mise cache clear
+mise ls-remote github:akitaonrails/ai-jail
+mise use -g github:akitaonrails/ai-jail@1.2.0
 ```
 
 ### Nix (flake)
@@ -90,6 +102,27 @@ sudo systemctl reload apparmor
 ```
 
 Pick whichever matches your threat model. We don't ship a profile with ai-jail itself because the profile has to apply to `bwrap`, which is system-owned.
+
+## Upgrade
+
+```bash
+# Homebrew
+brew update && brew upgrade ai-jail
+
+# cargo install
+cargo install ai-jail --force
+
+# mise
+mise cache clear
+mise upgrade github:akitaonrails/ai-jail
+# or pin a specific release:
+mise use -g github:akitaonrails/ai-jail@1.2.0
+
+```
+
+After a mise upgrade, open a new shell or refresh your command cache if the old binary still resolves (`rehash` in zsh, `hash -r` in bash).
+
+For Nix profile installs, run `nix profile list` and upgrade the profile entry that contains `github:akitaonrails/ai-jail`.
 
 ## Quick Start
 
