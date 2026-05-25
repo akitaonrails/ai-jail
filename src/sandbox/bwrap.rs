@@ -2391,6 +2391,29 @@ mod tests {
     }
 
     #[test]
+    fn regression_pi_home_dir_is_writable() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-pi-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let pi = home.join(".pi");
+        std::fs::create_dir_all(pi.join("agent").join("sessions")).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let mounts = discover_home_dotfiles(false, &[], &[], false);
+
+        assert!(
+            mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { src, dest } if src == &pi && dest == &pi
+            )),
+            "~/.pi must be mounted read-write so pi can write settings and sessions"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn lockdown_skips_host_home_dotfiles() {
         let mounts = discover_home_dotfiles(true, &[], &[], false);
         assert_eq!(mounts.len(), 1, "lockdown should only mount tmpfs home");

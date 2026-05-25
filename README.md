@@ -23,15 +23,15 @@ cargo install ai-jail
 mise use -g github:akitaonrails/ai-jail
 
 # Pin an exact release globally
-mise use -g github:akitaonrails/ai-jail@1.2.0
+mise use -g github:akitaonrails/ai-jail@1.2.1
 ```
 
-Use the version as mise reports it (`1.2.0`), not the Git tag shorthand (`v1.2`). If a just-published release does not appear yet, clear mise's GitHub release cache first:
+Use the version as mise reports it (`1.2.1`), not the Git tag shorthand (`v1.2`). If a just-published release does not appear yet, clear mise's GitHub release cache first:
 
 ```bash
 mise cache clear
 mise ls-remote github:akitaonrails/ai-jail
-mise use -g github:akitaonrails/ai-jail@1.2.0
+mise use -g github:akitaonrails/ai-jail@1.2.1
 ```
 
 ### Nix (flake)
@@ -116,7 +116,7 @@ cargo install ai-jail --force
 mise cache clear
 mise upgrade github:akitaonrails/ai-jail
 # or pin a specific release:
-mise use -g github:akitaonrails/ai-jail@1.2.0
+mise use -g github:akitaonrails/ai-jail@1.2.1
 
 ```
 
