@@ -19,9 +19,13 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 static COMPILE_HELPER: OnceLock<bool> = OnceLock::new();
+// Keep integration tests deterministic when the developer's project
+// `.ai-jail` enables passthrough like `ssh = true`, and avoid parallel
+// bwrap mount races against the same project-local `.ai-jail` mask.
+static SANDBOX_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 // ── Runtime prerequisite checks ─────────────────
 //
@@ -162,8 +166,16 @@ macro_rules! require_helper {
 
 /// Run a command inside the sandbox (normal mode).
 fn sandbox_run(args: &[&str]) -> Output {
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
     Command::new(ai_jail())
-        .args(["--no-gpu", "--no-docker", "--no-display", "--no-status-bar"])
+        .args([
+            "--clean",
+            "--no-ssh",
+            "--no-gpu",
+            "--no-docker",
+            "--no-display",
+            "--no-status-bar",
+        ])
         .args(args)
         .output()
         .expect("failed to spawn ai-jail")
@@ -171,8 +183,9 @@ fn sandbox_run(args: &[&str]) -> Output {
 
 /// Run a command inside the sandbox (lockdown mode).
 fn lockdown_run(args: &[&str]) -> Output {
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
     Command::new(ai_jail())
-        .args(["--lockdown", "--no-status-bar"])
+        .args(["--clean", "--lockdown", "--no-status-bar"])
         .args(args)
         .output()
         .expect("failed to spawn ai-jail")

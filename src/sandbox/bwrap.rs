@@ -2368,6 +2368,29 @@ mod tests {
     }
 
     #[test]
+    fn regression_omp_home_dir_is_writable() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-omp-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let omp = home.join(".omp");
+        std::fs::create_dir_all(omp.join("logs")).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let mounts = discover_home_dotfiles(false, &[], &[], false);
+
+        assert!(
+            mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { src, dest } if src == &omp && dest == &omp
+            )),
+            "~/.omp must be mounted read-write so OMP can create logs"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn lockdown_skips_host_home_dotfiles() {
         let mounts = discover_home_dotfiles(true, &[], &[], false);
         assert_eq!(mounts.len(), 1, "lockdown should only mount tmpfs home");
