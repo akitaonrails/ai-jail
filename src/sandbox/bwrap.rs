@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const DOCKER_SOCKET: &str = "/var/run/docker.sock";
+const WSL_DOCKER_DESKTOP_CLI_TOOLS: &str = "/mnt/wsl/docker-desktop/cli-tools";
+
 #[derive(Debug, Clone)]
 enum Mount {
     RoBind { src: PathBuf, dest: PathBuf },
@@ -1379,15 +1382,32 @@ fn discover_gpu(verbose: bool) -> Vec<Mount> {
 }
 
 fn discover_docker() -> Vec<Mount> {
-    let sock = PathBuf::from("/var/run/docker.sock");
-    if super::path_exists(&sock) {
-        vec![Mount::Bind {
-            src: sock.clone(),
-            dest: sock,
-        }]
-    } else {
-        vec![]
+    discover_docker_paths(
+        Path::new(DOCKER_SOCKET),
+        Path::new(WSL_DOCKER_DESKTOP_CLI_TOOLS),
+    )
+}
+
+fn discover_docker_paths(sock: &Path, wsl_cli_tools: &Path) -> Vec<Mount> {
+    let mut mounts = Vec::new();
+    if super::path_exists(sock) {
+        mounts.push(Mount::Bind {
+            src: sock.to_path_buf(),
+            dest: sock.to_path_buf(),
+        });
+
+        // Docker Desktop on WSL commonly installs /usr/bin/docker
+        // as a symlink into this directory. /usr is already mounted,
+        // but the symlink target is outside /usr, so expose it too.
+        if wsl_cli_tools.is_dir() {
+            mounts.push(Mount::RoBind {
+                src: wsl_cli_tools.to_path_buf(),
+                dest: wsl_cli_tools.to_path_buf(),
+            });
+        }
     }
+
+    mounts
 }
 
 fn discover_shm() -> Vec<Mount> {
@@ -1575,6 +1595,46 @@ mod tests {
             dest: "/tmp".into(),
         };
         assert_eq!(m.to_args(), vec!["--bind", "/tmp", "/tmp"]);
+    }
+
+    #[test]
+    fn docker_discovery_mounts_socket_and_wsl_cli_tools() {
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-docker-wsl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sock = root.join("docker.sock");
+        let cli_tools = root.join("cli-tools");
+        std::fs::create_dir_all(&cli_tools).unwrap();
+        std::fs::File::create(&sock).unwrap();
+
+        let mounts = discover_docker_paths(&sock, &cli_tools);
+
+        assert!(matches!(
+            &mounts[0],
+            Mount::Bind { src, dest } if src == &sock && dest == &sock
+        ));
+        assert!(matches!(
+            &mounts[1],
+            Mount::RoBind { src, dest } if src == &cli_tools && dest == &cli_tools
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn docker_discovery_skips_wsl_cli_tools_without_socket() {
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-docker-no-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sock = root.join("docker.sock");
+        let cli_tools = root.join("cli-tools");
+        std::fs::create_dir_all(&cli_tools).unwrap();
+
+        let mounts = discover_docker_paths(&sock, &cli_tools);
+
+        assert!(mounts.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

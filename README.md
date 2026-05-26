@@ -149,7 +149,7 @@ If you run `ai-jail` from a linked Git worktree, it auto-detects the worktree's 
 
 The default mode favors usability over maximum lockdown. These are intentionally open by default:
 
-1. Docker socket passthrough auto-enables when `/var/run/docker.sock` exists (`--no-docker` disables it).
+1. Docker socket passthrough auto-enables when `/var/run/docker.sock` exists (`--no-docker` disables it). On WSL 2 with Docker Desktop, ai-jail also exposes Docker Desktop's WSL CLI tools directory when present so the injected `docker` symlink keeps working.
 2. Display passthrough mounts `XDG_RUNTIME_DIR` on Linux, which can expose host IPC sockets.
 3. Environment variables are inherited (tokens/secrets in your shell env are visible in-jail).
 
@@ -603,6 +603,18 @@ ai-jail claude
 WSL 2 mounts your Windows drives under `/mnt/c/`, `/mnt/d/`, etc. The sandbox sees the Linux filesystem, so all the mount isolation works as expected. Your Windows files are accessible through those mount points.
 
 One thing to watch: WSL 2 filesystem performance is slower on `/mnt/c/` (the Windows side) than on the native Linux filesystem (`~/`). For large projects, cloning into `~/Projects/` inside WSL instead of working from `/mnt/c/` makes a noticeable difference.
+
+### Docker Desktop in WSL 2
+
+Docker passthrough needs both pieces to work inside the jail:
+
+```bash
+test -S /var/run/docker.sock
+command -v docker
+readlink -f "$(command -v docker)"
+```
+
+The socket is mounted automatically when it exists. Docker Desktop for Windows commonly injects `/usr/bin/docker` as a symlink to `/mnt/wsl/docker-desktop/cli-tools/usr/bin/docker`; ai-jail exposes that CLI tools directory read-only when it exists. If `docker` is still missing inside the jail, check Docker Desktop's WSL integration for your distro or install the Docker CLI package inside the WSL distro so the binary lives under `/usr/bin` directly.
 
 ## License
 
