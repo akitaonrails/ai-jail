@@ -19,7 +19,7 @@ yay -S ai-jail-bin    # prebuilt Linux x86_64 binary from GitHub Releases
 yay -S ai-jail        # builds from source with your local Rust toolchain
 ```
 
-The `-bin` variant is fastest and installs the same Linux x86_64 binary built by CI. The source variant compiles locally and is the right choice for Arch Linux ARM/aarch64. Both packages depend on `bubblewrap` and install the `ai-jail` binary to `/usr/bin/`. AUR packaging is tracked in `packaging/aur/`; project co-maintainer access was coordinated in [#29](https://github.com/akitaonrails/ai-jail/issues/29).
+The `-bin` variant is fastest and installs the same Linux x86_64 binary built by CI. The source variant compiles locally and is the right choice for Arch Linux ARM/aarch64. Both packages depend on `bubblewrap` and install the `ai-jail` binary to `/usr/bin/`. The project owns the AUR package bases, and packaging is tracked in `packaging/aur/`.
 
 ### cargo install
 
@@ -602,7 +602,7 @@ sudo apt update && sudo apt install bubblewrap
 
 ```bash
 cd ~/Projects
-git clone https://github.com/nicholasgasior/ai-jail.git
+git clone https://github.com/akitaonrails/ai-jail.git
 cd ai-jail
 cargo build --release
 cp target/release/ai-jail ~/.local/bin/
