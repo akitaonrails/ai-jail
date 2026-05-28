@@ -129,6 +129,17 @@ fn validate_write_flags(cli: &cli::CliArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn should_save_global_preferences(cli: &cli::CliArgs) -> bool {
+    !cli.dry_run && (cli.status_bar.is_some() || cli.status_bar_style.is_some())
+}
+
+fn should_auto_save_project_config(
+    cli: &cli::CliArgs,
+    config: &config::Config,
+) -> bool {
+    !cli.dry_run && !config.lockdown_enabled() && config.save_config_enabled()
+}
+
 fn run() -> Result<i32, String> {
     let cli = cli::parse()?;
     validate_write_flags(&cli)?;
@@ -171,7 +182,7 @@ fn run() -> Result<i32, String> {
     }
 
     // Persist user-level preferences (status bar) to $HOME/.ai-jail
-    if cli.status_bar.is_some() || cli.status_bar_style.is_some() {
+    if should_save_global_preferences(&cli) {
         config::save_global(&config);
     }
 
@@ -208,7 +219,7 @@ fn run() -> Result<i32, String> {
     // and `ai-jail codex` on the same project and the stored default
     // should not flip under them. First-run bootstrap (no stored
     // command yet) still persists the CLI command as the new default.
-    if !config.lockdown_enabled() && config.save_config_enabled() {
+    if should_auto_save_project_config(&cli, &config) {
         let mut to_save = config.clone();
         if !stored_command.is_empty() && !cli.command.is_empty() {
             to_save.command = stored_command;
@@ -378,6 +389,7 @@ mod tests {
     use super::{
         apply_browser_profile, command_is_browser, command_needs_direct_tty,
         resolve_browser_profile, running_inside_multiplexer,
+        should_auto_save_project_config, should_save_global_preferences,
         validate_write_flags,
     };
     use crate::cli::CliArgs;
@@ -521,5 +533,45 @@ mod tests {
             ..CliArgs::default()
         };
         assert!(validate_write_flags(&cli).is_ok());
+    }
+
+    #[test]
+    fn dry_run_skips_project_auto_save() {
+        let cli = CliArgs {
+            dry_run: true,
+            ..CliArgs::default()
+        };
+        let config = Config::default();
+
+        assert!(!should_auto_save_project_config(&cli, &config));
+    }
+
+    #[test]
+    fn normal_run_allows_project_auto_save_by_default() {
+        let cli = CliArgs::default();
+        let config = Config::default();
+
+        assert!(should_auto_save_project_config(&cli, &config));
+    }
+
+    #[test]
+    fn dry_run_skips_global_preference_save() {
+        let cli = CliArgs {
+            dry_run: true,
+            status_bar_style: Some("dark".into()),
+            ..CliArgs::default()
+        };
+
+        assert!(!should_save_global_preferences(&cli));
+    }
+
+    #[test]
+    fn status_bar_option_allows_global_preference_save() {
+        let cli = CliArgs {
+            status_bar_style: Some("dark".into()),
+            ..CliArgs::default()
+        };
+
+        assert!(should_save_global_preferences(&cli));
     }
 }

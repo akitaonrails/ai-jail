@@ -154,7 +154,7 @@ ai-jail bash
 ai-jail --dry-run claude
 ```
 
-On first run, `ai-jail` creates a `.ai-jail` config file in the current directory by default. Later runs reuse it. Commit `.ai-jail` to your repo if the sandbox policy belongs to the project. Use `--no-save-config` for one-off runs that should not create or update config.
+On first run, `ai-jail` creates a `.ai-jail` config file in the current directory by default. Later runs reuse it. Commit `.ai-jail` to your repo if the sandbox policy belongs to the project. `--dry-run` is read-only and does not create or update config. Use `--no-save-config` for one-off real runs that should not persist config.
 
 If you run `ai-jail` from a linked Git worktree, it auto-detects the worktree's external Git admin directories and exposes them safely inside the sandbox so `git status`, `git commit`, and similar commands keep working. Disable this with `--no-worktree` or `no_worktree = true`.
 
