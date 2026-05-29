@@ -182,6 +182,20 @@ mask = [".env", ".env.local", "credentials.json"]
 
 **Hiding the sandbox policy itself**: by default, ai-jail auto-masks the project's own `.ai-jail` config file inside the sandbox so the agent can't read its own policy and craft workarounds. Pass `--no-hide-config` (or set `no_hide_config = true`) if you need the file visible to the sandboxed process for some reason. The user's global `~/.ai-jail` is never mounted into the sandbox.
 
+**Hiding machine identifiers**: `/etc/machine-id` and `/var/lib/dbus/machine-id` are stable, unique identifiers for the host. Agents that phone home for telemetry, error reports, or feature flags often read these to fingerprint the device. If you'd rather not let the sandboxed process see them, mask them per-run:
+
+```bash
+ai-jail --mask /etc/machine-id --mask /var/lib/dbus/machine-id grok
+```
+
+Or persist in `.ai-jail`:
+
+```toml
+mask = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+```
+
+This is opt-in because some software fails outright when the IDs are absent (notably some D-Bus services). Most CLI agents read them only for telemetry and degrade gracefully.
+
 **Private home mode**: use `--private-home` when you want the project writable
 but do not want normal host dotdirs like `~/.config`, `~/.cache`, `~/.local`,
 or AI tool state mounted into the sandbox. Explicit mounts still apply.
