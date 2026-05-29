@@ -301,7 +301,18 @@ fn save_to_path(path: &Path, config: &Config) {
         output::warn(&format!("Refusing to write {}: {e}", path.display()));
         return;
     }
-    match toml::to_string_pretty(config) {
+    // Re-collapse `$HOME/...` prefixes back to `~/...` so the on-disk
+    // file stays portable across machines and stable across runs.
+    // Issue #52: configs typed with `~/.claude` were rewritten to
+    // absolute paths and lost their shareability.
+    let mut on_disk = config.clone();
+    collapse_tilde_vec(&mut on_disk.rw_maps);
+    collapse_tilde_vec(&mut on_disk.ro_maps);
+    collapse_tilde_vec(&mut on_disk.mask);
+    if let Some(p) = on_disk.claude_dir.take() {
+        on_disk.claude_dir = Some(collapse_tilde(&p));
+    }
+    match toml::to_string_pretty(&on_disk) {
         Ok(body) => {
             let contents = format!("{header}{body}");
             if let Err(e) = write_atomic(path, &contents) {
@@ -361,6 +372,40 @@ pub fn expand_tilde(path: PathBuf) -> PathBuf {
 fn expand_tilde_vec(paths: &mut [PathBuf]) {
     for p in paths.iter_mut() {
         *p = expand_tilde(std::mem::take(p));
+    }
+}
+
+/// Inverse of `expand_tilde`: if `path` starts with `$HOME`, rewrite
+/// that prefix to `~`. Used at save time so `.ai-jail` keeps its
+/// `~/...` notation across runs and stays portable across machines.
+/// Returns the path unchanged if `$HOME` is unset or the path is not
+/// a `$HOME` descendant.
+pub fn collapse_tilde(path: &Path) -> PathBuf {
+    let Ok(home) = std::env::var("HOME") else {
+        return path.to_path_buf();
+    };
+    if home.is_empty() {
+        return path.to_path_buf();
+    }
+    let home_path = PathBuf::from(&home);
+    if path == home_path {
+        return PathBuf::from("~");
+    }
+    if let Ok(rest) = path.strip_prefix(&home_path) {
+        // Preserve `~/` form even when the rest is empty (unreachable
+        // in practice — covered by the path==home branch above — but
+        // cheap to handle for safety).
+        if rest.as_os_str().is_empty() {
+            return PathBuf::from("~");
+        }
+        return PathBuf::from("~").join(rest);
+    }
+    path.to_path_buf()
+}
+
+fn collapse_tilde_vec(paths: &mut [PathBuf]) {
+    for p in paths.iter_mut() {
+        *p = collapse_tilde(p);
     }
 }
 
@@ -1962,6 +2007,107 @@ allow_tcp_ports = [32000, 8080]
         );
         assert_eq!(merged.rw_maps, vec![PathBuf::from("/home/user/work")]);
         assert_eq!(merged.mask, vec![PathBuf::from("/home/user/secret.env")]);
+    }
+
+    // ── Tilde collapse tests (issue #52) ──────────────────────
+
+    #[test]
+    fn collapse_tilde_rewrites_home_prefix() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::set("HOME", "/home/user");
+        assert_eq!(
+            collapse_tilde(Path::new("/home/user/.claude")),
+            PathBuf::from("~/.claude")
+        );
+    }
+
+    #[test]
+    fn collapse_tilde_rewrites_bare_home() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::set("HOME", "/home/user");
+        assert_eq!(collapse_tilde(Path::new("/home/user")), PathBuf::from("~"));
+    }
+
+    #[test]
+    fn collapse_tilde_leaves_unrelated_paths_alone() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::set("HOME", "/home/user");
+        let p = Path::new("/opt/data");
+        assert_eq!(collapse_tilde(p), PathBuf::from("/opt/data"));
+    }
+
+    #[test]
+    fn collapse_tilde_does_not_match_sibling_directories() {
+        // /home/user2/foo must NOT collapse just because $HOME is /home/user.
+        let _env = ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::set("HOME", "/home/user");
+        let p = Path::new("/home/user2/foo");
+        assert_eq!(collapse_tilde(p), PathBuf::from("/home/user2/foo"));
+    }
+
+    #[test]
+    fn collapse_tilde_returns_input_when_home_unset() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::remove("HOME");
+        let p = Path::new("/home/user/.claude");
+        assert_eq!(collapse_tilde(p), PathBuf::from("/home/user/.claude"));
+    }
+
+    #[test]
+    fn save_round_trip_preserves_tilde_notation() {
+        // Round-trip: write a config with `~/.claude` paths, run
+        // through save_to_path, parse the resulting TOML back, and
+        // confirm the on-disk file kept the `~/` form.
+        let _env = ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::set("HOME", "/home/user");
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ai-jail-collapse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let path = tmp_dir.join(".ai-jail");
+
+        let cfg = Config {
+            command: vec!["claude".into()],
+            // These are expanded as if they had passed through merge().
+            rw_maps: vec![PathBuf::from("/home/user/.claude")],
+            ro_maps: vec![PathBuf::from("/home/user/.bashrc")],
+            mask: vec![PathBuf::from("/home/user/secret.env")],
+            claude_dir: Some(PathBuf::from("/home/user/.claude-work")),
+            ..Config::default()
+        };
+        save_to_path(&path, &cfg);
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("\"~/.claude\""),
+            "expected ~/.claude in TOML, got:\n{written}"
+        );
+        assert!(written.contains("\"~/.bashrc\""), "rw_maps not collapsed");
+        assert!(written.contains("\"~/secret.env\""), "mask not collapsed");
+        assert!(
+            written.contains("\"~/.claude-work\""),
+            "claude_dir not collapsed"
+        );
+        // And the round-trip: parse it back and re-expand via merge
+        // should yield the same absolute paths we started with.
+        let parsed = parse_toml(&written).unwrap();
+        let merged = merge(&CliArgs::default(), parsed);
+        assert_eq!(merged.rw_maps, vec![PathBuf::from("/home/user/.claude")]);
+        assert_eq!(merged.ro_maps, vec![PathBuf::from("/home/user/.bashrc")]);
+        assert_eq!(merged.mask, vec![PathBuf::from("/home/user/secret.env")]);
+        assert_eq!(
+            merged.claude_dir,
+            Some(PathBuf::from("/home/user/.claude-work"))
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     // ── claude_dir tests ──────────────────────────────────────
