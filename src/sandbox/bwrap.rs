@@ -528,21 +528,89 @@ fn new_resolv_file() -> (Option<PathBuf>, Option<PathBuf>) {
 /// If `contents` references the systemd-resolved stub listener
 /// (`nameserver 127.0.0.53`), try to replace with the real upstream
 /// nameservers from `/run/systemd/resolve/resolv.conf`.
-/// Falls back to the original contents when the real file is absent.
+///
+/// The substitution exists because some sandboxed runtimes (notably
+/// Go's pure-Go resolver) cannot reliably dial the 127.0.0.53 stub
+/// from inside the bwrap mount/PID namespace.
+///
+/// **Exception — split-DNS scenarios** (issue #49). When tailscale or
+/// a similar tunnel registers its DNS with systemd-resolved, the
+/// uplink file lists the tunnel's DNS server alongside (or instead of)
+/// the real upstream. Flattening that into resolv.conf loses
+/// systemd-resolved's per-domain routing knowledge: the resolver
+/// dials the first nameserver, gets NXDOMAIN for a public host the
+/// tunnel doesn't know about, and gives up. Detect this and keep the
+/// stub, which still does the right routing internally.
 fn resolve_real_nameservers(contents: Vec<u8>) -> Vec<u8> {
-    let text = String::from_utf8_lossy(&contents);
-    let has_stub = text.lines().any(|line| {
-        line.trim().starts_with("nameserver") && line.contains("127.0.0.53")
-    });
-    if !has_stub {
+    if !contents_have_stub(&contents) {
         return contents;
     }
-
     let real = Path::new("/run/systemd/resolve/resolv.conf");
-    match std::fs::read(real) {
-        Ok(real_contents) => real_contents,
-        Err(_) => contents,
+    let Ok(real_contents) = std::fs::read(real) else {
+        return contents;
+    };
+    pick_resolv_contents(contents, real_contents)
+}
+
+fn contents_have_stub(contents: &[u8]) -> bool {
+    String::from_utf8_lossy(contents).lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("nameserver") && line.contains("127.0.0.53")
+    })
+}
+
+/// Decide which resolv.conf body to mount into the sandbox.
+///
+/// When `uplink` shows split-DNS markers (tunnel DNS in the CGNAT
+/// range, link-local DNS, or any explicit `127.x` loopback that
+/// isn't the stub itself), we keep the original stub so the stub
+/// listener at 127.0.0.53 keeps doing the per-domain routing. In
+/// every other case we use the uplink, preserving the original
+/// Go-resolver workaround.
+fn pick_resolv_contents(original: Vec<u8>, uplink: Vec<u8>) -> Vec<u8> {
+    if uplink_has_split_dns_markers(&uplink) {
+        original
+    } else {
+        uplink
     }
+}
+
+/// True iff `uplink` lists any nameserver address that strongly
+/// suggests split-DNS (tunnel/VPN). Currently:
+///
+/// * Carrier-grade NAT (`100.64.0.0/10`) — tailscale's DNS sits at
+///   `100.100.100.100` by default; many other tunnels use this range.
+/// * Link-local (`169.254.0.0/16`) — sometimes used by VPN agents
+///   for split-DNS forwarders.
+///
+/// Public DNS (8.8.8.8, 1.1.1.1, ISP ranges) and RFC1918 home/office
+/// LAN ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) are NOT
+/// flagged: they're far more often the legitimate upstream than a
+/// tunnel forwarder.
+fn uplink_has_split_dns_markers(uplink: &[u8]) -> bool {
+    String::from_utf8_lossy(uplink).lines().any(|line| {
+        let Some(rest) = line.trim().strip_prefix("nameserver") else {
+            return false;
+        };
+        let token = rest.split_whitespace().next().unwrap_or("");
+        is_split_dns_marker_ip(token)
+    })
+}
+
+fn is_split_dns_marker_ip(s: &str) -> bool {
+    let Ok(addr) = s.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let [a, b, _, _] = addr.octets();
+    // 100.64.0.0/10  →  first octet 100 AND second octet in [64, 127]
+    if a == 100 && (64..=127).contains(&b) {
+        return true;
+    }
+    // 169.254.0.0/16
+    if a == 169 && b == 254 {
+        return true;
+    }
+    false
 }
 
 fn resolve_landlock_wrapper(
@@ -2640,15 +2708,131 @@ mod tests {
     fn resolve_real_nameservers_detects_stub() {
         let input = b"nameserver 127.0.0.53\noptions edns0 trust-ad\n";
         let result = resolve_real_nameservers(input.to_vec());
-        // If /run/systemd/resolve/resolv.conf exists, we get its
-        // contents; otherwise we fall back to the original.
+        // If /run/systemd/resolve/resolv.conf exists, we either get
+        // its contents (no split-DNS markers) or the original stub
+        // back (split-DNS markers present, e.g. tailscale). Otherwise
+        // we always fall back to the original.
         let real = Path::new("/run/systemd/resolve/resolv.conf");
         if real.exists() {
-            let expected = std::fs::read(real).unwrap();
+            let real_contents = std::fs::read(real).unwrap();
+            let expected = pick_resolv_contents(input.to_vec(), real_contents);
             assert_eq!(result, expected);
         } else {
             assert_eq!(result, input.to_vec());
         }
+    }
+
+    // ── split-DNS detection (issue #49) ────────────────────────
+
+    #[test]
+    fn pick_resolv_swaps_in_uplink_when_clean() {
+        let original = b"nameserver 127.0.0.53\n".to_vec();
+        let uplink = b"nameserver 1.1.1.1\nnameserver 8.8.8.8\n".to_vec();
+        let out = pick_resolv_contents(original, uplink.clone());
+        assert_eq!(out, uplink);
+    }
+
+    #[test]
+    fn pick_resolv_keeps_stub_when_uplink_has_cgnat() {
+        let original = b"nameserver 127.0.0.53\n".to_vec();
+        // Tailscale's MagicDNS at 100.100.100.100 is the canonical
+        // case. Even with a "real" upstream listed alongside, glibc's
+        // resolver hits the CGNAT one first and gives up on NXDOMAIN,
+        // so the only safe answer is to fall back to the stub.
+        let uplink = b"\
+nameserver 100.100.100.100
+nameserver 1.1.1.1
+"
+        .to_vec();
+        let out = pick_resolv_contents(original.clone(), uplink);
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn pick_resolv_keeps_stub_when_uplink_has_link_local() {
+        let original = b"nameserver 127.0.0.53\n".to_vec();
+        let uplink = b"nameserver 169.254.10.42\n".to_vec();
+        let out = pick_resolv_contents(original.clone(), uplink);
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn pick_resolv_swaps_in_uplink_for_rfc1918() {
+        // RFC1918 ranges are normal home/office LAN DNS, not a
+        // split-DNS marker — let the substitution happen.
+        let original = b"nameserver 127.0.0.53\n".to_vec();
+        let lan = b"nameserver 192.168.1.1\n".to_vec();
+        let out = pick_resolv_contents(original, lan.clone());
+        assert_eq!(out, lan);
+
+        let original = b"nameserver 127.0.0.53\n".to_vec();
+        let lan = b"nameserver 10.0.0.1\n".to_vec();
+        let out = pick_resolv_contents(original, lan.clone());
+        assert_eq!(out, lan);
+
+        let original = b"nameserver 127.0.0.53\n".to_vec();
+        let lan = b"nameserver 172.20.0.1\n".to_vec();
+        let out = pick_resolv_contents(original, lan.clone());
+        assert_eq!(out, lan);
+    }
+
+    #[test]
+    fn split_dns_marker_classification() {
+        // CGNAT
+        assert!(is_split_dns_marker_ip("100.64.0.1"));
+        assert!(is_split_dns_marker_ip("100.100.100.100"));
+        assert!(is_split_dns_marker_ip("100.127.255.254"));
+        // CGNAT boundary — first octet only matches when second
+        // octet is in [64, 127].
+        assert!(!is_split_dns_marker_ip("100.63.255.254"));
+        assert!(!is_split_dns_marker_ip("100.128.0.1"));
+        // Link-local
+        assert!(is_split_dns_marker_ip("169.254.10.42"));
+        assert!(!is_split_dns_marker_ip("169.253.10.42"));
+        // Public
+        assert!(!is_split_dns_marker_ip("8.8.8.8"));
+        assert!(!is_split_dns_marker_ip("1.1.1.1"));
+        // RFC1918 (deliberately NOT flagged)
+        assert!(!is_split_dns_marker_ip("10.0.0.1"));
+        assert!(!is_split_dns_marker_ip("172.20.0.1"));
+        assert!(!is_split_dns_marker_ip("192.168.1.1"));
+        // Loopback
+        assert!(!is_split_dns_marker_ip("127.0.0.53"));
+        // Garbage
+        assert!(!is_split_dns_marker_ip(""));
+        assert!(!is_split_dns_marker_ip("notanip"));
+        assert!(!is_split_dns_marker_ip("100.100.100"));
+    }
+
+    #[test]
+    fn uplink_split_dns_picks_up_extra_whitespace_and_comments() {
+        // systemd-resolved sometimes prepends a # banner. The detector
+        // should not be fooled by indentation or comment lines.
+        let uplink = b"\
+# Generated by systemd-resolved
+    nameserver   100.100.100.100   # tailscale
+nameserver 8.8.8.8
+"
+        .to_vec();
+        assert!(uplink_has_split_dns_markers(&uplink));
+
+        let clean = b"\
+# Generated by systemd-resolved
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+"
+        .to_vec();
+        assert!(!uplink_has_split_dns_markers(&clean));
+    }
+
+    #[test]
+    fn contents_have_stub_detects_127_0_0_53() {
+        assert!(contents_have_stub(b"nameserver 127.0.0.53\n"));
+        assert!(contents_have_stub(
+            b"# header\nnameserver 127.0.0.53\noptions edns0\n"
+        ));
+        assert!(!contents_have_stub(b"nameserver 1.1.1.1\n"));
+        assert!(!contents_have_stub(b""));
     }
 
     #[test]
