@@ -536,15 +536,17 @@ fn collect_normal_paths(
         rw.push(dir.clone());
     }
 
-    // $HOME/.gitconfig: read-only — git needs user.name and
-    // user.email for commits, but the agent must not modify
-    // the user's git identity or credential helpers.
-    let gitconfig = home.join(".gitconfig");
-    if !private_home && gitconfig.is_file() {
-        if verbose {
-            output::verbose("Landlock: ~/.gitconfig ro");
+    // $HOME/.gitconfig and $HOME/.gitignore: read-only — git needs user.name,
+    // user.email, and ignore settings for commits, but the agent must not
+    // modify the user's git identity, credential helpers, or ignore defaults.
+    for filename in [".gitconfig", ".gitignore"] {
+        let git_file = home.join(filename);
+        if !private_home && git_file.is_file() {
+            if verbose {
+                output::verbose(&format!("Landlock: ~/{filename} ro"));
+            }
+            ro.push(git_file);
         }
-        ro.push(gitconfig);
     }
 
     if !browser_mode
@@ -952,6 +954,32 @@ mod tests {
                 && !ro.contains(&home.join(".local")),
             "host .local must not be allowed"
         );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn normal_paths_include_home_gitignore_read_only() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-landlock-gitignore-home-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let gitignore = home.join(".gitignore");
+        std::fs::write(&gitignore, b"target\n").unwrap();
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
+
+        let config = Config {
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            ..Config::default()
+        };
+        let (ro, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
+
+        assert!(ro.contains(&gitignore));
+        assert!(!rw.contains(&gitignore));
 
         let _ = std::fs::remove_dir_all(&home);
     }

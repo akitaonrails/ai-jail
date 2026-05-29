@@ -546,6 +546,15 @@ fn macos_lockdown_read_paths(
         }
     }
 
+    if !private_home {
+        for filename in [".gitconfig", ".gitignore"] {
+            let git_file = super::home_dir().join(filename);
+            if git_file.is_file() {
+                push_unique(canonicalize_or_keep(&git_file));
+            }
+        }
+    }
+
     if private_home && !browser_mode && !config.lockdown_enabled() {
         for p in config.rw_maps.iter().chain(config.ro_maps.iter()) {
             if super::path_exists(p) {
@@ -780,6 +789,32 @@ mod tests {
         let project = PathBuf::from("/tmp/test-project");
         let paths = macos_lockdown_read_paths(&Config::default(), &project);
         assert!(paths.contains(&project));
+    }
+
+    #[test]
+    fn lockdown_read_paths_include_home_gitignore() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-seatbelt-gitignore-home-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let gitignore = home.join(".gitignore");
+        std::fs::write(&gitignore, b"target\n").unwrap();
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
+
+        let paths = macos_lockdown_read_paths(
+            &Config {
+                lockdown: Some(true),
+                ..Config::default()
+            },
+            Path::new("/tmp/test-project"),
+        );
+
+        assert!(paths.contains(&canonicalize_or_keep(&gitignore)));
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

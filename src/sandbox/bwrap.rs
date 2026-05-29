@@ -1325,12 +1325,14 @@ fn discover_home_dotfiles(
         }
     }
 
-    let gitconfig = home.join(".gitconfig");
-    if gitconfig.is_file() {
-        mounts.push(Mount::RoBind {
-            src: gitconfig.clone(),
-            dest: gitconfig,
-        });
+    for filename in [".gitconfig", ".gitignore"] {
+        let git_file = home.join(filename);
+        if git_file.is_file() {
+            mounts.push(Mount::RoBind {
+                src: git_file.clone(),
+                dest: git_file,
+            });
+        }
     }
     let claude_json = home.join(".claude.json");
     if claude_json.is_file() {
@@ -2537,6 +2539,27 @@ mod tests {
             )),
             "~/.pi must be mounted read-write so pi can write settings and sessions"
         );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn home_gitignore_is_mounted_read_only() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-gitignore-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let gitignore = home.join(".gitignore");
+        std::fs::write(&gitignore, b"target\n").unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let mounts = discover_home_dotfiles(false, &[], &[], false);
+
+        assert!(mounts.iter().any(|m| matches!(
+            m,
+            Mount::RoBind { src, dest } if src == &gitignore && dest == &gitignore
+        )));
 
         let _ = std::fs::remove_dir_all(&home);
     }
