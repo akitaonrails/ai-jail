@@ -548,6 +548,15 @@ fn collect_normal_paths(
             ro.push(git_file);
         }
     }
+    // XDG-style global git settings dir: $HOME/.config/git/{config,ignore,...}.
+    // Single read-only hierarchy covers all the files Git looks for there.
+    let xdg_git = home.join(".config").join("git");
+    if !private_home && xdg_git.is_dir() {
+        if verbose {
+            output::verbose("Landlock: ~/.config/git ro");
+        }
+        ro.push(xdg_git);
+    }
 
     if !browser_mode
         && let Some(paths) =
@@ -980,6 +989,32 @@ mod tests {
 
         assert!(ro.contains(&gitignore));
         assert!(!rw.contains(&gitignore));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn normal_paths_include_xdg_git_dir_read_only() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-landlock-xdg-git-home-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let xdg_git = home.join(".config").join("git");
+        std::fs::create_dir_all(&xdg_git).unwrap();
+        std::fs::write(xdg_git.join("ignore"), b"target\n").unwrap();
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
+
+        let config = Config {
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            ..Config::default()
+        };
+        let (ro, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
+
+        assert!(ro.contains(&xdg_git));
+        assert!(!rw.contains(&xdg_git));
 
         let _ = std::fs::remove_dir_all(&home);
     }

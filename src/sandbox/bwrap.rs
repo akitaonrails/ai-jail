@@ -1334,6 +1334,17 @@ fn discover_home_dotfiles(
             });
         }
     }
+    // XDG-style global git settings: $HOME/.config/git/{config,ignore,attributes,...}.
+    // This is Git's default location when ~/.gitconfig/~/.gitignore are absent.
+    // Mounted as a read-only directory so all the files Git looks for there
+    // (config, ignore, attributes) come through in one shot.
+    let xdg_git = home.join(".config").join("git");
+    if xdg_git.is_dir() {
+        mounts.push(Mount::RoBind {
+            src: xdg_git.clone(),
+            dest: xdg_git,
+        });
+    }
     let claude_json = home.join(".claude.json");
     if claude_json.is_file() {
         mounts.push(Mount::Bind {
@@ -2560,6 +2571,53 @@ mod tests {
             m,
             Mount::RoBind { src, dest } if src == &gitignore && dest == &gitignore
         )));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn home_xdg_git_dir_is_mounted_read_only() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-xdg-git-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let xdg_git = home.join(".config").join("git");
+        std::fs::create_dir_all(&xdg_git).unwrap();
+        std::fs::write(xdg_git.join("ignore"), b"target\n").unwrap();
+        std::fs::write(xdg_git.join("config"), b"[user]\n").unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let mounts = discover_home_dotfiles(false, &[], &[], false);
+
+        assert!(
+            mounts.iter().any(|m| matches!(
+                m,
+                Mount::RoBind { src, dest } if src == &xdg_git && dest == &xdg_git
+            )),
+            "expected RoBind of ~/.config/git, got: {mounts:#?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn home_xdg_git_dir_skipped_when_absent() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-xdg-git-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let mounts = discover_home_dotfiles(false, &[], &[], false);
+
+        let xdg_git = home.join(".config").join("git");
+        assert!(
+            !mounts.iter().any(|m| matches!(
+                m, Mount::RoBind { src, .. } if src == &xdg_git
+            )),
+            "must not mount nonexistent ~/.config/git"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }

@@ -553,6 +553,13 @@ fn macos_lockdown_read_paths(
                 push_unique(canonicalize_or_keep(&git_file));
             }
         }
+        // XDG-style global git settings: ~/.config/git/{config,ignore,...}.
+        // Push the directory; push_path_rule emits a subpath allow that
+        // covers every file Git reads from there.
+        let xdg_git = super::home_dir().join(".config").join("git");
+        if xdg_git.is_dir() {
+            push_unique(canonicalize_or_keep(&xdg_git));
+        }
     }
 
     if private_home && !browser_mode && !config.lockdown_enabled() {
@@ -813,6 +820,32 @@ mod tests {
         );
 
         assert!(paths.contains(&canonicalize_or_keep(&gitignore)));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn lockdown_read_paths_include_xdg_git_dir() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-seatbelt-xdg-git-home-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let xdg_git = home.join(".config").join("git");
+        std::fs::create_dir_all(&xdg_git).unwrap();
+        std::fs::write(xdg_git.join("ignore"), b"target\n").unwrap();
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
+
+        let paths = macos_lockdown_read_paths(
+            &Config {
+                lockdown: Some(true),
+                ..Config::default()
+            },
+            Path::new("/tmp/test-project"),
+        );
+
+        assert!(paths.contains(&canonicalize_or_keep(&xdg_git)));
 
         let _ = std::fs::remove_dir_all(&home);
     }
