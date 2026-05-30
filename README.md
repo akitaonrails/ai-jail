@@ -364,7 +364,8 @@ Pass `--private-home` or set `private_home = true` to skip this automatic dotdir
 - `~/.cache/BraveSoftware`, `~/.cache/chromium`, `~/.cache/spotify`, `~/.cache/nvidia`, `~/.cache/mesa_shader_cache`, `~/.cache/basilisk-dev`
 
 **Explicit file mounts:**
-- `~/.gitconfig` (read-only)
+- `~/.gitconfig`, `~/.gitignore` (read-only) — git identity and global excludes
+- `$XDG_CONFIG_HOME/git/` (read-only, falls back to `~/.config/git/`) — Git's XDG-style global config/ignore/attributes
 - `~/.claude.json` (read-write)
 - Validated linked Git worktree admin dirs outside the project tree (auto, same-path passthrough)
 

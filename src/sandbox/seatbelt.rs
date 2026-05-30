@@ -553,10 +553,11 @@ fn macos_lockdown_read_paths(
                 push_unique(canonicalize_or_keep(&git_file));
             }
         }
-        // XDG-style global git settings: ~/.config/git/{config,ignore,...}.
+        // XDG-style global git settings: $XDG_CONFIG_HOME/git/{config,ignore,...}
+        // (defaults to $HOME/.config/git when XDG_CONFIG_HOME is unset).
         // Push the directory; push_path_rule emits a subpath allow that
         // covers every file Git reads from there.
-        let xdg_git = super::home_dir().join(".config").join("git");
+        let xdg_git = super::xdg_config_home().join("git");
         if xdg_git.is_dir() {
             push_unique(canonicalize_or_keep(&xdg_git));
         }
@@ -836,6 +837,7 @@ mod tests {
         std::fs::create_dir_all(&xdg_git).unwrap();
         std::fs::write(xdg_git.join("ignore"), b"target\n").unwrap();
         let _home = EnvVarGuard::set("HOME", home.as_os_str());
+        let _xdg = EnvVarGuard::remove("XDG_CONFIG_HOME");
 
         let paths = macos_lockdown_read_paths(
             &Config {

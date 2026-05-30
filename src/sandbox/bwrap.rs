@@ -1334,11 +1334,12 @@ fn discover_home_dotfiles(
             });
         }
     }
-    // XDG-style global git settings: $HOME/.config/git/{config,ignore,attributes,...}.
+    // XDG-style global git settings: $XDG_CONFIG_HOME/git/{config,ignore,attributes,...}
+    // (defaults to $HOME/.config/git when XDG_CONFIG_HOME is unset).
     // This is Git's default location when ~/.gitconfig/~/.gitignore are absent.
     // Mounted as a read-only directory so all the files Git looks for there
     // (config, ignore, attributes) come through in one shot.
-    let xdg_git = home.join(".config").join("git");
+    let xdg_git = super::xdg_config_home().join("git");
     if xdg_git.is_dir() {
         mounts.push(Mount::RoBind {
             src: xdg_git.clone(),
@@ -2587,6 +2588,7 @@ mod tests {
         std::fs::write(xdg_git.join("config"), b"[user]\n").unwrap();
 
         let _home = EnvVarGuard::set("HOME", &home);
+        let _xdg = EnvVarGuard::remove("XDG_CONFIG_HOME");
         let mounts = discover_home_dotfiles(false, &[], &[], false);
 
         assert!(
@@ -2601,6 +2603,50 @@ mod tests {
     }
 
     #[test]
+    fn xdg_config_home_env_overrides_dot_config_location() {
+        // XDG spec: $XDG_CONFIG_HOME wins when set. A user with
+        // XDG_CONFIG_HOME=/opt/cfg keeps their git config at
+        // /opt/cfg/git — ai-jail must follow the env var, not the
+        // hardcoded ~/.config fallback.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-xdg-env-home-{}", std::process::id()));
+        let xdg = std::env::temp_dir()
+            .join(format!("ai-jail-xdg-env-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&xdg);
+        std::fs::create_dir_all(&home).unwrap();
+        let xdg_git = xdg.join("git");
+        std::fs::create_dir_all(&xdg_git).unwrap();
+        std::fs::write(xdg_git.join("config"), b"[user]\n").unwrap();
+        // Decoy: a fallback path that should NOT be picked because
+        // XDG_CONFIG_HOME is set.
+        let decoy = home.join(".config").join("git");
+        std::fs::create_dir_all(&decoy).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _xdg_env = EnvVarGuard::set("XDG_CONFIG_HOME", &xdg);
+        let mounts = discover_home_dotfiles(false, &[], &[], false);
+
+        assert!(
+            mounts.iter().any(|m| matches!(
+                m, Mount::RoBind { src, .. } if src == &xdg_git
+            )),
+            "expected RoBind of {}, got: {mounts:#?}",
+            xdg_git.display()
+        );
+        assert!(
+            !mounts.iter().any(|m| matches!(
+                m, Mount::RoBind { src, .. } if src == &decoy
+            )),
+            "must not mount ~/.config/git fallback when XDG_CONFIG_HOME is set"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&xdg);
+    }
+
+    #[test]
     fn home_xdg_git_dir_skipped_when_absent() {
         let _lock = ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir()
@@ -2609,6 +2655,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
 
         let _home = EnvVarGuard::set("HOME", &home);
+        let _xdg = EnvVarGuard::remove("XDG_CONFIG_HOME");
         let mounts = discover_home_dotfiles(false, &[], &[], false);
 
         let xdg_git = home.join(".config").join("git");

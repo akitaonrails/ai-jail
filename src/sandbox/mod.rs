@@ -197,6 +197,17 @@ fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
 }
 
+/// Resolve `$XDG_CONFIG_HOME` per the XDG Base Directory spec:
+/// return its value if set and non-empty, otherwise fall back to
+/// `$HOME/.config`. Used by sandbox setup to find tools that store
+/// state under the XDG config dir (e.g. global git config/ignore).
+fn xdg_config_home() -> PathBuf {
+    match std::env::var("XDG_CONFIG_HOME") {
+        Ok(v) if !v.is_empty() => PathBuf::from(v),
+        _ => home_dir().join(".config"),
+    }
+}
+
 fn path_exists(p: &Path) -> bool {
     p.exists() || p.symlink_metadata().is_ok()
 }
@@ -624,6 +635,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::test_support::linked_worktree_fixture;
+    use crate::test_utils::{ENV_LOCK, EnvVarGuard};
 
     fn temp_test_dir(prefix: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -990,5 +1002,30 @@ mod tests {
             discover_git_worktree_paths(&config, &fixture.project_dir, false)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn xdg_config_home_falls_back_to_home_dot_config() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::set("HOME", "/home/test-user");
+        let _xdg = EnvVarGuard::remove("XDG_CONFIG_HOME");
+        assert_eq!(xdg_config_home(), PathBuf::from("/home/test-user/.config"));
+    }
+
+    #[test]
+    fn xdg_config_home_falls_back_when_env_is_empty() {
+        // XDG spec: treat empty value the same as unset.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::set("HOME", "/home/test-user");
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", "");
+        assert_eq!(xdg_config_home(), PathBuf::from("/home/test-user/.config"));
+    }
+
+    #[test]
+    fn xdg_config_home_honors_env_var() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::set("HOME", "/home/test-user");
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", "/opt/custom-config");
+        assert_eq!(xdg_config_home(), PathBuf::from("/opt/custom-config"));
     }
 }

@@ -548,12 +548,13 @@ fn collect_normal_paths(
             ro.push(git_file);
         }
     }
-    // XDG-style global git settings dir: $HOME/.config/git/{config,ignore,...}.
+    // XDG-style global git settings dir: $XDG_CONFIG_HOME/git/{config,ignore,...}
+    // (defaults to $HOME/.config/git when XDG_CONFIG_HOME is unset).
     // Single read-only hierarchy covers all the files Git looks for there.
-    let xdg_git = home.join(".config").join("git");
+    let xdg_git = super::xdg_config_home().join("git");
     if !private_home && xdg_git.is_dir() {
         if verbose {
-            output::verbose("Landlock: ~/.config/git ro");
+            output::verbose(&format!("Landlock: {} ro", xdg_git.display()));
         }
         ro.push(xdg_git);
     }
@@ -1005,6 +1006,7 @@ mod tests {
         std::fs::create_dir_all(&xdg_git).unwrap();
         std::fs::write(xdg_git.join("ignore"), b"target\n").unwrap();
         let _home = EnvVarGuard::set("HOME", home.as_os_str());
+        let _xdg = EnvVarGuard::remove("XDG_CONFIG_HOME");
 
         let config = Config {
             no_gpu: Some(true),
