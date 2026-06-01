@@ -443,8 +443,8 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 
 | Flag | Description |
 |------|-------------|
-| `--rw-map <PATH>` | Mount PATH read-write (repeatable) |
-| `--map <PATH>` | Mount PATH read-only (repeatable) |
+| `--rw-map <PATH>` | Mount PATH read-write (repeatable). Relative paths and `..` are resolved against the project directory, so `--rw-map ../sister-project` works from a project root. |
+| `--map <PATH>` | Mount PATH read-only (repeatable). Same path resolution as `--rw-map`. |
 | `--hide-dotdir <NAME>` | Never bind-mount the named home dotdir into the sandbox (e.g. `.my_secrets`). Leading dot is optional. Repeatable. Cannot hide dotdirs required for tool operation (`.cargo`, `.config`, `.cache`, etc.) — those emit a warning and stay visible. |
 | `--mask <PATH>` | Replace `PATH` inside the sandbox with an empty file (or empty tmpfs if the path is a directory). Relative paths resolve against the project directory. Repeatable. Useful for hiding sensitive files like `.env`, `credentials.json` from AI agents while keeping the rest of the project accessible. Missing paths are skipped with a warning. |
 | `--allow-tcp-port <PORT>` | Permit outbound TCP to PORT in lockdown mode (repeatable). Skips `--unshare-net` and uses Landlock V4 `NetPort` rules to deny everything else. Requires Linux ≥ 6.5; hard-fails otherwise. No effect outside lockdown or on macOS. |
@@ -557,7 +557,7 @@ lockdown = true
 When CLI flags and an existing config are both present:
 
 - `command`: CLI replaces config for the current run, but a CLI-passed command is **not** auto-persisted when the project already has a stored command — so `ai-jail codex` after `ai-jail claude` runs codex for that session without rewriting `.ai-jail`'s stored default. Use `ai-jail --init <command>` to explicitly change the stored command. First-run bootstrap (no stored command yet) still persists the CLI command as the new default.
-- `rw_maps` / `ro_maps` / `mask`: CLI values are appended (duplicates removed). Paths starting with `~/` or exactly `~` are expanded against `$HOME` at merge time, so you can write `ro_maps = ["~/.bashrc"]` in a config file.
+- `rw_maps` / `ro_maps` / `mask`: CLI values are appended (duplicates removed). Paths starting with `~/` or exactly `~` are expanded against `$HOME` at merge time, so you can write `ro_maps = ["~/.bashrc"]` in a config file. Relative paths in `rw_maps` / `ro_maps` (including `../sibling` style) are resolved against the project directory before being passed to the sandbox.
 - Boolean flags: CLI overrides config (`--no-gpu` sets `no_gpu = true`)
 - `--save-config` / `--no-save-config` override `no_save_config`
 - Config is updated after merge in normal mode when config saving is enabled; lockdown skips auto-save

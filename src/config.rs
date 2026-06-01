@@ -375,6 +375,78 @@ fn expand_tilde_vec(paths: &mut [PathBuf]) {
     }
 }
 
+/// Lexically normalize a path: collapse `.` and `..` components without
+/// touching the filesystem. Symbolic links are NOT resolved — we use
+/// this for user-supplied paths that may not exist at config time and
+/// don't want surprising symlink-following semantics.
+///
+/// `..` that would escape the root is dropped (so `/..` stays `/`),
+/// matching the behaviour of `cd /..` in a shell.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                // Pop the last Normal component; otherwise we're at a
+                // root or about to escape it, so drop the `..`.
+                if matches!(out.last(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !matches!(
+                    out.last(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                ) {
+                    // Relative path with leading `..` and nothing to pop:
+                    // preserve the `..` literally.
+                    out.push(comp);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let mut result = PathBuf::new();
+    for c in out {
+        result.push(c.as_os_str());
+    }
+    if result.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        result
+    }
+}
+
+/// Resolve a user-supplied path to an absolute, lexically-normalized
+/// form. Relative paths are joined with `base` (typically the user's
+/// invocation cwd / project dir) before normalization. Absolute paths
+/// are normalized in place.
+pub fn to_absolute(path: PathBuf, base: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    };
+    normalize_path(&joined)
+}
+
+fn absolutize_vec(paths: &mut [PathBuf], base: &Path) {
+    for p in paths.iter_mut() {
+        *p = to_absolute(std::mem::take(p), base);
+    }
+}
+
+/// Resolve relative paths in user-supplied fields against `cwd` so
+/// downstream sandbox code (bwrap, landlock, seatbelt) sees absolute
+/// paths consistently. Called once after [`merge`] in `main`.
+///
+/// Without this, `ai-jail --map ../sister-project` would hand bwrap
+/// a relative path which it silently rejects, leaving the mount
+/// invisible inside the sandbox (issue #54).
+pub fn absolutize_user_paths(config: &mut Config, cwd: &Path) {
+    absolutize_vec(&mut config.rw_maps, cwd);
+    absolutize_vec(&mut config.ro_maps, cwd);
+}
+
 /// Inverse of `expand_tilde`: if `path` starts with `$HOME`, rewrite
 /// that prefix to `~`. Used at save time so `.ai-jail` keeps its
 /// `~/...` notation across runs and stays portable across machines.
@@ -2007,6 +2079,134 @@ allow_tcp_ports = [32000, 8080]
         );
         assert_eq!(merged.rw_maps, vec![PathBuf::from("/home/user/work")]);
         assert_eq!(merged.mask, vec![PathBuf::from("/home/user/secret.env")]);
+    }
+
+    // ── Relative-path resolution tests (issue #54) ────────────
+
+    #[test]
+    fn normalize_path_collapses_parent_and_current() {
+        assert_eq!(
+            normalize_path(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
+        assert_eq!(normalize_path(Path::new("/a/./b")), PathBuf::from("/a/b"));
+        assert_eq!(
+            normalize_path(Path::new("/a/b/c/..")),
+            PathBuf::from("/a/b")
+        );
+    }
+
+    #[test]
+    fn normalize_path_drops_dotdot_above_root() {
+        // /.. is /, /../foo is /foo. Matches `cd /..` shell behaviour.
+        assert_eq!(normalize_path(Path::new("/..")), PathBuf::from("/"));
+        assert_eq!(normalize_path(Path::new("/../foo")), PathBuf::from("/foo"));
+        assert_eq!(
+            normalize_path(Path::new("/a/../../b")),
+            PathBuf::from("/b")
+        );
+    }
+
+    #[test]
+    fn normalize_path_preserves_leading_dotdot_when_relative() {
+        // Relative input with no base to resolve against: keep `..`.
+        // (In practice we always call this on absolute paths via
+        // to_absolute, but the helper itself should be sane.)
+        assert_eq!(
+            normalize_path(Path::new("../foo")),
+            PathBuf::from("../foo")
+        );
+    }
+
+    #[test]
+    fn normalize_path_empty_becomes_dot() {
+        assert_eq!(normalize_path(Path::new("./.")), PathBuf::from("."));
+    }
+
+    #[test]
+    fn to_absolute_resolves_parent_relative_against_base() {
+        // Core repro for #54: `--map ../sister-project` from
+        // /home/user/Projects/myproject must yield the absolute
+        // sibling, not be passed through to bwrap as `../sister-project`.
+        let cwd = Path::new("/home/user/Projects/myproject");
+        assert_eq!(
+            to_absolute(PathBuf::from("../sister-project"), cwd),
+            PathBuf::from("/home/user/Projects/sister-project")
+        );
+    }
+
+    #[test]
+    fn to_absolute_leaves_absolute_paths_alone_modulo_normalization() {
+        let cwd = Path::new("/home/user");
+        assert_eq!(
+            to_absolute(PathBuf::from("/opt/data"), cwd),
+            PathBuf::from("/opt/data")
+        );
+        // Absolute path with `..` still gets normalized.
+        assert_eq!(
+            to_absolute(PathBuf::from("/opt/foo/../data"), cwd),
+            PathBuf::from("/opt/data")
+        );
+    }
+
+    #[test]
+    fn to_absolute_resolves_bare_relative() {
+        let cwd = Path::new("/home/user/project");
+        assert_eq!(
+            to_absolute(PathBuf::from("subdir"), cwd),
+            PathBuf::from("/home/user/project/subdir")
+        );
+        assert_eq!(
+            to_absolute(PathBuf::from("./subdir"), cwd),
+            PathBuf::from("/home/user/project/subdir")
+        );
+    }
+
+    #[test]
+    fn absolutize_user_paths_handles_rw_and_ro_maps() {
+        let mut config = Config {
+            rw_maps: vec![
+                PathBuf::from("../sister"),
+                PathBuf::from("/opt/abs"),
+            ],
+            ro_maps: vec![PathBuf::from("./sub")],
+            // mask is intentionally NOT touched by absolutize; its
+            // existing "relative-to-project-dir at mount time" semantic
+            // (see build_mask_mounts) is left alone.
+            mask: vec![PathBuf::from("secret.env")],
+            ..Config::default()
+        };
+        absolutize_user_paths(
+            &mut config,
+            Path::new("/home/user/Projects/myproject"),
+        );
+        assert_eq!(
+            config.rw_maps,
+            vec![
+                PathBuf::from("/home/user/Projects/sister"),
+                PathBuf::from("/opt/abs"),
+            ]
+        );
+        assert_eq!(
+            config.ro_maps,
+            vec![PathBuf::from("/home/user/Projects/myproject/sub")]
+        );
+        assert_eq!(config.mask, vec![PathBuf::from("secret.env")]);
+    }
+
+    #[test]
+    fn absolutize_user_paths_is_idempotent() {
+        // The landlock-exec re-entry calls absolutize again; absolute
+        // paths must not be mangled.
+        let mut config = Config {
+            rw_maps: vec![PathBuf::from("/home/user/work")],
+            ro_maps: vec![PathBuf::from("/opt/data")],
+            ..Config::default()
+        };
+        absolutize_user_paths(&mut config, Path::new("/somewhere/else"));
+        absolutize_user_paths(&mut config, Path::new("/elsewhere"));
+        assert_eq!(config.rw_maps, vec![PathBuf::from("/home/user/work")]);
+        assert_eq!(config.ro_maps, vec![PathBuf::from("/opt/data")]);
     }
 
     // ── Tilde collapse tests (issue #52) ──────────────────────

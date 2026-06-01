@@ -96,7 +96,10 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
         .map_err(|e| format!("Cannot determine current directory: {e}"))?;
 
     // Use the fully resolved outer policy forwarded via internal args.
-    let config = config::merge(cli, config::Config::default());
+    let mut config = config::merge(cli, config::Config::default());
+    // Idempotent: parent absolutized before serializing wrapper args,
+    // but re-running guarantees no relative path reaches landlock.
+    config::absolutize_user_paths(&mut config, &project_dir);
 
     // Apply Landlock inside the sandbox (after bwrap namespace setup)
     sandbox::apply_landlock(&config, &project_dir, cli.verbose)?;
@@ -173,6 +176,13 @@ fn run() -> Result<i32, String> {
     // to explicitly change the stored command. See #20.
     let stored_command = existing.command.clone();
     let mut config = config::merge(&cli, existing);
+    // Resolve any relative paths in rw_maps/ro_maps against the user's
+    // invocation cwd before they reach bwrap/landlock/seatbelt (issue
+    // #54). Done here so display_status and the --init save path see
+    // the same canonical paths the sandbox will use.
+    let invocation_cwd = std::env::current_dir()
+        .map_err(|e| format!("Cannot determine current directory: {e}"))?;
+    config::absolutize_user_paths(&mut config, &invocation_cwd);
     apply_browser_profile(&mut config);
 
     // Handle status command
