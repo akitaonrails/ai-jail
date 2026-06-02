@@ -206,6 +206,9 @@ struct IoLoop<'a> {
     /// Optional control sequence to inject after the child has had a
     /// chance to process SIGWINCH. None when disabled.
     resize_redraw_key: Option<&'a [u8]>,
+    /// Extracts OSC 52 clipboard writes from the child stream so they
+    /// survive the alt-screen vt100 re-render (which drops them).
+    osc52: Osc52Forwarder,
 }
 
 impl<'a> IoLoop<'a> {
@@ -232,6 +235,7 @@ impl<'a> IoLoop<'a> {
             init_rows,
             init_cols,
             resize_redraw_key,
+            osc52: Osc52Forwarder::new(),
         }
     }
 
@@ -324,6 +328,15 @@ impl<'a> IoLoop<'a> {
         // primary screen uses raw pass-through anyway.
         if now_alt || now_alt != self.was_alt_screen {
             forward_keyboard_protocol(self.stdout, buf);
+        }
+
+        // Forward OSC 52 clipboard writes the same way. vt100 parses
+        // the OSC string but never re-emits it via state_diff /
+        // state_formatted, so a fullscreen TUI's "copy to clipboard"
+        // (opencode, claude --tui, etc.) is lost on the alt screen.
+        // The primary screen's raw pass-through carries it natively.
+        if now_alt {
+            self.osc52.feed(self.stdout, buf);
         }
 
         if now_alt != self.was_alt_screen {
@@ -563,6 +576,126 @@ fn forward_keyboard_protocol(fd: i32, data: &[u8]) {
                 // else: still in params
             }
             _ => st = 0,
+        }
+    }
+}
+
+/// Introducer for a 7-bit OSC 52 (manipulate selection) sequence.
+const OSC52_PREFIX: &[u8] = b"\x1b]52;";
+
+/// Hard cap on a single captured OSC 52 sequence. Clipboard payloads
+/// are base64 (~4/3 the raw size) and routinely span several read
+/// buffers; this guards against unbounded growth on malformed input.
+const OSC52_MAX_LEN: usize = 1 << 20;
+
+/// Where the OSC 52 scanner is within a (possibly read-spanning)
+/// sequence.
+enum Osc52State {
+    /// Not inside a candidate sequence.
+    Ground,
+    /// Matched this many leading bytes of `OSC52_PREFIX` (1..len).
+    Prefix(usize),
+    /// Inside the payload, accumulating until the terminator.
+    Body,
+    /// Saw `ESC` in the payload — maybe the start of an ST (`ESC \`).
+    BodyEsc,
+}
+
+/// Streaming extractor for OSC 52 clipboard sequences.
+///
+/// vt100 consumes the OSC string but does not expose or re-emit OSC
+/// 52, so on the alt-screen rendering paths (`state_diff` /
+/// `state_formatted`) a TUI's clipboard write is silently dropped.
+/// This scans the child's output byte-by-byte and forwards each
+/// complete `ESC ] 52 ; … (BEL | ST)` verbatim to the real terminal.
+///
+/// State persists across reads on purpose: a base64 selection can
+/// easily exceed a single 8 KiB read, so a stateless per-read scan
+/// (like `forward_keyboard_protocol`) would miss split sequences.
+struct Osc52Forwarder {
+    state: Osc52State,
+    buf: Vec<u8>,
+}
+
+impl Osc52Forwarder {
+    fn new() -> Self {
+        Self {
+            state: Osc52State::Ground,
+            buf: Vec::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.state = Osc52State::Ground;
+        self.buf.clear();
+    }
+
+    fn flush(&mut self, fd: i32) {
+        write_all_raw(fd, &self.buf);
+        self.reset();
+    }
+
+    fn feed(&mut self, fd: i32, data: &[u8]) {
+        for &b in data {
+            self.push(fd, b);
+        }
+    }
+
+    fn push(&mut self, fd: i32, b: u8) {
+        match self.state {
+            Osc52State::Ground => {
+                if b == 0x1b {
+                    self.buf.push(b);
+                    self.state = Osc52State::Prefix(1);
+                }
+            }
+            Osc52State::Prefix(n) => {
+                if b == OSC52_PREFIX[n] {
+                    self.buf.push(b);
+                    self.state = if n + 1 == OSC52_PREFIX.len() {
+                        Osc52State::Body
+                    } else {
+                        Osc52State::Prefix(n + 1)
+                    };
+                } else if b == 0x1b {
+                    // Mismatch, but a fresh ESC may start a new one.
+                    self.buf.clear();
+                    self.buf.push(b);
+                    self.state = Osc52State::Prefix(1);
+                } else {
+                    self.reset();
+                }
+            }
+            Osc52State::Body => match b {
+                0x07 => {
+                    // BEL terminator.
+                    self.buf.push(b);
+                    self.flush(fd);
+                }
+                0x1b => {
+                    self.buf.push(b);
+                    self.state = Osc52State::BodyEsc;
+                }
+                _ => {
+                    self.buf.push(b);
+                    if self.buf.len() > OSC52_MAX_LEN {
+                        self.reset();
+                    }
+                }
+            },
+            Osc52State::BodyEsc => {
+                if b == b'\\' {
+                    // ST terminator (ESC \).
+                    self.buf.push(b);
+                    self.flush(fd);
+                } else if b == 0x1b {
+                    // Another ESC — keep waiting for the backslash.
+                    self.buf.push(b);
+                } else {
+                    // Stray ESC, not a terminator: malformed, drop.
+                    self.reset();
+                }
+            }
         }
     }
 }
@@ -893,6 +1026,72 @@ mod tests {
     fn kbd_plain_text_ignored() {
         let out = capture_kbd_forward(b"hello world");
         assert!(out.is_empty());
+    }
+
+    fn capture_osc52(chunks: &[&[u8]]) -> Vec<u8> {
+        let (r, w) = nix::unistd::pipe().unwrap();
+        let mut fwd = super::Osc52Forwarder::new();
+        for chunk in chunks {
+            fwd.feed(w.as_raw_fd(), chunk);
+        }
+        drop(w);
+        let mut out = vec![0u8; 8192];
+        let n = nix::unistd::read(r.as_raw_fd(), &mut out).unwrap_or(0);
+        out.truncate(n);
+        out
+    }
+
+    #[test]
+    fn osc52_bel_terminated_forwarded() {
+        let seq = b"\x1b]52;c;aGVsbG8=\x07";
+        assert_eq!(capture_osc52(&[seq]), seq);
+    }
+
+    #[test]
+    fn osc52_st_terminated_forwarded() {
+        let seq = b"\x1b]52;c;aGVsbG8=\x1b\\";
+        assert_eq!(capture_osc52(&[seq]), seq);
+    }
+
+    #[test]
+    fn osc52_query_forwarded() {
+        // Apps query the clipboard with `?`; the terminal replies on
+        // our stdin, which the IO loop already routes to the child.
+        let seq = b"\x1b]52;c;?\x07";
+        assert_eq!(capture_osc52(&[seq]), seq);
+    }
+
+    #[test]
+    fn osc52_split_across_reads_forwarded_whole() {
+        // A base64 payload can straddle the 8 KiB read boundary.
+        let seq = b"\x1b]52;c;aGVsbG8gd29ybGQ=\x07";
+        assert_eq!(capture_osc52(&[&seq[..7], &seq[7..]]), seq);
+    }
+
+    #[test]
+    fn osc52_embedded_in_other_output_extracted() {
+        let data = b"some text\x1b[31m\x1b]52;c;Zm9v\x07more";
+        assert_eq!(capture_osc52(&[data]), b"\x1b]52;c;Zm9v\x07");
+    }
+
+    #[test]
+    fn osc52_other_osc_not_forwarded() {
+        // OSC 0 (window title) must not be mistaken for OSC 52.
+        let out = capture_osc52(&[b"\x1b]0;my title\x07"]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn osc52_plain_text_ignored() {
+        assert!(capture_osc52(&[b"just plain text"]).is_empty());
+    }
+
+    #[test]
+    fn osc52_oversized_payload_dropped() {
+        let mut seq = b"\x1b]52;c;".to_vec();
+        seq.extend(std::iter::repeat_n(b'A', super::OSC52_MAX_LEN + 16));
+        seq.push(0x07);
+        assert!(capture_osc52(&[&seq]).is_empty());
     }
 
     #[test]
