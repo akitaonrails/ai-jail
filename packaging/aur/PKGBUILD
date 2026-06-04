@@ -37,6 +37,9 @@ build() {
 check() {
     cd "$pkgname-$pkgver"
     export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    # Pin CARGO_HOME to the real cargo cache (populated by prepare()/build())
+    export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
     export HOME="$srcdir/test-home"
     mkdir -p "$HOME"
     # Keep AUR builds robust across user kernels/containers: run the unit test
