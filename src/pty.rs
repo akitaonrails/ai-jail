@@ -613,15 +613,16 @@ fn forward_terminal_queries(fd: i32, data: &[u8]) {
 /// input.
 const OSC_MAX_LEN: usize = 1 << 20;
 
-/// OSC command numbers that vt100 swallows and which we forward
-/// verbatim to the real terminal:
+/// OSC command numbers forwarded unconditionally (set or query) when
+/// vt100 swallows them on the alt screen:
 ///   - 0/1/2 — set icon name / window title. Without forwarding, a
 ///     fullscreen TUI's tab title never updates (opencode, #57).
 ///   - 52    — clipboard manipulation (copy / query).
-///   - 10/11/12 — fg / bg / cursor color set & query. TUIs query these
-///     to adapt their palette; the reply round-trips via our stdin.
-const OSC_FORWARD_CMDS: &[&[u8]] =
-    &[b"0", b"1", b"2", b"10", b"11", b"12", b"52"];
+///
+/// Color commands (OSC 10/11/12) are handled separately in
+/// [`OscForwarder::is_forwardable`] — only their *query* form is
+/// forwarded.
+const OSC_FORWARD_CMDS: &[&[u8]] = &[b"0", b"1", b"2", b"52"];
 
 /// Where the OSC scanner is within a (possibly read-spanning) sequence.
 enum OscState {
@@ -642,7 +643,8 @@ enum OscState {
 /// a TUI's window-title update, clipboard write, or color query is
 /// silently lost. This scans the child's output byte-by-byte and
 /// forwards each complete `ESC ] <cmd> ; … (BEL | ST)` verbatim to the
-/// real terminal when `<cmd>` is in [`OSC_FORWARD_CMDS`].
+/// real terminal when `<cmd>` is forwardable (see
+/// [`OscForwarder::is_forwardable`]).
 ///
 /// State persists across reads on purpose: a base64 OSC 52 selection
 /// can easily exceed a single 8 KiB read, so a stateless per-read scan
@@ -688,7 +690,20 @@ impl OscForwarder {
             .iter()
             .position(|&b| b == b';' || b == 0x07 || b == 0x1b)
             .unwrap_or(body.len());
-        OSC_FORWARD_CMDS.contains(&&body[..end])
+        let cmd = &body[..end];
+        if OSC_FORWARD_CMDS.contains(&cmd) {
+            return true;
+        }
+        // Color commands (fg/bg/cursor). Forward only the *query* form
+        // (`\x1b]1{0,1,2};?…`): forwarding a set would change the real
+        // terminal's default color, and the matching reset (OSC
+        // 110/111/112) is not forwarded, so a set would leak past the
+        // child's exit. The query reply round-trips via our stdin.
+        if matches!(cmd, b"10" | b"11" | b"12") {
+            return body.get(end) == Some(&b';')
+                && body.get(end + 1) == Some(&b'?');
+        }
+        false
     }
 
     fn feed(&mut self, fd: i32, data: &[u8]) {
@@ -1192,6 +1207,19 @@ mod tests {
         // from the reply, which round-trips via our stdin.
         let q = b"\x1b]11;?\x07";
         assert_eq!(capture_osc52(&[q]), q);
+        // OSC 10 (foreground) and OSC 12 (cursor) queries too.
+        let q10 = b"\x1b]10;?\x1b\\";
+        assert_eq!(capture_osc52(&[q10]), q10);
+    }
+
+    #[test]
+    fn osc_color_set_not_forwarded() {
+        // A color *set* (no `?`) must NOT be forwarded: it would change
+        // the real terminal's default color, and the matching reset
+        // (OSC 110/111/112) is not forwarded, so the change would leak
+        // past the child's exit.
+        let set = b"\x1b]11;rgb:0000/0000/0000\x07";
+        assert!(capture_osc52(&[set]).is_empty());
     }
 
     #[test]
