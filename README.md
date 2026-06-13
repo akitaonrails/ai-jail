@@ -580,6 +580,7 @@ ai-jail drops a `.gitignore` (`*`) inside `.ai-jail-overlays/` automatically, so
 - **Linux/bwrap only.** Backed by bubblewrap's `--overlay`, which needs unprivileged OverlayFS (Linux kernel ≥ 5.11). On **macOS** there is no equivalent, so overlay maps degrade to **read-only** with a warning (writes are denied, protecting the original).
 - **Disabled under `--lockdown` and browser mode** (both are read-only/ephemeral by design); a warning is printed if overlay maps are configured there.
 - Missing sources, unwritable storage, or overlapping destinations are skipped with a warning — never fatal.
+- **Storage is created eagerly.** The `.ai-jail-overlays/` directory (with its auto `.gitignore`) is created as soon as an overlay map is configured — including under `--dry-run`, because the upper/work layers must exist on disk before OverlayFS can mount them. It is git-ignored automatically; delete it any time with `rm -rf .ai-jail-overlays/`.
 
 ## Config file (`.ai-jail`)
 
