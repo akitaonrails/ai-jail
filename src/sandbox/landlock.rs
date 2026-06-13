@@ -598,6 +598,21 @@ fn collect_normal_paths(
                 ));
             }
         }
+        // Overlay maps need read-write here: Landlock runs INSIDE the
+        // bwrap sandbox (via --landlock-exec), where the destination is
+        // already an overlayfs mount. Writing there lands in the upper
+        // layer, never the original — so granting rw is both required
+        // for the feature to work and safe for the source directory.
+        for p in &config.overlay_maps {
+            if super::path_exists(p) {
+                rw.push(p.clone());
+            } else {
+                output::warn(&format!(
+                    "Landlock: overlay map {} not found, skipping",
+                    p.display()
+                ));
+            }
+        }
         if verbose && (!config.rw_maps.is_empty() || !config.ro_maps.is_empty())
         {
             output::verbose("Landlock: extra maps");

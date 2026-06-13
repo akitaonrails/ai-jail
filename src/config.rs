@@ -36,6 +36,12 @@ pub struct Config {
     pub rw_maps: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ro_maps: Vec<PathBuf>,
+    /// Copy-on-write overlay mounts: PATH is visible read-write inside
+    /// the sandbox, but writes land on a side layer under
+    /// `<project>/.ai-jail-overlays/` while the original stays
+    /// untouched (Linux/bwrap only; read-only fallback on macOS).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlay_maps: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hide_dotdirs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -218,6 +224,8 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     dedup_paths(&mut c.rw_maps);
     c.ro_maps.extend(local.ro_maps);
     dedup_paths(&mut c.ro_maps);
+    c.overlay_maps.extend(local.overlay_maps);
+    dedup_paths(&mut c.overlay_maps);
     c.hide_dotdirs.extend(local.hide_dotdirs);
     dedup_strings(&mut c.hide_dotdirs);
     c.mask.extend(local.mask);
@@ -308,6 +316,7 @@ fn save_to_path(path: &Path, config: &Config) {
     let mut on_disk = config.clone();
     collapse_tilde_vec(&mut on_disk.rw_maps);
     collapse_tilde_vec(&mut on_disk.ro_maps);
+    collapse_tilde_vec(&mut on_disk.overlay_maps);
     collapse_tilde_vec(&mut on_disk.mask);
     if let Some(p) = on_disk.claude_dir.take() {
         on_disk.claude_dir = Some(collapse_tilde(&p));
@@ -445,6 +454,7 @@ fn absolutize_vec(paths: &mut [PathBuf], base: &Path) {
 pub fn absolutize_user_paths(config: &mut Config, cwd: &Path) {
     absolutize_vec(&mut config.rw_maps, cwd);
     absolutize_vec(&mut config.ro_maps, cwd);
+    absolutize_vec(&mut config.overlay_maps, cwd);
 }
 
 /// Inverse of `expand_tilde`: if `path` starts with `$HOME`, rewrite
@@ -495,6 +505,9 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
 
     config.ro_maps.extend(cli.ro_maps.iter().cloned());
     dedup_paths(&mut config.ro_maps);
+
+    config.overlay_maps.extend(cli.overlay_maps.iter().cloned());
+    dedup_paths(&mut config.overlay_maps);
 
     // hide_dotdirs: CLI values appended, deduplicated
     config.hide_dotdirs.extend(cli.hide_dotdirs.iter().cloned());
@@ -565,6 +578,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     // tilde is recognized; `~user` is left alone.
     expand_tilde_vec(&mut config.rw_maps);
     expand_tilde_vec(&mut config.ro_maps);
+    expand_tilde_vec(&mut config.overlay_maps);
     expand_tilde_vec(&mut config.mask);
     if let Some(p) = config.claude_dir.take() {
         config.claude_dir = Some(expand_tilde(p));
@@ -584,6 +598,7 @@ pub fn display_status(config: &Config) {
     print_command(config);
     print_path_list("  RW maps", &config.rw_maps);
     print_path_list("  RO maps", &config.ro_maps);
+    print_path_list("  Overlay maps", &config.overlay_maps);
     print_string_list("  Hide dotdirs", &config.hide_dotdirs);
     print_path_list("  Masked files", &config.mask);
 
@@ -1023,6 +1038,39 @@ allow_tcp_ports = []
     }
 
     #[test]
+    fn regression_v1_7_0_config_without_overlay_maps() {
+        // Configs written before overlay_maps existed must still parse,
+        // defaulting the new field to an empty list.
+        let toml = r#"
+command = ["claude"]
+rw_maps = ["/tmp/rw"]
+ro_maps = ["/opt/ro"]
+hide_dotdirs = []
+mask = []
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.rw_maps, vec![PathBuf::from("/tmp/rw")]);
+        assert_eq!(cfg.ro_maps, vec![PathBuf::from("/opt/ro")]);
+        assert!(cfg.overlay_maps.is_empty());
+    }
+
+    #[test]
+    fn parse_config_with_overlay_maps() {
+        let toml = r#"
+command = ["claude"]
+overlay_maps = ["/home/u/.claude", "/home/u/.config/foo"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(
+            cfg.overlay_maps,
+            vec![
+                PathBuf::from("/home/u/.claude"),
+                PathBuf::from("/home/u/.config/foo"),
+            ]
+        );
+    }
+
+    #[test]
     fn regression_empty_config_file() {
         // An empty .ai-jail file must not crash
         let cfg = parse_toml("").unwrap();
@@ -1044,6 +1092,7 @@ allow_tcp_ports = []
             command: vec!["claude".into()],
             rw_maps: vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
             ro_maps: vec![PathBuf::from("/opt/data")],
+            overlay_maps: vec![PathBuf::from("/home/u/.claude")],
             hide_dotdirs: vec![".my_secrets".into(), ".proton".into()],
             mask: vec![PathBuf::from(".env")],
             no_gpu: Some(true),
@@ -1951,6 +2000,7 @@ allow_tcp_ports = [32000, 8080]
             command: vec!["codex".into()],
             rw_maps: vec![PathBuf::from("/tmp/shared")],
             ro_maps: vec![],
+            overlay_maps: vec![],
             hide_dotdirs: vec![],
             mask: vec![],
             no_gpu: Some(true),
