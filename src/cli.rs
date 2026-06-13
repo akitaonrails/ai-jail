@@ -16,6 +16,10 @@ COMMANDS (positional):
 OPTIONS:
     --rw-map <PATH>                Mount PATH read-write inside sandbox (repeatable)
     --map <PATH>                   Mount PATH read-only inside sandbox (repeatable)
+    --overlay-map <PATH>           Mount PATH copy-on-write: writes go to a side
+                                   layer, PATH itself stays untouched so you can
+                                   diff/promote later (repeatable; Linux/bwrap
+                                   only, read-only on macOS)
     --hide-dotdir <NAME>           Never mount dotdir NAME (e.g., .my_secrets) (repeatable)
     --mask <PATH>                  Replace PATH with an empty file inside sandbox (repeatable)
     --private-home / --no-private-home
@@ -57,6 +61,7 @@ pub struct CliArgs {
     pub command: Vec<String>,
     pub rw_maps: Vec<PathBuf>,
     pub ro_maps: Vec<PathBuf>,
+    pub overlay_maps: Vec<PathBuf>,
     pub hide_dotdirs: Vec<String>,
     pub mask: Vec<PathBuf>,
     pub private_home: Option<bool>,
@@ -110,6 +115,11 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 let val: PathBuf =
                     parser.value().map_err(|e| e.to_string())?.into();
                 args.ro_maps.push(val);
+            }
+            Long("overlay-map") => {
+                let val: PathBuf =
+                    parser.value().map_err(|e| e.to_string())?.into();
+                args.overlay_maps.push(val);
             }
             Long("mask") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -557,6 +567,25 @@ mod tests {
     fn parse_rw_map() {
         let args = parse_test(&["--rw-map", "/tmp/test", "bash"]).unwrap();
         assert_eq!(args.rw_maps, vec![PathBuf::from("/tmp/test")]);
+    }
+
+    #[test]
+    fn parse_overlay_map() {
+        let args = parse_test(&[
+            "--overlay-map",
+            "/home/u/.claude",
+            "--overlay-map",
+            "/home/u/.config/foo",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.overlay_maps,
+            vec![
+                PathBuf::from("/home/u/.claude"),
+                PathBuf::from("/home/u/.config/foo"),
+            ]
+        );
     }
 
     #[test]

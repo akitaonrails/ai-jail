@@ -12,14 +12,44 @@ const WSL_DOCKER_DESKTOP_CLI_TOOLS: &str = "/mnt/wsl/docker-desktop/cli-tools";
 
 #[derive(Debug, Clone)]
 enum Mount {
-    RoBind { src: PathBuf, dest: PathBuf },
-    Bind { src: PathBuf, dest: PathBuf },
-    DevBind { src: PathBuf, dest: PathBuf },
-    Dev { dest: PathBuf },
-    Proc { dest: PathBuf },
-    Tmpfs { dest: PathBuf },
-    Symlink { src: String, dest: PathBuf },
-    FileRoBind { src: PathBuf, dest: PathBuf },
+    RoBind {
+        src: PathBuf,
+        dest: PathBuf,
+    },
+    Bind {
+        src: PathBuf,
+        dest: PathBuf,
+    },
+    DevBind {
+        src: PathBuf,
+        dest: PathBuf,
+    },
+    Dev {
+        dest: PathBuf,
+    },
+    Proc {
+        dest: PathBuf,
+    },
+    Tmpfs {
+        dest: PathBuf,
+    },
+    Symlink {
+        src: String,
+        dest: PathBuf,
+    },
+    FileRoBind {
+        src: PathBuf,
+        dest: PathBuf,
+    },
+    /// Copy-on-write overlay: `lower` is mounted read-only as the base
+    /// at `dest`, writes go to `upper` (with overlayfs scratch in
+    /// `work`). The original `lower` directory is never modified.
+    Overlay {
+        lower: PathBuf,
+        upper: PathBuf,
+        work: PathBuf,
+        dest: PathBuf,
+    },
 }
 
 impl Mount {
@@ -62,6 +92,23 @@ impl Mount {
                     dest.display().to_string(),
                 ]
             }
+            Mount::Overlay {
+                lower,
+                upper,
+                work,
+                dest,
+            } => {
+                // `--overlay-src` sets the read-only lower layer for
+                // the `--overlay` that immediately follows it.
+                vec![
+                    "--overlay-src".into(),
+                    lower.display().to_string(),
+                    "--overlay".into(),
+                    upper.display().to_string(),
+                    work.display().to_string(),
+                    dest.display().to_string(),
+                ]
+            }
         }
     }
 }
@@ -85,12 +132,17 @@ struct MountSet {
     pictures: Vec<Mount>,
     browser_state: Vec<Mount>,
     extra: Vec<Mount>,
+    overlay: Vec<Mount>,
     project: Vec<Mount>,
     mask: Vec<Mount>,
+    /// tmpfs that hides the on-host overlay upper/work storage from
+    /// inside the sandbox. Applied last so it sits on top of the
+    /// project mount that contains it.
+    overlay_hide: Vec<Mount>,
 }
 
 impl MountSet {
-    fn ordered_mounts(&self) -> [&[Mount]; 17] {
+    fn ordered_mounts(&self) -> [&[Mount]; 19] {
         [
             &self.base,
             &self.sys_masks,
@@ -107,8 +159,10 @@ impl MountSet {
             &self.pictures,
             &self.browser_state,
             &self.extra,
+            &self.overlay,
             &self.project,
             &self.mask,
+            &self.overlay_hide,
         ]
     }
 
@@ -941,6 +995,19 @@ fn discover_mounts(
         lockdown,
         verbose,
     );
+    // Overlay maps are opt-in and only meaningful when the sandbox
+    // can write: disabled under lockdown (read-only) and browser mode.
+    let (overlay_mounts_v, overlay_hide_v) = if lockdown || browser_mode {
+        if !config.overlay_maps.is_empty() {
+            output::warn(
+                "Overlay maps are disabled under lockdown/browser \
+                     mode; skipping.",
+            );
+        }
+        (vec![], vec![])
+    } else {
+        overlay_mounts(&config.overlay_maps, project_dir, verbose)
+    };
 
     MountSet {
         base: discover_base(hosts_file, resolv_mount),
@@ -985,8 +1052,10 @@ fn discover_mounts(
         } else {
             extra_mounts(&config.rw_maps, &config.ro_maps)
         },
+        overlay: overlay_mounts_v,
         project: project_mount(project_dir, lockdown || browser_mode),
         mask: mask_mounts,
+        overlay_hide: overlay_hide_v,
     }
 }
 
@@ -1623,6 +1692,141 @@ fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
     }
 
     mounts
+}
+
+/// Directory (inside the project) that holds the on-host upper and
+/// work layers for overlay maps. Masked from inside the sandbox.
+const OVERLAY_STORAGE_DIR: &str = ".ai-jail-overlays";
+
+/// Turn an absolute destination path into a filesystem-safe, readable
+/// directory name for its overlay layer storage. `/home/u/.claude`
+/// becomes `home_u_.claude`. Preserving the full path keeps distinct
+/// destinations collision-free.
+fn overlay_storage_name(dest: &Path) -> String {
+    let s = dest.to_string_lossy();
+    let mut name = String::with_capacity(s.len());
+    for ch in s.trim_start_matches('/').chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            name.push(ch);
+        } else {
+            name.push('_');
+        }
+    }
+    if name.is_empty() {
+        name.push_str("root");
+    }
+    name
+}
+
+/// Build overlayfs mounts for `--overlay-map` destinations, plus the
+/// tmpfs that hides their on-host upper/work storage from inside the
+/// sandbox.
+///
+/// Each map mounts the real directory (read-only lower) at the same
+/// path inside the sandbox with a writable upper layer under
+/// `<project>/.ai-jail-overlays/<name>/upper`. Writes land in the
+/// upper layer; the original directory is never modified, so the user
+/// can diff the upper layer afterwards and promote changes.
+///
+/// Returns `(overlay_mounts, storage_hide_mounts)`. Overlays that
+/// cannot be set up (missing source, unwritable storage, overlapping
+/// destination) are skipped with a warning — never fatal.
+fn overlay_mounts(
+    overlay_maps: &[PathBuf],
+    project_dir: &Path,
+    verbose: bool,
+) -> (Vec<Mount>, Vec<Mount>) {
+    if overlay_maps.is_empty() {
+        return (vec![], vec![]);
+    }
+    let storage_root = project_dir.join(OVERLAY_STORAGE_DIR);
+    let mut mounts = Vec::new();
+    let mut accepted: Vec<PathBuf> = Vec::new();
+
+    for dest in overlay_maps {
+        if !super::path_exists(dest) {
+            output::warn(&format!(
+                "Overlay map {} not found, skipping.",
+                dest.display()
+            ));
+            continue;
+        }
+        // Reject overlapping destinations (equal / parent / child):
+        // two overlays sharing a subtree give overlayfs ambiguous
+        // layering and risk silent data confusion.
+        if let Some(conflict) = accepted
+            .iter()
+            .find(|a| *a == dest || a.starts_with(dest) || dest.starts_with(a))
+        {
+            output::warn(&format!(
+                "Overlay map {} overlaps {}, skipping.",
+                dest.display(),
+                conflict.display()
+            ));
+            continue;
+        }
+
+        let base = storage_root.join(overlay_storage_name(dest));
+        let upper = base.join("upper");
+        let work = base.join("work");
+        if let Err(e) = std::fs::create_dir_all(&upper)
+            .and_then(|_| std::fs::create_dir_all(&work))
+        {
+            output::warn(&format!(
+                "Overlay map {}: cannot create layer storage {}: {e}; \
+                 skipping.",
+                dest.display(),
+                base.display()
+            ));
+            continue;
+        }
+
+        // Always surface this, even without --verbose: the feature is
+        // opt-in and the whole point is that writes do NOT touch the
+        // original. Tell the user where the captured changes live so
+        // nobody loses work unknowingly.
+        output::info(&format!(
+            "Overlay: {} is copy-on-write; changes captured in {} \
+             (original untouched)",
+            dest.display(),
+            upper.display()
+        ));
+
+        mounts.push(Mount::Overlay {
+            lower: dest.clone(),
+            upper,
+            work,
+            dest: dest.clone(),
+        });
+        accepted.push(dest.clone());
+    }
+
+    if mounts.is_empty() {
+        return (vec![], vec![]);
+    }
+
+    // Drop a .gitignore so overlay layers never get committed by
+    // accident, then hide the raw storage from inside the sandbox so
+    // the agent cannot read or tamper with the upper/work layers
+    // directly — it must go through the overlay mount at the dest.
+    write_overlay_gitignore(&storage_root);
+    if verbose {
+        output::verbose(&format!("Overlay maps: {} active", mounts.len()));
+    }
+    let hide = vec![Mount::Tmpfs { dest: storage_root }];
+    (mounts, hide)
+}
+
+/// Write a `.gitignore` into the overlay storage root so the layers
+/// are never accidentally committed. Best-effort; failure is silent.
+fn write_overlay_gitignore(storage_root: &Path) {
+    let gitignore = storage_root.join(".gitignore");
+    if !super::path_exists(&gitignore) {
+        let _ = std::fs::write(
+            &gitignore,
+            "# ai-jail overlay layers — do not commit\n*\n",
+        );
+    }
 }
 
 fn project_mount(project_dir: &Path, readonly: bool) -> Vec<Mount> {
@@ -2292,6 +2496,170 @@ mod tests {
             .windows(3)
             .any(|w| w[0] == "--bind" && w[1] == "/tmp" && w[2] == "/tmp");
         assert!(!has_tmp_bind);
+    }
+
+    /// Create a fresh `(project_dir, source_dir)` pair under the temp
+    /// dir for overlay tests. Caller removes the parent when done.
+    fn overlay_test_dirs(prefix: &str) -> (PathBuf, PathBuf) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-ovl-{prefix}-{}-{nonce}",
+            std::process::id()
+        ));
+        let project = root.join("project");
+        let source = root.join("source");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        (project, source)
+    }
+
+    #[test]
+    fn mount_overlay_to_args() {
+        let m = Mount::Overlay {
+            lower: PathBuf::from("/home/u/.claude"),
+            upper: PathBuf::from("/p/.ai-jail-overlays/x/upper"),
+            work: PathBuf::from("/p/.ai-jail-overlays/x/work"),
+            dest: PathBuf::from("/home/u/.claude"),
+        };
+        assert_eq!(
+            m.to_args(),
+            vec![
+                "--overlay-src".to_string(),
+                "/home/u/.claude".into(),
+                "--overlay".into(),
+                "/p/.ai-jail-overlays/x/upper".into(),
+                "/p/.ai-jail-overlays/x/work".into(),
+                "/home/u/.claude".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn overlay_storage_name_sanitizes_path() {
+        assert_eq!(
+            overlay_storage_name(Path::new("/home/u/.claude")),
+            "home_u_.claude"
+        );
+        assert_eq!(overlay_storage_name(Path::new("/a b/c@d")), "a_b_c_d");
+    }
+
+    #[test]
+    fn overlay_mounts_creates_layers_and_hide() {
+        let (project, source) = overlay_test_dirs("create");
+        let (mounts, hide) =
+            overlay_mounts(std::slice::from_ref(&source), &project, false);
+
+        assert_eq!(mounts.len(), 1);
+        match &mounts[0] {
+            Mount::Overlay {
+                lower,
+                upper,
+                work,
+                dest,
+            } => {
+                assert_eq!(lower, &source);
+                assert_eq!(dest, &source);
+                assert!(upper.is_dir(), "upper layer must be created");
+                assert!(work.is_dir(), "work dir must be created");
+                assert!(upper.starts_with(project.join(".ai-jail-overlays")));
+            }
+            other => panic!("expected Overlay, got {other:?}"),
+        }
+
+        assert_eq!(hide.len(), 1);
+        match &hide[0] {
+            Mount::Tmpfs { dest } => {
+                assert_eq!(dest, &project.join(".ai-jail-overlays"));
+            }
+            other => panic!("expected Tmpfs hide, got {other:?}"),
+        }
+        assert!(
+            project.join(".ai-jail-overlays/.gitignore").is_file(),
+            "a .gitignore must guard the storage dir"
+        );
+
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+
+    #[test]
+    fn overlay_mounts_skips_overlapping() {
+        let (project, source) = overlay_test_dirs("overlap");
+        let child = source.join("sub");
+        std::fs::create_dir_all(&child).unwrap();
+        // child overlaps source → only the first (source) is accepted.
+        let maps = vec![source.clone(), child];
+        let (mounts, _hide) = overlay_mounts(&maps, &project, false);
+        assert_eq!(mounts.len(), 1);
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+
+    #[test]
+    fn overlay_mounts_skips_missing_source() {
+        let (project, _source) = overlay_test_dirs("missing");
+        let missing = project.join("does-not-exist");
+        let (mounts, hide) =
+            overlay_mounts(std::slice::from_ref(&missing), &project, false);
+        assert!(mounts.is_empty());
+        assert!(hide.is_empty());
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+
+    #[test]
+    fn overlay_present_in_normal_mode() {
+        let (project, source) = overlay_test_dirs("normal");
+        let mut config = minimal_test_config();
+        config.overlay_maps = vec![source.clone()];
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        assert!(args.windows(2).any(|w| {
+            w[0] == "--overlay-src" && Path::new(&w[1]) == source
+        }));
+        assert!(args.iter().any(|a| a == "--overlay"));
+        // Raw storage is hidden from inside the sandbox.
+        let storage = project.join(".ai-jail-overlays");
+        assert!(
+            args.windows(2)
+                .any(|w| { w[0] == "--tmpfs" && Path::new(&w[1]) == storage })
+        );
+
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+
+    #[test]
+    fn overlay_disabled_in_lockdown() {
+        let (project, source) = overlay_test_dirs("lockdown");
+        let mut config = minimal_test_config();
+        config.lockdown = Some(true);
+        config.overlay_maps = vec![source];
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        assert!(!args.iter().any(|a| a == "--overlay"));
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
     }
 
     #[test]

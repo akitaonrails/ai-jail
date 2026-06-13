@@ -445,6 +445,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 |------|-------------|
 | `--rw-map <PATH>` | Mount PATH read-write (repeatable). Relative paths and `..` are resolved against the project directory, so `--rw-map ../sister-project` works from a project root. |
 | `--map <PATH>` | Mount PATH read-only (repeatable). Same path resolution as `--rw-map`. |
+| `--overlay-map <PATH>` | Mount PATH **copy-on-write** (repeatable). The agent sees PATH read-write, but writes land on a side layer under `<project>/.ai-jail-overlays/` while PATH itself is never modified — so you can diff and selectively promote changes afterwards. Opt-in only. Linux/bwrap only; degrades to **read-only** (with a warning) on macOS, and is disabled under `--lockdown` / browser mode. See [Overlay maps](#overlay-maps). |
 | `--hide-dotdir <NAME>` | Never bind-mount the named home dotdir into the sandbox (e.g. `.my_secrets`). Leading dot is optional. Repeatable. Cannot hide dotdirs required for tool operation (`.cargo`, `.config`, `.cache`, etc.) — those emit a warning and stay visible. |
 | `--mask <PATH>` | Replace `PATH` inside the sandbox with an empty file (or empty tmpfs if the path is a directory). Relative paths resolve against the project directory. Repeatable. Useful for hiding sensitive files like `.env`, `credentials.json` from AI agents while keeping the rest of the project accessible. Missing paths are skipped with a warning. |
 | `--allow-tcp-port <PORT>` | Permit outbound TCP to PORT in lockdown mode (repeatable). Skips `--unshare-net` and uses Landlock V4 `NetPort` rules to deny everything else. Requires Linux ≥ 6.5; hard-fails otherwise. No effect outside lockdown or on macOS. |
@@ -483,6 +484,9 @@ ai-jail --rw-map ~/Projects/shared-lib claude
 
 # Read-only access to reference data
 ai-jail --map /opt/datasets claude
+
+# Let the agent experiment with ~/.claude without touching the real one
+ai-jail --overlay-map ~/.claude claude
 
 # No GPU, no Docker, just the basics
 ai-jail --no-gpu --no-docker claude
@@ -534,6 +538,49 @@ ai-jail --clean --init claude
 ai-jail -- claude --model opus
 ```
 
+## Overlay maps
+
+`--overlay-map <PATH>` (config: `overlay_maps`) mounts a directory **copy-on-write**. Inside the sandbox the agent sees `PATH` as a normal read-write directory, but every write — new file, edit, or delete — lands on a private *upper* layer instead of the real directory. **The original `PATH` is never modified.**
+
+This lets an agent freely experiment with something you care about (your `~/.claude` config, a dotfiles repo, a data directory) while you keep the original safe and decide afterwards what — if anything — to keep.
+
+```bash
+# The agent can rewrite ~/.claude all it wants; your real one is untouched
+ai-jail --overlay-map ~/.claude claude
+```
+
+### Where the changes go
+
+Writes are captured under the project directory:
+
+```
+<project>/.ai-jail-overlays/<sanitized-path>/upper/   # exactly what changed
+<project>/.ai-jail-overlays/<sanitized-path>/work/    # overlayfs scratch (ignore)
+```
+
+The `upper/` layer contains *only* the files the agent created or changed — so it doubles as a precise diff. After a session you can inspect it and promote what you want:
+
+```bash
+# See what the agent changed
+ls -R .ai-jail-overlays/home_you_.claude/upper/
+
+# Promote a change you like back to the real directory
+cp .ai-jail-overlays/home_you_.claude/upper/settings.json ~/.claude/settings.json
+
+# Or throw the whole experiment away
+rm -rf .ai-jail-overlays/
+```
+
+ai-jail drops a `.gitignore` (`*`) inside `.ai-jail-overlays/` automatically, so the layers are never accidentally committed. The storage directory is masked (empty tmpfs) inside the sandbox, so the agent cannot reach or tamper with the raw layers — it can only go through the overlay at the destination.
+
+### Notes and limits
+
+- **Opt-in only.** Nothing overlays unless you pass `--overlay-map` / set `overlay_maps`. All existing behavior is unchanged.
+- **Multiple overlays** are allowed as long as their destinations don't overlap (a parent and its child are rejected with a warning).
+- **Linux/bwrap only.** Backed by bubblewrap's `--overlay`, which needs unprivileged OverlayFS (Linux kernel ≥ 5.11). On **macOS** there is no equivalent, so overlay maps degrade to **read-only** with a warning (writes are denied, protecting the original).
+- **Disabled under `--lockdown` and browser mode** (both are read-only/ephemeral by design); a warning is printed if overlay maps are configured there.
+- Missing sources, unwritable storage, or overlapping destinations are skipped with a warning — never fatal.
+
 ## Config file (`.ai-jail`)
 
 Created in the project directory on first run. Example:
@@ -569,6 +616,7 @@ When CLI flags and an existing config are both present:
 | `command` | string array | `["bash"]` | Default command to run inside sandbox. Set by first run or by `--init`; not overwritten when a different command is passed on the CLI. |
 | `rw_maps` | path array | `[]` | Extra read-write mounts |
 | `ro_maps` | path array | `[]` | Extra read-only mounts |
+| `overlay_maps` | path array | `[]` | Extra copy-on-write overlay mounts (see [Overlay maps](#overlay-maps)). Writes go to a side layer; the source stays untouched. Linux/bwrap only. |
 | `hide_dotdirs` | string array | `[]` | Extra home dotdirs to deny (e.g. `[".my_secrets"]`). Leading dot optional. Built-in deny list (`.ssh`, `.gnupg`, `.aws`, `.mozilla`) always applies. |
 | `mask` | path array | `[]` | Paths to replace with empty files/tmpfs (e.g. `[".env", "secrets.json"]`). Relative paths resolve against the project directory. |
 | `allow_tcp_ports` | u16 array | `[]` | TCP ports permitted outbound in lockdown mode (e.g. `[32000, 8080]`). Requires Linux ≥ 6.5 for Landlock V4. No effect outside lockdown. |

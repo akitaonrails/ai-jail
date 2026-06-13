@@ -34,6 +34,12 @@ pub fn platform_notes(config: &Config) {
              lockdown (seatbelt blocks all network)",
         );
     }
+    if !config.overlay_maps.is_empty() {
+        output::warn(
+            "overlay maps are read-only on macOS (no overlayfs); \
+             writes to those paths will be denied",
+        );
+    }
 }
 
 pub fn build(config: &Config, project_dir: &Path, verbose: bool) -> Command {
@@ -510,6 +516,16 @@ fn macos_lockdown_read_paths(
     {
         for path in worktree.unique_paths() {
             push_unique(canonicalize_or_keep(&path));
+        }
+    }
+
+    // Overlay maps degrade to read-only on macOS (no overlayfs), so
+    // they are always readable but never writable. Writes are denied
+    // because the paths are not in the writable set — this protects
+    // the original directory. A warning is emitted in platform_notes.
+    for p in &config.overlay_maps {
+        if super::path_exists(p) {
+            push_unique(canonicalize_or_keep(p));
         }
     }
 

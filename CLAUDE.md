@@ -80,10 +80,12 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox.rs` must 
 13. Pictures mount
 14. Browser profile state mount
 15. Extra user mounts (`--map`, `--rw-map`)
-16. Project directory (pwd, rw or ro depending on mode)
-17. Mask overlays (`--mask` and hidden project `.ai-jail`)
+16. Overlay maps (`--overlay-map` — copy-on-write `--overlay-src`/`--overlay`)
+17. Project directory (pwd, rw or ro depending on mode)
+18. Mask overlays (`--mask` and hidden project `.ai-jail`)
+19. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last so it sits on top of the project mount that contains the upper/work layers)
 
-Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts.
+Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts. Overlay maps come after the home/dotfile mounts (so an overlay on a home path sits on top) and their storage hide comes after the project mount (so it masks the layers the project mount would otherwise expose).
 
 ## Before Committing
 
