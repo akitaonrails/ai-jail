@@ -170,14 +170,7 @@ fn generate_sbpl_profile(
     let restricted_files = lockdown || browser_mode || private_home;
     let exempt = super::dotdir_exemptions(config);
     let mut deny_paths = macos_read_deny_paths(&config.hide_dotdirs, &exempt);
-    for p in &config.mask {
-        let abs = if p.is_absolute() {
-            p.clone()
-        } else {
-            project_dir.join(p)
-        };
-        deny_paths.push(abs);
-    }
+    deny_paths.extend(super::expand_mask_patterns(&config.mask, project_dir));
     let writable_paths = macos_writable_paths(project_dir, config, lockdown);
     let atomic_paths = macos_atomic_write_paths(config);
 

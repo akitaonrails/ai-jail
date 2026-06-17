@@ -1,4 +1,6 @@
 use crate::config::Config;
+use crate::output;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -159,6 +161,201 @@ const BROWSER_COMMANDS: &[&str] = &[
 
 pub(crate) fn is_browser_command_name(name: &str) -> bool {
     BROWSER_COMMANDS.contains(&name)
+}
+
+fn has_glob_meta(path: &Path) -> bool {
+    path.as_os_str()
+        .to_string_lossy()
+        .chars()
+        .any(|c| matches!(c, '*' | '?' | '['))
+}
+
+fn component_has_glob_meta(component: &OsStr) -> bool {
+    component
+        .to_string_lossy()
+        .chars()
+        .any(|c| matches!(c, '*' | '?' | '['))
+}
+
+fn glob_base_and_pattern(
+    pattern: &Path,
+    project_dir: &Path,
+) -> (PathBuf, Vec<String>) {
+    let absolute =
+        crate::config::to_absolute(pattern.to_path_buf(), project_dir);
+    let mut base = PathBuf::new();
+    let mut pattern_components = Vec::new();
+    let mut seen_glob = false;
+
+    for component in absolute.components() {
+        let os = component.as_os_str();
+        if !seen_glob && !component_has_glob_meta(os) {
+            base.push(os);
+        } else {
+            seen_glob = true;
+            pattern_components.push(os.to_string_lossy().into_owned());
+        }
+    }
+
+    if base.as_os_str().is_empty() {
+        base.push(project_dir);
+    }
+
+    (base, pattern_components)
+}
+
+fn matches_char_class(class: &[char], ch: char) -> bool {
+    let mut i = 0;
+    let mut matched = false;
+    while i < class.len() {
+        if i + 2 < class.len() && class[i + 1] == '-' {
+            if class[i] <= ch && ch <= class[i + 2] {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if class[i] == ch {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+    matched
+}
+
+fn glob_component_matches(pattern: &str, text: &str) -> bool {
+    fn inner(pattern: &[char], text: &[char]) -> bool {
+        if pattern.is_empty() {
+            return text.is_empty();
+        }
+
+        match pattern[0] {
+            '*' => {
+                inner(&pattern[1..], text)
+                    || (!text.is_empty() && inner(pattern, &text[1..]))
+            }
+            '?' => !text.is_empty() && inner(&pattern[1..], &text[1..]),
+            '[' => {
+                let Some(end) = pattern.iter().position(|c| *c == ']') else {
+                    return !text.is_empty()
+                        && pattern[0] == text[0]
+                        && inner(&pattern[1..], &text[1..]);
+                };
+                !text.is_empty()
+                    && matches_char_class(&pattern[1..end], text[0])
+                    && inner(&pattern[end + 1..], &text[1..])
+            }
+            c => {
+                !text.is_empty()
+                    && c == text[0]
+                    && inner(&pattern[1..], &text[1..])
+            }
+        }
+    }
+
+    inner(
+        &pattern.chars().collect::<Vec<_>>(),
+        &text.chars().collect::<Vec<_>>(),
+    )
+}
+
+fn glob_path_matches(pattern: &[String], components: &[String]) -> bool {
+    if pattern.is_empty() {
+        return components.is_empty();
+    }
+
+    if pattern[0] == "**" {
+        glob_path_matches(&pattern[1..], components)
+            || (!components.is_empty()
+                && glob_path_matches(pattern, &components[1..]))
+    } else {
+        !components.is_empty()
+            && glob_component_matches(&pattern[0], &components[0])
+            && glob_path_matches(&pattern[1..], &components[1..])
+    }
+}
+
+fn collect_glob_candidates(
+    base: &Path,
+    current: &Path,
+    out: &mut Vec<PathBuf>,
+) {
+    out.push(current.to_path_buf());
+
+    let Ok(meta) = std::fs::symlink_metadata(current) else {
+        return;
+    };
+    if !meta.file_type().is_dir() || meta.file_type().is_symlink() {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(current) else {
+        output::warn(&format!(
+            "Mask glob: cannot read {}, skipping nested entries",
+            current.display()
+        ));
+        return;
+    };
+
+    let mut paths = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    for path in paths {
+        if path.starts_with(base) {
+            collect_glob_candidates(base, &path, out);
+        }
+    }
+}
+
+fn path_components_relative_to(path: &Path, base: &Path) -> Vec<String> {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Expand mask entries that contain glob metacharacters (`*`, `?`, `[...]`).
+/// Literal entries keep their existing project-relative semantics. Globs are
+/// expanded at sandbox-policy time so config files can keep portable patterns.
+pub(crate) fn expand_mask_patterns(
+    mask: &[PathBuf],
+    project_dir: &Path,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+
+    for entry in mask {
+        if !has_glob_meta(entry) {
+            out.push(if entry.is_absolute() {
+                entry.clone()
+            } else {
+                project_dir.join(entry)
+            });
+            continue;
+        }
+
+        let (base, pattern) = glob_base_and_pattern(entry, project_dir);
+        let mut candidates = Vec::new();
+        collect_glob_candidates(&base, &base, &mut candidates);
+        let before = out.len();
+        for candidate in candidates {
+            let rel = path_components_relative_to(&candidate, &base);
+            if glob_path_matches(&pattern, &rel) && !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+
+        if out.len() == before {
+            output::warn(&format!(
+                "Mask glob: {} matched nothing, skipping",
+                entry.display()
+            ));
+        }
+    }
+
+    out
 }
 
 fn browser_basename(program: &str) -> Option<&str> {
@@ -644,6 +841,92 @@ mod tests {
             .unwrap_or(0);
         std::env::temp_dir()
             .join(format!("ai-jail-{prefix}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn expand_mask_patterns_keeps_literal_project_relative() {
+        let project = PathBuf::from("/tmp/project");
+        let expanded = expand_mask_patterns(&[PathBuf::from(".env")], &project);
+
+        assert_eq!(expanded, vec![PathBuf::from("/tmp/project/.env")]);
+    }
+
+    #[test]
+    fn expand_mask_patterns_supports_recursive_globs() {
+        let root = temp_test_dir("mask-glob-recursive");
+        let project = root.join("project");
+        std::fs::create_dir_all(project.join("a/b")).unwrap();
+        std::fs::create_dir_all(project.join("node_modules/pkg")).unwrap();
+        std::fs::write(project.join(".env"), "root").unwrap();
+        std::fs::write(project.join("a/.env"), "nested").unwrap();
+        std::fs::write(project.join("a/b/app.env"), "deep").unwrap();
+        std::fs::write(project.join("a/b/app.txt"), "nope").unwrap();
+        std::fs::write(project.join("node_modules/pkg/.env"), "vendor")
+            .unwrap();
+
+        let expanded =
+            expand_mask_patterns(&[PathBuf::from("**/*.env")], &project);
+
+        assert_eq!(
+            expanded,
+            vec![
+                project.join(".env"),
+                project.join("a/.env"),
+                project.join("a/b/app.env"),
+                project.join("node_modules/pkg/.env"),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn expand_mask_patterns_supports_question_and_bracket_classes() {
+        let root = temp_test_dir("mask-glob-classes");
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("app1.env"), "one").unwrap();
+        std::fs::write(project.join("app2.env"), "two").unwrap();
+        std::fs::write(project.join("app9.env"), "nine").unwrap();
+        std::fs::write(project.join("app10.env"), "ten").unwrap();
+
+        let expanded =
+            expand_mask_patterns(&[PathBuf::from("app[1-2].env")], &project);
+        assert_eq!(
+            expanded,
+            vec![project.join("app1.env"), project.join("app2.env")]
+        );
+
+        let expanded =
+            expand_mask_patterns(&[PathBuf::from("app?.env")], &project);
+        assert_eq!(
+            expanded,
+            vec![
+                project.join("app1.env"),
+                project.join("app2.env"),
+                project.join("app9.env"),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn expand_mask_patterns_supports_parent_relative_glob() {
+        let root = temp_test_dir("mask-glob-parent");
+        let project = root.join("repo/app");
+        let shared = root.join("repo/shared");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("secret.env"), "secret").unwrap();
+        std::fs::write(shared.join("public.txt"), "public").unwrap();
+
+        let expanded =
+            expand_mask_patterns(&[PathBuf::from("../shared/*.env")], &project);
+
+        assert_eq!(expanded, vec![shared.join("secret.env")]);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

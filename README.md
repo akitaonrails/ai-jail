@@ -168,17 +168,20 @@ The default mode favors usability over maximum lockdown. These are intentionally
 2. Display passthrough mounts `XDG_RUNTIME_DIR` on Linux, which can expose host IPC sockets.
 3. Environment variables are inherited (tokens/secrets in your shell env are visible in-jail).
 
-**Hiding project-level secrets**: the project directory is mounted in its entirety, so files like `.env`, `credentials.json`, or `secrets.yml` are visible to whatever runs inside. Use `--mask PATH` to replace them with empty files inside the sandbox. Example:
+**Hiding project-level secrets**: the project directory is mounted in its entirety, so files like `.env`, `credentials.json`, or `secrets.yml` are visible to whatever runs inside. Use `--mask PATH` to replace them with empty files inside the sandbox. `--mask` also accepts glob patterns (`*`, `?`, `[a-z]`, and recursive `**`) that are expanded when the sandbox policy is built. Examples:
 
 ```bash
 ai-jail --mask .env --mask .env.local claude
+ai-jail --mask '**/*.env' claude
 ```
 
 Or persist the list in `.ai-jail`:
 
 ```toml
-mask = [".env", ".env.local", "credentials.json"]
+mask = [".env", ".env.local", "credentials.json", "**/*.env"]
 ```
+
+Glob masks match existing files/directories only. Unmatched patterns are skipped with a warning, just like missing literal mask paths. Quote glob masks in your shell so ai-jail receives the pattern instead of your shell expanding it first.
 
 **Hiding the sandbox policy itself**: by default, ai-jail auto-masks the project's own `.ai-jail` config file inside the sandbox so the agent can't read its own policy and craft workarounds. Pass `--no-hide-config` (or set `no_hide_config = true`) if you need the file visible to the sandboxed process for some reason. The user's global `~/.ai-jail` is never mounted into the sandbox.
 
@@ -447,7 +450,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--map <PATH>` | Mount PATH read-only (repeatable). Same path resolution as `--rw-map`. |
 | `--overlay-map <PATH>` | Mount PATH **copy-on-write** (repeatable). The agent sees PATH read-write, but writes land on a side layer under `<project>/.ai-jail-overlays/` while PATH itself is never modified — so you can diff and selectively promote changes afterwards. Opt-in only. Linux/bwrap only; degrades to **read-only** (with a warning) on macOS, and is disabled under `--lockdown` / browser mode. See [Overlay maps](#overlay-maps). |
 | `--hide-dotdir <NAME>` | Never bind-mount the named home dotdir into the sandbox (e.g. `.my_secrets`). Leading dot is optional. Repeatable. Cannot hide dotdirs required for tool operation (`.cargo`, `.config`, `.cache`, etc.) — those emit a warning and stay visible. |
-| `--mask <PATH>` | Replace `PATH` inside the sandbox with an empty file (or empty tmpfs if the path is a directory). Relative paths resolve against the project directory. Repeatable. Useful for hiding sensitive files like `.env`, `credentials.json` from AI agents while keeping the rest of the project accessible. Missing paths are skipped with a warning. |
+| `--mask <PATH\|GLOB>` | Replace `PATH` or glob matches inside the sandbox with an empty file (or empty tmpfs if the path is a directory). Relative paths resolve against the project directory. Repeatable. Supports `*`, `?`, `[a-z]`, and recursive `**`; quote glob masks in your shell. Useful for hiding sensitive files like `.env`, `**/*.env`, `credentials.json` from AI agents while keeping the rest of the project accessible. Missing paths/unmatched globs are skipped with a warning. |
 | `--allow-tcp-port <PORT>` | Permit outbound TCP to PORT in lockdown mode (repeatable). Skips `--unshare-net` and uses Landlock V4 `NetPort` rules to deny everything else. Requires Linux ≥ 6.5; hard-fails otherwise. No effect outside lockdown or on macOS. |
 | `--private-home` / `--no-private-home` | Enable/disable private home mode. Private home skips automatic host dotdir passthrough while leaving the project writable and explicit maps active. Linux uses tmpfs `$HOME`; macOS uses seatbelt allowlists. |
 | `--lockdown` / `--no-lockdown` | Enable/disable strict read-only lockdown mode |
@@ -593,7 +596,7 @@ Created in the project directory on first run. Example:
 command = ["claude"]
 rw_maps = ["/home/user/Projects/shared-lib"]
 ro_maps = []
-mask = [".env", ".env.local"]
+mask = [".env", ".env.local", "**/*.env"]
 no_gpu = true
 ssh = true
 private_home = true
@@ -605,7 +608,7 @@ lockdown = true
 When CLI flags and an existing config are both present:
 
 - `command`: CLI replaces config for the current run, but a CLI-passed command is **not** auto-persisted when the project already has a stored command — so `ai-jail codex` after `ai-jail claude` runs codex for that session without rewriting `.ai-jail`'s stored default. Use `ai-jail --init <command>` to explicitly change the stored command. First-run bootstrap (no stored command yet) still persists the CLI command as the new default.
-- `rw_maps` / `ro_maps` / `mask`: CLI values are appended (duplicates removed). Paths starting with `~/` or exactly `~` are expanded against `$HOME` at merge time, so you can write `ro_maps = ["~/.bashrc"]` in a config file. Relative paths in `rw_maps` / `ro_maps` (including `../sibling` style) are resolved against the project directory before being passed to the sandbox.
+- `rw_maps` / `ro_maps` / `mask`: CLI values are appended (duplicates removed). Paths starting with `~/` or exactly `~` are expanded against `$HOME` at merge time, so you can write `ro_maps = ["~/.bashrc"]` in a config file. Relative paths in `rw_maps` / `ro_maps` (including `../sibling` style) are resolved against the project directory before being passed to the sandbox. Relative `mask` entries resolve against the project directory when the sandbox policy is built; glob masks are expanded at that same point so committed configs can keep portable patterns.
 - Boolean flags: CLI overrides config (`--no-gpu` sets `no_gpu = true`)
 - `--save-config` / `--no-save-config` override `no_save_config`
 - Config is updated after merge in normal mode when config saving is enabled; lockdown skips auto-save
@@ -619,7 +622,7 @@ When CLI flags and an existing config are both present:
 | `ro_maps` | path array | `[]` | Extra read-only mounts |
 | `overlay_maps` | path array | `[]` | Extra copy-on-write overlay mounts (see [Overlay maps](#overlay-maps)). Writes go to a side layer; the source stays untouched. Linux/bwrap only. |
 | `hide_dotdirs` | string array | `[]` | Extra home dotdirs to deny (e.g. `[".my_secrets"]`). Leading dot optional. Built-in deny list (`.ssh`, `.gnupg`, `.aws`, `.mozilla`) always applies. |
-| `mask` | path array | `[]` | Paths to replace with empty files/tmpfs (e.g. `[".env", "secrets.json"]`). Relative paths resolve against the project directory. |
+| `mask` | path array | `[]` | Paths or glob patterns to replace with empty files/tmpfs (e.g. `[".env", "**/*.env", "secrets.json"]`). Relative paths resolve against the project directory. |
 | `allow_tcp_ports` | u16 array | `[]` | TCP ports permitted outbound in lockdown mode (e.g. `[32000, 8080]`). Requires Linux ≥ 6.5 for Landlock V4. No effect outside lockdown. |
 | `private_home` | bool | not set (off) | `true` skips automatic host dotdir passthrough without enabling full lockdown. Project and explicit maps remain writable. Linux uses tmpfs `$HOME`; macOS uses seatbelt allowlists. |
 | `no_gpu` | bool | not set (auto) | `true` disables GPU passthrough |

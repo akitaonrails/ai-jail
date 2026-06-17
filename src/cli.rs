@@ -21,7 +21,7 @@ OPTIONS:
                                    diff/promote later (repeatable; Linux/bwrap
                                    only, read-only on macOS)
     --hide-dotdir <NAME>           Never mount dotdir NAME (e.g., .my_secrets) (repeatable)
-    --mask <PATH>                  Replace PATH with an empty file inside sandbox (repeatable)
+    --mask <PATH|GLOB>             Replace PATH/glob matches with empty files/tmpfs (repeatable)
     --private-home / --no-private-home
                                    Disable/enable automatic host home dotdir passthrough
     --lockdown / --no-lockdown     Enable/disable strict read-only lockdown mode

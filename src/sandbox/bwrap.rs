@@ -1137,7 +1137,8 @@ fn discover_mask_mounts(
             effective.push(local_config);
         }
     }
-    build_mask_mounts(&effective, project_dir, empty_path, verbose)
+    let expanded = super::expand_mask_patterns(&effective, project_dir);
+    build_mask_mounts(&expanded, project_dir, empty_path, verbose)
 }
 
 fn discover_pictures_mount(
@@ -1998,6 +1999,54 @@ mod tests {
 
         assert!(mounts.is_empty());
         let _ = std::fs::remove_file(&empty);
+    }
+
+    #[test]
+    fn mask_glob_expands_into_dry_run_mounts() {
+        let project = std::env::temp_dir()
+            .join(format!("ai-jail-mask-glob-{}", std::process::id()));
+        let nested = project.join("app/config");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(project.join(".env"), "root").unwrap();
+        std::fs::write(nested.join("local.env"), "nested").unwrap();
+        std::fs::write(nested.join("public.txt"), "public").unwrap();
+
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            mask: vec![PathBuf::from("**/*.env")],
+            no_hide_config: Some(true),
+            ..minimal_test_config()
+        };
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_path(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        let empty_str = guard.empty_path().display().to_string();
+        for masked in [project.join(".env"), nested.join("local.env")] {
+            let masked_str = masked.display().to_string();
+            assert!(
+                args.windows(3).any(|w| {
+                    w[0] == "--ro-bind"
+                        && w[1] == empty_str
+                        && w[2] == masked_str
+                }),
+                "expected glob-expanded mask for {}; args: {args:?}",
+                masked.display()
+            );
+        }
+        assert!(
+            !args.iter().any(|arg| arg.ends_with("public.txt")),
+            "non-matching files must not be masked; args: {args:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]
