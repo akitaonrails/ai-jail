@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 const WSL_DOCKER_DESKTOP_CLI_TOOLS: &str = "/mnt/wsl/docker-desktop/cli-tools";
+const TAILSCALE_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
 
 #[derive(Debug, Clone)]
 enum Mount {
@@ -123,6 +124,7 @@ struct MountSet {
     git_worktree: Vec<Mount>,
     gpu: Vec<Mount>,
     docker: Vec<Mount>,
+    tailscale: Vec<Mount>,
     shm: Vec<Mount>,
     display: Vec<Mount>,
     display_env: Vec<(String, String)>,
@@ -142,13 +144,14 @@ struct MountSet {
 }
 
 impl MountSet {
-    fn ordered_mounts(&self) -> [&[Mount]; 19] {
+    fn ordered_mounts(&self) -> [&[Mount]; 20] {
         [
             &self.base,
             &self.sys_masks,
             &self.gpu,
-            &self.shm,
             &self.docker,
+            &self.tailscale,
+            &self.shm,
             &self.display,
             &self.home_dotfiles,
             &self.config_hide,
@@ -616,13 +619,16 @@ fn contents_have_stub(contents: &[u8]) -> bool {
 /// Decide which resolv.conf body to mount into the sandbox.
 ///
 /// When `uplink` shows split-DNS markers (tunnel DNS in the CGNAT
-/// range, link-local DNS, or any explicit `127.x` loopback that
-/// isn't the stub itself), we keep the original stub so the stub
+/// range or link-local DNS), or either file mentions Tailscale
+/// MagicDNS search domains, we keep the original stub so the stub
 /// listener at 127.0.0.53 keeps doing the per-domain routing. In
 /// every other case we use the uplink, preserving the original
 /// Go-resolver workaround.
 fn pick_resolv_contents(original: Vec<u8>, uplink: Vec<u8>) -> Vec<u8> {
-    if uplink_has_split_dns_markers(&uplink) {
+    if uplink_has_split_dns_markers(&uplink)
+        || resolv_has_tailscale_magicdns_domain(&original)
+        || resolv_has_tailscale_magicdns_domain(&uplink)
+    {
         original
     } else {
         uplink
@@ -667,6 +673,22 @@ fn is_split_dns_marker_ip(s: &str) -> bool {
     false
 }
 
+fn resolv_has_tailscale_magicdns_domain(contents: &[u8]) -> bool {
+    String::from_utf8_lossy(contents).lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let Some(kind) = fields.next() else {
+            return false;
+        };
+        if kind != "search" && kind != "domain" {
+            return false;
+        }
+        fields.any(|token| {
+            let token = token.trim_end_matches('.');
+            token == "ts.net" || token.ends_with(".ts.net")
+        })
+    })
+}
+
 fn resolve_landlock_wrapper(
     config: &Config,
 ) -> Result<Option<PathBuf>, String> {
@@ -707,6 +729,11 @@ fn landlock_wrapper_args(config: &Config, verbose: bool) -> Vec<String> {
         "--docker".into()
     } else {
         "--no-docker".into()
+    });
+    args.push(if config.tailscale_enabled() {
+        "--tailscale".into()
+    } else {
+        "--no-tailscale".into()
     });
     args.push(if config.display_enabled() {
         "--display".into()
@@ -971,6 +998,7 @@ fn discover_mounts(
         lockdown || browser_mode || config.private_home_enabled();
     let enable_gpu = !lockdown && config.gpu_enabled();
     let enable_docker = !lockdown && config.docker_enabled();
+    let enable_tailscale = !lockdown && config.tailscale_enabled();
     let enable_display = !lockdown && config.display_enabled();
     let exempt = super::dotdir_exemptions(config);
 
@@ -1036,6 +1064,11 @@ fn discover_mounts(
         },
         docker: if enable_docker {
             discover_docker()
+        } else {
+            vec![]
+        },
+        tailscale: if enable_tailscale {
+            discover_tailscale()
         } else {
             vec![]
         },
@@ -1562,6 +1595,21 @@ fn discover_docker_paths(sock: &Path, wsl_cli_tools: &Path) -> Vec<Mount> {
     mounts
 }
 
+fn discover_tailscale() -> Vec<Mount> {
+    discover_tailscale_paths(Path::new(TAILSCALE_SOCKET))
+}
+
+fn discover_tailscale_paths(sock: &Path) -> Vec<Mount> {
+    if super::path_exists(sock) {
+        vec![Mount::Bind {
+            src: sock.to_path_buf(),
+            dest: sock.to_path_buf(),
+        }]
+    } else {
+        vec![]
+    }
+}
+
 fn discover_shm() -> Vec<Mount> {
     let shm = PathBuf::from("/dev/shm");
     if shm.is_dir() {
@@ -1922,6 +1970,39 @@ mod tests {
         assert!(mounts.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tailscale_discovery_mounts_socket_when_present() {
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-tailscale-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let sock = root.join("tailscaled.sock");
+        std::fs::File::create(&sock).unwrap();
+
+        let mounts = discover_tailscale_paths(&sock);
+
+        assert_eq!(mounts.len(), 1);
+        assert!(matches!(
+            &mounts[0],
+            Mount::Bind { src, dest } if src == &sock && dest == &sock
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tailscale_discovery_skips_missing_socket() {
+        let sock = std::env::temp_dir().join(format!(
+            "ai-jail-missing-tailscale-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&sock);
+
+        let mounts = discover_tailscale_paths(&sock);
+
+        assert!(mounts.is_empty());
     }
 
     #[test]
@@ -3319,6 +3400,34 @@ nameserver 1.1.1.1
         let lan = b"nameserver 172.20.0.1\n".to_vec();
         let out = pick_resolv_contents(original, lan.clone());
         assert_eq!(out, lan);
+    }
+
+    #[test]
+    fn pick_resolv_keeps_stub_for_tailscale_search_domain() {
+        let original =
+            b"nameserver 127.0.0.53\nsearch tailnet.ts.net\n".to_vec();
+        let uplink = b"nameserver 192.168.1.1\n".to_vec();
+        let out = pick_resolv_contents(original.clone(), uplink);
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn pick_resolv_keeps_stub_for_tailscale_domain_in_uplink() {
+        let original = b"nameserver 127.0.0.53\n".to_vec();
+        let uplink = b"nameserver 192.168.1.1\ndomain ts.net\n".to_vec();
+        let out = pick_resolv_contents(original.clone(), uplink);
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn tailscale_magicdns_domain_detection() {
+        assert!(resolv_has_tailscale_magicdns_domain(b"search ts.net\n"));
+        assert!(resolv_has_tailscale_magicdns_domain(
+            b"search corp.example tailnet.ts.net\n"
+        ));
+        assert!(!resolv_has_tailscale_magicdns_domain(
+            b"search notts.net example.com\n"
+        ));
     }
 
     #[test]

@@ -30,6 +30,7 @@ OPTIONS:
     --rlimits / --no-rlimits       Enable/disable resource limits (default: on)
     --no-gpu / --gpu               Disable/enable GPU device passthrough (Linux only)
     --no-docker / --docker         Disable/enable Docker socket passthrough
+    --tailscale / --no-tailscale   Enable/disable Tailscale socket passthrough (default: off)
     --no-display / --display       Disable/enable X11/Wayland passthrough (Linux only)
     --worktree / --no-worktree     Enable/disable linked Git worktree metadata passthrough
     --no-mise / --mise             Disable/enable mise integration
@@ -71,6 +72,7 @@ pub struct CliArgs {
     pub rlimits: Option<bool>,
     pub gpu: Option<bool>,
     pub docker: Option<bool>,
+    pub tailscale: Option<bool>,
     pub display: Option<bool>,
     pub worktree: Option<bool>,
     pub mise: Option<bool>,
@@ -180,6 +182,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("docker" | "no-docker")) => {
                 args.docker = Some(s == "docker");
+            }
+            Long(s @ ("tailscale" | "no-tailscale")) => {
+                args.tailscale = Some(s == "tailscale");
             }
             Long(s @ ("display" | "no-display")) => {
                 args.display = Some(s == "display");
@@ -420,6 +425,18 @@ mod tests {
     fn parse_docker() {
         let args = parse_test(&["--docker", "bash"]).unwrap();
         assert_eq!(args.docker, Some(true));
+    }
+
+    #[test]
+    fn parse_no_tailscale() {
+        let args = parse_test(&["--no-tailscale", "bash"]).unwrap();
+        assert_eq!(args.tailscale, Some(false));
+    }
+
+    #[test]
+    fn parse_tailscale() {
+        let args = parse_test(&["--tailscale", "bash"]).unwrap();
+        assert_eq!(args.tailscale, Some(true));
     }
 
     #[test]
@@ -935,6 +952,13 @@ mod tests {
     fn parse_last_wins_docker() {
         let args = parse_test(&["--docker", "--no-docker", "bash"]).unwrap();
         assert_eq!(args.docker, Some(false));
+    }
+
+    #[test]
+    fn parse_last_wins_tailscale() {
+        let args =
+            parse_test(&["--tailscale", "--no-tailscale", "bash"]).unwrap();
+        assert_eq!(args.tailscale, Some(false));
     }
 
     #[test]

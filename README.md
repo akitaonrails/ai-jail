@@ -459,6 +459,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--rlimits` / `--no-rlimits` | Enable/disable resource limits (default: on) |
 | `--gpu` / `--no-gpu` | Enable/disable GPU passthrough |
 | `--docker` / `--no-docker` | Enable/disable Docker socket |
+| `--tailscale` / `--no-tailscale` | Enable/disable Tailscale socket passthrough (default: off). When enabled, maps `/var/run/tailscale/tailscaled.sock` for the `tailscale` CLI if it exists. |
 | `--display` / `--no-display` | Enable/disable X11/Wayland |
 | `--worktree` / `--no-worktree` | Enable/disable linked Git worktree metadata passthrough (default: on) |
 | `--mise` / `--no-mise` | Enable/disable mise integration |
@@ -627,6 +628,7 @@ When CLI flags and an existing config are both present:
 | `private_home` | bool | not set (off) | `true` skips automatic host dotdir passthrough without enabling full lockdown. Project and explicit maps remain writable. Linux uses tmpfs `$HOME`; macOS uses seatbelt allowlists. |
 | `no_gpu` | bool | not set (auto) | `true` disables GPU passthrough |
 | `no_docker` | bool | not set (auto) | `true` disables Docker socket |
+| `tailscale` | bool | not set (off) | `true` maps `/var/run/tailscale/tailscaled.sock` for the `tailscale` CLI if it exists. Opt-in for privacy/safety. |
 | `no_display` | bool | not set (auto) | `true` disables X11/Wayland |
 | `no_worktree` | bool | not set (auto) | `true` disables linked Git worktree metadata passthrough |
 | `no_mise` | bool | not set (auto) | `true` disables mise integration |

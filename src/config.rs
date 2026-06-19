@@ -51,6 +51,8 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_docker: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailscale: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_display: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_worktree: Option<bool>,
@@ -94,6 +96,10 @@ impl Config {
     }
     pub fn docker_enabled(&self) -> bool {
         self.no_docker != Some(true)
+    }
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fn tailscale_enabled(&self) -> bool {
+        self.tailscale == Some(true)
     }
     pub fn display_enabled(&self) -> bool {
         self.no_display != Some(true)
@@ -242,6 +248,7 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     }
     take!(no_gpu);
     take!(no_docker);
+    take!(tailscale);
     take!(no_display);
     take!(no_mise);
     take!(no_worktree);
@@ -546,6 +553,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
 
     invert!(gpu, no_gpu);
     invert!(docker, no_docker);
+    direct!(tailscale);
     invert!(display, no_display);
     invert!(mise, no_mise);
     invert!(save_config, no_save_config);
@@ -604,6 +612,7 @@ pub fn display_status(config: &Config) {
 
     print_auto_tristate("  GPU", config.no_gpu);
     print_auto_tristate("  Docker", config.no_docker);
+    print_shared_or_hidden("  Tailscale", config.tailscale);
     print_auto_tristate("  Display", config.no_display);
     print_auto_tristate("  Git worktree", config.no_worktree);
     print_auto_tristate("  Mise", config.no_mise);
@@ -1084,6 +1093,18 @@ overlay_maps = ["/home/u/.claude", "/home/u/.config/foo"]
         assert!(cfg.command.is_empty());
     }
 
+    #[test]
+    fn regression_old_config_without_tailscale_parses() {
+        let toml = r#"
+command = ["claude"]
+no_docker = false
+no_gpu = true
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.tailscale, None);
+        assert!(!cfg.tailscale_enabled());
+    }
+
     // ── Roundtrip tests ────────────────────────────────────────
 
     #[test]
@@ -1097,6 +1118,7 @@ overlay_maps = ["/home/u/.claude", "/home/u/.config/foo"]
             mask: vec![PathBuf::from(".env")],
             no_gpu: Some(true),
             no_docker: None,
+            tailscale: Some(true),
             no_display: Some(false),
             no_worktree: Some(false),
             no_mise: None,
@@ -1124,6 +1146,7 @@ overlay_maps = ["/home/u/.claude", "/home/u/.config/foo"]
         assert_eq!(deserialized.hide_dotdirs, config.hide_dotdirs);
         assert_eq!(deserialized.no_gpu, config.no_gpu);
         assert_eq!(deserialized.no_docker, config.no_docker);
+        assert_eq!(deserialized.tailscale, config.tailscale);
         assert_eq!(deserialized.no_display, config.no_display);
         assert_eq!(deserialized.no_worktree, config.no_worktree);
         assert_eq!(deserialized.no_mise, config.no_mise);
@@ -1255,6 +1278,17 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
     }
 
     #[test]
+    fn parse_tailscale_config() {
+        let toml = r#"
+command = ["claude"]
+tailscale = true
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.tailscale, Some(true));
+        assert!(cfg.tailscale_enabled());
+    }
+
+    #[test]
     fn merge_gpu_flag_overrides() {
         let existing = Config {
             no_gpu: Some(true),
@@ -1283,6 +1317,7 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
         let existing = Config {
             no_gpu: Some(true),
             no_docker: Some(false),
+            tailscale: Some(true),
             no_display: None,
             no_worktree: Some(true),
             no_mise: Some(true),
@@ -1295,6 +1330,7 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
         let merged = merge(&cli, existing);
         assert_eq!(merged.no_gpu, Some(true));
         assert_eq!(merged.no_docker, Some(false));
+        assert_eq!(merged.tailscale, Some(true));
         assert_eq!(merged.no_display, None);
         assert_eq!(merged.no_worktree, Some(true));
         assert_eq!(merged.no_mise, Some(true));
@@ -1309,6 +1345,7 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
         let cli = CliArgs {
             gpu: Some(false),         // --no-gpu
             docker: Some(false),      // --no-docker
+            tailscale: Some(true),    // --tailscale
             display: Some(true),      // --display
             worktree: Some(false),    // --no-worktree
             mise: Some(true),         // --mise
@@ -1320,6 +1357,7 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
         let merged = merge(&cli, existing);
         assert_eq!(merged.no_gpu, Some(true));
         assert_eq!(merged.no_docker, Some(true));
+        assert_eq!(merged.tailscale, Some(true));
         assert_eq!(merged.no_display, Some(false));
         assert_eq!(merged.no_worktree, Some(true));
         assert_eq!(merged.no_mise, Some(false));
@@ -1413,6 +1451,20 @@ hide_dotdirs = [".my_secrets", ".proton", ".password-store"]
         };
         let merged = merge_with_global(global, local);
         assert_eq!(merged.private_home, Some(false));
+    }
+
+    #[test]
+    fn merge_with_global_local_tailscale_wins() {
+        let global = Config {
+            tailscale: Some(false),
+            ..Config::default()
+        };
+        let local = Config {
+            tailscale: Some(true),
+            ..Config::default()
+        };
+        let merged = merge_with_global(global, local);
+        assert_eq!(merged.tailscale, Some(true));
     }
 
     #[test]
@@ -1650,6 +1702,25 @@ allow_tcp_ports = [32000, 8080]
                 ..Config::default()
             }
             .docker_enabled()
+        );
+    }
+
+    #[test]
+    fn tailscale_enabled_accessor() {
+        assert!(!Config::default().tailscale_enabled());
+        assert!(
+            Config {
+                tailscale: Some(true),
+                ..Config::default()
+            }
+            .tailscale_enabled()
+        );
+        assert!(
+            !Config {
+                tailscale: Some(false),
+                ..Config::default()
+            }
+            .tailscale_enabled()
         );
     }
 
@@ -2005,6 +2076,7 @@ allow_tcp_ports = [32000, 8080]
             mask: vec![],
             no_gpu: Some(true),
             no_docker: None,
+            tailscale: Some(true),
             no_display: None,
             no_worktree: None,
             no_mise: None,
