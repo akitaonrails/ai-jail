@@ -1330,6 +1330,10 @@ fn discover_base(
         // else: does not exist, skip
     }
 
+    // Resolve /etc/hosts symlink (e.g. on NixOS) so bwrap can bind-mount over it.
+    let hosts_dest = std::fs::canonicalize("/etc/hosts")
+        .unwrap_or_else(|_| PathBuf::from("/etc/hosts"));
+
     mounts.extend([
         Mount::RoBind {
             src: "/etc".into(),
@@ -1337,7 +1341,7 @@ fn discover_base(
         },
         Mount::FileRoBind {
             src: hosts_file.to_path_buf(),
-            dest: "/etc/hosts".into(),
+            dest: hosts_dest,
         },
         Mount::RoBind {
             src: "/opt".into(),
