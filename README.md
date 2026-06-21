@@ -489,6 +489,9 @@ ai-jail --rw-map ~/Projects/shared-lib claude
 # Read-only access to reference data
 ai-jail --map /opt/datasets claude
 
+# NixOS: ai-jail automatically follows /etc/hosts into /nix/store and
+# mounts /nix early enough for the private hosts override to work.
+
 # Let the agent experiment with ~/.claude without touching the real one
 ai-jail --overlay-map ~/.claude claude
 
