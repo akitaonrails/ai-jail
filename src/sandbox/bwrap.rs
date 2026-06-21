@@ -263,6 +263,11 @@ impl MountSet {
 
 pub struct SandboxGuard {
     hosts_path: PathBuf,
+    /// Where to mount the private hosts file inside the sandbox.
+    /// If /etc/hosts is a symlink (e.g. NixOS), this is the symlink
+    /// target so the symlink inherited from --ro-bind /etc resolves.
+    /// If it is a regular file, this is /etc/hosts itself.
+    hosts_dest: PathBuf,
     resolv_path: Option<PathBuf>,
     /// Where to mount the resolv temp file inside the sandbox.
     /// If /etc/resolv.conf is a symlink, this is the symlink target
@@ -274,8 +279,13 @@ pub struct SandboxGuard {
 }
 
 impl SandboxGuard {
+    #[cfg(test)]
     fn hosts_path(&self) -> &Path {
         &self.hosts_path
+    }
+
+    fn hosts_mount(&self) -> (&Path, &Path) {
+        (&self.hosts_path, &self.hosts_dest)
     }
 
     fn resolv_mount(&self) -> Option<(&Path, &Path)> {
@@ -305,6 +315,7 @@ impl SandboxGuard {
     fn test_with_hosts(path: PathBuf) -> Self {
         SandboxGuard {
             hosts_path: path,
+            hosts_dest: PathBuf::from("/etc/hosts"),
             resolv_path: None,
             resolv_dest: None,
             empty_path: PathBuf::from("/tmp/ai-jail-test-empty"),
@@ -465,6 +476,7 @@ pub fn check() -> Result<(), String> {
 
 pub fn prepare() -> Result<SandboxGuard, String> {
     let (path, mut file) = new_hosts_file()?;
+    let hosts_dest = resolved_hosts_dest();
     let contents =
         b"127.0.0.1 localhost ai-sandbox\n::1       localhost ai-sandbox\n";
 
@@ -478,10 +490,16 @@ pub fn prepare() -> Result<SandboxGuard, String> {
 
     Ok(SandboxGuard {
         hosts_path: path,
+        hosts_dest,
         resolv_path,
         resolv_dest,
         empty_path,
     })
+}
+
+fn resolved_hosts_dest() -> PathBuf {
+    std::fs::canonicalize("/etc/hosts")
+        .unwrap_or_else(|_| PathBuf::from("/etc/hosts"))
 }
 
 /// Create a zero-byte tempfile used as the source for --mask
@@ -798,7 +816,7 @@ pub fn build(
     let mount_set = discover_mounts(
         config,
         project_dir,
-        guard.hosts_path(),
+        guard.hosts_mount(),
         guard.resolv_mount(),
         guard.empty_path(),
         verbose,
@@ -868,7 +886,7 @@ pub fn dry_run(
     let args = build_dry_run_args(
         config,
         project_dir,
-        guard.hosts_path(),
+        guard.hosts_mount(),
         guard.resolv_mount(),
         guard.empty_path(),
         verbose,
@@ -879,7 +897,7 @@ pub fn dry_run(
 fn build_dry_run_args(
     config: &Config,
     project_dir: &Path,
-    hosts_file: &Path,
+    hosts_mount: (&Path, &Path),
     resolv_mount: Option<(&Path, &Path)>,
     empty_path: &Path,
     verbose: bool,
@@ -887,7 +905,7 @@ fn build_dry_run_args(
     let mount_set = discover_mounts(
         config,
         project_dir,
-        hosts_file,
+        hosts_mount,
         resolv_mount,
         empty_path,
         verbose,
@@ -986,7 +1004,7 @@ fn format_dry_run_args(args: &[String]) -> String {
 fn discover_mounts(
     config: &Config,
     project_dir: &Path,
-    hosts_file: &Path,
+    hosts_mount: (&Path, &Path),
     resolv_mount: Option<(&Path, &Path)>,
     empty_path: &Path,
     verbose: bool,
@@ -1038,7 +1056,7 @@ fn discover_mounts(
     };
 
     MountSet {
-        base: discover_base(hosts_file, resolv_mount),
+        base: discover_base(hosts_mount, resolv_mount),
         sys_masks: discover_sys_masks(lockdown),
         home_dotfiles,
         config_hide: if private_home {
@@ -1296,9 +1314,18 @@ fn build_mask_mounts(
 }
 
 fn discover_base(
-    hosts_file: &Path,
+    hosts_mount: (&Path, &Path),
     resolv_mount: Option<(&Path, &Path)>,
 ) -> Vec<Mount> {
+    discover_base_with_nix_root(hosts_mount, resolv_mount, Path::new("/nix"))
+}
+
+fn discover_base_with_nix_root(
+    hosts_mount: (&Path, &Path),
+    resolv_mount: Option<(&Path, &Path)>,
+    nix_root: &Path,
+) -> Vec<Mount> {
+    let (hosts_file, hosts_dest) = hosts_mount;
     let mut mounts = vec![Mount::RoBind {
         src: "/usr".into(),
         dest: "/usr".into(),
@@ -1330,9 +1357,16 @@ fn discover_base(
         // else: does not exist, skip
     }
 
-    // Resolve /etc/hosts symlink (e.g. on NixOS) so bwrap can bind-mount over it.
-    let hosts_dest = std::fs::canonicalize("/etc/hosts")
-        .unwrap_or_else(|_| PathBuf::from("/etc/hosts"));
+    // On NixOS, /etc/hosts can be a symlink into /nix/store.
+    // The private hosts bind below is in the base group, before user
+    // --map/ro_maps are applied, so mount /nix early when the resolved
+    // destination needs it.
+    if hosts_dest.starts_with(nix_root) && nix_root.is_dir() {
+        mounts.push(Mount::RoBind {
+            src: nix_root.to_path_buf(),
+            dest: nix_root.to_path_buf(),
+        });
+    }
 
     mounts.extend([
         Mount::RoBind {
@@ -1341,7 +1375,7 @@ fn discover_base(
         },
         Mount::FileRoBind {
             src: hosts_file.to_path_buf(),
-            dest: hosts_dest,
+            dest: hosts_dest.to_path_buf(),
         },
         Mount::RoBind {
             src: "/opt".into(),
@@ -2106,7 +2140,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2150,7 +2184,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2189,7 +2223,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2307,7 +2341,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2371,7 +2405,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2391,7 +2425,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2421,7 +2455,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2448,7 +2482,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2494,7 +2528,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2539,7 +2573,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2572,7 +2606,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2596,7 +2630,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2619,7 +2653,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2752,7 +2786,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2785,7 +2819,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2806,7 +2840,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &fixture.project_dir,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2848,7 +2882,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &fixture.project_dir,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2890,7 +2924,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &fixture.project_dir,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2916,7 +2950,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &fixture.project_dir,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2943,7 +2977,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -2968,7 +3002,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -3218,7 +3252,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -3240,7 +3274,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -3280,7 +3314,7 @@ mod tests {
         let args = build_dry_run_args(
             &config,
             &project,
-            guard.hosts_path(),
+            guard.hosts_mount(),
             guard.resolv_mount(),
             guard.empty_path(),
             false,
@@ -3296,7 +3330,7 @@ mod tests {
     #[test]
     fn resolv_bind_after_run_tmpfs() {
         let mounts = discover_base(
-            Path::new("/tmp/test-hosts"),
+            (Path::new("/tmp/test-hosts"), Path::new("/etc/hosts")),
             Some((
                 Path::new("/tmp/test-resolv"),
                 Path::new("/run/resolvconf/resolv.conf"),
@@ -3325,6 +3359,42 @@ mod tests {
             run_tmpfs_idx.unwrap() < resolv_idx.unwrap(),
             "resolv bind must come after /run tmpfs"
         );
+    }
+
+    #[test]
+    fn nix_hosts_dest_mounts_nix_before_hosts_bind() {
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-nix-hosts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let nix = root.join("nix");
+        let hosts_dest = nix.join("store/abcd-hosts/hosts");
+        let hosts_src = root.join("private-hosts");
+        std::fs::create_dir_all(hosts_dest.parent().unwrap()).unwrap();
+        std::fs::write(&hosts_dest, "host hosts").unwrap();
+        std::fs::write(&hosts_src, "private hosts").unwrap();
+
+        let mounts =
+            discover_base_with_nix_root((&hosts_src, &hosts_dest), None, &nix);
+
+        let nix_idx = mounts.iter().position(|m| {
+            matches!(m, Mount::RoBind { src, dest } if src == &nix && dest == &nix)
+        });
+        let hosts_idx = mounts.iter().position(|m| {
+            matches!(
+                m,
+                Mount::FileRoBind { src, dest }
+                    if src == &hosts_src && dest == &hosts_dest
+            )
+        });
+
+        assert!(nix_idx.is_some(), "expected early /nix-style mount");
+        assert!(hosts_idx.is_some(), "expected private hosts bind");
+        assert!(
+            nix_idx.unwrap() < hosts_idx.unwrap(),
+            "/nix-style mount must come before hosts bind"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3544,7 +3614,7 @@ nameserver 8.8.8.8
         let args = build_dry_run_args(
             &config,
             &project,
-            Path::new("/tmp/hosts"),
+            (Path::new("/tmp/hosts"), Path::new("/etc/hosts")),
             None,
             Path::new("/tmp/empty"),
             false,
@@ -3589,7 +3659,7 @@ nameserver 8.8.8.8
         let args = build_dry_run_args(
             &config,
             &project,
-            Path::new("/tmp/hosts"),
+            (Path::new("/tmp/hosts"), Path::new("/etc/hosts")),
             None,
             Path::new("/tmp/empty"),
             false,
