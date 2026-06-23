@@ -355,7 +355,7 @@ Your real `$HOME` is replaced with a tmpfs. Dotfiles and dotdirs are selectively
 Pass `--private-home` or set `private_home = true` to skip this automatic dotdir layering entirely. `--ssh`, `--pictures`, `--map`, and `--rw-map` remain explicit opt-ins. On macOS, `sandbox-exec` does not provide tmpfs mounts, so ai-jail approximates this by denying normal host-home reads and writes.
 
 **Never mounted (sensitive data):**
-- `.gnupg`, `.aws`, `.ssh`, `.mozilla`, `.basilisk-dev`, `.sparrow`
+- `.gnupg`, `.aws`, `.ssh`, `.mozilla`, `.thunderbird`, `.basilisk-dev`, `.sparrow`
 
 **Mounted read-write (AI tools and build caches):**
 - `.gemini`, `.claude`, `.crush`, `.codex`, `.aider`, `.config`, `.cargo`, `.cache`, `.docker`
