@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-22.04
@@ -66,10 +67,14 @@ jobs:
           codesign --sign "$APPLE_SIGNING_IDENTITY" --options runtime --timestamp \
             target/${{ matrix.target }}/release/ai-jail
 
-          # Notarize
+          # Notarize when Apple accepts the account state. If the Apple
+          # developer agreement is missing/expired, keep the signed binary
+          # artifact flowing instead of blocking Linux/crates/Homebrew release.
           ditto -c -k target/${{ matrix.target }}/release/ai-jail ai-jail-notarize.zip
-          xcrun notarytool submit ai-jail-notarize.zip \
-            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          if ! xcrun notarytool submit ai-jail-notarize.zip \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait; then
+            echo "::warning::Skipping notarization — Apple notary service rejected the submission"
+          fi
 
           rm -f cert.p12 ai-jail-notarize.zip
 
