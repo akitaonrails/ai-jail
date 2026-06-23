@@ -177,18 +177,12 @@ fn run() -> Result<i32, String> {
 
     // Load global ($HOME/.ai-jail) then local (./.ai-jail), merge
     let global = config::load_global();
-    let local = if cli.clean {
+    let project_config = if cli.clean {
         config::Config::default()
     } else {
         config::load()
     };
-    let existing = config::merge_with_global(global, local);
-    // Capture the stored project command before the CLI command
-    // merges on top of it. The auto-save path below restores this
-    // so that `ai-jail codex` after `ai-jail claude` does not
-    // rewrite the project's stored default to codex. Use `--init`
-    // to explicitly change the stored command. See #20.
-    let stored_command = existing.command.clone();
+    let existing = config::merge_with_global(global, project_config.clone());
     let mut config = config::merge(&cli, existing);
     // Resolve any relative paths in rw_maps/ro_maps against the user's
     // invocation cwd before they reach bwrap/landlock/seatbelt (issue
@@ -238,16 +232,12 @@ fn run() -> Result<i32, String> {
     // Save config in normal mode. In lockdown mode avoid host writes unless user
     // explicitly requested persistence via --init.
     //
-    // A CLI-passed command is NOT persisted when the project already
-    // has a stored command — multi-agent users run `ai-jail claude`
-    // and `ai-jail codex` on the same project and the stored default
-    // should not flip under them. First-run bootstrap (no stored
-    // command yet) still persists the CLI command as the new default.
     if should_auto_save_project_config(&cli, &config) {
-        let mut to_save = config.clone();
-        if !stored_command.is_empty() && !cli.command.is_empty() {
-            to_save.command = stored_command;
-        }
+        let to_save = config::project_config_for_auto_save(
+            &cli,
+            project_config,
+            &invocation_cwd,
+        );
         config::save(&to_save);
     }
 

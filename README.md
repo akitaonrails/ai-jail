@@ -616,7 +616,7 @@ When CLI flags and an existing config are both present:
 - `rw_maps` / `ro_maps` / `mask`: CLI values are appended (duplicates removed). Paths starting with `~/` or exactly `~` are expanded against `$HOME` at merge time, so you can write `ro_maps = ["~/.bashrc"]` in a config file. Relative paths in `rw_maps` / `ro_maps` (including `../sibling` style) are resolved against the project directory before being passed to the sandbox. Relative `mask` entries resolve against the project directory when the sandbox policy is built; glob masks are expanded at that same point so committed configs can keep portable patterns.
 - Boolean flags: CLI overrides config (`--no-gpu` sets `no_gpu = true`)
 - `--save-config` / `--no-save-config` override `no_save_config`
-- Config is updated after merge in normal mode when config saving is enabled; lockdown skips auto-save
+- Project config is updated in normal mode when config saving is enabled; inherited values from `$HOME/.ai-jail` are used at runtime but are not copied into the project `.ai-jail`. Lockdown skips auto-save.
 
 ### Available fields
 

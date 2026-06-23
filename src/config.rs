@@ -595,6 +595,31 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     config
 }
 
+/// Build the project-local config to write during automatic saves.
+///
+/// Runtime config may include values inherited from `$HOME/.ai-jail` via
+/// [`merge_with_global`]. Auto-save must not copy those inherited values into
+/// the project `.ai-jail`; it should persist only the existing project config
+/// plus CLI-persistable changes from this invocation.
+pub fn project_config_for_auto_save(
+    cli: &CliArgs,
+    project: Config,
+    invocation_cwd: &Path,
+) -> Config {
+    let stored_project_command = project.command.clone();
+    let mut to_save = merge(cli, project);
+
+    // A CLI-passed command is transient when the project already has a stored
+    // command. Preserve that project default instead of flipping it between
+    // agents on ordinary runs; `--init` remains the explicit way to change it.
+    if !stored_project_command.is_empty() && !cli.command.is_empty() {
+        to_save.command = stored_project_command;
+    }
+
+    absolutize_user_paths(&mut to_save, invocation_cwd);
+    to_save
+}
+
 pub fn display_status(config: &Config) {
     let path = config_path();
     if !path.exists() {
@@ -1465,6 +1490,159 @@ tailscale = true
         };
         let merged = merge_with_global(global, local);
         assert_eq!(merged.tailscale, Some(true));
+    }
+
+    #[test]
+    fn auto_save_project_config_does_not_copy_global_only_scalars() {
+        let global = Config {
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            tailscale: Some(true),
+            private_home: Some(true),
+            claude_dir: Some(PathBuf::from("/home/u/.claude-global")),
+            ..Config::default()
+        };
+        let project = Config::default();
+        let runtime = merge_with_global(global, project.clone());
+        assert_eq!(runtime.no_gpu, Some(true));
+        assert_eq!(
+            runtime.claude_dir,
+            Some(PathBuf::from("/home/u/.claude-global"))
+        );
+
+        let to_save = project_config_for_auto_save(
+            &CliArgs::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert_eq!(to_save.no_gpu, None);
+        assert_eq!(to_save.no_docker, None);
+        assert_eq!(to_save.tailscale, None);
+        assert_eq!(to_save.private_home, None);
+        assert_eq!(to_save.claude_dir, None);
+    }
+
+    #[test]
+    fn auto_save_project_config_keeps_project_and_cli_vectors_not_global() {
+        let global = Config {
+            rw_maps: vec![PathBuf::from("/global/rw")],
+            ro_maps: vec![PathBuf::from("/global/ro")],
+            overlay_maps: vec![PathBuf::from("/global/overlay")],
+            hide_dotdirs: vec![".global".into()],
+            mask: vec![PathBuf::from("/global/mask")],
+            allow_tcp_ports: vec![1111],
+            ..Config::default()
+        };
+        let project = Config {
+            rw_maps: vec![PathBuf::from("/project/rw")],
+            ro_maps: vec![PathBuf::from("/project/ro")],
+            overlay_maps: vec![PathBuf::from("/project/overlay")],
+            hide_dotdirs: vec![".project".into()],
+            mask: vec![PathBuf::from("/project/mask")],
+            allow_tcp_ports: vec![2222],
+            ..Config::default()
+        };
+        let runtime = merge_with_global(global, project.clone());
+        assert!(runtime.rw_maps.contains(&PathBuf::from("/global/rw")));
+
+        let cli = CliArgs {
+            rw_maps: vec![PathBuf::from("cli-rw")],
+            ro_maps: vec![PathBuf::from("cli-ro")],
+            overlay_maps: vec![PathBuf::from("cli-overlay")],
+            hide_dotdirs: vec![".cli".into()],
+            mask: vec![PathBuf::from("/cli/mask")],
+            allow_tcp_ports: vec![3333],
+            ..CliArgs::default()
+        };
+        let to_save =
+            project_config_for_auto_save(&cli, project, Path::new("/project"));
+
+        assert_eq!(
+            to_save.rw_maps,
+            vec![
+                PathBuf::from("/project/rw"),
+                PathBuf::from("/project/cli-rw")
+            ]
+        );
+        assert_eq!(
+            to_save.ro_maps,
+            vec![
+                PathBuf::from("/project/ro"),
+                PathBuf::from("/project/cli-ro")
+            ]
+        );
+        assert_eq!(
+            to_save.overlay_maps,
+            vec![
+                PathBuf::from("/project/overlay"),
+                PathBuf::from("/project/cli-overlay"),
+            ]
+        );
+        assert_eq!(to_save.hide_dotdirs, vec![".project", ".cli"]);
+        assert_eq!(
+            to_save.mask,
+            vec![PathBuf::from("/project/mask"), PathBuf::from("/cli/mask")]
+        );
+        assert_eq!(to_save.allow_tcp_ports, vec![2222, 3333]);
+    }
+
+    #[test]
+    fn auto_save_persists_cli_command_when_only_global_command_exists() {
+        let global = Config {
+            command: vec!["global-agent".into()],
+            ..Config::default()
+        };
+        let project = Config::default();
+        let runtime = merge_with_global(global, project.clone());
+        assert_eq!(runtime.command, vec!["global-agent"]);
+
+        let cli = CliArgs {
+            command: vec!["claude".into()],
+            ..CliArgs::default()
+        };
+        let to_save =
+            project_config_for_auto_save(&cli, project, Path::new("/project"));
+        assert_eq!(to_save.command, vec!["claude"]);
+    }
+
+    #[test]
+    fn auto_save_project_config_preserves_existing_project_command() {
+        let project = Config {
+            command: vec!["claude".into()],
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            command: vec!["codex".into()],
+            ..CliArgs::default()
+        };
+        let to_save =
+            project_config_for_auto_save(&cli, project, Path::new("/project"));
+        assert_eq!(to_save.command, vec!["claude"]);
+    }
+
+    #[test]
+    fn auto_save_project_config_persists_cli_boolean_overrides() {
+        let project = Config {
+            no_gpu: Some(false),
+            no_docker: Some(true),
+            tailscale: Some(false),
+            no_seccomp: Some(false),
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            gpu: Some(false),
+            docker: Some(true),
+            tailscale: Some(true),
+            seccomp: Some(false),
+            ..CliArgs::default()
+        };
+        let to_save =
+            project_config_for_auto_save(&cli, project, Path::new("/project"));
+
+        assert_eq!(to_save.no_gpu, Some(true));
+        assert_eq!(to_save.no_docker, Some(false));
+        assert_eq!(to_save.tailscale, Some(true));
+        assert_eq!(to_save.no_seccomp, Some(true));
     }
 
     #[test]
