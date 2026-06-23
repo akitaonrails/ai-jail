@@ -128,6 +128,8 @@ struct MountSet {
     shm: Vec<Mount>,
     display: Vec<Mount>,
     display_env: Vec<(String, String)>,
+    systemd_user: Vec<Mount>,
+    systemd_env: Vec<(String, String)>,
     ssh_agent: Vec<Mount>,
     ssh_env: Vec<(String, String)>,
     claude_env: Vec<(String, String)>,
@@ -145,7 +147,7 @@ struct MountSet {
 }
 
 impl MountSet {
-    fn ordered_mounts(&self) -> [&[Mount]; 21] {
+    fn ordered_mounts(&self) -> [&[Mount]; 22] {
         [
             &self.base,
             &self.sys_masks,
@@ -154,6 +156,7 @@ impl MountSet {
             &self.tailscale,
             &self.shm,
             &self.display,
+            &self.systemd_user,
             &self.home_dotfiles,
             &self.config_hide,
             &self.cache_hide,
@@ -228,6 +231,11 @@ impl MountSet {
             }
         } else {
             for (key, val) in &self.display_env {
+                args.push("--setenv".into());
+                args.push(key.clone());
+                args.push(val.clone());
+            }
+            for (key, val) in &self.systemd_env {
                 args.push("--setenv".into());
                 args.push(key.clone());
                 args.push(val.clone());
@@ -854,6 +862,13 @@ fn landlock_wrapper_args(config: &Config, verbose: bool) -> Vec<String> {
     } else {
         "--no-display".into()
     });
+    if let Some(enabled) = config.systemd_user {
+        args.push(if enabled {
+            "--systemd-user".into()
+        } else {
+            "--no-systemd-user".into()
+        });
+    }
     if let Some(enabled) = config.no_worktree.map(|value| !value) {
         args.push(if enabled {
             "--worktree".into()
@@ -1129,6 +1144,14 @@ fn discover_mounts_full(
     } else {
         (vec![], vec![])
     };
+    let (systemd_mounts, systemd_env) = discover_systemd_user(
+        config,
+        lockdown,
+        browser_mode,
+        enable_display,
+        sources.deny_file_path,
+        verbose,
+    );
     let (ssh_agent_mount, ssh_env) =
         discover_ssh(config, lockdown, browser_mode, private_home, verbose);
     let claude_env = discover_claude_env(config);
@@ -1204,6 +1227,8 @@ fn discover_mounts_full(
         shm: if lockdown { vec![] } else { discover_shm() },
         display: display_mounts,
         display_env,
+        systemd_user: systemd_mounts,
+        systemd_env,
         ssh_agent: ssh_agent_mount,
         ssh_env,
         claude_env,
@@ -1891,6 +1916,95 @@ fn discover_display(verbose: bool) -> (Vec<Mount>, Vec<(String, String)>) {
     (mounts, env)
 }
 
+fn discover_systemd_user(
+    config: &Config,
+    lockdown: bool,
+    browser_mode: bool,
+    display_enabled: bool,
+    deny_file_path: &Path,
+    verbose: bool,
+) -> (Vec<Mount>, Vec<(String, String)>) {
+    if !config.systemd_user_enabled() {
+        return (vec![], vec![]);
+    }
+    if lockdown {
+        output::warn("--systemd-user is not supported in lockdown; skipping");
+        return (vec![], vec![]);
+    }
+    let Ok(xdg_dir) = std::env::var("XDG_RUNTIME_DIR") else {
+        output::warn("--systemd-user requires XDG_RUNTIME_DIR; skipping");
+        return (vec![], vec![]);
+    };
+    let xdg_path = PathBuf::from(&xdg_dir);
+    if !xdg_path.is_dir() {
+        output::warn("--systemd-user XDG_RUNTIME_DIR does not exist; skipping");
+        return (vec![], vec![]);
+    }
+
+    let bus = xdg_path.join("bus");
+    let private = xdg_path.join("systemd/private");
+    let existing_paths: Vec<&Path> = [&bus, &private]
+        .into_iter()
+        .filter(|path| super::path_exists(path))
+        .map(PathBuf::as_path)
+        .collect();
+    if existing_paths.is_empty() {
+        output::warn(
+            "--systemd-user found no user bus sockets in XDG_RUNTIME_DIR; skipping",
+        );
+        return (vec![], vec![]);
+    }
+
+    let mut mounts = Vec::new();
+
+    if browser_mode {
+        output::warn(
+            "--systemd-user is not supported in browser profile mode; denying known user bus sockets",
+        );
+        for path in existing_paths {
+            mounts.push(Mount::FileRoBind {
+                src: deny_file_path.to_path_buf(),
+                dest: path.to_path_buf(),
+            });
+        }
+        return (mounts, vec![]);
+    }
+
+    let mut env = Vec::new();
+    if !display_enabled {
+        env.push(("XDG_RUNTIME_DIR".into(), xdg_dir.clone()));
+    }
+
+    // If display passthrough is enabled, it already bind-mounts the whole
+    // runtime dir. Do not add duplicate narrow binds, but still provide the
+    // DBus/systemd env for callers such as `systemd-run --user`.
+    if !display_enabled {
+        for path in existing_paths {
+            if verbose {
+                output::verbose(&format!(
+                    "systemd-user: {} rw",
+                    path.display()
+                ));
+            }
+            mounts.push(Mount::Bind {
+                src: path.to_path_buf(),
+                dest: path.to_path_buf(),
+            });
+        }
+    }
+
+    if super::path_exists(&bus) {
+        let explicit = format!("unix:path={}", bus.display());
+        let value = match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+            Ok(existing) if existing == explicit => existing,
+            _ => explicit,
+        };
+        env.push(("DBUS_SESSION_BUS_ADDRESS".into(), value));
+    }
+
+    (mounts, env)
+}
+
 fn git_worktree_mounts(
     config: &Config,
     project_dir: &Path,
@@ -2449,6 +2563,121 @@ mod tests {
         }));
 
         let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn systemd_user_dry_run_binds_narrow_runtime_paths_and_env() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let runtime = std::env::temp_dir()
+            .join(format!("ai-jail-systemd-user-{}", std::process::id()));
+        let systemd_dir = runtime.join("systemd");
+        std::fs::create_dir_all(&systemd_dir).unwrap();
+        let bus = runtime.join("bus");
+        let private = systemd_dir.join("private");
+        std::fs::write(&bus, "").unwrap();
+        std::fs::write(&private, "").unwrap();
+        let _xdg = EnvVarGuard::set("XDG_RUNTIME_DIR", runtime.as_os_str());
+        let _dbus = EnvVarGuard::remove("DBUS_SESSION_BUS_ADDRESS");
+
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            systemd_user: Some(true),
+            no_display: Some(true),
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let args = build_dry_run_args_full(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+        )
+        .unwrap();
+
+        for path in [&bus, &private] {
+            let path_str = path.display().to_string();
+            assert!(
+                args.windows(3).any(|w| w[0] == "--bind"
+                    && w[1] == path_str
+                    && w[2] == path_str),
+                "expected narrow systemd-user bind for {path_str}; args: {args:?}"
+            );
+        }
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--setenv"
+                && w[1] == "XDG_RUNTIME_DIR"
+                && w[2] == runtime.display().to_string()
+        }));
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--setenv"
+                && w[1] == "DBUS_SESSION_BUS_ADDRESS"
+                && w[2] == format!("unix:path={}", bus.display())
+        }));
+
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    #[test]
+    fn systemd_user_dry_run_skips_in_lockdown_and_browser() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let runtime = std::env::temp_dir()
+            .join(format!("ai-jail-systemd-user-skip-{}", std::process::id()));
+        let systemd_dir = runtime.join("systemd");
+        std::fs::create_dir_all(&systemd_dir).unwrap();
+        let bus = runtime.join("bus");
+        let private = systemd_dir.join("private");
+        std::fs::write(&bus, "").unwrap();
+        std::fs::write(&private, "").unwrap();
+        let _xdg = EnvVarGuard::set("XDG_RUNTIME_DIR", runtime.as_os_str());
+
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let lockdown_config = Config {
+            systemd_user: Some(true),
+            lockdown: Some(true),
+            no_display: Some(true),
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let args = build_dry_run_args_full(
+            &lockdown_config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+        )
+        .unwrap();
+        let bus_str = bus.display().to_string();
+        let private_str = private.display().to_string();
+        assert!(!args.windows(3).any(|w| {
+            w[0] == "--bind" && (w[1] == bus_str || w[1] == private_str)
+        }));
+
+        let browser_config = Config {
+            systemd_user: Some(true),
+            browser_profile: Some("hard".into()),
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let args = build_dry_run_args_full(
+            &browser_config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+        )
+        .unwrap();
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--ro-bind"
+                && w[1] == guard.deny_file_path().display().to_string()
+                && w[2] == bus_str
+        }));
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--ro-bind"
+                && w[1] == guard.deny_file_path().display().to_string()
+                && w[2] == private_str
+        }));
+
+        let _ = std::fs::remove_dir_all(&runtime);
     }
 
     #[test]

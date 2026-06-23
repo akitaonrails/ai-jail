@@ -30,6 +30,8 @@ OPTIONS:
     --landlock / --no-landlock     Enable/disable Landlock LSM (Linux 5.13+, default: on)
     --seccomp / --no-seccomp       Enable/disable seccomp syscall filter (Linux, default: on)
     --rlimits / --no-rlimits       Enable/disable resource limits (default: on)
+    --systemd-user / --no-systemd-user
+                                   Expose host systemd --user bus (dangerous; default: off)
     --no-gpu / --gpu               Disable/enable GPU device passthrough (Linux only)
     --no-docker / --docker         Disable/enable Docker socket passthrough
     --tailscale / --no-tailscale   Enable/disable Tailscale socket passthrough (default: off)
@@ -73,6 +75,7 @@ pub struct CliArgs {
     pub landlock: Option<bool>,
     pub seccomp: Option<bool>,
     pub rlimits: Option<bool>,
+    pub systemd_user: Option<bool>,
     pub gpu: Option<bool>,
     pub docker: Option<bool>,
     pub tailscale: Option<bool>,
@@ -171,6 +174,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("rlimits" | "no-rlimits")) => {
                 args.rlimits = Some(s == "rlimits");
+            }
+            Long(s @ ("systemd-user" | "no-systemd-user")) => {
+                args.systemd_user = Some(s == "systemd-user");
             }
             Long("allow-tcp-port") => {
                 let val: String = parser
@@ -417,6 +423,30 @@ mod tests {
     fn parse_no_lockdown() {
         let args = parse_test(&["--no-lockdown", "bash"]).unwrap();
         assert_eq!(args.lockdown, Some(false));
+    }
+
+    #[test]
+    fn parse_systemd_user() {
+        let args = parse_test(&["--systemd-user", "bash"]).unwrap();
+        assert_eq!(args.systemd_user, Some(true));
+    }
+
+    #[test]
+    fn parse_no_systemd_user() {
+        let args = parse_test(&["--no-systemd-user", "bash"]).unwrap();
+        assert_eq!(args.systemd_user, Some(false));
+    }
+
+    #[test]
+    fn parse_systemd_user_last_wins() {
+        let args = parse_test(&[
+            "--systemd-user",
+            "--no-systemd-user",
+            "--systemd-user",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.systemd_user, Some(true));
     }
 
     #[test]

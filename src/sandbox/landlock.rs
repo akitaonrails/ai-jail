@@ -660,6 +660,31 @@ fn collect_normal_paths(
         }
     }
 
+    // systemd --user bus: dangerous opt-in. When display passthrough is off,
+    // bwrap only exposes the narrow user-bus sockets; Landlock must allow the
+    // sockets and their parents so `systemd-run --user` can connect. Display
+    // mode already grants the whole XDG runtime dir above. Never added in
+    // lockdown because collect_lockdown_paths does not call this function.
+    if config.systemd_user_enabled()
+        && !browser_mode
+        && !config.display_enabled()
+    {
+        for path in systemd_user_paths() {
+            if super::path_exists(&path) {
+                if verbose {
+                    output::verbose(&format!(
+                        "Landlock: systemd-user {} rw",
+                        path.display()
+                    ));
+                }
+                rw.push(path.clone());
+                if let Some(parent) = path.parent() {
+                    rw.push(parent.to_path_buf());
+                }
+            }
+        }
+    }
+
     // bwrap binary: read+execute — Landlock's from_read()
     // includes execute permission. Without this, the initial
     // bwrap exec would fail after Landlock restricts the
@@ -672,6 +697,14 @@ fn collect_normal_paths(
     }
 
     (ro, rw)
+}
+
+fn systemd_user_paths() -> Vec<PathBuf> {
+    let Ok(xdg_dir) = std::env::var("XDG_RUNTIME_DIR") else {
+        return vec![];
+    };
+    let xdg_path = PathBuf::from(xdg_dir);
+    vec![xdg_path.join("bus"), xdg_path.join("systemd/private")]
 }
 
 /// Classify home dotdirs into read-only or read-write.
@@ -1068,6 +1101,70 @@ mod tests {
         assert!(rw.contains(&tmp_root));
 
         let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn systemd_user_paths_absent_by_default_and_in_lockdown() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let runtime = std::env::temp_dir().join(format!(
+            "ai-jail-landlock-systemd-default-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(runtime.join("systemd")).unwrap();
+        let bus = runtime.join("bus");
+        let private = runtime.join("systemd/private");
+        std::fs::write(&bus, "").unwrap();
+        std::fs::write(&private, "").unwrap();
+        let _xdg = EnvVarGuard::set("XDG_RUNTIME_DIR", runtime.as_os_str());
+
+        let default_config = Config {
+            no_display: Some(true),
+            ..Config::default()
+        };
+        let (_, rw_default) =
+            collect_normal_paths(&default_config, Path::new("/tmp"), false);
+        assert!(!rw_default.contains(&bus));
+        assert!(!rw_default.contains(&private));
+
+        let lockdown_config = Config {
+            systemd_user: Some(true),
+            lockdown: Some(true),
+            no_display: Some(true),
+            ..Config::default()
+        };
+        let (_, rw_lockdown) =
+            collect_lockdown_paths(&lockdown_config, Path::new("/tmp"), false);
+        assert!(!rw_lockdown.contains(&bus));
+        assert!(!rw_lockdown.contains(&private));
+
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    #[test]
+    fn systemd_user_normal_paths_include_socket_paths_when_enabled() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let runtime = std::env::temp_dir()
+            .join(format!("ai-jail-landlock-systemd-{}", std::process::id()));
+        let systemd_dir = runtime.join("systemd");
+        std::fs::create_dir_all(&systemd_dir).unwrap();
+        let bus = runtime.join("bus");
+        let private = systemd_dir.join("private");
+        std::fs::write(&bus, "").unwrap();
+        std::fs::write(&private, "").unwrap();
+        let _xdg = EnvVarGuard::set("XDG_RUNTIME_DIR", runtime.as_os_str());
+
+        let config = Config {
+            systemd_user: Some(true),
+            no_display: Some(true),
+            ..Config::default()
+        };
+        let (_, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
+        assert!(rw.contains(&bus));
+        assert!(rw.contains(&runtime));
+        assert!(rw.contains(&private));
+        assert!(rw.contains(&systemd_dir));
+
+        let _ = std::fs::remove_dir_all(&runtime);
     }
 
     #[test]

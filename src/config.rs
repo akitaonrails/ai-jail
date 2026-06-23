@@ -87,6 +87,8 @@ pub struct Config {
     pub no_seccomp: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_rlimits: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub systemd_user: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_tcp_ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,6 +176,9 @@ impl Config {
     }
     pub fn rlimits_enabled(&self) -> bool {
         self.no_rlimits != Some(true)
+    }
+    pub fn systemd_user_enabled(&self) -> bool {
+        self.systemd_user == Some(true)
     }
     pub fn allow_tcp_ports(&self) -> &[u16] {
         &self.allow_tcp_ports
@@ -343,6 +348,7 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     take!(no_landlock);
     take!(no_seccomp);
     take!(no_rlimits);
+    take!(systemd_user);
     c.allow_tcp_ports.extend(local.allow_tcp_ports);
     c.allow_tcp_ports.sort_unstable();
     c.allow_tcp_ports.dedup();
@@ -683,6 +689,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     direct!(private_home);
     invert!(worktree, no_worktree);
     direct!(lockdown);
+    direct!(systemd_user);
     invert!(landlock, no_landlock);
     invert!(seccomp, no_seccomp);
     invert!(rlimits, no_rlimits);
@@ -771,6 +778,7 @@ pub fn display_status(config: &Config) {
     print_auto_tristate("  Landlock", config.no_landlock);
     print_auto_tristate("  Seccomp", config.no_seccomp);
     print_auto_tristate("  Rlimits", config.no_rlimits);
+    print_shared_or_hidden("  systemd --user", config.systemd_user);
     print_auto_tristate("  Lockdown", config.lockdown.map(|v| !v));
     print_allow_tcp_ports(&config.allow_tcp_ports, config.lockdown_enabled());
     print_default_on_tristate("  Status bar", config.no_status_bar);
@@ -1221,6 +1229,17 @@ mask = [".env"]
     }
 
     #[test]
+    fn regression_old_config_without_systemd_user() {
+        let toml = r#"
+command = ["claude"]
+rw_maps = ["/tmp/rw"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.systemd_user, None);
+        assert!(!cfg.systemd_user_enabled());
+    }
+
+    #[test]
     fn parse_config_with_overlay_maps() {
         let toml = r#"
 command = ["claude"]
@@ -1247,6 +1266,13 @@ deny_paths = [".env", "secrets/*.json"]
             cfg.deny_paths,
             vec![PathBuf::from(".env"), PathBuf::from("secrets/*.json")]
         );
+    }
+
+    #[test]
+    fn parse_systemd_user() {
+        let cfg = parse_toml("systemd_user = true\n").unwrap();
+        assert_eq!(cfg.systemd_user, Some(true));
+        assert!(cfg.systemd_user_enabled());
     }
 
     #[test]
@@ -1306,6 +1332,7 @@ no_gpu = true
             resize_redraw_key: Some("ctrl-shift-l".into()),
             no_seccomp: None,
             no_rlimits: None,
+            systemd_user: Some(true),
             allow_tcp_ports: vec![32000, 8080],
             claude_dir: None,
         };
@@ -1330,6 +1357,7 @@ no_gpu = true
         assert_eq!(deserialized.resize_redraw_key, config.resize_redraw_key);
         assert_eq!(deserialized.no_seccomp, config.no_seccomp);
         assert_eq!(deserialized.no_rlimits, config.no_rlimits);
+        assert_eq!(deserialized.systemd_user, config.systemd_user);
         assert_eq!(deserialized.allow_tcp_ports, config.allow_tcp_ports);
         assert_eq!(deserialized.claude_dir, config.claude_dir);
     }
@@ -1426,6 +1454,20 @@ no_gpu = true
             merged.deny_paths,
             vec![PathBuf::from(".env"), PathBuf::from("secrets/*.json")]
         );
+    }
+
+    #[test]
+    fn merge_systemd_user_from_cli() {
+        let existing = Config {
+            systemd_user: Some(false),
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            systemd_user: Some(true),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(merged.systemd_user, Some(true));
     }
 
     #[test]
@@ -2636,6 +2678,7 @@ rw_maps = ["~/.claude"]
             resize_redraw_key: Some("ctrl-shift-l".into()),
             no_seccomp: None,
             no_rlimits: None,
+            systemd_user: Some(true),
             allow_tcp_ports: vec![32000],
             claude_dir: None,
         };
@@ -2647,6 +2690,7 @@ rw_maps = ["~/.claude"]
         assert_eq!(loaded.no_gpu, Some(true));
         assert_eq!(loaded.lockdown, Some(false));
         assert_eq!(loaded.allow_tcp_ports, vec![32000]);
+        assert_eq!(loaded.systemd_user, Some(true));
         assert_eq!(loaded.deny_paths, vec![PathBuf::from("secrets.json")]);
         assert_eq!(loaded.resize_redraw_key, None);
         assert_eq!(loaded.browser_profile.as_deref(), Some("hard"));

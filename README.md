@@ -201,6 +201,8 @@ mask = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
 
 This is opt-in because some software fails outright when the IDs are absent (notably some D-Bus services). Most CLI agents read them only for telemetry and degrade gracefully.
 
+**Host `systemd --user` bus**: `--systemd-user` (or `systemd_user = true`) exposes the host user bus so tools like `systemd-run --user` can talk to the host user manager. This is dangerous: a sandboxed agent can ask the host user manager to start services outside the sandbox. It is off by default and only works in normal Linux mode. With `--no-display`, ai-jail bind-mounts only `$XDG_RUNTIME_DIR/bus` and `$XDG_RUNTIME_DIR/systemd/private`; with display enabled, `$XDG_RUNTIME_DIR` may already be exposed for Wayland/display IPC, so ai-jail only adds the bus environment. In browser profile mode, `--systemd-user` is skipped and ai-jail overlays permission-denied placeholders on the known user-bus sockets when display passthrough exposed `$XDG_RUNTIME_DIR`.
+
 **Private home mode**: use `--private-home` when you want the project writable
 but do not want normal host dotdirs like `~/.config`, `~/.cache`, `~/.local`,
 or AI tool state mounted into the sandbox. Explicit mounts still apply.
@@ -461,6 +463,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--landlock` / `--no-landlock` | Enable/disable Landlock LSM (Linux 5.13+, default: on) |
 | `--seccomp` / `--no-seccomp` | Enable/disable seccomp syscall filter (Linux, default: on) |
 | `--rlimits` / `--no-rlimits` | Enable/disable resource limits (default: on) |
+| `--systemd-user` / `--no-systemd-user` | Dangerous opt-in: expose the host `systemd --user` bus so tools like `systemd-run --user` can talk to the host user manager. Linux normal mode only; skipped in lockdown and browser profile mode. With `--no-display`, only the narrow user-bus sockets are mounted. |
 | `--gpu` / `--no-gpu` | Enable/disable GPU passthrough |
 | `--docker` / `--no-docker` | Enable/disable Docker socket |
 | `--tailscale` / `--no-tailscale` | Enable/disable Tailscale socket passthrough (default: off). When enabled, maps `/var/run/tailscale/tailscaled.sock` for the `tailscale` CLI if it exists. |
@@ -663,6 +666,7 @@ The command key is selected from the first available command name: CLI command, 
 | `no_landlock` | bool | not set (auto) | `true` disables Landlock LSM (Linux only) |
 | `no_seccomp` | bool | not set (auto) | `true` disables seccomp syscall filter (Linux only) |
 | `no_rlimits` | bool | not set (auto) | `true` disables resource limits |
+| `systemd_user` | bool | not set (off) | `true` exposes the host user D-Bus/systemd manager sockets for `systemd-run --user`. Dangerous: the sandboxed agent can ask the host user manager to start services outside the sandbox. Linux normal mode only; skipped in lockdown/browser mode. With `no_display = true`, only the narrow user-bus sockets are mounted. |
 | `lockdown` | bool | not set (disabled) | `true` enables strict read-only lockdown mode |
 
 Status bar preferences (`no_status_bar`, `status_bar_style`, `resize_redraw_key`) are stored in `$HOME/.ai-jail` (global user config), not in per-project `.ai-jail` files. `status_bar_style` accepts `"dark"`, `"light"`, or `"pastel"` — pastel rotates through a curated set of soft pastel palettes (with high-contrast foreground), picking a new one at random for each session. Set it back to `"dark"` or `"light"` to disable the rotation. `resize_redraw_key` is used only by the PTY/status-bar path on terminal resize; accepted values are `ctrl-l`, `ctrl-shift-l` (same wire encoding as `ctrl-l`), or `disabled`. If unset, `codex` gets the `ctrl-shift-l` default and other commands stay off.

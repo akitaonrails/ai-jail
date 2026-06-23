@@ -28,6 +28,9 @@ pub fn platform_notes(config: &Config) {
             "--no-display has no effect on macOS (Cocoa is system-level)",
         );
     }
+    if config.systemd_user_enabled() {
+        output::warn("--systemd-user has no effect on macOS");
+    }
     if !config.allow_tcp_ports().is_empty() && config.lockdown_enabled() {
         output::warn(
             "--allow-tcp-port has no effect on macOS \
