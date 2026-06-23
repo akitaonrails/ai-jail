@@ -1751,6 +1751,12 @@ fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
     //   --map ~/Projects --rw-map ~/Projects/ai-jail
     // makes ~/Projects read-only except the ai-jail subdir.
     for path in ro_maps {
+        if path == Path::new("/") {
+            output::warn(
+                "Refusing to map / as an extra read-only mount; map explicit subpaths instead.",
+            );
+            continue;
+        }
         if super::path_exists(path) {
             mounts.push(Mount::RoBind {
                 src: path.clone(),
@@ -1765,6 +1771,12 @@ fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
     }
 
     for path in rw_maps {
+        if path == Path::new("/") {
+            output::warn(
+                "Refusing to map / as an extra read-write mount; map explicit subpaths instead.",
+            );
+            continue;
+        }
         if super::path_exists(path) {
             mounts.push(Mount::Bind {
                 src: path.clone(),
@@ -2389,6 +2401,31 @@ mod tests {
     }
 
     #[test]
+    fn extra_mounts_refuses_root_maps() {
+        let ro = vec![PathBuf::from("/"), PathBuf::from("/usr")];
+        let rw = vec![PathBuf::from("/"), PathBuf::from("/usr/bin")];
+        let mounts = extra_mounts(&rw, &ro);
+
+        assert_eq!(mounts.len(), 2);
+        assert!(mounts.iter().all(|m| match m {
+            Mount::Bind { src, dest } | Mount::RoBind { src, dest } => {
+                src != Path::new("/") && dest != Path::new("/")
+            }
+            _ => true,
+        }));
+        assert!(matches!(
+            &mounts[0],
+            Mount::RoBind { src, dest }
+                if src == Path::new("/usr") && dest == Path::new("/usr")
+        ));
+        assert!(matches!(
+            &mounts[1],
+            Mount::Bind { src, dest }
+                if src == Path::new("/usr/bin") && dest == Path::new("/usr/bin")
+        ));
+    }
+
+    #[test]
     fn format_dry_run_empty() {
         let args: Vec<String> = vec![];
         let output = format_dry_run_args(&args);
@@ -2664,6 +2701,35 @@ mod tests {
             .windows(3)
             .any(|w| w[0] == "--bind" && w[1] == "/tmp" && w[2] == "/tmp");
         assert!(!has_tmp_bind);
+    }
+
+    #[test]
+    fn root_extra_maps_are_not_emitted_in_dry_run() {
+        let mut config = minimal_test_config();
+        config.ro_maps = vec![PathBuf::from("/")];
+        config.rw_maps = vec![PathBuf::from("/")];
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let project = PathBuf::from("/home/user/project");
+
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        let has_root_ro_bind = args
+            .windows(3)
+            .any(|w| w[0] == "--ro-bind" && w[1] == "/" && w[2] == "/");
+        let has_root_bind = args
+            .windows(3)
+            .any(|w| w[0] == "--bind" && w[1] == "/" && w[2] == "/");
+        assert!(!has_root_ro_bind);
+        assert!(!has_root_bind);
     }
 
     /// Create a fresh `(project_dir, source_dir)` pair under the temp

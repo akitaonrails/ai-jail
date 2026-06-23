@@ -447,8 +447,8 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 
 | Flag | Description |
 |------|-------------|
-| `--rw-map <PATH>` | Mount PATH read-write (repeatable). Relative paths and `..` are resolved against the project directory, so `--rw-map ../sister-project` works from a project root. |
-| `--map <PATH>` | Mount PATH read-only (repeatable). Same path resolution as `--rw-map`. |
+| `--rw-map <PATH>` | Mount PATH read-write (repeatable). Relative paths and `..` are resolved against the project directory, so `--rw-map ../sister-project` works from a project root. Mapping `/` is refused; map explicit subpaths instead. |
+| `--map <PATH>` | Mount PATH read-only (repeatable). Same path resolution as `--rw-map`. Mapping `/` is refused; map explicit subpaths instead. |
 | `--overlay-map <PATH>` | Mount PATH **copy-on-write** (repeatable). The agent sees PATH read-write, but writes land on a side layer under `<project>/.ai-jail-overlays/` while PATH itself is never modified — so you can diff and selectively promote changes afterwards. Opt-in only. Linux/bwrap only; degrades to **read-only** (with a warning) on macOS, and is disabled under `--lockdown` / browser mode. See [Overlay maps](#overlay-maps). |
 | `--hide-dotdir <NAME>` | Never bind-mount the named home dotdir into the sandbox (e.g. `.my_secrets`). Leading dot is optional. Repeatable. Cannot hide dotdirs required for tool operation (`.cargo`, `.config`, `.cache`, etc.) — those emit a warning and stay visible. |
 | `--mask <PATH\|GLOB>` | Replace `PATH` or glob matches inside the sandbox with an empty file (or empty tmpfs if the path is a directory). Relative paths resolve against the project directory. Repeatable. Supports `*`, `?`, `[a-z]`, and recursive `**`; quote glob masks in your shell. Useful for hiding sensitive files like `.env`, `**/*.env`, `credentials.json` from AI agents while keeping the rest of the project accessible. Missing paths/unmatched globs are skipped with a warning. |
@@ -623,8 +623,8 @@ When CLI flags and an existing config are both present:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `command` | string array | `["bash"]` | Default command to run inside sandbox. Set by first run or by `--init`; not overwritten when a different command is passed on the CLI. |
-| `rw_maps` | path array | `[]` | Extra read-write mounts |
-| `ro_maps` | path array | `[]` | Extra read-only mounts |
+| `rw_maps` | path array | `[]` | Extra read-write mounts. `/` is refused; map explicit subpaths instead. |
+| `ro_maps` | path array | `[]` | Extra read-only mounts. `/` is refused; map explicit subpaths instead. |
 | `overlay_maps` | path array | `[]` | Extra copy-on-write overlay mounts (see [Overlay maps](#overlay-maps)). Writes go to a side layer; the source stays untouched. Linux/bwrap only. |
 | `hide_dotdirs` | string array | `[]` | Extra home dotdirs to deny (e.g. `[".my_secrets"]`). Leading dot optional. Built-in deny list (`.ssh`, `.gnupg`, `.aws`, `.mozilla`) always applies. |
 | `mask` | path array | `[]` | Paths or glob patterns to replace with empty files/tmpfs (e.g. `[".env", "**/*.env", "secrets.json"]`). Relative paths resolve against the project directory. |
