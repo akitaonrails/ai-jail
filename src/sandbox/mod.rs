@@ -35,6 +35,7 @@ const DOTDIR_DENY: &[&str] = &[
     ".aws",
     ".ssh",
     ".mozilla",
+    ".thunderbird",
     ".basilisk-dev",
     ".sparrow",
 ];
@@ -1089,6 +1090,7 @@ mod tests {
             ".aws",
             ".ssh",
             ".mozilla",
+            ".thunderbird",
             ".basilisk-dev",
             ".sparrow",
         ] {
@@ -1142,6 +1144,7 @@ mod tests {
         assert!(is_dotdir_denied(".aws", &[], &[]));
         assert!(is_dotdir_denied(".ssh", &[], &[]));
         assert!(is_dotdir_denied(".mozilla", &[], &[]));
+        assert!(is_dotdir_denied(".thunderbird", &[], &[]));
         assert!(is_dotdir_denied(".basilisk-dev", &[], &[]));
         assert!(is_dotdir_denied(".sparrow", &[], &[]));
     }
