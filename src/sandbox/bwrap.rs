@@ -398,6 +398,7 @@ const CACHE_DENY: &[&str] = &[
 const LOCAL_SHARE_RW: &[&str] = &[
     "zoxide",
     "crush",
+    "kiro-cli",
     "opencode",
     "soulforge",
     "atuin",

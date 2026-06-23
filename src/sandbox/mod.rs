@@ -117,6 +117,7 @@ const DOTDIR_RW: &[&str] = &[
     ".crush",
     ".codex",
     ".aider",
+    ".kiro",
     ".soulforge",
     ".grok",
     ".agents",
