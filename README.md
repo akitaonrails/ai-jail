@@ -618,6 +618,20 @@ When CLI flags and an existing config are both present:
 - `--save-config` / `--no-save-config` override `no_save_config`
 - Project config is updated in normal mode when config saving is enabled; inherited values from `$HOME/.ai-jail` are used at runtime but are not copied into the project `.ai-jail`. Lockdown skips auto-save.
 
+### Global command-specific config
+
+The global user config (`~/.ai-jail`) may also contain command-scoped tables. These are **global-only**; project `.ai-jail` files stay flat.
+
+```toml
+rw_maps = ["~/common"]
+
+[commands.pi]
+rw_maps = ["~/.pi", "~/.pi-lens"]
+tailscale = true
+```
+
+The command key is selected from the first available command name: CLI command, then project `command`, then global base `command`. Runtime merge order is global base config, matching `[commands.<name>]`, project config, then CLI flags. Vector fields append and deduplicate; scalar options in project config override command-scoped global values.
+
 ### Available fields
 
 | Field | Type | Default | Description |

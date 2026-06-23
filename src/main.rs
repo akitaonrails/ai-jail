@@ -175,13 +175,13 @@ fn run() -> Result<i32, String> {
         return run_landlock_exec(&cli);
     }
 
-    // Load global ($HOME/.ai-jail) then local (./.ai-jail), merge
-    let global = config::load_global();
+    // Load local (./.ai-jail), then command-aware global ($HOME/.ai-jail), merge
     let project_config = if cli.clean {
         config::Config::default()
     } else {
         config::load()
     };
+    let global = config::load_global_for_command(&cli, &project_config);
     let existing = config::merge_with_global(global, project_config.clone());
     let mut config = config::merge(&cli, existing);
     // Resolve any relative paths in rw_maps/ro_maps against the user's

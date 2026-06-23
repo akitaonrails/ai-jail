@@ -1,6 +1,7 @@
 use crate::cli::CliArgs;
 use crate::output;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 const CONFIG_FILE: &str = ".ai-jail";
@@ -88,6 +89,14 @@ pub struct Config {
     pub allow_tcp_ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct GlobalConfig {
+    #[serde(flatten)]
+    base: Config,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    commands: BTreeMap<String, Config>,
 }
 
 impl Config {
@@ -183,6 +192,10 @@ pub fn parse_toml(contents: &str) -> Result<Config, String> {
     toml::from_str(contents).map_err(|e| e.to_string())
 }
 
+fn parse_global_toml(contents: &str) -> Result<GlobalConfig, String> {
+    toml::from_str(contents).map_err(|e| e.to_string())
+}
+
 fn load_from_path(path: &Path) -> Config {
     if !path.exists() {
         return Config::default();
@@ -205,17 +218,81 @@ fn load_from_path(path: &Path) -> Config {
     }
 }
 
+fn load_global_from_path(path: &Path) -> GlobalConfig {
+    if !path.exists() {
+        return GlobalConfig::default();
+    }
+    match std::fs::read_to_string(path) {
+        Ok(contents) => match parse_global_toml(&contents) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                output::warn(&format!(
+                    "Failed to parse {}: {e}",
+                    path.display()
+                ));
+                GlobalConfig::default()
+            }
+        },
+        Err(e) => {
+            output::warn(&format!("Failed to read {}: {e}", path.display()));
+            GlobalConfig::default()
+        }
+    }
+}
+
 /// Load project-level config from `.ai-jail` in the current dir.
 pub fn load() -> Config {
     load_from_path(&config_path())
 }
 
 /// Load global user config from `$HOME/.ai-jail`.
+#[allow(dead_code)]
 pub fn load_global() -> Config {
     match global_config_path() {
         Some(p) => load_from_path(&p),
         None => Config::default(),
     }
+}
+
+/// Load global user config from `$HOME/.ai-jail`, applying a matching
+/// `[commands.<name>]` table when present. The selection key is based on the
+/// effective command before global command tables are merged: CLI command,
+/// then project command, then global base command.
+pub fn load_global_for_command(cli: &CliArgs, project: &Config) -> Config {
+    match global_config_path() {
+        Some(p) => load_global_for_command_from_path(&p, cli, project),
+        None => Config::default(),
+    }
+}
+
+fn load_global_for_command_from_path(
+    path: &Path,
+    cli: &CliArgs,
+    project: &Config,
+) -> Config {
+    let global = load_global_from_path(path);
+    global_config_for_command(global, cli, project)
+}
+
+fn global_config_for_command(
+    global: GlobalConfig,
+    cli: &CliArgs,
+    project: &Config,
+) -> Config {
+    let command_name = cli
+        .command
+        .first()
+        .or_else(|| project.command.first())
+        .or_else(|| global.base.command.first())
+        .cloned();
+
+    let mut base = global.base;
+    if let Some(name) = command_name
+        && let Some(command_config) = global.commands.get(&name)
+    {
+        base = merge_with_global(base, command_config.clone());
+    }
+    base
 }
 
 /// Merge global (user-level) and local (project-level) configs.
@@ -297,14 +374,44 @@ pub fn save_global(config: &Config) {
 }
 
 fn save_global_to_path(path: &Path, config: &Config) {
-    let mut global = load_from_path(path);
+    let mut global = load_global_from_path(path);
     if config.no_status_bar.is_some() {
-        global.no_status_bar = config.no_status_bar;
+        global.base.no_status_bar = config.no_status_bar;
     }
     if config.status_bar_style.is_some() {
-        global.status_bar_style = config.status_bar_style.clone();
+        global.base.status_bar_style = config.status_bar_style.clone();
     }
-    save_to_path(path, &global);
+    save_global_doc_to_path(path, &global);
+}
+
+fn save_global_doc_to_path(path: &Path, global: &GlobalConfig) {
+    let header = "# ai-jail sandbox configuration\n\
+                  # https://github.com/akitaonrails/ai-jail\n\
+                  # Edit freely. Regenerate with: \
+                  ai-jail --clean --init\n\n";
+    if let Err(e) = ensure_regular_target_or_absent(path) {
+        output::warn(&format!("Refusing to write {}: {e}", path.display()));
+        return;
+    }
+    let mut on_disk = global.clone();
+    collapse_tilde_config(&mut on_disk.base);
+    for command_config in on_disk.commands.values_mut() {
+        collapse_tilde_config(command_config);
+    }
+    match toml::to_string_pretty(&on_disk) {
+        Ok(body) => {
+            let contents = format!("{header}{body}");
+            if let Err(e) = write_atomic(path, &contents) {
+                output::warn(&format!(
+                    "Failed to write {}: {e}",
+                    path.display()
+                ));
+            }
+        }
+        Err(e) => {
+            output::warn(&format!("Failed to serialize config: {e}"));
+        }
+    }
 }
 
 fn save_to_path(path: &Path, config: &Config) {
@@ -321,13 +428,7 @@ fn save_to_path(path: &Path, config: &Config) {
     // Issue #52: configs typed with `~/.claude` were rewritten to
     // absolute paths and lost their shareability.
     let mut on_disk = config.clone();
-    collapse_tilde_vec(&mut on_disk.rw_maps);
-    collapse_tilde_vec(&mut on_disk.ro_maps);
-    collapse_tilde_vec(&mut on_disk.overlay_maps);
-    collapse_tilde_vec(&mut on_disk.mask);
-    if let Some(p) = on_disk.claude_dir.take() {
-        on_disk.claude_dir = Some(collapse_tilde(&p));
-    }
+    collapse_tilde_config(&mut on_disk);
     match toml::to_string_pretty(&on_disk) {
         Ok(body) => {
             let contents = format!("{header}{body}");
@@ -341,6 +442,16 @@ fn save_to_path(path: &Path, config: &Config) {
         Err(e) => {
             output::warn(&format!("Failed to serialize config: {e}"));
         }
+    }
+}
+
+fn collapse_tilde_config(config: &mut Config) {
+    collapse_tilde_vec(&mut config.rw_maps);
+    collapse_tilde_vec(&mut config.ro_maps);
+    collapse_tilde_vec(&mut config.overlay_maps);
+    collapse_tilde_vec(&mut config.mask);
+    if let Some(p) = config.claude_dir.take() {
+        config.claude_dir = Some(collapse_tilde(&p));
     }
 }
 
@@ -1646,6 +1757,157 @@ tailscale = true
     }
 
     #[test]
+    fn command_scoped_global_applies_for_cli_command() {
+        let global = parse_global_toml(
+            r#"
+rw_maps = ["~/common"]
+no_gpu = true
+
+[commands.pi]
+rw_maps = ["~/.pi", "~/.pi-lens"]
+tailscale = true
+
+[commands.claude]
+rw_maps = ["~/.claude"]
+tailscale = false
+"#,
+        )
+        .unwrap();
+        let cli = CliArgs {
+            command: vec!["pi".into()],
+            ..CliArgs::default()
+        };
+
+        let selected =
+            global_config_for_command(global, &cli, &Config::default());
+
+        assert_eq!(
+            selected.rw_maps,
+            vec![
+                PathBuf::from("~/common"),
+                PathBuf::from("~/.pi"),
+                PathBuf::from("~/.pi-lens"),
+            ]
+        );
+        assert_eq!(selected.no_gpu, Some(true));
+        assert_eq!(selected.tailscale, Some(true));
+        assert!(!selected.rw_maps.contains(&PathBuf::from("~/.claude")));
+    }
+
+    #[test]
+    fn command_scoped_global_uses_project_command_when_cli_absent() {
+        let global = parse_global_toml(
+            r#"
+rw_maps = ["~/common"]
+
+[commands.pi]
+rw_maps = ["~/.pi"]
+tailscale = true
+"#,
+        )
+        .unwrap();
+        let project = Config {
+            command: vec!["pi".into()],
+            ..Config::default()
+        };
+
+        let selected =
+            global_config_for_command(global, &CliArgs::default(), &project);
+
+        assert_eq!(
+            selected.rw_maps,
+            vec![PathBuf::from("~/common"), PathBuf::from("~/.pi")]
+        );
+        assert_eq!(selected.tailscale, Some(true));
+    }
+
+    #[test]
+    fn command_scoped_global_uses_base_command_as_fallback() {
+        let global = parse_global_toml(
+            r#"
+command = ["pi"]
+rw_maps = ["~/common"]
+
+[commands.pi]
+rw_maps = ["~/.pi"]
+tailscale = true
+"#,
+        )
+        .unwrap();
+
+        let selected = global_config_for_command(
+            global,
+            &CliArgs::default(),
+            &Config::default(),
+        );
+
+        assert_eq!(selected.command, vec!["pi"]);
+        assert_eq!(
+            selected.rw_maps,
+            vec![PathBuf::from("~/common"), PathBuf::from("~/.pi")]
+        );
+        assert_eq!(selected.tailscale, Some(true));
+    }
+
+    #[test]
+    fn project_config_overrides_command_scoped_global() {
+        let global = parse_global_toml(
+            r#"
+no_gpu = true
+rw_maps = ["~/common"]
+
+[commands.pi]
+tailscale = true
+no_docker = true
+rw_maps = ["~/.pi"]
+"#,
+        )
+        .unwrap();
+        let cli = CliArgs {
+            command: vec!["pi".into()],
+            ..CliArgs::default()
+        };
+        let project = Config {
+            tailscale: Some(false),
+            no_docker: Some(false),
+            rw_maps: vec![PathBuf::from("/project/rw")],
+            ..Config::default()
+        };
+
+        let selected = global_config_for_command(global, &cli, &project);
+        let merged = merge_with_global(selected, project);
+
+        assert_eq!(merged.no_gpu, Some(true));
+        assert_eq!(merged.tailscale, Some(false));
+        assert_eq!(merged.no_docker, Some(false));
+        assert_eq!(
+            merged.rw_maps,
+            vec![
+                PathBuf::from("~/common"),
+                PathBuf::from("~/.pi"),
+                PathBuf::from("/project/rw"),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_parse_toml_ignores_commands_table() {
+        let cfg = parse_toml(
+            r#"
+rw_maps = ["/project"]
+
+[commands.pi]
+rw_maps = ["/global-pi"]
+tailscale = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.rw_maps, vec![PathBuf::from("/project")]);
+        assert_eq!(cfg.tailscale, None);
+    }
+
+    #[test]
     fn browser_profile_disabled_accessor() {
         assert!(
             !Config {
@@ -2209,6 +2471,52 @@ allow_tcp_ports = [32000, 8080]
         let global = load_from_path(&path);
         assert_eq!(global.no_status_bar, Some(true));
         assert_eq!(global.status_bar_style.as_deref(), Some("dark"));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_global_preserves_command_scoped_tables() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-jail-home-global-commands-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(".ai-jail");
+        std::fs::write(
+            &path,
+            r#"rw_maps = ["~/common"]
+
+[commands.pi]
+rw_maps = ["~/.pi", "~/.pi-lens"]
+tailscale = true
+
+[commands.claude]
+rw_maps = ["~/.claude"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config {
+            status_bar_style: Some("dark".into()),
+            ..Config::default()
+        };
+        save_global_to_path(&path, &cfg);
+
+        let global = load_global_from_path(&path);
+        assert_eq!(global.base.status_bar_style.as_deref(), Some("dark"));
+        assert_eq!(global.base.rw_maps, vec![PathBuf::from("~/common")]);
+        assert_eq!(global.commands.len(), 2);
+        assert_eq!(
+            global.commands["pi"].rw_maps,
+            vec![PathBuf::from("~/.pi"), PathBuf::from("~/.pi-lens")]
+        );
+        assert_eq!(global.commands["pi"].tailscale, Some(true));
+        assert_eq!(
+            global.commands["claude"].rw_maps,
+            vec![PathBuf::from("~/.claude")]
+        );
 
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(&dir);
