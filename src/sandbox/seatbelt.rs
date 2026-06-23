@@ -171,6 +171,9 @@ fn generate_sbpl_profile(
     let exempt = super::dotdir_exemptions(config);
     let mut deny_paths = macos_read_deny_paths(&config.hide_dotdirs, &exempt);
     deny_paths.extend(super::expand_mask_patterns(&config.mask, project_dir));
+    let explicit_deny_paths =
+        super::expand_mask_patterns(&config.deny_paths, project_dir);
+    deny_paths.extend(explicit_deny_paths.clone());
     let writable_paths = macos_writable_paths(project_dir, config, lockdown);
     let atomic_paths = macos_atomic_write_paths(config);
 
@@ -192,6 +195,7 @@ fn generate_sbpl_profile(
         lockdown,
         &writable_paths,
         &atomic_paths,
+        &explicit_deny_paths,
     );
     push_docker_section(&mut profile, lockdown, enable_docker);
 
@@ -294,8 +298,12 @@ fn push_file_write_section(
     lockdown: bool,
     writable_paths: &[PathBuf],
     atomic_paths: &[PathBuf],
+    deny_paths: &[PathBuf],
 ) {
     if lockdown {
+        for deny_path in deny_paths {
+            push_path_rule(profile, "deny", "file-write*", deny_path);
+        }
         profile.push_str("; Lockdown: no host file-write allowances\n\n");
         return;
     }
@@ -323,6 +331,9 @@ fn push_file_write_section(
                 "(allow file-write* (regex #\"{siblings}\"))\n"
             ));
         }
+    }
+    for deny_path in deny_paths {
+        push_path_rule(profile, "deny", "file-write*", deny_path);
     }
     profile.push('\n');
 }
@@ -633,6 +644,22 @@ mod tests {
         assert!(profile.contains("(allow network-outbound)"));
         assert!(profile.contains("(allow network-inbound)"));
         assert!(profile.contains("(allow file-read*)"));
+    }
+
+    #[test]
+    fn sbpl_profile_denies_deny_paths_for_read_and_write() {
+        let config = Config {
+            deny_paths: vec![PathBuf::from(".env")],
+            ..Config::default()
+        };
+        let project = PathBuf::from("/tmp/test-project");
+        let profile = generate_sbpl_profile(&config, &project, false, false);
+        assert!(profile.contains(
+            "(deny file-read* (subpath \"/tmp/test-project/.env\"))"
+        ));
+        assert!(profile.contains(
+            "(deny file-write* (subpath \"/tmp/test-project/.env\"))"
+        ));
     }
 
     #[test]

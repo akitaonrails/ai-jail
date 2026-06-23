@@ -137,6 +137,7 @@ struct MountSet {
     overlay: Vec<Mount>,
     project: Vec<Mount>,
     mask: Vec<Mount>,
+    deny: Vec<Mount>,
     /// tmpfs that hides the on-host overlay upper/work storage from
     /// inside the sandbox. Applied last so it sits on top of the
     /// project mount that contains it.
@@ -144,7 +145,7 @@ struct MountSet {
 }
 
 impl MountSet {
-    fn ordered_mounts(&self) -> [&[Mount]; 20] {
+    fn ordered_mounts(&self) -> [&[Mount]; 21] {
         [
             &self.base,
             &self.sys_masks,
@@ -165,6 +166,7 @@ impl MountSet {
             &self.overlay,
             &self.project,
             &self.mask,
+            &self.deny,
             &self.overlay_hide,
         ]
     }
@@ -261,6 +263,40 @@ impl MountSet {
     }
 }
 
+struct MountSources<'a> {
+    hosts_mount: (&'a Path, &'a Path),
+    resolv_mount: Option<(&'a Path, &'a Path)>,
+    empty_path: &'a Path,
+    deny_file_path: &'a Path,
+    deny_dir_path: &'a Path,
+}
+
+impl<'a> MountSources<'a> {
+    fn from_guard(guard: &'a SandboxGuard) -> Self {
+        Self {
+            hosts_mount: guard.hosts_mount(),
+            resolv_mount: guard.resolv_mount(),
+            empty_path: guard.empty_path(),
+            deny_file_path: guard.deny_file_path(),
+            deny_dir_path: guard.deny_dir_path(),
+        }
+    }
+
+    fn legacy(
+        hosts_mount: (&'a Path, &'a Path),
+        resolv_mount: Option<(&'a Path, &'a Path)>,
+        empty_path: &'a Path,
+    ) -> Self {
+        Self {
+            hosts_mount,
+            resolv_mount,
+            empty_path,
+            deny_file_path: empty_path,
+            deny_dir_path: empty_path,
+        }
+    }
+}
+
 pub struct SandboxGuard {
     hosts_path: PathBuf,
     /// Where to mount the private hosts file inside the sandbox.
@@ -276,6 +312,10 @@ pub struct SandboxGuard {
     resolv_dest: Option<PathBuf>,
     /// Empty tempfile used as the source for --mask file overlays.
     empty_path: PathBuf,
+    /// Mode-000 tempfile used as the source for --deny-path file overlays.
+    deny_file_path: PathBuf,
+    /// Mode-000 temp directory used as the source for --deny-path directory overlays.
+    deny_dir_path: PathBuf,
 }
 
 impl SandboxGuard {
@@ -298,6 +338,14 @@ impl SandboxGuard {
     fn empty_path(&self) -> &Path {
         &self.empty_path
     }
+
+    fn deny_file_path(&self) -> &Path {
+        &self.deny_file_path
+    }
+
+    fn deny_dir_path(&self) -> &Path {
+        &self.deny_dir_path
+    }
 }
 
 impl Drop for SandboxGuard {
@@ -307,6 +355,8 @@ impl Drop for SandboxGuard {
             let _ = std::fs::remove_file(p);
         }
         let _ = std::fs::remove_file(&self.empty_path);
+        let _ = std::fs::remove_file(&self.deny_file_path);
+        let _ = std::fs::remove_dir(&self.deny_dir_path);
     }
 }
 
@@ -319,6 +369,8 @@ impl SandboxGuard {
             resolv_path: None,
             resolv_dest: None,
             empty_path: PathBuf::from("/tmp/ai-jail-test-empty"),
+            deny_file_path: PathBuf::from("/tmp/ai-jail-test-deny-file"),
+            deny_dir_path: PathBuf::from("/tmp/ai-jail-test-deny-dir"),
         }
     }
 }
@@ -487,6 +539,8 @@ pub fn prepare() -> Result<SandboxGuard, String> {
 
     let (resolv_path, resolv_dest) = new_resolv_file();
     let empty_path = new_empty_file()?;
+    let deny_file_path = new_deny_file()?;
+    let deny_dir_path = new_deny_dir()?;
 
     Ok(SandboxGuard {
         hosts_path: path,
@@ -494,6 +548,8 @@ pub fn prepare() -> Result<SandboxGuard, String> {
         resolv_path,
         resolv_dest,
         empty_path,
+        deny_file_path,
+        deny_dir_path,
     })
 }
 
@@ -532,6 +588,46 @@ fn new_empty_file() -> Result<PathBuf, String> {
         }
     }
     Err("Failed to create empty tempfile after 128 attempts".into())
+}
+
+/// Create a mode-000 tempfile used as the source for --deny-path file overlays.
+fn new_deny_file() -> Result<PathBuf, String> {
+    let path = new_empty_file()?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+        .map_err(|e| format!("Failed to chmod deny tempfile: {e}"))?;
+    Ok(path)
+}
+
+/// Create a mode-000 temp directory used as the source for --deny-path directory overlays.
+fn new_deny_dir() -> Result<PathBuf, String> {
+    let tmp = std::env::temp_dir();
+    for attempt in 0..128_u32 {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let name = format!(
+            "ai-jail-deny-dir.{}.{}.{}",
+            std::process::id(),
+            nonce,
+            attempt
+        );
+        let path = tmp.join(name);
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                std::fs::set_permissions(
+                    &path,
+                    std::fs::Permissions::from_mode(0o000),
+                )
+                .map_err(|e| format!("Failed to chmod deny tempdir: {e}"))?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!("Failed to create deny tempdir: {e}"));
+            }
+        }
+    }
+    Err("Failed to create deny tempdir after 128 attempts".into())
 }
 
 /// Create a temp copy of /etc/resolv.conf and determine where to
@@ -794,6 +890,10 @@ fn landlock_wrapper_args(config: &Config, verbose: bool) -> Vec<String> {
         args.push("--mask".into());
         args.push(path.display().to_string());
     }
+    for path in &config.deny_paths {
+        args.push("--deny-path".into());
+        args.push(path.display().to_string());
+    }
     if let Some(dir) = &config.claude_dir {
         args.push("--claude-dir".into());
         args.push(dir.display().to_string());
@@ -813,14 +913,9 @@ pub fn build(
     project_dir: &Path,
     verbose: bool,
 ) -> Result<Command, String> {
-    let mount_set = discover_mounts(
-        config,
-        project_dir,
-        guard.hosts_mount(),
-        guard.resolv_mount(),
-        guard.empty_path(),
-        verbose,
-    );
+    let sources = MountSources::from_guard(guard);
+    let mount_set =
+        discover_mounts_full(config, project_dir, &sources, verbose);
     let lockdown = config.lockdown_enabled();
     let bwrap = bwrap_program_for_exec();
     let launch = super::build_launch_command(config);
@@ -883,17 +978,12 @@ pub fn dry_run(
     project_dir: &Path,
     verbose: bool,
 ) -> Result<String, String> {
-    let args = build_dry_run_args(
-        config,
-        project_dir,
-        guard.hosts_mount(),
-        guard.resolv_mount(),
-        guard.empty_path(),
-        verbose,
-    )?;
+    let sources = MountSources::from_guard(guard);
+    let args = build_dry_run_args_full(config, project_dir, &sources, verbose)?;
     Ok(format_dry_run_args(&args))
 }
 
+#[allow(dead_code)]
 fn build_dry_run_args(
     config: &Config,
     project_dir: &Path,
@@ -902,14 +992,17 @@ fn build_dry_run_args(
     empty_path: &Path,
     verbose: bool,
 ) -> Result<Vec<String>, String> {
-    let mount_set = discover_mounts(
-        config,
-        project_dir,
-        hosts_mount,
-        resolv_mount,
-        empty_path,
-        verbose,
-    );
+    let sources = MountSources::legacy(hosts_mount, resolv_mount, empty_path);
+    build_dry_run_args_full(config, project_dir, &sources, verbose)
+}
+
+fn build_dry_run_args_full(
+    config: &Config,
+    project_dir: &Path,
+    sources: &MountSources<'_>,
+    verbose: bool,
+) -> Result<Vec<String>, String> {
+    let mount_set = discover_mounts_full(config, project_dir, sources, verbose);
     let lockdown = config.lockdown_enabled();
     let launch = super::build_launch_command(config);
     let mut args: Vec<String> =
@@ -1001,12 +1094,23 @@ fn format_dry_run_args(args: &[String]) -> String {
     out
 }
 
+#[allow(dead_code)]
 fn discover_mounts(
     config: &Config,
     project_dir: &Path,
     hosts_mount: (&Path, &Path),
     resolv_mount: Option<(&Path, &Path)>,
     empty_path: &Path,
+    verbose: bool,
+) -> MountSet {
+    let sources = MountSources::legacy(hosts_mount, resolv_mount, empty_path);
+    discover_mounts_full(config, project_dir, &sources, verbose)
+}
+
+fn discover_mounts_full(
+    config: &Config,
+    project_dir: &Path,
+    sources: &MountSources<'_>,
     verbose: bool,
 ) -> MountSet {
     let lockdown = config.lockdown_enabled();
@@ -1029,7 +1133,14 @@ fn discover_mounts(
         discover_ssh(config, lockdown, browser_mode, private_home, verbose);
     let claude_env = discover_claude_env(config);
     let mask_mounts =
-        discover_mask_mounts(config, project_dir, empty_path, verbose);
+        discover_mask_mounts(config, project_dir, sources.empty_path, verbose);
+    let deny_mounts = discover_deny_mounts(
+        config,
+        project_dir,
+        sources.deny_file_path,
+        sources.deny_dir_path,
+        verbose,
+    );
     let pictures_mount =
         discover_pictures_mount(config, lockdown, browser_mode);
     let browser_state_mount =
@@ -1056,7 +1167,7 @@ fn discover_mounts(
     };
 
     MountSet {
-        base: discover_base(hosts_mount, resolv_mount),
+        base: discover_base(sources.hosts_mount, sources.resolv_mount),
         sys_masks: discover_sys_masks(lockdown),
         home_dotfiles,
         config_hide: if private_home {
@@ -1106,6 +1217,7 @@ fn discover_mounts(
         overlay: overlay_mounts_v,
         project: project_mount(project_dir, lockdown || browser_mode),
         mask: mask_mounts,
+        deny: deny_mounts,
         overlay_hide: overlay_hide_v,
     }
 }
@@ -1190,6 +1302,23 @@ fn discover_mask_mounts(
     }
     let expanded = super::expand_mask_patterns(&effective, project_dir);
     build_mask_mounts(&expanded, project_dir, empty_path, verbose)
+}
+
+fn discover_deny_mounts(
+    config: &Config,
+    project_dir: &Path,
+    deny_file_path: &Path,
+    deny_dir_path: &Path,
+    verbose: bool,
+) -> Vec<Mount> {
+    let expanded = super::expand_mask_patterns(&config.deny_paths, project_dir);
+    build_deny_mounts(
+        &expanded,
+        project_dir,
+        deny_file_path,
+        deny_dir_path,
+        verbose,
+    )
 }
 
 fn discover_pictures_mount(
@@ -1306,6 +1435,56 @@ fn build_mask_mounts(
             }
             mounts.push(Mount::FileRoBind {
                 src: empty_path.to_path_buf(),
+                dest: target,
+            });
+        }
+    }
+    mounts
+}
+
+/// Build bwrap mounts that replace each denied path with a mode-000 file or
+/// directory, causing reads/listing/writes to fail with permission denied.
+fn build_deny_mounts(
+    deny_paths: &[PathBuf],
+    project_dir: &Path,
+    deny_file_path: &Path,
+    deny_dir_path: &Path,
+    verbose: bool,
+) -> Vec<Mount> {
+    let mut mounts = Vec::new();
+    for p in deny_paths {
+        let target = if p.is_absolute() {
+            p.clone()
+        } else {
+            project_dir.join(p)
+        };
+        if !super::path_exists(&target) {
+            output::warn(&format!(
+                "Deny: {} not found, skipping",
+                target.display()
+            ));
+            continue;
+        }
+        if target.is_dir() {
+            if verbose {
+                output::verbose(&format!(
+                    "Deny: {} (000 dir)",
+                    target.display()
+                ));
+            }
+            mounts.push(Mount::RoBind {
+                src: deny_dir_path.to_path_buf(),
+                dest: target,
+            });
+        } else {
+            if verbose {
+                output::verbose(&format!(
+                    "Deny: {} (000 file)",
+                    target.display()
+                ));
+            }
+            mounts.push(Mount::FileRoBind {
+                src: deny_file_path.to_path_buf(),
                 dest: target,
             });
         }
@@ -2133,6 +2312,64 @@ mod tests {
     }
 
     #[test]
+    fn deny_temp_file_and_dir_permissions_are_000() {
+        let file = new_deny_file().unwrap();
+        let dir = new_deny_dir().unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0
+        );
+
+        let _ = std::fs::remove_file(file);
+        let _ = std::fs::set_permissions(
+            &dir,
+            std::fs::Permissions::from_mode(0o700),
+        );
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn build_deny_mounts_file_and_dir_use_000_ro_bind() {
+        let project = std::env::temp_dir()
+            .join(format!("ai-jail-deny-mounts-{}", std::process::id()));
+        let secrets_dir = project.join("secrets");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        let env_file = project.join(".env");
+        std::fs::write(&env_file, "SECRET=xyz").unwrap();
+        let deny_file = std::env::temp_dir().join("ai-jail-deny-file-src");
+        let deny_dir = std::env::temp_dir().join("ai-jail-deny-dir-src");
+        let _ = std::fs::File::create(&deny_file).unwrap();
+        let _ = std::fs::create_dir_all(&deny_dir);
+
+        let mounts = build_deny_mounts(
+            &[PathBuf::from(".env"), PathBuf::from("secrets")],
+            &project,
+            &deny_file,
+            &deny_dir,
+            false,
+        );
+
+        assert_eq!(mounts.len(), 2);
+        assert!(matches!(
+            &mounts[0],
+            Mount::FileRoBind { src, dest } if src == &deny_file && dest == &env_file
+        ));
+        assert!(matches!(
+            &mounts[1],
+            Mount::RoBind { src, dest } if src == &deny_dir && dest == &secrets_dir
+        ));
+
+        let _ = std::fs::remove_dir_all(&project);
+        let _ = std::fs::remove_file(&deny_file);
+        let _ = std::fs::remove_dir_all(&deny_dir);
+    }
+
+    #[test]
     fn mask_glob_expands_into_dry_run_mounts() {
         let project = std::env::temp_dir()
             .join(format!("ai-jail-mask-glob-{}", std::process::id()));
@@ -2176,6 +2413,40 @@ mod tests {
             !args.iter().any(|arg| arg.ends_with("public.txt")),
             "non-matching files must not be masked; args: {args:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn deny_paths_emit_ro_bind_for_file_and_dir_in_dry_run() {
+        let project = std::env::temp_dir()
+            .join(format!("ai-jail-deny-dry-run-{}", std::process::id()));
+        let secrets_dir = project.join("secrets");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        let env_file = project.join(".env");
+        std::fs::write(&env_file, "root").unwrap();
+
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            deny_paths: vec![PathBuf::from(".env"), PathBuf::from("secrets")],
+            no_hide_config: Some(true),
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let args = build_dry_run_args_full(&config, &project, &sources, false)
+            .unwrap();
+
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--ro-bind"
+                && w[1] == guard.deny_file_path().display().to_string()
+                && w[2] == env_file.display().to_string()
+        }));
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--ro-bind"
+                && w[1] == guard.deny_dir_path().display().to_string()
+                && w[2] == secrets_dir.display().to_string()
+        }));
 
         let _ = std::fs::remove_dir_all(&project);
     }

@@ -47,6 +47,8 @@ pub struct Config {
     pub hide_dotdirs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mask: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_paths: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_gpu: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -313,6 +315,8 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     dedup_strings(&mut c.hide_dotdirs);
     c.mask.extend(local.mask);
     dedup_paths(&mut c.mask);
+    c.deny_paths.extend(local.deny_paths);
+    dedup_paths(&mut c.deny_paths);
     // Each Option-typed field follows the same pattern: local
     // overrides global iff local explicitly set it. The macro is
     // local to the function so it stays scoped to this single use.
@@ -450,6 +454,7 @@ fn collapse_tilde_config(config: &mut Config) {
     collapse_tilde_vec(&mut config.ro_maps);
     collapse_tilde_vec(&mut config.overlay_maps);
     collapse_tilde_vec(&mut config.mask);
+    collapse_tilde_vec(&mut config.deny_paths);
     if let Some(p) = config.claude_dir.take() {
         config.claude_dir = Some(collapse_tilde(&p));
     }
@@ -634,6 +639,9 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     config.mask.extend(cli.mask.iter().cloned());
     dedup_paths(&mut config.mask);
 
+    config.deny_paths.extend(cli.deny_paths.iter().cloned());
+    dedup_paths(&mut config.deny_paths);
+
     // Boolean flags: CLI overrides config (--no-gpu => no_gpu=Some(true), --gpu => no_gpu=Some(false))
     // Three macros for the three patterns the CLI uses:
     //  invert!: CLI positive flag flips a `no_*` config field
@@ -699,6 +707,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     expand_tilde_vec(&mut config.ro_maps);
     expand_tilde_vec(&mut config.overlay_maps);
     expand_tilde_vec(&mut config.mask);
+    expand_tilde_vec(&mut config.deny_paths);
     if let Some(p) = config.claude_dir.take() {
         config.claude_dir = Some(expand_tilde(p));
     }
@@ -745,6 +754,7 @@ pub fn display_status(config: &Config) {
     print_path_list("  Overlay maps", &config.overlay_maps);
     print_string_list("  Hide dotdirs", &config.hide_dotdirs);
     print_path_list("  Masked files", &config.mask);
+    print_path_list("  Denied paths", &config.deny_paths);
 
     print_auto_tristate("  GPU", config.no_gpu);
     print_auto_tristate("  Docker", config.no_docker);
@@ -1200,6 +1210,17 @@ mask = []
     }
 
     #[test]
+    fn regression_old_config_without_deny_paths() {
+        let toml = r#"
+command = ["claude"]
+rw_maps = ["/tmp/rw"]
+mask = [".env"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert!(cfg.deny_paths.is_empty());
+    }
+
+    #[test]
     fn parse_config_with_overlay_maps() {
         let toml = r#"
 command = ["claude"]
@@ -1212,6 +1233,19 @@ overlay_maps = ["/home/u/.claude", "/home/u/.config/foo"]
                 PathBuf::from("/home/u/.claude"),
                 PathBuf::from("/home/u/.config/foo"),
             ]
+        );
+    }
+
+    #[test]
+    fn parse_deny_paths() {
+        let toml = r#"
+command = ["claude"]
+deny_paths = [".env", "secrets/*.json"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(
+            cfg.deny_paths,
+            vec![PathBuf::from(".env"), PathBuf::from("secrets/*.json")]
         );
     }
 
@@ -1252,6 +1286,7 @@ no_gpu = true
             overlay_maps: vec![PathBuf::from("/home/u/.claude")],
             hide_dotdirs: vec![".my_secrets".into(), ".proton".into()],
             mask: vec![PathBuf::from(".env")],
+            deny_paths: vec![PathBuf::from("secrets.json")],
             no_gpu: Some(true),
             no_docker: None,
             tailscale: Some(true),
@@ -1280,6 +1315,7 @@ no_gpu = true
         assert_eq!(deserialized.rw_maps, config.rw_maps);
         assert_eq!(deserialized.ro_maps, config.ro_maps);
         assert_eq!(deserialized.hide_dotdirs, config.hide_dotdirs);
+        assert_eq!(deserialized.deny_paths, config.deny_paths);
         assert_eq!(deserialized.no_gpu, config.no_gpu);
         assert_eq!(deserialized.no_docker, config.no_docker);
         assert_eq!(deserialized.tailscale, config.tailscale);
@@ -1369,6 +1405,26 @@ no_gpu = true
         assert_eq!(
             merged.ro_maps,
             vec![PathBuf::from("/opt/x"), PathBuf::from("/opt/y")]
+        );
+    }
+
+    #[test]
+    fn merge_deny_paths_appended_and_deduplicated() {
+        let existing = Config {
+            deny_paths: vec![PathBuf::from(".env")],
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            deny_paths: vec![
+                PathBuf::from(".env"),
+                PathBuf::from("secrets/*.json"),
+            ],
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(
+            merged.deny_paths,
+            vec![PathBuf::from(".env"), PathBuf::from("secrets/*.json")]
         );
     }
 
@@ -2560,6 +2616,7 @@ rw_maps = ["~/.claude"]
             overlay_maps: vec![],
             hide_dotdirs: vec![],
             mask: vec![],
+            deny_paths: vec![PathBuf::from("secrets.json")],
             no_gpu: Some(true),
             no_docker: None,
             tailscale: Some(true),
@@ -2590,6 +2647,7 @@ rw_maps = ["~/.claude"]
         assert_eq!(loaded.no_gpu, Some(true));
         assert_eq!(loaded.lockdown, Some(false));
         assert_eq!(loaded.allow_tcp_ports, vec![32000]);
+        assert_eq!(loaded.deny_paths, vec![PathBuf::from("secrets.json")]);
         assert_eq!(loaded.resize_redraw_key, None);
         assert_eq!(loaded.browser_profile.as_deref(), Some("hard"));
         assert_eq!(loaded.claude_dir, None);

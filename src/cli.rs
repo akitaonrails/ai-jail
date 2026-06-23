@@ -23,6 +23,7 @@ OPTIONS:
                                    only, read-only on macOS)
     --hide-dotdir <NAME>           Never mount dotdir NAME (e.g., .my_secrets) (repeatable)
     --mask <PATH|GLOB>             Replace PATH/glob matches with empty files/tmpfs (repeatable)
+    --deny-path <PATH|GLOB>        Deny access to PATH/glob with permission errors (repeatable)
     --private-home / --no-private-home
                                    Disable/enable automatic host home dotdir passthrough
     --lockdown / --no-lockdown     Enable/disable strict read-only lockdown mode
@@ -66,6 +67,7 @@ pub struct CliArgs {
     pub overlay_maps: Vec<PathBuf>,
     pub hide_dotdirs: Vec<String>,
     pub mask: Vec<PathBuf>,
+    pub deny_paths: Vec<PathBuf>,
     pub private_home: Option<bool>,
     pub lockdown: Option<bool>,
     pub landlock: Option<bool>,
@@ -131,6 +133,14 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     return Err("--mask requires a non-empty path".into());
                 }
                 args.mask.push(PathBuf::from(s.into_owned()));
+            }
+            Long("deny-path") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let s = val.to_string_lossy();
+                if s.is_empty() {
+                    return Err("--deny-path requires a non-empty path".into());
+                }
+                args.deny_paths.push(PathBuf::from(s.into_owned()));
             }
             Long("hide-dotdir") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -589,6 +599,40 @@ mod tests {
     #[test]
     fn parse_mask_missing_value_errors() {
         let result = parse_test(&["--mask"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_deny_path_single() {
+        let args = parse_test(&["--deny-path", ".env", "bash"]).unwrap();
+        assert_eq!(args.deny_paths, vec![PathBuf::from(".env")]);
+    }
+
+    #[test]
+    fn parse_deny_path_multiple() {
+        let args = parse_test(&[
+            "--deny-path",
+            ".env",
+            "--deny-path",
+            "secrets/*.json",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.deny_paths,
+            vec![PathBuf::from(".env"), PathBuf::from("secrets/*.json")]
+        );
+    }
+
+    #[test]
+    fn parse_deny_path_empty_errors() {
+        let result = parse_test(&["--deny-path", "", "bash"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_deny_path_missing_value_errors() {
+        let result = parse_test(&["--deny-path"]);
         assert!(result.is_err());
     }
 
