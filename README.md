@@ -646,7 +646,7 @@ The command key is selected from the first available command name: CLI command, 
 | `rw_maps` | path array | `[]` | Extra read-write mounts. `/` is refused; map explicit subpaths instead. |
 | `ro_maps` | path array | `[]` | Extra read-only mounts. `/` is refused; map explicit subpaths instead. |
 | `overlay_maps` | path array | `[]` | Extra copy-on-write overlay mounts (see [Overlay maps](#overlay-maps)). Writes go to a side layer; the source stays untouched. Linux/bwrap only. |
-| `hide_dotdirs` | string array | `[]` | Extra home dotdirs to deny (e.g. `[".my_secrets"]`). Leading dot optional. Built-in deny list (`.ssh`, `.gnupg`, `.aws`, `.mozilla`) always applies. |
+| `hide_dotdirs` | string array | `[]` | Extra home dotdirs to deny (e.g. `[".my_secrets"]`). Leading dot optional. Built-in deny list (`.ssh`, `.gnupg`, `.aws`, `.mozilla`, `.thunderbird`) always applies. |
 | `mask` | path array | `[]` | Paths or glob patterns to replace with empty files/tmpfs (e.g. `[".env", "**/*.env", "secrets.json"]`). Relative paths resolve against the project directory. |
 | `deny_paths` | path array | `[]` | Paths or glob patterns to deny with permission errors (e.g. `[".env", "secrets/*.json"]`). Relative paths resolve against the project directory. |
 | `allow_tcp_ports` | u16 array | `[]` | TCP ports permitted outbound in lockdown mode (e.g. `[32000, 8080]`). Requires Linux ≥ 6.5 for Landlock V4. No effect outside lockdown. |
