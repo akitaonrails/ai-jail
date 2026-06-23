@@ -63,29 +63,32 @@ There are regression tests in `src/config.rs` that parse old config file formats
 
 ## Mount Order Matters
 
-The bwrap command mounts are order-dependent. The sequence in `sandbox.rs` must be:
+The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs` must be:
 
 1. Base mounts (`/usr`, `/etc`, `/opt`, `/sys`, `/dev`, `/proc`, `/tmp`, `/run`)
 2. Sensitive /sys masks (tmpfs over `/sys/firmware`, `/sys/kernel/security`, etc.)
 3. GPU devices
-4. Shared memory (`/dev/shm`)
-5. Docker socket
-6. Display mounts (X11, Wayland, XDG_RUNTIME_DIR)
-7. Home directory (tmpfs `$HOME` first, then dotfiles on top)
-8. Config hide (tmpfs over sensitive `~/.config/*` subdirs)
-9. Cache hide (tmpfs over sensitive `~/.cache/*` subdirs)
-10. Local overrides (`~/.local/state`, `~/.local/share/*` rw subdirs)
-11. Linked Git worktree metadata
-12. SSH agent socket and `~/.ssh` exemption mounts
-13. Pictures mount
-14. Browser profile state mount
-15. Extra user mounts (`--map`, `--rw-map`)
-16. Overlay maps (`--overlay-map` — copy-on-write `--overlay-src`/`--overlay`)
-17. Project directory (pwd, rw or ro depending on mode)
-18. Mask overlays (`--mask` and hidden project `.ai-jail`)
-19. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last so it sits on top of the project mount that contains the upper/work layers)
+4. Docker socket
+5. Tailscale socket
+6. Shared memory (`/dev/shm`)
+7. Display mounts (X11, Wayland, XDG_RUNTIME_DIR)
+8. systemd user bus mounts (`--systemd-user`, narrow XDG runtime sockets)
+9. Home directory (tmpfs `$HOME` first, then dotfiles on top)
+10. Config hide (tmpfs over sensitive `~/.config/*` subdirs)
+11. Cache hide (tmpfs over sensitive `~/.cache/*` subdirs)
+12. Local overrides (`~/.local/state`, `~/.local/share/*` rw subdirs)
+13. Linked Git worktree metadata
+14. SSH agent socket and `~/.ssh` exemption mounts
+15. Pictures mount
+16. Browser profile state mount
+17. Extra user mounts (`--map`, `--rw-map`)
+18. Overlay maps (`--overlay-map` — copy-on-write `--overlay-src`/`--overlay`)
+19. Project directory (pwd, rw or ro depending on mode)
+20. Mask overlays (`--mask` and hidden project `.ai-jail`)
+21. Deny overlays (`--deny-path`, mode-000 file/dir placeholders)
+22. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last so it sits on top of the project mount that contains the upper/work layers)
 
-Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts. Overlay maps come after the home/dotfile mounts (so an overlay on a home path sits on top) and their storage hide comes after the project mount (so it masks the layers the project mount would otherwise expose).
+Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts. Overlay maps come after the home/dotfile mounts (so an overlay on a home path sits on top). Mask and deny overlays come after the project mount so they override project-visible files. Overlay storage hide comes last, after the project mount, so it masks the upper/work layers the project mount would otherwise expose.
 
 ## Before Committing
 

@@ -113,11 +113,13 @@ fn child_sees_initial_size_minus_one() {
         cmd.stderr(slave_stdio(slave_fd));
     }
 
-    let _child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn().unwrap();
     drop(slave);
 
     let output = read_available(&master, 500);
+    let status = child.wait().unwrap();
     let text = strip_ansi(&output);
+    assert!(status.success(), "child exited with {status:?}");
     assert!(
         text.contains("39 80"),
         "Expected '39 80' in output, got: {:?}",
@@ -163,7 +165,7 @@ fn resize_pty_delivers_sigwinch_and_new_size() {
         });
     }
 
-    let _child = cmd.spawn().unwrap();
+    let mut child = cmd.spawn().unwrap();
     drop(slave);
 
     // Wait for child to start
@@ -176,7 +178,9 @@ fn resize_pty_delivers_sigwinch_and_new_size() {
 
     // Read child's SIGWINCH response
     let output = read_available(&master, 500);
+    let status = child.wait().unwrap();
     let text = strip_ansi(&output);
+    assert!(status.success(), "child exited with {status:?}");
     assert!(
         text.contains("79 120"),
         "Expected '79 120' after resize, got: {:?}",

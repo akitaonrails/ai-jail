@@ -252,15 +252,6 @@ pub fn load() -> Config {
     load_from_path(&config_path())
 }
 
-/// Load global user config from `$HOME/.ai-jail`.
-#[allow(dead_code)]
-pub fn load_global() -> Config {
-    match global_config_path() {
-        Some(p) => load_from_path(&p),
-        None => Config::default(),
-    }
-}
-
 /// Load global user config from `$HOME/.ai-jail`, applying a matching
 /// `[commands.<name>]` table when present. The selection key is based on the
 /// effective command before global command tables are merged: CLI command,

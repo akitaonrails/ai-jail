@@ -290,6 +290,7 @@ impl<'a> MountSources<'a> {
         }
     }
 
+    #[cfg(test)]
     fn legacy(
         hosts_mount: (&'a Path, &'a Path),
         resolv_mount: Option<(&'a Path, &'a Path)>,
@@ -998,7 +999,7 @@ pub fn dry_run(
     Ok(format_dry_run_args(&args))
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn build_dry_run_args(
     config: &Config,
     project_dir: &Path,
@@ -1107,19 +1108,6 @@ fn format_dry_run_args(args: &[String]) -> String {
     }
 
     out
-}
-
-#[allow(dead_code)]
-fn discover_mounts(
-    config: &Config,
-    project_dir: &Path,
-    hosts_mount: (&Path, &Path),
-    resolv_mount: Option<(&Path, &Path)>,
-    empty_path: &Path,
-    verbose: bool,
-) -> MountSet {
-    let sources = MountSources::legacy(hosts_mount, resolv_mount, empty_path);
-    discover_mounts_full(config, project_dir, &sources, verbose)
 }
 
 fn discover_mounts_full(
