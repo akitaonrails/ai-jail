@@ -358,7 +358,7 @@ Pass `--private-home` or set `private_home = true` to skip this automatic dotdir
 - `.gnupg`, `.aws`, `.ssh`, `.mozilla`, `.basilisk-dev`, `.sparrow`
 
 **Mounted read-write (AI tools and build caches):**
-- `.gemini`, `.claude`, `.crush`, `.codex`, `.aider`, `.config`, `.cargo`, `.cache`, `.docker`
+- `.gemini`, `.claude`, `.crush`, `.codex`, `.aider`, `.soulforge`, `.grok`, `.agents`, `.omp`, `.pi`, `.pi-lens`, `.config`, `.cargo`, `.cache`, `.docker`
 
 **Everything else:** mounted read-only.
 
@@ -436,6 +436,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 | `codex` | Run GPT Codex |
 | `opencode` | Run OpenCode |
 | `crush` | Run Crush |
+| `pi` | Run Pi CLI |
 | `bash` | Drop into a bash shell |
 | `status` | Show current `.ai-jail` config |
 | Any other | Passed through as the command |

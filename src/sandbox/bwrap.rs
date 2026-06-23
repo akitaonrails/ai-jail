@@ -3092,6 +3092,29 @@ mod tests {
     }
 
     #[test]
+    fn regression_pi_lens_home_dir_is_writable() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-pi-lens-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let pi_lens = home.join(".pi-lens");
+        std::fs::create_dir_all(pi_lens.join("sessions")).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let mounts = discover_home_dotfiles(false, &[], &[], false);
+
+        assert!(
+            mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { src, dest } if src == &pi_lens && dest == &pi_lens
+            )),
+            "~/.pi-lens must be mounted read-write so pi can write lens state"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn home_gitignore_is_mounted_read_only() {
         let _lock = ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir()

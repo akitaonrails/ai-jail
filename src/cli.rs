@@ -9,7 +9,8 @@ USAGE:
     ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 
 COMMANDS (positional):
-    gemini, claude, codex, opencode, crush, soulforge, grok, bash   Known AI tool presets
+    gemini, claude, codex, opencode, crush, soulforge, grok, pi, bash
+                                            Known AI tool presets
     status                                 Show current .ai-jail config
     Any other string                       Passed through as the command
 
@@ -322,6 +323,17 @@ mod tests {
     fn parse_bash_command() {
         let args = parse_test(&["bash"]).unwrap();
         assert_eq!(args.command, vec!["bash"]);
+    }
+
+    #[test]
+    fn parse_pi_command() {
+        let args = parse_test(&["pi"]).unwrap();
+        assert_eq!(args.command, vec!["pi"]);
+    }
+
+    #[test]
+    fn help_lists_pi_preset() {
+        assert!(HELP.contains("grok, pi, bash"));
     }
 
     #[test]
