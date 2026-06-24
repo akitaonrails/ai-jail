@@ -362,7 +362,7 @@ Pass `--private-home` or set `private_home = true` to skip this automatic dotdir
 - `.gnupg`, `.aws`, `.ssh`, `.mozilla`, `.thunderbird`, `.basilisk-dev`, `.sparrow`
 
 **Mounted read-write (AI tools and build caches):**
-- `.gemini`, `.claude`, `.crush`, `.codex`, `.aider`, `.soulforge`, `.grok`, `.agents`, `.omp`, `.pi`, `.pi-lens`, `.config`, `.cargo`, `.cache`, `.docker`
+- `.gemini`, `.claude`, `.crush`, `.codex`, `.aider`, `.kiro`, `.soulforge`, `.grok`, `.agents`, `.omp`, `.pi`, `.pi-lens`, `.config`, `.cargo`, `.cache`, `.docker`
 
 **Everything else:** mounted read-only.
 
@@ -378,7 +378,7 @@ Pass `--private-home` or set `private_home = true` to skip this automatic dotdir
 
 **Local overrides (read-write):**
 - `~/.local/state`
-- `~/.local/share/{zoxide,crush,opencode,atuin,mise,yarn,flutter,kotlin,NuGet,pipx,ruby-advisory-db,uv}`
+- `~/.local/share/{zoxide,crush,kiro-cli,opencode,atuin,mise,yarn,flutter,kotlin,NuGet,pipx,ruby-advisory-db,uv}`
 
 ### Namespace isolation
 
