@@ -117,6 +117,7 @@ const DOTDIR_RW: &[&str] = &[
     ".crush",
     ".codex",
     ".aider",
+    ".kiro",
     ".soulforge",
     ".grok",
     ".agents",
@@ -1109,6 +1110,7 @@ mod tests {
             ".crush",
             ".codex",
             ".aider",
+            ".kiro",
             ".soulforge",
             ".grok",
             ".agents",
@@ -1187,8 +1189,8 @@ mod tests {
     #[test]
     fn cannot_deny_rw_required_dirs() {
         let required = [
-            ".cargo", ".cache", ".config", ".claude", ".gemini", ".omp", ".pi",
-            ".pi-lens",
+            ".cargo", ".cache", ".config", ".claude", ".gemini", ".kiro",
+            ".omp", ".pi", ".pi-lens",
         ];
         for name in required {
             let extra = vec![name.to_string()];
@@ -1207,6 +1209,8 @@ mod tests {
         assert!(is_dotdir_rw(".cache"));
         assert!(is_dotdir_rw(".omp"));
         assert!(is_dotdir_rw("omp"));
+        assert!(is_dotdir_rw(".kiro"));
+        assert!(is_dotdir_rw("kiro"));
         assert!(is_dotdir_rw(".pi"));
         assert!(is_dotdir_rw("pi"));
         assert!(is_dotdir_rw(".pi-lens"));

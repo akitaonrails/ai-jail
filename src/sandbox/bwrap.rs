@@ -398,6 +398,7 @@ const CACHE_DENY: &[&str] = &[
 const LOCAL_SHARE_RW: &[&str] = &[
     "zoxide",
     "crush",
+    "kiro-cli",
     "opencode",
     "soulforge",
     "atuin",
@@ -2911,6 +2912,26 @@ mod tests {
             Mount::Bind { src, dest }
                 if src == Path::new("/usr/bin") && dest == Path::new("/usr/bin")
         ));
+    }
+
+    #[test]
+    fn local_share_kiro_cli_is_mounted_read_write() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-kiro-cli-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let kiro_cli = home.join(".local/share/kiro-cli");
+        std::fs::create_dir_all(&kiro_cli).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let mounts = discover_local_overrides();
+
+        assert!(mounts.iter().any(|m| matches!(
+            m,
+            Mount::Bind { src, dest } if src == &kiro_cli && dest == &kiro_cli
+        )));
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
