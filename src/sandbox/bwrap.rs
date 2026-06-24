@@ -2026,6 +2026,18 @@ fn git_worktree_mounts(
 }
 
 fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
+    extra_mounts_with_check(rw_maps, ro_maps, super::path_exists)
+}
+
+/// Inner implementation of [`extra_mounts`] that accepts an injectable
+/// path-existence predicate. This makes the logic unit-testable in hermetic
+/// environments (e.g. the Nix build sandbox) where host paths like `/usr`
+/// may not exist.
+fn extra_mounts_with_check(
+    rw_maps: &[PathBuf],
+    ro_maps: &[PathBuf],
+    path_exists: impl Fn(&Path) -> bool,
+) -> Vec<Mount> {
     let mut mounts = Vec::new();
 
     // Apply ro-maps first, then rw-maps on top. This lets a
@@ -2039,7 +2051,7 @@ fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
             );
             continue;
         }
-        if super::path_exists(path) {
+        if path_exists(path) {
             mounts.push(Mount::RoBind {
                 src: path.clone(),
                 dest: path.clone(),
@@ -2059,7 +2071,7 @@ fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
             );
             continue;
         }
-        if super::path_exists(path) {
+        if path_exists(path) {
             mounts.push(Mount::Bind {
                 src: path.clone(),
                 dest: path.clone(),
@@ -2868,12 +2880,13 @@ mod tests {
 
     #[test]
     fn extra_mounts_rw_child_overrides_ro_parent() {
-        // Use /usr and /usr/bin which always exist. The order
-        // of returned mounts must be: ro first, rw after — so a
-        // rw subdirectory can overlay its ro parent.
+        // Inject |_| true so the test is hermetic: it doesn't require
+        // /usr or /usr/bin to exist on the host (they won't in the Nix
+        // build sandbox). The ordering guarantee — ro first, rw after —
+        // is the invariant under test, not path existence.
         let ro = vec![PathBuf::from("/usr")];
         let rw = vec![PathBuf::from("/usr/bin")];
-        let mounts = extra_mounts(&rw, &ro);
+        let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
         assert_eq!(mounts.len(), 2);
         match &mounts[0] {
             Mount::RoBind { src, .. } => {
@@ -2891,9 +2904,12 @@ mod tests {
 
     #[test]
     fn extra_mounts_refuses_root_maps() {
+        // Use |_| true so real host paths aren't required (hermetic in
+        // the Nix sandbox). The invariant under test is that "/" entries
+        // are filtered out regardless of existence.
         let ro = vec![PathBuf::from("/"), PathBuf::from("/usr")];
         let rw = vec![PathBuf::from("/"), PathBuf::from("/usr/bin")];
-        let mounts = extra_mounts(&rw, &ro);
+        let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
 
         assert_eq!(mounts.len(), 2);
         assert!(mounts.iter().all(|m| match m {

@@ -106,7 +106,12 @@
           buildInputs = [
             rust
             formatter
+            pkgs.bubblewrap
           ];
+
+          shellHook = ''
+            export BWRAP_BIN="${pkgs.bubblewrap}/bin/bwrap"
+          '';
         };
       }
     );
