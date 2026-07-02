@@ -12,6 +12,13 @@ const WSL_DOCKER_DESKTOP_CLI_TOOLS: &str = "/mnt/wsl/docker-desktop/cli-tools";
 /// Also granted read-write by Landlock (`collect_normal_paths`) —
 /// keep the two in sync via this shared constant.
 pub(crate) const TAILSCALE_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
+/// DBus session bus socket, relative to `XDG_RUNTIME_DIR`.
+const SYSTEMD_USER_BUS_SUBPATH: &str = "bus";
+/// Socket paths (relative to `XDG_RUNTIME_DIR`) that `--systemd-user`
+/// exposes. Also granted read-write by Landlock (`systemd_user_paths`)
+/// — keep the two in sync via this shared constant.
+pub(crate) const SYSTEMD_USER_SUBPATHS: &[&str] =
+    &[SYSTEMD_USER_BUS_SUBPATH, "systemd/private"];
 
 #[derive(Debug, Clone)]
 enum Mount {
@@ -1932,10 +1939,12 @@ fn discover_systemd_user(
         return (vec![], vec![]);
     }
 
-    let bus = xdg_path.join("bus");
-    let private = xdg_path.join("systemd/private");
-    let existing_paths: Vec<&Path> = [&bus, &private]
-        .into_iter()
+    let candidates: Vec<PathBuf> = SYSTEMD_USER_SUBPATHS
+        .iter()
+        .map(|sub| xdg_path.join(sub))
+        .collect();
+    let existing_paths: Vec<&Path> = candidates
+        .iter()
         .filter(|path| super::path_exists(path))
         .map(PathBuf::as_path)
         .collect();
@@ -1984,6 +1993,7 @@ fn discover_systemd_user(
         }
     }
 
+    let bus = xdg_path.join(SYSTEMD_USER_BUS_SUBPATH);
     if super::path_exists(&bus) {
         let explicit = format!("unix:path={}", bus.display());
         let value = match std::env::var("DBUS_SESSION_BUS_ADDRESS") {

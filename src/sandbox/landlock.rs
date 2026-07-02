@@ -717,7 +717,10 @@ fn systemd_user_paths() -> Vec<PathBuf> {
         return vec![];
     };
     let xdg_path = PathBuf::from(xdg_dir);
-    vec![xdg_path.join("bus"), xdg_path.join("systemd/private")]
+    super::bwrap::SYSTEMD_USER_SUBPATHS
+        .iter()
+        .map(|sub| xdg_path.join(sub))
+        .collect()
 }
 
 /// Classify home dotdirs into read-only or read-write.
