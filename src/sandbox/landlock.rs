@@ -634,6 +634,19 @@ fn collect_normal_paths(
         }
     }
 
+    // Tailscale socket: read-write — Landlock runs INSIDE the bwrap
+    // sandbox, which bind-mounts the socket when --tailscale is set;
+    // without a matching FS rule here every access to the (visible)
+    // socket is denied and the feature silently breaks. Mirrors the
+    // Docker socket rule above.
+    if config.tailscale_enabled() {
+        collect_tailscale_path(
+            &mut rw,
+            Path::new(super::bwrap::TAILSCALE_SOCKET),
+            verbose,
+        );
+    }
+
     // GPU devices: read-write — needed for CUDA/OpenCL/Vulkan
     // workloads. Grants access to /dev/nvidia* and /dev/dri/*.
     // Controlled by --no-gpu config flag.
@@ -755,6 +768,20 @@ fn collect_home_paths(
             }
             ro.push(path);
         }
+    }
+}
+
+/// Grant rw access to the Tailscale control socket when it exists.
+/// Split out with the socket path as a parameter so tests can
+/// exercise it with a temp file (the real socket rarely exists on
+/// build machines). Missing socket → skip silently, matching the
+/// bwrap mount discovery.
+fn collect_tailscale_path(rw: &mut Vec<PathBuf>, sock: &Path, verbose: bool) {
+    if super::path_exists(sock) {
+        if verbose {
+            output::verbose("Landlock: tailscale socket rw");
+        }
+        rw.push(sock.to_path_buf());
     }
 }
 
@@ -948,6 +975,46 @@ mod tests {
             ro.contains(&PathBuf::from("/")),
             "/ must be in ro list so bwrap can set up mount namespaces"
         );
+    }
+
+    #[test]
+    fn tailscale_socket_granted_rw_when_present() {
+        // Regression: bwrap bind-mounts the tailscale socket, but
+        // Landlock (running inside the sandbox) also needs an FS
+        // rule for it — without one, --tailscale is silently broken
+        // whenever Landlock enforces.
+        let tmp_root = std::env::temp_dir()
+            .join(format!("ai-jail-ll-ts-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_root);
+        let sock = tmp_root.join("tailscaled.sock");
+        let mut f = std::fs::File::create(&sock).unwrap();
+        let _ = f.write_all(b"x");
+
+        let mut rw = Vec::new();
+        collect_tailscale_path(&mut rw, &sock, false);
+        assert_eq!(rw, vec![sock.clone()]);
+
+        // Missing socket → skipped silently, never pushed.
+        let mut rw = Vec::new();
+        collect_tailscale_path(&mut rw, &tmp_root.join("absent"), false);
+        assert!(rw.is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn normal_paths_skip_tailscale_when_disabled() {
+        // Default config (tailscale unset) must not grant the socket
+        // even if it exists on the host.
+        let config = Config {
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            ..Config::default()
+        };
+        let (_ro, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
+        assert!(!rw.iter().any(|p| {
+            p == Path::new(crate::sandbox::bwrap::TAILSCALE_SOCKET)
+        }));
     }
 
     #[test]

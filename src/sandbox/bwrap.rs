@@ -9,7 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 const WSL_DOCKER_DESKTOP_CLI_TOOLS: &str = "/mnt/wsl/docker-desktop/cli-tools";
-const TAILSCALE_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
+/// Also granted read-write by Landlock (`collect_normal_paths`) —
+/// keep the two in sync via this shared constant.
+pub(crate) const TAILSCALE_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
 
 #[derive(Debug, Clone)]
 enum Mount {
