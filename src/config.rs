@@ -384,11 +384,15 @@ fn save_global_to_path(path: &Path, config: &Config) {
     save_global_doc_to_path(path, &global);
 }
 
-fn save_global_doc_to_path(path: &Path, global: &GlobalConfig) {
-    let header = "# ai-jail sandbox configuration\n\
+/// Comment block written at the top of every saved `.ai-jail` file
+/// (project and global).
+const CONFIG_FILE_HEADER: &str = "# ai-jail sandbox configuration\n\
                   # https://github.com/akitaonrails/ai-jail\n\
                   # Edit freely. Regenerate with: \
                   ai-jail --clean --init\n\n";
+
+fn save_global_doc_to_path(path: &Path, global: &GlobalConfig) {
+    let header = CONFIG_FILE_HEADER;
     if let Err(e) = ensure_regular_target_or_absent(path) {
         output::warn(&format!("Refusing to write {}: {e}", path.display()));
         return;
@@ -415,10 +419,7 @@ fn save_global_doc_to_path(path: &Path, global: &GlobalConfig) {
 }
 
 fn save_to_path(path: &Path, config: &Config) {
-    let header = "# ai-jail sandbox configuration\n\
-                  # https://github.com/akitaonrails/ai-jail\n\
-                  # Edit freely. Regenerate with: \
-                  ai-jail --clean --init\n\n";
+    let header = CONFIG_FILE_HEADER;
     if let Err(e) = ensure_regular_target_or_absent(path) {
         output::warn(&format!("Refusing to write {}: {e}", path.display()));
         return;

@@ -207,6 +207,15 @@ fn glob_base_and_pattern(
     (base, pattern_components)
 }
 
+/// Match a single character against a glob `[...]` class body
+/// (literals and `a-z` ranges).
+///
+/// Deliberately minimal — this hand-rolled glob avoids a crate
+/// dependency. Unsupported syntax, by design:
+///   - negation (`[!...]` / `[^...]`) — `!`/`^` are treated as
+///     literal characters;
+///   - an unclosed `[` is treated as a literal bracket by the
+///     caller, not a class.
 fn matches_char_class(class: &[char], ch: char) -> bool {
     let mut i = 0;
     let mut matched = false;

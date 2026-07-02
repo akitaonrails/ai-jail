@@ -806,6 +806,11 @@ fn is_split_dns_marker_ip(s: &str) -> bool {
     false
 }
 
+/// Tailscale MagicDNS domains always live under this public TLD
+/// (`<tailnet>.ts.net`); its presence in resolv.conf search/domain
+/// lines signals a tailscale split-DNS setup.
+const TAILSCALE_MAGICDNS_TLD: &str = "ts.net";
+
 fn resolv_has_tailscale_magicdns_domain(contents: &[u8]) -> bool {
     String::from_utf8_lossy(contents).lines().any(|line| {
         let mut fields = line.split_whitespace();
@@ -817,7 +822,10 @@ fn resolv_has_tailscale_magicdns_domain(contents: &[u8]) -> bool {
         }
         fields.any(|token| {
             let token = token.trim_end_matches('.');
-            token == "ts.net" || token.ends_with(".ts.net")
+            token == TAILSCALE_MAGICDNS_TLD
+                || token
+                    .strip_suffix(TAILSCALE_MAGICDNS_TLD)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
         })
     })
 }
