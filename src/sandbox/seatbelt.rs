@@ -31,6 +31,13 @@ pub fn platform_notes(config: &Config) {
     if config.systemd_user_enabled() {
         output::warn("--systemd-user has no effect on macOS");
     }
+    if config.tailscale_enabled() {
+        output::warn(
+            "--tailscale has no effect on macOS (no socket bind; \
+             tailscaled is reachable only if seatbelt network rules \
+             already allow it)",
+        );
+    }
     if !config.allow_tcp_ports().is_empty() && config.lockdown_enabled() {
         output::warn(
             "--allow-tcp-port has no effect on macOS \

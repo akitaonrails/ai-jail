@@ -110,7 +110,6 @@ impl Config {
     pub fn docker_enabled(&self) -> bool {
         self.no_docker != Some(true)
     }
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn tailscale_enabled(&self) -> bool {
         self.tailscale == Some(true)
     }
