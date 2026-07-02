@@ -2362,6 +2362,45 @@ mod tests {
     }
 
     #[test]
+    fn tailscale_bind_absent_from_args_when_disabled_or_missing() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let project = PathBuf::from("/home/user/project");
+
+        // Disabled (the default) → the socket bind must never be
+        // emitted, even on hosts running tailscaled.
+        let config = minimal_test_config();
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+        assert!(!args.iter().any(|a| a == TAILSCALE_SOCKET));
+
+        // Enabled but socket absent → warn-and-skip with no dangling
+        // bind (bwrap aborts on a missing bind source). Only
+        // assertable on hosts without a live tailscaled.
+        if !Path::new(TAILSCALE_SOCKET).exists() {
+            let mut config = minimal_test_config();
+            config.tailscale = Some(true);
+            let args = build_dry_run_args(
+                &config,
+                &project,
+                guard.hosts_mount(),
+                guard.resolv_mount(),
+                guard.empty_path(),
+                false,
+            )
+            .unwrap();
+            assert!(!args.iter().any(|a| a == TAILSCALE_SOCKET));
+        }
+    }
+
+    #[test]
     fn build_mask_mounts_file_uses_empty_ro_bind() {
         use std::io::Write;
         // Create a temp project dir with a real file to mask

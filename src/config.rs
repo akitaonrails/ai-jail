@@ -2612,6 +2612,46 @@ rw_maps = ["~/.claude"]
     }
 
     #[test]
+    fn regression_old_plain_global_roundtrips_through_save() {
+        // A global .ai-jail written before [commands.*] tables existed
+        // (plain Config fields only) must survive a save cycle: the
+        // serde(flatten) load/save path must not drop or reshape any
+        // base field, and must not invent a [commands] table.
+        let dir = std::env::temp_dir()
+            .join(format!("ai-jail-old-plain-global-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(".ai-jail");
+        std::fs::write(
+            &path,
+            r#"command = ["claude"]
+rw_maps = ["~/shared"]
+no_gpu = true
+hide_dotdirs = [".my_secrets"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config {
+            status_bar_style: Some("dark".into()),
+            ..Config::default()
+        };
+        save_global_to_path(&path, &cfg);
+
+        let global = load_global_from_path(&path);
+        assert_eq!(global.base.command, vec!["claude"]);
+        assert_eq!(global.base.rw_maps, vec![PathBuf::from("~/shared")]);
+        assert_eq!(global.base.no_gpu, Some(true));
+        assert_eq!(global.base.hide_dotdirs, vec![".my_secrets"]);
+        assert_eq!(global.base.status_bar_style.as_deref(), Some("dark"));
+        assert!(global.commands.is_empty());
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("[commands"));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn merge_with_global_keeps_status_bar_preferences_from_global() {
         let global = Config {
             no_status_bar: Some(false),
