@@ -25,4 +25,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo test
-      - run: RUSTFLAGS="-D warnings" cargo check --target aarch64-apple-darwin
+      # Clippy (not just check) so macOS-only lint warnings can't drift
+      # past the Linux-only CI (#75). Subsumes the previous
+      # RUSTFLAGS="-D warnings" cargo check: clippy type-checks the same
+      # code and `-D warnings` denies rustc warnings as well.
+      - run: cargo clippy --target aarch64-apple-darwin --all-targets -- -D warnings
