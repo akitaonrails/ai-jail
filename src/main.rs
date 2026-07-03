@@ -626,4 +626,17 @@ mod tests {
 
         assert!(!should_save_global_preferences(&cli));
     }
+
+    #[test]
+    fn exec_skips_global_preference_save_for_style() {
+        // The guard's other disjunct: --status-bar=STYLE combined with
+        // --exec must not persist either.
+        let cli = CliArgs {
+            exec: true,
+            status_bar_style: Some("dark".into()),
+            ..CliArgs::default()
+        };
+
+        assert!(!should_save_global_preferences(&cli));
+    }
 }
