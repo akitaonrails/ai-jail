@@ -850,25 +850,36 @@ mod tests {
         // Regression: without a read rule on the root node itself, the
         // dyld loader on macOS 26 aborts every dynamically-linked process
         // with SIGABRT. Must be `literal "/"` (not `subpath "/"`, which
-        // would grant read of the whole filesystem). Both restricted
-        // modes (private-home and lockdown) need it.
-        for lockdown in [false, true] {
-            let config = Config {
-                private_home: Some(!lockdown),
-                lockdown: Some(lockdown),
-                ..Config::default()
-            };
+        // would grant read of the whole filesystem). All three restricted
+        // modes (private-home, lockdown, browser) need it.
+        let private_home = Config {
+            private_home: Some(true),
+            ..Config::default()
+        };
+        let lockdown = Config {
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        let browser = Config {
+            browser_profile: Some("soft".into()),
+            ..Config::default()
+        };
+        let cases = [
+            ("private-home", private_home, false),
+            ("lockdown", lockdown, true),
+            ("browser", browser, false),
+        ];
+        for (mode, config, lockdown) in cases {
             let project = PathBuf::from("/tmp/test-project");
             let profile =
                 generate_sbpl_profile(&config, &project, false, lockdown);
             assert!(
                 profile.contains("(allow file-read* (literal \"/\"))"),
-                "restricted read profile must grant the root node \
-                 (lockdown={lockdown})"
+                "restricted read profile must grant the root node ({mode})"
             );
             assert!(
                 !profile.contains("(allow file-read* (subpath \"/\"))"),
-                "must not grant subpath / (would expose everything)"
+                "must not grant subpath / (would expose everything, {mode})"
             );
         }
     }
