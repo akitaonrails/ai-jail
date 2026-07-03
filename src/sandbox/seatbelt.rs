@@ -287,6 +287,13 @@ fn push_file_read_section(
 ) {
     if restricted_files {
         profile.push_str("; File reads: restricted allow-list\n");
+        // The root node itself must be readable, or the dyld loader on
+        // macOS 26 (Tahoe) can't resolve absolute paths and every
+        // dynamically-linked process aborts with SIGABRT before it runs.
+        // This is a `literal` (not `subpath`) rule on purpose: it grants
+        // read of `/` alone — listing top-level names — without opening
+        // up any subtree the allow-list below hasn't already granted.
+        profile.push_str("(allow file-read* (literal \"/\"))\n");
         for rd_path in macos_lockdown_read_paths(config, project_dir) {
             push_path_rule(profile, "allow", "file-read*", &rd_path);
         }
@@ -836,6 +843,34 @@ mod tests {
         let profile = generate_sbpl_profile(&config, &project, false, false);
         assert!(profile.contains("; File reads: restricted allow-list"));
         assert!(!profile.contains("(allow file-read*)\n"));
+    }
+
+    #[test]
+    fn restricted_reads_allow_root_node() {
+        // Regression: without a read rule on the root node itself, the
+        // dyld loader on macOS 26 aborts every dynamically-linked process
+        // with SIGABRT. Must be `literal "/"` (not `subpath "/"`, which
+        // would grant read of the whole filesystem). Both restricted
+        // modes (private-home and lockdown) need it.
+        for lockdown in [false, true] {
+            let config = Config {
+                private_home: Some(!lockdown),
+                lockdown: Some(lockdown),
+                ..Config::default()
+            };
+            let project = PathBuf::from("/tmp/test-project");
+            let profile =
+                generate_sbpl_profile(&config, &project, false, lockdown);
+            assert!(
+                profile.contains("(allow file-read* (literal \"/\"))"),
+                "restricted read profile must grant the root node \
+                 (lockdown={lockdown})"
+            );
+            assert!(
+                !profile.contains("(allow file-read* (subpath \"/\"))"),
+                "must not grant subpath / (would expose everything)"
+            );
+        }
     }
 
     #[test]
