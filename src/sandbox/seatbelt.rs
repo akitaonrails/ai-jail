@@ -454,10 +454,10 @@ fn macos_writable_paths(
         }
     }
 
-    if let Some(dir) = &config.claude_dir {
-        if super::path_exists(dir) {
-            paths.push(dir.clone());
-        }
+    if let Some(dir) = &config.claude_dir
+        && super::path_exists(dir)
+    {
+        paths.push(dir.clone());
     }
 
     paths.push(PathBuf::from("/tmp"));
@@ -570,10 +570,8 @@ fn macos_lockdown_read_paths(
     let browser_mode = config.browser_profile().is_some();
     let private_home = config.private_home_enabled();
 
-    if browser_mode {
-        if let Some(state) = super::browser_state_dir(config) {
-            push_unique(canonicalize_or_keep(&state));
-        }
+    if browser_mode && let Some(state) = super::browser_state_dir(config) {
+        push_unique(canonicalize_or_keep(&state));
     }
 
     if !private_home {
@@ -674,8 +672,10 @@ mod tests {
 
     #[test]
     fn sbpl_profile_lockdown_disables_network_and_writes() {
-        let mut config = Config::default();
-        config.lockdown = Some(true);
+        let config = Config {
+            lockdown: Some(true),
+            ..Config::default()
+        };
         let project = PathBuf::from("/tmp/test-project");
         let profile = generate_sbpl_profile(&config, &project, false, true);
         assert!(!profile.contains("(allow network-outbound)"));
