@@ -147,7 +147,16 @@ fn validate_write_flags(cli: &cli::CliArgs) -> Result<(), String> {
 }
 
 fn should_save_global_preferences(cli: &cli::CliArgs) -> bool {
-    !cli.dry_run && (cli.status_bar.is_some() || cli.status_bar_style.is_some())
+    // Skip --exec: it forces `status_bar = Some(false)` for clean stdout
+    // (see cli.rs), which is indistinguishable here from an explicit
+    // --no-status-bar. Without this guard, a one-off `ai-jail --exec
+    // ./script` would persist `no_status_bar = true` to the global
+    // $HOME/.ai-jail and silently disable the status bar for every later
+    // run. --exec is an execution mode, not a UI preference — same reason
+    // --dry-run is excluded.
+    !cli.dry_run
+        && !cli.exec
+        && (cli.status_bar.is_some() || cli.status_bar_style.is_some())
 }
 
 fn should_auto_save_project_config(
@@ -598,5 +607,19 @@ mod tests {
         };
 
         assert!(should_save_global_preferences(&cli));
+    }
+
+    #[test]
+    fn exec_skips_global_preference_save() {
+        // --exec forces status_bar = Some(false) for clean stdout. That
+        // must not leak into the global $HOME/.ai-jail — a one-off exec
+        // run should never persist no_status_bar for every later run.
+        let cli = CliArgs {
+            exec: true,
+            status_bar: Some(false),
+            ..CliArgs::default()
+        };
+
+        assert!(!should_save_global_preferences(&cli));
     }
 }
