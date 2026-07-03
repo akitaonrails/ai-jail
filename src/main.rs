@@ -383,7 +383,11 @@ fn run() -> Result<i32, String> {
         code
     };
 
-    // Guard is dropped here, cleaning up any temp files
+    // Guard is dropped here, cleaning up any temp files. On macOS the
+    // guard is a unit struct (no temp files to clean), so the explicit
+    // drop is a no-op there; clippy's drop_non_drop only fires on that
+    // platform. The drop stays meaningful on Linux (RAII temp files).
+    #[cfg_attr(target_os = "macos", allow(clippy::drop_non_drop))]
     drop(guard);
 
     Ok(exit_code)
