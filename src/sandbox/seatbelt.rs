@@ -604,6 +604,13 @@ fn macos_lockdown_read_paths(
                 push_unique(canonicalize_or_keep(p));
             }
         }
+        // The invoked command itself may live under $HOME (e.g. the
+        // official Claude installer targets ~/.local/bin); without a
+        // read allowance on its install paths the exec fails before
+        // the agent starts (#81).
+        for p in super::command_home_paths(config) {
+            push_unique(canonicalize_or_keep(&p));
+        }
         if config.ssh_enabled() {
             let ssh_dir = super::home_dir().join(".ssh");
             if ssh_dir.is_dir() {
@@ -843,6 +850,54 @@ mod tests {
         let profile = generate_sbpl_profile(&config, &project, false, false);
         assert!(profile.contains("; File reads: restricted allow-list"));
         assert!(!profile.contains("(allow file-read*)\n"));
+    }
+
+    #[test]
+    fn private_home_reads_allow_home_installed_command() {
+        // Regression for #81: an agent installed the official way
+        // (~/.local/bin symlink into ~/.local/share/<tool>/versions)
+        // must stay readable in private-home mode or the exec fails
+        // before the agent starts.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-seatbelt-cmd-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let versions = home.join(".local/share/agent/versions");
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(&versions).unwrap();
+        let target = versions.join("1.0");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, home.join(".local/bin/agent"))
+            .unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path =
+            EnvVarGuard::set("PATH", home.join(".local/bin").as_os_str());
+
+        let config = Config {
+            command: vec!["agent".into()],
+            private_home: Some(true),
+            ..Config::default()
+        };
+        let project = home.join("project");
+        let profile = generate_sbpl_profile(&config, &project, false, false);
+
+        // The versions dir surfaces as a subpath read allowance; the
+        // PATH entry canonicalizes to the target file (literal rule).
+        assert!(
+            profile
+                .contains(&format!("(subpath \"{}\")", sbpl_path(&versions)))
+        );
+        assert!(
+            profile.contains(&format!("(literal \"{}\")", sbpl_path(&target)))
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

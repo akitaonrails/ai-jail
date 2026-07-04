@@ -352,6 +352,8 @@ In browser profile mode, the project is mounted read-only, `$HOME` is private tm
 
 In `--private-home` mode, normal host dotdirs are not exposed, but the project remains read-write and explicit `--map` / `--rw-map` mounts still work. On Linux this is a private tmpfs `$HOME`; on macOS it is enforced with seatbelt read/write allowlists because `sandbox-exec` cannot create a replacement home mount. This is useful for non-agent or experimental workloads where you want normal project access without exposing your real `~/.config`, `~/.cache`, or tool state.
 
+One exemption keeps the mode usable: the command you invoke is resolved on the host, and if its binary lives under `$HOME` (the official Claude installer targets `~/.local/bin`, for example), the resolved symlink chain and install directory are mounted read-only so the agent can start. Programs become visible; config, cache, and state stay hidden. Tools that need more than their install directory at startup can be granted paths explicitly with `--map`.
+
 ### Home directory handling
 
 Your real `$HOME` is replaced with a tmpfs. Dotfiles and dotdirs are selectively layered on top:

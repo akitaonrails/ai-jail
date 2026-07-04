@@ -130,6 +130,9 @@ struct MountSet {
     config_hide: Vec<Mount>,
     cache_hide: Vec<Mount>,
     local_overrides: Vec<Mount>,
+    /// Read-only binds keeping the invoked command startable in
+    /// private-home mode when it is installed under `$HOME` (#81).
+    command_binary: Vec<Mount>,
     git_worktree: Vec<Mount>,
     gpu: Vec<Mount>,
     docker: Vec<Mount>,
@@ -156,7 +159,7 @@ struct MountSet {
 }
 
 impl MountSet {
-    fn ordered_mounts(&self) -> [&[Mount]; 22] {
+    fn ordered_mounts(&self) -> [&[Mount]; 23] {
         [
             &self.base,
             &self.sys_masks,
@@ -170,6 +173,7 @@ impl MountSet {
             &self.config_hide,
             &self.cache_hide,
             &self.local_overrides,
+            &self.command_binary,
             &self.git_worktree,
             &self.ssh_agent,
             &self.pictures,
@@ -1214,6 +1218,14 @@ fn discover_mounts_full(
         } else {
             discover_local_overrides()
         },
+        // Only for user-requested private home: lockdown clears the
+        // environment (system PATH only), and browser mode runs
+        // system-installed browsers.
+        command_binary: if config.private_home_enabled() && !lockdown {
+            discover_command_binary(config, verbose)
+        } else {
+            vec![]
+        },
         git_worktree: git_worktree_mounts(config, project_dir, verbose),
         gpu: if enable_gpu {
             discover_gpu(verbose)
@@ -1718,6 +1730,29 @@ fn discover_subdir_hide(parent: &str, deny_list: &[&str]) -> Vec<Mount> {
                 Some(Mount::Tmpfs { dest: path })
             } else {
                 None
+            }
+        })
+        .collect()
+}
+
+/// Read-only binds for the invoked command's binary when it lives
+/// under `$HOME` (#81). Private home replaces `$HOME` with a tmpfs,
+/// which would otherwise hide agents installed the official way
+/// (e.g. `~/.local/bin/claude` → `~/.local/share/claude/versions/<v>`)
+/// and make the inner exec fail with ENOENT.
+fn discover_command_binary(config: &Config, verbose: bool) -> Vec<Mount> {
+    super::command_home_paths(config)
+        .into_iter()
+        .map(|path| {
+            if verbose {
+                output::verbose(&format!(
+                    "Command binary: {} ro",
+                    path.display()
+                ));
+            }
+            Mount::RoBind {
+                src: path.clone(),
+                dest: path,
             }
         })
         .collect()
@@ -3005,6 +3040,109 @@ mod tests {
             m,
             Mount::Bind { src, dest } if src == &kiro_cli && dest == &kiro_cli
         )));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Fixture mirroring the official Claude installer layout:
+    /// `<home>/.local/bin/agent` → `<home>/.local/share/agent/versions/1.0`.
+    fn installer_layout_home(tag: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-bwrap-cmd-home-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let versions = home.join(".local/share/agent/versions");
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(&versions).unwrap();
+        let target = versions.join("1.0");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, home.join(".local/bin/agent"))
+            .unwrap();
+        home
+    }
+
+    fn has_ro_bind(args: &[String], path: &Path) -> bool {
+        let p = path.display().to_string();
+        args.windows(3)
+            .any(|w| w[0] == "--ro-bind" && w[1] == p && w[2] == p)
+    }
+
+    #[test]
+    fn private_home_binds_command_binary_from_home() {
+        // Regression for #81: `ai-jail --private-home claude` must be
+        // able to exec an agent installed under $HOME.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = installer_layout_home("private");
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path =
+            EnvVarGuard::set("PATH", home.join(".local/bin").as_os_str());
+
+        let config = Config {
+            command: vec!["agent".into()],
+            private_home: Some(true),
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &home.join("project"),
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        assert!(has_ro_bind(&args, &home.join(".local/bin/agent")));
+        assert!(has_ro_bind(
+            &args,
+            &home.join(".local/share/agent/versions")
+        ));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn lockdown_skips_command_binary_mounts() {
+        // Lockdown clears the environment down to the system PATH, so
+        // home-installed binaries stay hidden there by design.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = installer_layout_home("lockdown");
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path =
+            EnvVarGuard::set("PATH", home.join(".local/bin").as_os_str());
+
+        let config = Config {
+            command: vec!["agent".into()],
+            private_home: Some(true),
+            lockdown: Some(true),
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &home.join("project"),
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        assert!(!has_ro_bind(&args, &home.join(".local/bin/agent")));
+        assert!(!has_ro_bind(
+            &args,
+            &home.join(".local/share/agent/versions")
+        ));
 
         let _ = std::fs::remove_dir_all(&home);
     }

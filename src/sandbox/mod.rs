@@ -406,6 +406,102 @@ fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
 }
 
+/// Paths under `$HOME` that must stay visible in private-home mode for
+/// the sandboxed command itself to start (issue #81). Private home
+/// replaces `$HOME` with a tmpfs and skips all dotdir binds, which
+/// also hides the agent binary when it was installed under the home
+/// directory — e.g. the official Claude installer symlinks
+/// `~/.local/bin/claude` to `~/.local/share/claude/versions/<v>`.
+///
+/// Resolves the command the way exec will (host `PATH` search), then
+/// walks the symlink chain: every hop under `$HOME` is collected, and
+/// for the final regular-file target its parent directory is collected
+/// so version payloads and launcher siblings resolve. Tools with needs
+/// beyond their install directory stay on the `--map` escape hatch.
+pub(crate) fn command_home_paths(config: &Config) -> Vec<PathBuf> {
+    let Some(cmd) = config.command.first() else {
+        return vec![];
+    };
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    command_home_paths_impl(cmd, &home_dir(), &path_env)
+}
+
+fn command_home_paths_impl(
+    cmd: &str,
+    home: &Path,
+    path_env: &str,
+) -> Vec<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let is_executable_file = |p: &Path| {
+        p.metadata()
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+
+    let start = if cmd.contains('/') {
+        let p = PathBuf::from(cmd);
+        if !p.is_absolute() {
+            // Relative-with-slash resolves against the project cwd,
+            // which is always mounted.
+            return vec![];
+        }
+        p
+    } else {
+        match path_env
+            .split(':')
+            .filter(|d| !d.is_empty())
+            .map(|d| Path::new(d).join(cmd))
+            .find(|c| is_executable_file(c))
+        {
+            Some(p) => p,
+            None => return vec![],
+        }
+    };
+
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let push_unique = |paths: &mut Vec<PathBuf>, p: PathBuf| {
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    };
+
+    let mut cur = start;
+    // Cap the walk so a symlink loop can't hang sandbox setup.
+    for _ in 0..16 {
+        match std::fs::read_link(&cur) {
+            Ok(target) => {
+                // A symlink hop; the chain may leave and re-enter
+                // $HOME, so collect per hop rather than bailing early.
+                if cur.starts_with(home) {
+                    push_unique(&mut paths, cur.clone());
+                }
+                cur = if target.is_absolute() {
+                    target
+                } else {
+                    match cur.parent() {
+                        Some(parent) => parent.join(target),
+                        None => break,
+                    }
+                };
+            }
+            Err(_) => {
+                // Terminal: a regular file (or a broken link target —
+                // warn-and-skip philosophy, exec will report it).
+                if cur.starts_with(home)
+                    && cur.is_file()
+                    && let Some(parent) = cur.parent()
+                {
+                    push_unique(&mut paths, parent.to_path_buf());
+                }
+                break;
+            }
+        }
+    }
+
+    paths
+}
+
 /// Resolve `$XDG_CONFIG_HOME` per the XDG Base Directory spec:
 /// return its value if set and non-empty, otherwise fall back to
 /// `$HOME/.config`. Used by sandbox setup to find tools that store
@@ -1331,5 +1427,117 @@ mod tests {
         let _home = EnvVarGuard::set("HOME", "/home/test-user");
         let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", "/opt/custom-config");
         assert_eq!(xdg_config_home(), PathBuf::from("/opt/custom-config"));
+    }
+
+    /// Fixture mirroring the official Claude installer layout:
+    /// `<home>/.local/bin/agent` → `<home>/.local/share/agent/versions/1.0`.
+    fn command_home_fixture(tag: &str) -> PathBuf {
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-cmd-home-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let versions = home.join(".local/share/agent/versions");
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(&versions).unwrap();
+        let target = versions.join("1.0");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &target,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink(&target, home.join(".local/bin/agent"))
+            .unwrap();
+        home
+    }
+
+    #[test]
+    fn command_home_paths_follows_installer_symlink_chain() {
+        // Regression for #81: PATH entry + final target's parent dir
+        // must both surface so private-home mode can exec the agent.
+        let home = command_home_fixture("chain");
+        let path_env =
+            format!("/usr/bin:{}", home.join(".local/bin").display());
+
+        let paths = command_home_paths_impl("agent", &home, &path_env);
+
+        assert_eq!(
+            paths,
+            vec![
+                home.join(".local/bin/agent"),
+                home.join(".local/share/agent/versions"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn command_home_paths_resolves_absolute_command() {
+        let home = command_home_fixture("abs");
+        let cmd = home.join(".local/bin/agent");
+
+        let paths =
+            command_home_paths_impl(cmd.to_str().unwrap(), &home, "/usr/bin");
+
+        assert_eq!(
+            paths,
+            vec![
+                home.join(".local/bin/agent"),
+                home.join(".local/share/agent/versions"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn command_home_paths_ignores_system_binaries() {
+        // A command outside $HOME needs no extra mounts.
+        let home = PathBuf::from("/home/definitely-not-this-user");
+        assert!(
+            command_home_paths_impl("sh", &home, "/usr/bin:/bin").is_empty()
+        );
+        assert!(
+            command_home_paths_impl("/bin/sh", &home, "/usr/bin").is_empty()
+        );
+    }
+
+    #[test]
+    fn command_home_paths_ignores_missing_and_relative_commands() {
+        let home = command_home_fixture("miss");
+        let path_env = home.join(".local/bin").display().to_string();
+
+        // Not on PATH at all.
+        assert!(
+            command_home_paths_impl("no-such-agent", &home, &path_env)
+                .is_empty()
+        );
+        // Relative-with-slash resolves against the project cwd, which
+        // is always mounted.
+        assert!(
+            command_home_paths_impl("./agent", &home, &path_env).is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn command_home_paths_survives_symlink_loops() {
+        // The chain walk is capped; a loop must not hang or panic.
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-cmd-home-loop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(bin.join("b"), bin.join("a")).unwrap();
+        std::os::unix::fs::symlink(bin.join("a"), bin.join("b")).unwrap();
+
+        let cmd = bin.join("a");
+        let paths = command_home_paths_impl(cmd.to_str().unwrap(), &home, "");
+
+        // Only the symlink hops are collected; no final dir exists.
+        assert!(paths.iter().all(|p| p.starts_with(&home)));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

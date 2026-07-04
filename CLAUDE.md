@@ -77,16 +77,17 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 10. Config hide (tmpfs over sensitive `~/.config/*` subdirs)
 11. Cache hide (tmpfs over sensitive `~/.cache/*` subdirs)
 12. Local overrides (`~/.local/state`, `~/.local/share/*` rw subdirs)
-13. Linked Git worktree metadata
-14. SSH agent socket and `~/.ssh` exemption mounts
-15. Pictures mount
-16. Browser profile state mount
-17. Extra user mounts (`--map`, `--rw-map`)
-18. Overlay maps (`--overlay-map` — copy-on-write `--overlay-src`/`--overlay`)
-19. Project directory (pwd, rw or ro depending on mode)
-20. Mask overlays (`--mask` and hidden project `.ai-jail`)
-21. Deny overlays (`--deny-path`, mode-000 file/dir placeholders)
-22. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last so it sits on top of the project mount that contains the upper/work layers)
+13. Command binary exemption (private-home only: ro-binds of the invoked command's `$HOME` install paths, so `--private-home claude` can exec an agent installed under the home directory)
+14. Linked Git worktree metadata
+15. SSH agent socket and `~/.ssh` exemption mounts
+16. Pictures mount
+17. Browser profile state mount
+18. Extra user mounts (`--map`, `--rw-map`)
+19. Overlay maps (`--overlay-map` — copy-on-write `--overlay-src`/`--overlay`)
+20. Project directory (pwd, rw or ro depending on mode)
+21. Mask overlays (`--mask` and hidden project `.ai-jail`)
+22. Deny overlays (`--deny-path`, mode-000 file/dir placeholders)
+23. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last so it sits on top of the project mount that contains the upper/work layers)
 
 Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts. Overlay maps come after the home/dotfile mounts (so an overlay on a home path sits on top). Mask and deny overlays come after the project mount so they override project-visible files. Overlay storage hide comes last, after the project mount, so it masks the upper/work layers the project mount would otherwise expose.
 
