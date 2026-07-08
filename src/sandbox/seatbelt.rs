@@ -186,6 +186,20 @@ fn generate_sbpl_profile(
     deny_paths.extend(explicit_deny_paths.clone());
     let writable_paths = macos_writable_paths(project_dir, config, lockdown);
     let atomic_paths = macos_atomic_write_paths(config);
+    // Read-only intents need explicit write denies: SBPL is
+    // last-match-wins, so an `--map` or `--overlay-map` path inside the
+    // project would otherwise stay writable through the project-subtree
+    // write allowance (#83). Overlay maps are read-only fallbacks on
+    // macOS (no overlayfs), so they get the same deny.
+    let mut write_deny_paths = explicit_deny_paths.clone();
+    write_deny_paths.extend(
+        config
+            .ro_maps
+            .iter()
+            .chain(config.overlay_maps.iter())
+            .filter(|p| super::path_exists(p))
+            .cloned(),
+    );
 
     let mut profile = String::new();
     profile.push_str("(version 1)\n");
@@ -205,7 +219,7 @@ fn generate_sbpl_profile(
         lockdown,
         &writable_paths,
         &atomic_paths,
-        &explicit_deny_paths,
+        &write_deny_paths,
     );
     push_docker_section(&mut profile, lockdown, enable_docker);
 
@@ -850,6 +864,58 @@ mod tests {
         let profile = generate_sbpl_profile(&config, &project, false, false);
         assert!(profile.contains("; File reads: restricted allow-list"));
         assert!(!profile.contains("(allow file-read*)\n"));
+    }
+
+    /// Regression for #83 on the macOS side: SBPL is last-match-wins,
+    /// so without an explicit write deny an `--map` (or `--overlay-map`)
+    /// path inside the project stays writable through the project
+    /// subtree's write allowance.
+    #[test]
+    fn ro_and_overlay_maps_get_write_denies_after_project_allow() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-seatbelt-ro-map-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let project = home.join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::create_dir_all(project.join("vendor")).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let config = Config {
+            ro_maps: vec![project.join(".git")],
+            overlay_maps: vec![project.join("vendor")],
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile(&config, &project, false, false);
+
+        let allow_project = format!(
+            "(allow file-write* (subpath \"{}\"))",
+            sbpl_path(&project)
+        );
+        let deny_ro_map = format!(
+            "(deny file-write* (subpath \"{}\"))",
+            sbpl_path(&project.join(".git"))
+        );
+        let deny_overlay = format!(
+            "(deny file-write* (subpath \"{}\"))",
+            sbpl_path(&project.join("vendor"))
+        );
+        let allow_at = profile
+            .find(&allow_project)
+            .expect("project write allowance present");
+        let deny_ro_at = profile
+            .find(&deny_ro_map)
+            .expect("ro map write deny present");
+        assert!(
+            profile.contains(&deny_overlay),
+            "overlay map write deny present (read-only fallback on macOS)"
+        );
+        assert!(
+            deny_ro_at > allow_at,
+            "write deny must come after the project allow (last match wins)"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

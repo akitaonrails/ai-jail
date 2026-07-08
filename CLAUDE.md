@@ -85,11 +85,13 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 18. Extra user mounts (`--map`, `--rw-map`)
 19. Overlay maps (`--overlay-map` — copy-on-write `--overlay-src`/`--overlay`)
 20. Project directory (pwd, rw or ro depending on mode)
-21. Mask overlays (`--mask` and hidden project `.ai-jail`)
-22. Deny overlays (`--deny-path`, mode-000 file/dir placeholders)
-23. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last so it sits on top of the project mount that contains the upper/work layers)
+21. In-project user mounts (`--map`/`--rw-map` paths inside the project dir, after the project bind so it cannot shadow them)
+22. In-project overlay maps (`--overlay-map` paths inside the project dir, same shadowing rule)
+23. Mask overlays (`--mask` and hidden project `.ai-jail`)
+24. Deny overlays (`--deny-path`, mode-000 file/dir placeholders)
+25. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last so it sits on top of the project mount that contains the upper/work layers)
 
-Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts. Overlay maps come after the home/dotfile mounts (so an overlay on a home path sits on top). Mask and deny overlays come after the project mount so they override project-visible files. Overlay storage hide comes last, after the project mount, so it masks the upper/work layers the project mount would otherwise expose.
+Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts. Overlay maps come after the home/dotfile mounts (so an overlay on a home path sits on top). User mounts and overlay maps whose destination sits **inside** the project directory are emitted after the project mount — bwrap gives the later mount precedence, so emitting them earlier lets the project bind silently shadow them (issue #83: `--map .git` stayed writable and in-project overlay writes hit the real files). Mask and deny overlays come after those so they still win. Overlay storage hide comes last, after the project mount, so it masks the upper/work layers the project mount would otherwise expose.
 
 ## Before Committing
 

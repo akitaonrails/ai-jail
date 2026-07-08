@@ -588,6 +588,13 @@ fn collect_normal_paths(
                 ));
             }
         }
+        // NOTE: an ro map inside the project dir cannot be enforced by
+        // Landlock — access rights are unioned across rules with no
+        // deny semantics, so the project's read-write rule always wins
+        // for its subtree. Read-only enforcement for such paths comes
+        // from the bwrap mount layer, which binds them ro on top of the
+        // project mount (#83); the ro rule here still covers maps
+        // outside the project.
         for p in &config.ro_maps {
             if super::path_exists(p) {
                 ro.push(p.clone());

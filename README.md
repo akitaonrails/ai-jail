@@ -454,7 +454,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | Flag | Description |
 |------|-------------|
 | `--rw-map <PATH>` | Mount PATH read-write (repeatable). Relative paths and `..` are resolved against the project directory, so `--rw-map ../sister-project` works from a project root. Mapping `/` is refused; map explicit subpaths instead. |
-| `--map <PATH>` | Mount PATH read-only (repeatable). Same path resolution as `--rw-map`. Mapping `/` is refused; map explicit subpaths instead. |
+| `--map <PATH>` | Mount PATH read-only (repeatable). Same path resolution as `--rw-map`. Works on paths **inside** the writable project too — `--map .git` keeps `.git` visible but read-only (enforced by mount ordering on Linux and a write-deny rule on macOS). Mapping `/` is refused; map explicit subpaths instead. |
 | `--overlay-map <PATH>` | Mount PATH **copy-on-write** (repeatable). The agent sees PATH read-write, but writes land on a side layer under `<project>/.ai-jail-overlays/` while PATH itself is never modified — so you can diff and selectively promote changes afterwards. Opt-in only. Linux/bwrap only; degrades to **read-only** (with a warning) on macOS, and is disabled under `--lockdown` / browser mode. See [Overlay maps](#overlay-maps). |
 | `--hide-dotdir <NAME>` | Never bind-mount the named home dotdir into the sandbox (e.g. `.my_secrets`). Leading dot is optional. Repeatable. Cannot hide dotdirs required for tool operation (`.cargo`, `.config`, `.cache`, etc.) — those emit a warning and stay visible. |
 | `--mask <PATH\|GLOB>` | Replace `PATH` or glob matches inside the sandbox with an empty file (or empty tmpfs if the path is a directory). Relative paths resolve against the project directory. Repeatable. Supports `*`, `?`, `[a-z]`, and recursive `**`; quote glob masks in your shell. Useful for hiding sensitive files like `.env`, `**/*.env`, `credentials.json` from AI agents while keeping the rest of the project accessible. Missing paths/unmatched globs are skipped with a warning. |
@@ -497,6 +497,10 @@ ai-jail --rw-map ~/Projects/shared-lib claude
 
 # Read-only access to reference data
 ai-jail --map /opt/datasets claude
+
+# Keep .git visible but read-only inside the writable project
+# (protects history and hooks from the agent)
+ai-jail --map .git claude
 
 # NixOS: ai-jail automatically follows /etc/hosts into /nix/store and
 # mounts /nix early enough for the private hosts override to work.

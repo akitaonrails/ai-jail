@@ -63,6 +63,20 @@ enum Mount {
 }
 
 impl Mount {
+    fn dest(&self) -> &Path {
+        match self {
+            Mount::RoBind { dest, .. }
+            | Mount::FileRoBind { dest, .. }
+            | Mount::Bind { dest, .. }
+            | Mount::DevBind { dest, .. }
+            | Mount::Dev { dest }
+            | Mount::Proc { dest }
+            | Mount::Tmpfs { dest }
+            | Mount::Symlink { dest, .. }
+            | Mount::Overlay { dest, .. } => dest,
+        }
+    }
+
     fn to_args(&self) -> Vec<String> {
         match self {
             Mount::RoBind { src, dest } | Mount::FileRoBind { src, dest } => {
@@ -150,6 +164,15 @@ struct MountSet {
     extra: Vec<Mount>,
     overlay: Vec<Mount>,
     project: Vec<Mount>,
+    /// `--map` / `--rw-map` mounts whose destination sits inside the
+    /// project directory. Applied after the project bind — bwrap gives
+    /// the later mount precedence, so emitting these earlier would let
+    /// the read-write project bind silently shadow them (#83).
+    extra_inside: Vec<Mount>,
+    /// `--overlay-map` mounts inside the project directory; same
+    /// shadowing rule as `extra_inside` (#83). Without this, writes
+    /// bypassed the copy-on-write layer and landed in the real files.
+    overlay_inside: Vec<Mount>,
     mask: Vec<Mount>,
     deny: Vec<Mount>,
     /// tmpfs that hides the on-host overlay upper/work storage from
@@ -159,7 +182,7 @@ struct MountSet {
 }
 
 impl MountSet {
-    fn ordered_mounts(&self) -> [&[Mount]; 23] {
+    fn ordered_mounts(&self) -> [&[Mount]; 25] {
         [
             &self.base,
             &self.sys_masks,
@@ -181,6 +204,8 @@ impl MountSet {
             &self.extra,
             &self.overlay,
             &self.project,
+            &self.extra_inside,
+            &self.overlay_inside,
             &self.mask,
             &self.deny,
             &self.overlay_hide,
@@ -1198,6 +1223,16 @@ fn discover_mounts_full(
     } else {
         overlay_mounts(&config.overlay_maps, project_dir, verbose)
     };
+    let (extra_outside, extra_inside) = if lockdown || browser_mode {
+        (vec![], vec![])
+    } else {
+        split_by_project(
+            extra_mounts(&config.rw_maps, &config.ro_maps),
+            project_dir,
+        )
+    };
+    let (overlay_outside, overlay_inside) =
+        split_by_project(overlay_mounts_v, project_dir);
 
     MountSet {
         base: discover_base(sources.hosts_mount, sources.resolv_mount),
@@ -1252,17 +1287,29 @@ fn discover_mounts_full(
         claude_env,
         pictures: pictures_mount,
         browser_state: browser_state_mount,
-        extra: if lockdown || browser_mode {
-            vec![]
-        } else {
-            extra_mounts(&config.rw_maps, &config.ro_maps)
-        },
-        overlay: overlay_mounts_v,
+        extra: extra_outside,
+        overlay: overlay_outside,
         project: project_mount(project_dir, lockdown || browser_mode),
+        extra_inside,
+        overlay_inside,
         mask: mask_mounts,
         deny: deny_mounts,
         overlay_hide: overlay_hide_v,
     }
+}
+
+/// Split mounts into (outside, inside) the project directory. A mount
+/// whose destination sits inside the project must be applied after the
+/// project bind: bwrap gives the later mount precedence, so emitting it
+/// earlier lets the project bind silently shadow it — `--map .git`
+/// stayed writable and `--overlay-map` writes hit the real files (#83).
+fn split_by_project(
+    mounts: Vec<Mount>,
+    project_dir: &Path,
+) -> (Vec<Mount>, Vec<Mount>) {
+    mounts
+        .into_iter()
+        .partition(|m| !m.dest().starts_with(project_dir))
 }
 
 /// SSH agent socket + ~/.ssh + tmpfs over /etc/ssh/ssh_config.d.
@@ -3040,6 +3087,144 @@ mod tests {
             m,
             Mount::Bind { src, dest } if src == &kiro_cli && dest == &kiro_cli
         )));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Index of the first exact `[flag, src, dest]` triple in the args.
+    fn mount_arg_index(args: &[String], flag: &str, path: &Path) -> usize {
+        let p = path.display().to_string();
+        args.windows(3)
+            .position(|w| w[0] == flag && w[1] == p && w[2] == p)
+            .unwrap_or_else(|| panic!("no `{flag} {p} {p}` in args"))
+    }
+
+    /// Regression for #83: an `--map` path inside the project must be
+    /// bound after the project mount, or bwrap's later project bind
+    /// silently shadows the read-only bind and the path stays writable.
+    #[test]
+    fn in_project_ro_map_binds_after_project_mount() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-map-order-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let project = home.join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::write(project.join(".ai-jail"), "").unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let config = Config {
+            ro_maps: vec![project.join(".git")],
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        let project_at = mount_arg_index(&args, "--bind", &project);
+        let ro_map_at =
+            mount_arg_index(&args, "--ro-bind", &project.join(".git"));
+        assert!(
+            ro_map_at > project_at,
+            "in-project ro map (idx {ro_map_at}) must come after the \
+             project bind (idx {project_at})"
+        );
+        // Mask overlays (the hidden project .ai-jail among them) must
+        // still stack above in-project maps.
+        let hide = project.join(".ai-jail");
+        let hide_at = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--ro-bind" && w[2] == hide.display().to_string()
+            })
+            .expect("hidden project .ai-jail bind present");
+        assert!(hide_at > ro_map_at);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn out_of_project_ro_map_stays_before_project_mount() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-map-order-out-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let project = home.join("project");
+        let outside = home.join("shared-data");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let config = Config {
+            ro_maps: vec![outside.clone()],
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        let project_at = mount_arg_index(&args, "--bind", &project);
+        let ro_map_at = mount_arg_index(&args, "--ro-bind", &outside);
+        assert!(ro_map_at < project_at);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Regression for #83's overlay sibling: an in-project overlay map
+    /// emitted before the project bind was shadowed by it, so writes
+    /// bypassed the copy-on-write layer and mutated the real files.
+    #[test]
+    fn in_project_overlay_map_mounts_after_project_mount() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-overlay-order-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let project = home.join("project");
+        std::fs::create_dir_all(project.join("vendor")).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let config = Config {
+            overlay_maps: vec![project.join("vendor")],
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        let project_at = mount_arg_index(&args, "--bind", &project);
+        let overlay_at = args
+            .iter()
+            .position(|a| a == "--overlay-src")
+            .expect("overlay args present");
+        assert!(
+            overlay_at > project_at,
+            "in-project overlay (idx {overlay_at}) must come after the \
+             project bind (idx {project_at})"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }
