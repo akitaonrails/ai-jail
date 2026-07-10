@@ -210,8 +210,25 @@ On Linux, this uses a tmpfs `$HOME`; on macOS, seatbelt rules deny normal
 host-home reads/writes instead.
 
 ```bash
-ai-jail --private-home claude
+ai-jail --private-home nvim
 ai-jail --private-home --rw-map ~/Downloads/test-data bash
+```
+
+**For AI agents, use the default mode** — it is designed for them: agent
+state (`~/.claude`, `~/.claude.json`, `~/.codex`, …) is mounted read-write
+so the agent stays logged in and configured, while sensitive dotdirs
+(`~/.gnupg`, `~/.aws`, `~/.ssh`, browser profiles) are never mounted and
+sensitive `~/.config` / `~/.cache` subdirs are hidden. Running an agent
+under `--private-home` starts it with no config and no credentials — that
+is the mode working as documented, not a bug (#84). If you deliberately
+want an agent inside a private home, grant its state once in the global
+config and it applies to every run of that command:
+
+```toml
+# ~/.ai-jail
+[commands.claude]
+private_home = true
+rw_maps = ["~/.claude", "~/.claude.json"]
 ```
 
 ### Defense-in-depth layers (Linux)
@@ -352,7 +369,7 @@ In browser profile mode, the project is mounted read-only, `$HOME` is private tm
 
 In `--private-home` mode, normal host dotdirs are not exposed, but the project remains read-write and explicit `--map` / `--rw-map` mounts still work. On Linux this is a private tmpfs `$HOME`; on macOS it is enforced with seatbelt read/write allowlists because `sandbox-exec` cannot create a replacement home mount. This is useful for non-agent or experimental workloads where you want normal project access without exposing your real `~/.config`, `~/.cache`, or tool state.
 
-One exemption keeps the mode usable: the command you invoke is resolved on the host, and if its binary lives under `$HOME` (the official Claude installer targets `~/.local/bin`, for example), the resolved symlink chain and install directory are mounted read-only so the agent can start. Programs become visible; config, cache, and state stay hidden. Tools that need more than their install directory at startup can be granted paths explicitly with `--map`.
+One exemption keeps the mode usable: the command you invoke is resolved on the host, and if its binary lives under `$HOME` (the official Claude installer targets `~/.local/bin`, for example), the resolved symlink chain and install directory are mounted read-only so the agent can start. Programs become visible; config, cache, and state stay hidden — an AI agent started this way is deliberately unconfigured and logged out (#84). The default mode is the intended way to run agents; to keep an agent usable inside a private home anyway, grant its state explicitly (once, via `[commands.<name>]` in the global config): e.g. `--rw-map ~/.claude --rw-map ~/.claude.json`.
 
 ### Home directory handling
 
