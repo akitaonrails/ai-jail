@@ -1,4 +1,6 @@
 use crate::config::Config;
+#[cfg(any(target_os = "macos", test))]
+use crate::config::MapSpec;
 use crate::output;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -837,15 +839,29 @@ pub fn build_launch_command(config: &Config) -> LaunchCommand {
 pub fn apply_landlock(
     config: &Config,
     project_dir: &Path,
+    mounted_ro_paths: &[PathBuf],
+    mounted_rw_paths: &[PathBuf],
     verbose: bool,
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        landlock::apply(config, project_dir, verbose)
+        landlock::apply(
+            config,
+            project_dir,
+            mounted_ro_paths,
+            mounted_rw_paths,
+            verbose,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (config, project_dir, verbose);
+        let _ = (
+            config,
+            project_dir,
+            mounted_ro_paths,
+            mounted_rw_paths,
+            verbose,
+        );
         Ok(())
     }
 }
@@ -900,6 +916,57 @@ pub fn platform_notes(config: &Config) {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn prepare_seatbelt_maps(
+    paths: &[PathBuf],
+    access: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let mut prepared = Vec::new();
+    for encoded in paths {
+        let spec = match MapSpec::parse(encoded) {
+            Ok(spec) => spec,
+            Err(reason) => {
+                output::warn(&format!(
+                    "Invalid {access} map {}: {reason}; skipping.",
+                    encoded.display()
+                ));
+                continue;
+            }
+        };
+        if let Err(reason) = spec.validate() {
+            output::warn(&format!(
+                "Invalid {access} map {}: {reason}; skipping.",
+                encoded.display()
+            ));
+            continue;
+        }
+        if spec.is_alternate() {
+            return Err(format!(
+                "alternate map destinations are not supported on macOS: {}; \
+                 use Linux/bubblewrap or map the path at its host location",
+                encoded.display()
+            ));
+        }
+        if !path_exists(&spec.source) {
+            output::warn(&format!(
+                "Path {} not found, skipping.",
+                spec.source.display()
+            ));
+            continue;
+        }
+        prepared.push(spec.encode());
+    }
+    Ok(prepared)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn prepare_seatbelt_config(config: &Config) -> Result<Config, String> {
+    let mut prepared = config.clone();
+    prepared.rw_maps = prepare_seatbelt_maps(&config.rw_maps, "read-write")?;
+    prepared.ro_maps = prepare_seatbelt_maps(&config.ro_maps, "read-only")?;
+    Ok(prepared)
+}
+
 pub fn build(
     guard: &SandboxGuard,
     config: &Config,
@@ -913,7 +980,8 @@ pub fn build(
     #[cfg(target_os = "macos")]
     {
         let _ = guard;
-        Ok(seatbelt::build(config, project_dir, verbose))
+        let prepared = prepare_seatbelt_config(config)?;
+        Ok(seatbelt::build(&prepared, project_dir, verbose))
     }
 }
 
@@ -930,7 +998,8 @@ pub fn dry_run(
     #[cfg(target_os = "macos")]
     {
         let _ = guard;
-        Ok(seatbelt::dry_run(config, project_dir, verbose))
+        let prepared = prepare_seatbelt_config(config)?;
+        Ok(seatbelt::dry_run(&prepared, project_dir, verbose))
     }
 }
 
@@ -949,6 +1018,50 @@ mod tests {
             .unwrap_or(0);
         std::env::temp_dir()
             .join(format!("ai-jail-{prefix}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn seatbelt_config_rejects_alternate_map_destinations() {
+        let config = Config {
+            ro_maps: vec![PathBuf::from("/host/data:/jail/data")],
+            ..Config::default()
+        };
+
+        let error = prepare_seatbelt_config(&config).unwrap_err();
+
+        assert!(error.contains("alternate map destinations"));
+        assert!(error.contains("Linux/bubblewrap"));
+    }
+
+    #[test]
+    fn seatbelt_config_keeps_existing_same_path_maps() {
+        let path = temp_test_dir("seatbelt-map-existing");
+        std::fs::create_dir_all(&path).unwrap();
+        let config = Config {
+            rw_maps: vec![path.clone()],
+            ..Config::default()
+        };
+
+        let prepared = prepare_seatbelt_config(&config).unwrap();
+
+        assert_eq!(prepared.rw_maps, vec![path.clone()]);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn seatbelt_config_skips_invalid_and_missing_same_path_maps() {
+        let config = Config {
+            ro_maps: vec![
+                PathBuf::from("/"),
+                PathBuf::from(":/invalid"),
+                PathBuf::from("/definitely/missing/ai-jail-map"),
+            ],
+            ..Config::default()
+        };
+
+        let prepared = prepare_seatbelt_config(&config).unwrap();
+
+        assert!(prepared.ro_maps.is_empty());
     }
 
     #[test]

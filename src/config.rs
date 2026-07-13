@@ -2,6 +2,8 @@ use crate::cli::CliArgs;
 use crate::output;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 const CONFIG_FILE: &str = ".ai-jail";
@@ -26,6 +28,99 @@ pub fn parse_browser_profile_spec(value: &str) -> Option<BrowserProfile> {
         "hard" | "isolated" | "ephemeral" => Some(BrowserProfile::Hard),
         "soft" | "persistent" | "survivable" => Some(BrowserProfile::Soft),
         _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct MapSpec {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+}
+
+#[allow(dead_code)]
+impl MapSpec {
+    pub fn parse(value: &Path) -> Result<Self, String> {
+        let bytes = value.as_os_str().as_bytes();
+        let Some(separator) = bytes.iter().position(|byte| *byte == b':')
+        else {
+            if bytes.is_empty() {
+                return Err("map has empty source and destination".into());
+            }
+            return Ok(Self {
+                source: value.to_path_buf(),
+                destination: value.to_path_buf(),
+            });
+        };
+
+        let source = &bytes[..separator];
+        let destination = &bytes[separator + 1..];
+        if source.is_empty() {
+            return Err("map has empty source".into());
+        }
+        if destination.is_empty() {
+            return Err("map has empty destination".into());
+        }
+
+        Ok(Self {
+            source: PathBuf::from(OsString::from_vec(source.to_vec())),
+            destination: PathBuf::from(OsString::from_vec(
+                destination.to_vec(),
+            )),
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.source.as_os_str().is_empty() {
+            return Err("map has empty source".into());
+        }
+        if self.destination.as_os_str().is_empty() {
+            return Err("map has empty destination".into());
+        }
+        if self.source.to_str().is_none() {
+            return Err("map source must be valid UTF-8".into());
+        }
+        if self.destination.to_str().is_none() {
+            return Err("map destination must be valid UTF-8".into());
+        }
+        if self.source == Path::new("/") {
+            return Err("map cannot use root source".into());
+        }
+        if self.destination == Path::new("/") {
+            return Err("map cannot use root destination".into());
+        }
+        Ok(())
+    }
+
+    pub fn is_alternate(&self) -> bool {
+        self.source != self.destination
+    }
+
+    pub fn encode(&self) -> PathBuf {
+        if !self.is_alternate() {
+            return self.source.clone();
+        }
+
+        let mut encoded = self.source.as_os_str().as_bytes().to_vec();
+        encoded.push(b':');
+        encoded.extend_from_slice(self.destination.as_os_str().as_bytes());
+        PathBuf::from(OsString::from_vec(encoded))
+    }
+}
+
+fn transform_map_specs(
+    paths: &mut [PathBuf],
+    mut transform: impl FnMut(PathBuf) -> PathBuf,
+) {
+    for path in paths {
+        let Ok(spec) = MapSpec::parse(path) else {
+            continue;
+        };
+        *path = MapSpec {
+            source: transform(spec.source),
+            destination: transform(spec.destination),
+        }
+        .encode();
     }
 }
 
@@ -447,8 +542,8 @@ fn save_to_path(path: &Path, config: &Config) {
 }
 
 fn collapse_tilde_config(config: &mut Config) {
-    collapse_tilde_vec(&mut config.rw_maps);
-    collapse_tilde_vec(&mut config.ro_maps);
+    transform_map_specs(&mut config.rw_maps, |path| collapse_tilde(&path));
+    transform_map_specs(&mut config.ro_maps, |path| collapse_tilde(&path));
     collapse_tilde_vec(&mut config.overlay_maps);
     collapse_tilde_vec(&mut config.mask);
     collapse_tilde_vec(&mut config.deny_paths);
@@ -572,8 +667,8 @@ fn absolutize_vec(paths: &mut [PathBuf], base: &Path) {
 /// a relative path which it silently rejects, leaving the mount
 /// invisible inside the sandbox (issue #54).
 pub fn absolutize_user_paths(config: &mut Config, cwd: &Path) {
-    absolutize_vec(&mut config.rw_maps, cwd);
-    absolutize_vec(&mut config.ro_maps, cwd);
+    transform_map_specs(&mut config.rw_maps, |path| to_absolute(path, cwd));
+    transform_map_specs(&mut config.ro_maps, |path| to_absolute(path, cwd));
     absolutize_vec(&mut config.overlay_maps, cwd);
 }
 
@@ -701,8 +796,8 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     // Config files are TOML (no shell expansion); CLI args are
     // shell-expanded already but harmless to re-run. Only leading
     // tilde is recognized; `~user` is left alone.
-    expand_tilde_vec(&mut config.rw_maps);
-    expand_tilde_vec(&mut config.ro_maps);
+    transform_map_specs(&mut config.rw_maps, expand_tilde);
+    transform_map_specs(&mut config.ro_maps, expand_tilde);
     expand_tilde_vec(&mut config.overlay_maps);
     expand_tilde_vec(&mut config.mask);
     expand_tilde_vec(&mut config.deny_paths);
@@ -895,6 +990,104 @@ mod tests {
     // ── Parsing tests ──────────────────────────────────────────
 
     #[test]
+    fn map_spec_parses_same_path_and_alternate_destination() {
+        let same = MapSpec::parse(Path::new("/opt/data")).unwrap();
+        assert_eq!(same.source, PathBuf::from("/opt/data"));
+        assert_eq!(same.destination, PathBuf::from("/opt/data"));
+        assert!(!same.is_alternate());
+
+        let alternate =
+            MapSpec::parse(Path::new("/host/data:/jail/data:copy")).unwrap();
+        assert_eq!(alternate.source, PathBuf::from("/host/data"));
+        assert_eq!(alternate.destination, PathBuf::from("/jail/data:copy"));
+        assert!(alternate.is_alternate());
+    }
+
+    #[test]
+    fn map_spec_rejects_empty_components_and_root() {
+        let error = MapSpec::parse(Path::new(":/jail")).unwrap_err();
+        assert!(error.contains("empty source"));
+
+        let error = MapSpec::parse(Path::new("/host:")).unwrap_err();
+        assert!(error.contains("empty destination"));
+
+        let root_source = MapSpec::parse(Path::new("/:/jail")).unwrap();
+        let error = root_source.validate().unwrap_err();
+        assert!(error.contains("root source"));
+
+        let root_destination = MapSpec::parse(Path::new("/host:/")).unwrap();
+        let error = root_destination.validate().unwrap_err();
+        assert!(error.contains("root destination"));
+    }
+
+    #[test]
+    fn map_spec_validate_rejects_empty_components() {
+        let empty_source = MapSpec {
+            source: PathBuf::new(),
+            destination: PathBuf::from("/jail"),
+        };
+        let error = empty_source.validate().unwrap_err();
+        assert!(error.contains("empty source"));
+
+        let empty_destination = MapSpec {
+            source: PathBuf::from("/host"),
+            destination: PathBuf::new(),
+        };
+        let error = empty_destination.validate().unwrap_err();
+        assert!(error.contains("empty destination"));
+    }
+
+    #[test]
+    fn map_spec_encoding_keeps_legacy_shape() {
+        let same = MapSpec {
+            source: PathBuf::from("/opt/data"),
+            destination: PathBuf::from("/opt/data"),
+        };
+        assert_eq!(same.encode(), PathBuf::from("/opt/data"));
+
+        let alternate = MapSpec {
+            source: PathBuf::from("/host/data"),
+            destination: PathBuf::from("/jail/data"),
+        };
+        assert_eq!(alternate.encode(), PathBuf::from("/host/data:/jail/data"));
+    }
+
+    #[test]
+    fn map_spec_preserves_but_rejects_non_utf8_bytes() {
+        fn assert_rejected(
+            encoded_bytes: &[u8],
+            source: &[u8],
+            destination: &[u8],
+            component: &str,
+        ) {
+            let encoded =
+                PathBuf::from(OsString::from_vec(encoded_bytes.to_vec()));
+            let map = MapSpec::parse(&encoded).unwrap();
+
+            assert_eq!(map.source.as_os_str().as_bytes(), source);
+            assert_eq!(map.destination.as_os_str().as_bytes(), destination);
+            assert_eq!(map.encode().as_os_str().as_bytes(), encoded_bytes);
+
+            let error = map.validate().unwrap_err();
+            assert!(error.contains(component), "unexpected error: {error}");
+            assert!(error.contains("UTF-8"), "unexpected error: {error}");
+        }
+
+        assert_rejected(
+            b"/host/\xff/data:/jail/data",
+            b"/host/\xff/data",
+            b"/jail/data",
+            "source",
+        );
+        assert_rejected(
+            b"/host/data:/jail/\xfe/data:copy",
+            b"/host/data",
+            b"/jail/\xfe/data:copy",
+            "destination",
+        );
+    }
+
+    #[test]
     fn parse_minimal_config() {
         let cfg = parse_toml("").unwrap();
         assert!(cfg.command.is_empty());
@@ -967,6 +1160,19 @@ lockdown = true
 
     // ── Backward compatibility regression tests ────────────────
     // NEVER DELETE THESE. Add new ones when the format changes.
+
+    #[test]
+    fn regression_pre_alternate_destination_map_format() {
+        let toml = r#"
+command = ["claude"]
+rw_maps = ["/tmp/shared"]
+ro_maps = ["~/.ssh"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+
+        assert_eq!(cfg.rw_maps, vec![PathBuf::from("/tmp/shared")]);
+        assert_eq!(cfg.ro_maps, vec![PathBuf::from("~/.ssh")]);
+    }
 
     #[test]
     fn regression_v0_1_0_config_format() {
@@ -1424,6 +1630,31 @@ no_gpu = true
         assert_eq!(
             merged.ro_maps,
             vec![PathBuf::from("/opt/x"), PathBuf::from("/opt/y")]
+        );
+    }
+
+    #[test]
+    fn merge_deduplicates_complete_map_specifications() {
+        let existing = Config {
+            rw_maps: vec![PathBuf::from("/host/data:/jail/one")],
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            rw_maps: vec![
+                PathBuf::from("/host/data:/jail/one"),
+                PathBuf::from("/host/data:/jail/two"),
+            ],
+            ..CliArgs::default()
+        };
+
+        let merged = merge(&cli, existing);
+
+        assert_eq!(
+            merged.rw_maps,
+            vec![
+                PathBuf::from("/host/data:/jail/one"),
+                PathBuf::from("/host/data:/jail/two"),
+            ]
         );
     }
 
@@ -2822,6 +3053,23 @@ hide_dotdirs = [".my_secrets"]
         assert_eq!(merged.mask, vec![PathBuf::from("/home/user/secret.env")]);
     }
 
+    #[test]
+    fn merge_expands_tilde_on_both_map_sides() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::set("HOME", "/home/user");
+        let existing = Config {
+            ro_maps: vec![PathBuf::from("~/.ssh/ai-jail:~/.ssh")],
+            ..Config::default()
+        };
+
+        let merged = merge(&CliArgs::default(), existing);
+
+        assert_eq!(
+            merged.ro_maps,
+            vec![PathBuf::from("/home/user/.ssh/ai-jail:/home/user/.ssh")]
+        );
+    }
+
     // ── Relative-path resolution tests (issue #54) ────────────
 
     #[test]
@@ -2950,6 +3198,37 @@ hide_dotdirs = [".my_secrets"]
         assert_eq!(config.ro_maps, vec![PathBuf::from("/opt/data")]);
     }
 
+    #[test]
+    fn absolutize_user_paths_resolves_both_map_sides() {
+        let mut config = Config {
+            rw_maps: vec![PathBuf::from("../shared:vendor/shared")],
+            ..Config::default()
+        };
+
+        absolutize_user_paths(&mut config, Path::new("/work/project"));
+
+        assert_eq!(
+            config.rw_maps,
+            vec![PathBuf::from("/work/shared:/work/project/vendor/shared")]
+        );
+    }
+
+    #[test]
+    fn alternate_map_absolutization_is_idempotent() {
+        let mut config = Config {
+            rw_maps: vec![PathBuf::from("/host/data:/jail/data")],
+            ..Config::default()
+        };
+
+        absolutize_user_paths(&mut config, Path::new("/first"));
+        absolutize_user_paths(&mut config, Path::new("/second"));
+
+        assert_eq!(
+            config.rw_maps,
+            vec![PathBuf::from("/host/data:/jail/data")]
+        );
+    }
+
     // ── Tilde collapse tests (issue #52) ──────────────────────
 
     #[test]
@@ -3016,7 +3295,10 @@ hide_dotdirs = [".my_secrets"]
         let cfg = Config {
             command: vec!["claude".into()],
             // These are expanded as if they had passed through merge().
-            rw_maps: vec![PathBuf::from("/home/user/.claude")],
+            rw_maps: vec![
+                PathBuf::from("/home/user/.claude"),
+                PathBuf::from("/home/user/.ssh/ai-jail:/home/user/.ssh"),
+            ],
             ro_maps: vec![PathBuf::from("/home/user/.bashrc")],
             mask: vec![PathBuf::from("/home/user/secret.env")],
             claude_dir: Some(PathBuf::from("/home/user/.claude-work")),
@@ -3029,6 +3311,10 @@ hide_dotdirs = [".my_secrets"]
             written.contains("\"~/.claude\""),
             "expected ~/.claude in TOML, got:\n{written}"
         );
+        assert!(
+            written.contains("\"~/.ssh/ai-jail:~/.ssh\""),
+            "alternate map not collapsed: {written}"
+        );
         assert!(written.contains("\"~/.bashrc\""), "rw_maps not collapsed");
         assert!(written.contains("\"~/secret.env\""), "mask not collapsed");
         assert!(
@@ -3039,7 +3325,13 @@ hide_dotdirs = [".my_secrets"]
         // should yield the same absolute paths we started with.
         let parsed = parse_toml(&written).unwrap();
         let merged = merge(&CliArgs::default(), parsed);
-        assert_eq!(merged.rw_maps, vec![PathBuf::from("/home/user/.claude")]);
+        assert_eq!(
+            merged.rw_maps,
+            vec![
+                PathBuf::from("/home/user/.claude"),
+                PathBuf::from("/home/user/.ssh/ai-jail:/home/user/.ssh"),
+            ]
+        );
         assert_eq!(merged.ro_maps, vec![PathBuf::from("/home/user/.bashrc")]);
         assert_eq!(merged.mask, vec![PathBuf::from("/home/user/secret.env")]);
         assert_eq!(

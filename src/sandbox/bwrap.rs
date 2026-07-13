@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, MapSpec};
 use crate::output;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -135,6 +135,28 @@ impl Mount {
             }
         }
     }
+}
+
+fn mounted_map_args<'a>(
+    mounts: impl IntoIterator<Item = &'a Mount>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    for mount in mounts {
+        match mount {
+            Mount::RoBind { dest, .. } => {
+                // Internal flags carry mounted destinations opaquely; public
+                // map flags would reinterpret ':' as source/destination syntax.
+                args.push("--landlock-ro-path".into());
+                args.push(dest.display().to_string());
+            }
+            Mount::Bind { dest, .. } => {
+                args.push("--landlock-rw-path".into());
+                args.push(dest.display().to_string());
+            }
+            _ => {}
+        }
+    }
+    args
 }
 
 struct MountSet {
@@ -876,7 +898,11 @@ fn resolve_landlock_wrapper(
     }
 }
 
-fn landlock_wrapper_args(config: &Config, verbose: bool) -> Vec<String> {
+fn landlock_wrapper_args(
+    config: &Config,
+    map_args: &[String],
+    verbose: bool,
+) -> Vec<String> {
     let mut args = vec![
         LANDLOCK_WRAPPER_DEST.into(),
         "--landlock-exec".into(),
@@ -940,14 +966,7 @@ fn landlock_wrapper_args(config: &Config, verbose: bool) -> Vec<String> {
     }
 
     if config.browser_profile().is_none() {
-        for path in &config.rw_maps {
-            args.push("--rw-map".into());
-            args.push(path.display().to_string());
-        }
-        for path in &config.ro_maps {
-            args.push("--map".into());
-            args.push(path.display().to_string());
-        }
+        args.extend_from_slice(map_args);
     }
     for path in &config.mask {
         args.push("--mask".into());
@@ -979,6 +998,9 @@ pub fn build(
     let sources = MountSources::from_guard(guard);
     let mount_set =
         discover_mounts_full(config, project_dir, &sources, verbose);
+    let map_args = mounted_map_args(
+        mount_set.extra.iter().chain(mount_set.extra_inside.iter()),
+    );
     let lockdown = config.lockdown_enabled();
     let bwrap = bwrap_program_for_exec();
     let launch = super::build_launch_command(config);
@@ -1022,7 +1044,7 @@ pub fn build(
     cmd.arg("--");
 
     if wrapper.is_some() {
-        for arg in landlock_wrapper_args(config, verbose) {
+        for arg in landlock_wrapper_args(config, &map_args, verbose) {
             cmd.arg(arg);
         }
     }
@@ -1066,6 +1088,9 @@ fn build_dry_run_args_full(
     verbose: bool,
 ) -> Result<Vec<String>, String> {
     let mount_set = discover_mounts_full(config, project_dir, sources, verbose);
+    let map_args = mounted_map_args(
+        mount_set.extra.iter().chain(mount_set.extra_inside.iter()),
+    );
     let lockdown = config.lockdown_enabled();
     let launch = super::build_launch_command(config);
     let mut args: Vec<String> =
@@ -1092,7 +1117,7 @@ fn build_dry_run_args_full(
     args.push("--".into());
 
     if wrapper.is_some() {
-        args.extend(landlock_wrapper_args(config, verbose));
+        args.extend(landlock_wrapper_args(config, &map_args, verbose));
     }
 
     args.push(launch.program);
@@ -2131,6 +2156,27 @@ fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
     extra_mounts_with_check(rw_maps, ro_maps, super::path_exists)
 }
 
+fn parse_extra_map(encoded: &Path, access: &str) -> Option<MapSpec> {
+    let spec = match MapSpec::parse(encoded) {
+        Ok(spec) => spec,
+        Err(reason) => {
+            output::warn(&format!(
+                "Invalid {access} map {}: {reason}; skipping.",
+                encoded.display()
+            ));
+            return None;
+        }
+    };
+    if let Err(reason) = spec.validate() {
+        output::warn(&format!(
+            "Invalid {access} map {}: {reason}; skipping.",
+            encoded.display()
+        ));
+        return None;
+    }
+    Some(spec)
+}
+
 /// Inner implementation of [`extra_mounts`] that accepts an injectable
 /// path-existence predicate. This makes the logic unit-testable in hermetic
 /// environments (e.g. the Nix build sandbox) where host paths like `/usr`
@@ -2146,42 +2192,36 @@ fn extra_mounts_with_check(
     // rw-subdirectory override an ro-parent, e.g.:
     //   --map ~/Projects --rw-map ~/Projects/ai-jail
     // makes ~/Projects read-only except the ai-jail subdir.
-    for path in ro_maps {
-        if path == Path::new("/") {
-            output::warn(
-                "Refusing to map / as an extra read-only mount; map explicit subpaths instead.",
-            );
+    for encoded in ro_maps {
+        let Some(spec) = parse_extra_map(encoded, "read-only") else {
             continue;
-        }
-        if path_exists(path) {
+        };
+        if path_exists(&spec.source) {
             mounts.push(Mount::RoBind {
-                src: path.clone(),
-                dest: path.clone(),
+                src: spec.source,
+                dest: spec.destination,
             });
         } else {
             output::warn(&format!(
                 "Path {} not found, skipping.",
-                path.display()
+                spec.source.display()
             ));
         }
     }
 
-    for path in rw_maps {
-        if path == Path::new("/") {
-            output::warn(
-                "Refusing to map / as an extra read-write mount; map explicit subpaths instead.",
-            );
+    for encoded in rw_maps {
+        let Some(spec) = parse_extra_map(encoded, "read-write") else {
             continue;
-        }
-        if path_exists(path) {
+        };
+        if path_exists(&spec.source) {
             mounts.push(Mount::Bind {
-                src: path.clone(),
-                dest: path.clone(),
+                src: spec.source,
+                dest: spec.destination,
             });
         } else {
             output::warn(&format!(
                 "Path {} not found, skipping.",
-                path.display()
+                spec.source.display()
             ));
         }
     }
@@ -2376,6 +2416,30 @@ mod tests {
             dest: "/tmp".into(),
         };
         assert_eq!(m.to_args(), vec!["--bind", "/tmp", "/tmp"]);
+    }
+
+    #[test]
+    fn mounted_map_args_forward_only_destinations() {
+        let mounts = [
+            Mount::RoBind {
+                src: "/host/ro".into(),
+                dest: "/jail/ro".into(),
+            },
+            Mount::Bind {
+                src: "/host/rw".into(),
+                dest: "/jail/rw".into(),
+            },
+        ];
+
+        assert_eq!(
+            mounted_map_args(&mounts),
+            vec![
+                "--landlock-ro-path",
+                "/jail/ro",
+                "--landlock-rw-path",
+                "/jail/rw",
+            ]
+        );
     }
 
     #[test]
@@ -3044,6 +3108,65 @@ mod tests {
     }
 
     #[test]
+    fn extra_mounts_use_alternate_source_and_destination() {
+        let ro = vec![PathBuf::from("/host/ro:/jail/ro")];
+        let rw = vec![PathBuf::from("/host/rw:/jail/rw")];
+
+        let mounts =
+            extra_mounts_with_check(&rw, &ro, |path| path.starts_with("/host"));
+
+        assert_eq!(mounts.len(), 2);
+        assert!(matches!(
+            &mounts[0],
+            Mount::RoBind { src, dest }
+                if src == Path::new("/host/ro")
+                    && dest == Path::new("/jail/ro")
+        ));
+        assert!(matches!(
+            &mounts[1],
+            Mount::Bind { src, dest }
+                if src == Path::new("/host/rw")
+                    && dest == Path::new("/jail/rw")
+        ));
+    }
+
+    #[test]
+    fn extra_mounts_check_source_and_reject_invalid_specs() {
+        let ro = vec![
+            PathBuf::from("/missing:/existing"),
+            PathBuf::from(":/invalid"),
+        ];
+        let rw = vec![PathBuf::from("/host:/")];
+        let checked = std::cell::RefCell::new(Vec::new());
+
+        let mounts = extra_mounts_with_check(&rw, &ro, |path| {
+            checked.borrow_mut().push(path.to_path_buf());
+            false
+        });
+
+        assert!(mounts.is_empty());
+        assert_eq!(checked.into_inner(), vec![PathBuf::from("/missing")]);
+    }
+
+    #[test]
+    fn extra_mounts_reject_non_utf8_before_source_check() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let ro = vec![PathBuf::from(std::ffi::OsString::from_vec(
+            b"/host/ro:/jail/\xff".to_vec(),
+        ))];
+        let checks = std::cell::Cell::new(0);
+
+        let mounts = extra_mounts_with_check(&[], &ro, |_| {
+            checks.set(checks.get() + 1);
+            true
+        });
+
+        assert!(mounts.is_empty());
+        assert_eq!(checks.get(), 0);
+    }
+
+    #[test]
     fn extra_mounts_refuses_root_maps() {
         // Use |_| true so real host paths aren't required (hermetic in
         // the Nix sandbox). The invariant under test is that "/" entries
@@ -3092,11 +3215,17 @@ mod tests {
     }
 
     /// Index of the first exact `[flag, src, dest]` triple in the args.
-    fn mount_arg_index(args: &[String], flag: &str, path: &Path) -> usize {
-        let p = path.display().to_string();
+    fn mount_arg_index(
+        args: &[String],
+        flag: &str,
+        src: &Path,
+        dest: &Path,
+    ) -> usize {
+        let src = src.display().to_string();
+        let dest = dest.display().to_string();
         args.windows(3)
-            .position(|w| w[0] == flag && w[1] == p && w[2] == p)
-            .unwrap_or_else(|| panic!("no `{flag} {p} {p}` in args"))
+            .position(|w| w[0] == flag && w[1] == src && w[2] == dest)
+            .unwrap_or_else(|| panic!("no `{flag} {src} {dest}` in args"))
     }
 
     /// Regression for #83: an `--map` path inside the project must be
@@ -3129,9 +3258,9 @@ mod tests {
         )
         .unwrap();
 
-        let project_at = mount_arg_index(&args, "--bind", &project);
-        let ro_map_at =
-            mount_arg_index(&args, "--ro-bind", &project.join(".git"));
+        let project_at = mount_arg_index(&args, "--bind", &project, &project);
+        let git = project.join(".git");
+        let ro_map_at = mount_arg_index(&args, "--ro-bind", &git, &git);
         assert!(
             ro_map_at > project_at,
             "in-project ro map (idx {ro_map_at}) must come after the \
@@ -3179,9 +3308,56 @@ mod tests {
         )
         .unwrap();
 
-        let project_at = mount_arg_index(&args, "--bind", &project);
-        let ro_map_at = mount_arg_index(&args, "--ro-bind", &outside);
+        let project_at = mount_arg_index(&args, "--bind", &project, &project);
+        let ro_map_at = mount_arg_index(&args, "--ro-bind", &outside, &outside);
         assert!(ro_map_at < project_at);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn alternate_destination_inside_project_binds_after_project() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-alternate-map-order-home-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let project = home.join("project");
+        let source = home.join("shared-data");
+        let destination = project.join("vendor/shared");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let config = Config {
+            ro_maps: vec![PathBuf::from(format!(
+                "{}:{}",
+                source.display(),
+                destination.display()
+            ))],
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        let project_at = mount_arg_index(&args, "--bind", &project, &project);
+        let ro_map_at =
+            mount_arg_index(&args, "--ro-bind", &source, &destination);
+        assert!(
+            ro_map_at > project_at,
+            "alternate in-project destination (idx {ro_map_at}) must come \
+             after the project bind (idx {project_at})"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -3215,7 +3391,7 @@ mod tests {
         )
         .unwrap();
 
-        let project_at = mount_arg_index(&args, "--bind", &project);
+        let project_at = mount_arg_index(&args, "--bind", &project, &project);
         let overlay_at = args
             .iter()
             .position(|a| a == "--overlay-src")
@@ -3994,13 +4170,117 @@ mod tests {
         config.lockdown = Some(true);
         config.allow_tcp_ports = vec![32000, 8080];
 
-        let wrapper_args = landlock_wrapper_args(&config, false);
+        let wrapper_args = landlock_wrapper_args(&config, &[], false);
         let port_args: Vec<_> = wrapper_args
             .windows(2)
             .filter(|w| w[0] == "--allow-tcp-port")
             .map(|w| w[1].clone())
             .collect();
         assert_eq!(port_args, vec!["32000", "8080"]);
+    }
+
+    #[test]
+    fn landlock_wrapper_forwards_only_successfully_mounted_destinations() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-landlock-wrapper-maps-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        let source = root.join("source");
+        let destination = project.join("destination");
+        let missing_source = root.join("missing-source");
+        let missing_destination = project.join("missing-destination");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+
+        let config = Config {
+            rw_maps: vec![
+                MapSpec {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                }
+                .encode(),
+                MapSpec {
+                    source: missing_source.clone(),
+                    destination: missing_destination.clone(),
+                }
+                .encode(),
+            ],
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        let wrapper_args = &args[separator + 1..];
+
+        assert!(wrapper_args.windows(2).any(|args| {
+            args[0] == "--landlock-rw-path"
+                && args[1] == destination.display().to_string()
+        }));
+        assert!(!wrapper_args.contains(&source.display().to_string()));
+        assert!(!wrapper_args.contains(&missing_source.display().to_string()));
+        assert!(
+            !wrapper_args.contains(&missing_destination.display().to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn landlock_wrapper_keeps_colon_destination_opaque() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-landlock-wrapper-colon-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        let source = root.join("source");
+        let destination = project.join("name:/etc");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+
+        let config = Config {
+            rw_maps: vec![
+                MapSpec {
+                    source,
+                    destination: destination.clone(),
+                }
+                .encode(),
+            ],
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        let wrapper_args = &args[separator + 1..];
+
+        assert!(wrapper_args.windows(2).any(|args| {
+            args[0] == "--landlock-rw-path"
+                && args[1] == destination.display().to_string()
+        }));
+        assert!(!wrapper_args.contains(&"--rw-map".to_string()));
+        assert!(!wrapper_args.contains(&"--map".to_string()));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4011,7 +4291,7 @@ mod tests {
         config.rw_maps = vec![PathBuf::from("/tmp/browser-rw")];
         config.ro_maps = vec![PathBuf::from("/tmp/browser-ro")];
 
-        let wrapper_args = landlock_wrapper_args(&config, false);
+        let wrapper_args = landlock_wrapper_args(&config, &[], false);
 
         assert!(!wrapper_args.contains(&"--rw-map".into()));
         assert!(!wrapper_args.contains(&"--map".into()));
