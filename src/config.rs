@@ -32,13 +32,11 @@ pub fn parse_browser_profile_spec(value: &str) -> Option<BrowserProfile> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct MapSpec {
     pub source: PathBuf,
     pub destination: PathBuf,
 }
 
-#[allow(dead_code)]
 impl MapSpec {
     pub fn parse(value: &Path) -> Result<Self, String> {
         let bytes = value.as_os_str().as_bytes();
@@ -94,6 +92,26 @@ impl MapSpec {
 
     pub fn is_alternate(&self) -> bool {
         self.source != self.destination
+    }
+
+    /// Parse and validate an encoded map entry, warning and returning
+    /// `None` on malformed input (warn-and-skip convention). `label`
+    /// names the map kind in the warning, e.g. "read-only".
+    pub fn parse_validated(encoded: &Path, label: &str) -> Option<Self> {
+        let parsed = Self::parse(encoded).and_then(|spec| {
+            spec.validate()?;
+            Ok(spec)
+        });
+        match parsed {
+            Ok(spec) => Some(spec),
+            Err(reason) => {
+                output::warn(&format!(
+                    "Invalid {label} map {}: {reason}; skipping.",
+                    encoded.display()
+                ));
+                None
+            }
+        }
     }
 
     pub fn encode(&self) -> PathBuf {

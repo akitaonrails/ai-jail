@@ -923,23 +923,9 @@ fn prepare_seatbelt_maps(
 ) -> Result<Vec<PathBuf>, String> {
     let mut prepared = Vec::new();
     for encoded in paths {
-        let spec = match MapSpec::parse(encoded) {
-            Ok(spec) => spec,
-            Err(reason) => {
-                output::warn(&format!(
-                    "Invalid {access} map {}: {reason}; skipping.",
-                    encoded.display()
-                ));
-                continue;
-            }
-        };
-        if let Err(reason) = spec.validate() {
-            output::warn(&format!(
-                "Invalid {access} map {}: {reason}; skipping.",
-                encoded.display()
-            ));
+        let Some(spec) = MapSpec::parse_validated(encoded, access) else {
             continue;
-        }
+        };
         if spec.is_alternate() {
             return Err(format!(
                 "alternate map destinations are not supported on macOS: {}; \

@@ -2156,27 +2156,6 @@ fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
     extra_mounts_with_check(rw_maps, ro_maps, super::path_exists)
 }
 
-fn parse_extra_map(encoded: &Path, access: &str) -> Option<MapSpec> {
-    let spec = match MapSpec::parse(encoded) {
-        Ok(spec) => spec,
-        Err(reason) => {
-            output::warn(&format!(
-                "Invalid {access} map {}: {reason}; skipping.",
-                encoded.display()
-            ));
-            return None;
-        }
-    };
-    if let Err(reason) = spec.validate() {
-        output::warn(&format!(
-            "Invalid {access} map {}: {reason}; skipping.",
-            encoded.display()
-        ));
-        return None;
-    }
-    Some(spec)
-}
-
 /// Inner implementation of [`extra_mounts`] that accepts an injectable
 /// path-existence predicate. This makes the logic unit-testable in hermetic
 /// environments (e.g. the Nix build sandbox) where host paths like `/usr`
@@ -2193,7 +2172,7 @@ fn extra_mounts_with_check(
     //   --map ~/Projects --rw-map ~/Projects/ai-jail
     // makes ~/Projects read-only except the ai-jail subdir.
     for encoded in ro_maps {
-        let Some(spec) = parse_extra_map(encoded, "read-only") else {
+        let Some(spec) = MapSpec::parse_validated(encoded, "read-only") else {
             continue;
         };
         if path_exists(&spec.source) {
@@ -2210,7 +2189,7 @@ fn extra_mounts_with_check(
     }
 
     for encoded in rw_maps {
-        let Some(spec) = parse_extra_map(encoded, "read-write") else {
+        let Some(spec) = MapSpec::parse_validated(encoded, "read-write") else {
             continue;
         };
         if path_exists(&spec.source) {

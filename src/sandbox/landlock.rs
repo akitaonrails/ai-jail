@@ -371,44 +371,15 @@ fn collect_lockdown_paths(
 /// (mise, npm, cargo, etc.). Optional passthrough for Docker,
 /// GPU, and display sockets is controlled by config flags.
 ///
+/// Extra user maps arrive as `mounted_ro_paths` / `mounted_rw_paths`:
+/// destinations already mounted by bwrap, forwarded through opaque
+/// internal flags. They must never be reparsed as public map specs.
+///
 /// Security invariant: even with broad Landlock access, bwrap's
 /// mount namespace hides paths not explicitly bind-mounted. The
 /// two layers are complementary — Landlock prevents writes to
 /// ro-bind-mounted paths, bwrap prevents access to unmounted
 /// paths.
-#[cfg(test)]
-fn collect_normal_paths(
-    config: &Config,
-    project_dir: &Path,
-    verbose: bool,
-) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let (mounted_ro_paths, mounted_rw_paths) =
-        if config.browser_profile().is_some() {
-            (Vec::new(), Vec::new())
-        } else {
-            let rw = config
-                .rw_maps
-                .iter()
-                .filter_map(|path| landlock_map_destination(path, "rw"))
-                .collect();
-            let ro = config
-                .ro_maps
-                .iter()
-                .filter_map(|path| landlock_map_destination(path, "ro"))
-                .collect();
-            (ro, rw)
-        };
-    collect_normal_paths_with_mounted_paths(
-        config,
-        project_dir,
-        &mounted_ro_paths,
-        &mounted_rw_paths,
-        verbose,
-    )
-}
-
-/// Collect normal-mode paths using destinations already mounted by bwrap.
-/// These paths are opaque and must never be reparsed as public map specs.
 fn collect_normal_paths_with_mounted_paths(
     config: &Config,
     project_dir: &Path,
@@ -771,28 +742,6 @@ fn collect_normal_paths_with_mounted_paths(
     (ro, rw)
 }
 
-#[cfg(test)]
-fn landlock_map_destination(encoded: &Path, access: &str) -> Option<PathBuf> {
-    let spec = match MapSpec::parse(encoded) {
-        Ok(spec) => spec,
-        Err(reason) => {
-            output::warn(&format!(
-                "Landlock: invalid {access} map {}: {reason}; skipping",
-                encoded.display()
-            ));
-            return None;
-        }
-    };
-    if let Err(reason) = spec.validate() {
-        output::warn(&format!(
-            "Landlock: invalid {access} map {}: {reason}; skipping",
-            encoded.display()
-        ));
-        return None;
-    }
-    Some(spec.destination)
-}
-
 fn systemd_user_paths() -> Vec<PathBuf> {
     let Ok(xdg_dir) = std::env::var("XDG_RUNTIME_DIR") else {
         return vec![];
@@ -912,6 +861,43 @@ mod tests {
     fn create_linked_worktree_fixture()
     -> crate::sandbox::test_support::LinkedWorktreeFixture {
         linked_worktree_fixture("landlock-worktree")
+    }
+
+    /// Test convenience: derive mounted map destinations from the
+    /// config the way the outer bwrap process would, then collect.
+    /// Production code receives destinations via opaque internal
+    /// flags instead (see `collect_normal_paths_with_mounted_paths`).
+    fn collect_normal_paths(
+        config: &Config,
+        project_dir: &Path,
+        verbose: bool,
+    ) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let (mounted_ro, mounted_rw): (Vec<PathBuf>, Vec<PathBuf>) =
+            if config.browser_profile().is_some() {
+                (Vec::new(), Vec::new())
+            } else {
+                (
+                    config
+                        .ro_maps
+                        .iter()
+                        .filter_map(|p| MapSpec::parse_validated(p, "ro"))
+                        .map(|spec| spec.destination)
+                        .collect(),
+                    config
+                        .rw_maps
+                        .iter()
+                        .filter_map(|p| MapSpec::parse_validated(p, "rw"))
+                        .map(|spec| spec.destination)
+                        .collect(),
+                )
+            };
+        collect_normal_paths_with_mounted_paths(
+            config,
+            project_dir,
+            &mounted_ro,
+            &mounted_rw,
+            verbose,
+        )
     }
 
     #[test]
