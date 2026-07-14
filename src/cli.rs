@@ -15,8 +15,10 @@ COMMANDS (positional):
     Any other string                       Passed through as the command
 
 OPTIONS:
-    --rw-map <PATH>                Mount PATH read-write inside sandbox (repeatable)
-    --map <PATH>                   Mount PATH read-only inside sandbox (repeatable)
+    --rw-map <PATH|SOURCE:DEST>    Mount read-write, optionally at DEST
+                                   (repeatable)
+    --map <PATH|SOURCE:DEST>       Mount read-only, optionally at DEST
+                                   (repeatable)
     --overlay-map <PATH>           Mount PATH copy-on-write: writes go to a side
                                    layer, PATH itself stays untouched so you can
                                    diff/promote later (repeatable; Linux/bwrap
@@ -101,6 +103,10 @@ pub struct CliArgs {
     /// Internal: apply Landlock and exec remaining command.
     /// Used as a wrapper inside the bwrap sandbox.
     pub landlock_exec: bool,
+    /// Internal: opaque read-write mount destinations for Landlock.
+    pub landlock_rw_paths: Vec<PathBuf>,
+    /// Internal: opaque read-only mount destinations for Landlock.
+    pub landlock_ro_paths: Vec<PathBuf>,
 }
 
 pub fn parse() -> Result<CliArgs, String> {
@@ -266,6 +272,16 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 args.status_bar = Some(false);
             }
             Long("landlock-exec") => args.landlock_exec = true,
+            Long("landlock-rw-path") => {
+                let val: PathBuf =
+                    parser.value().map_err(|e| e.to_string())?.into();
+                args.landlock_rw_paths.push(val);
+            }
+            Long("landlock-ro-path") => {
+                let val: PathBuf =
+                    parser.value().map_err(|e| e.to_string())?.into();
+                args.landlock_ro_paths.push(val);
+            }
             Long("clean") => args.clean = true,
             Long("dry-run") => args.dry_run = true,
             Long("init") => args.init = true,
@@ -698,6 +714,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_maps_with_alternate_destinations() {
+        let args = parse_test(&[
+            "--map",
+            "~/.ssh/ai-jail:~/.ssh",
+            "--rw-map",
+            "data:vendor/data",
+            "bash",
+        ])
+        .unwrap();
+
+        assert_eq!(args.ro_maps, vec![PathBuf::from("~/.ssh/ai-jail:~/.ssh")]);
+        assert_eq!(args.rw_maps, vec![PathBuf::from("data:vendor/data")]);
+    }
+
+    #[test]
     fn parse_multiple_maps() {
         let args = parse_test(&[
             "--rw-map", "/tmp/a", "--rw-map", "/tmp/b", "--map", "/opt/c",
@@ -870,6 +901,27 @@ mod tests {
         assert_eq!(args.lockdown, Some(true));
         assert!(args.verbose);
         assert_eq!(args.command, vec!["bash"]);
+    }
+
+    #[test]
+    fn parse_internal_landlock_paths_are_opaque() {
+        let rw = PathBuf::from("/jail/name:/etc");
+        let ro = PathBuf::from("/jail/ro:name");
+        let args = parse_test(&[
+            "--landlock-rw-path",
+            rw.to_str().unwrap(),
+            "--landlock-ro-path",
+            ro.to_str().unwrap(),
+            "--landlock-exec",
+            "--",
+            "bash",
+        ])
+        .unwrap();
+
+        assert_eq!(args.landlock_rw_paths, vec![rw]);
+        assert_eq!(args.landlock_ro_paths, vec![ro]);
+        assert!(!HELP.contains("--landlock-rw-path"));
+        assert!(!HELP.contains("--landlock-ro-path"));
     }
 
     // ── Exec mode ──────────────────────────────────────────────

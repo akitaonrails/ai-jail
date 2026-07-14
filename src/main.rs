@@ -109,14 +109,22 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     let project_dir = std::env::current_dir()
         .map_err(|e| format!("Cannot determine current directory: {e}"))?;
 
-    // Use the fully resolved outer policy forwarded via internal args.
+    // Use the fully resolved non-map policy forwarded via internal args.
+    // Mounted destinations remain separate opaque paths below.
     let mut config = config::merge(cli, config::Config::default());
     // Idempotent: parent absolutized before serializing wrapper args,
     // but re-running guarantees no relative path reaches landlock.
     config::absolutize_user_paths(&mut config, &project_dir);
 
-    // Apply Landlock inside the sandbox (after bwrap namespace setup)
-    sandbox::apply_landlock(&config, &project_dir, cli.verbose)?;
+    // Apply Landlock inside the sandbox (after bwrap namespace setup).
+    // Hidden path flags preserve destinations atomically, including ':'.
+    sandbox::apply_landlock(
+        &config,
+        &project_dir,
+        &cli.landlock_ro_paths,
+        &cli.landlock_rw_paths,
+        cli.verbose,
+    )?;
 
     // Apply seccomp filter after Landlock (reduces kernel syscall
     // surface). Must happen before exec so the user command inherits

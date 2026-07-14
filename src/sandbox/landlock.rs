@@ -43,6 +43,8 @@
 //    no Docker, no GPU, no display.
 
 use crate::config::Config;
+#[cfg(test)]
+use crate::config::MapSpec;
 use crate::output;
 use landlock::{
     ABI, Access, AccessFs, AccessNet, NetPort, Ruleset, RulesetAttr,
@@ -56,6 +58,8 @@ const ABI_NET: ABI = ABI::V4;
 pub fn apply(
     config: &Config,
     project_dir: &Path,
+    mounted_ro_paths: &[PathBuf],
+    mounted_rw_paths: &[PathBuf],
     verbose: bool,
 ) -> Result<(), String> {
     if !config.landlock_enabled() {
@@ -68,7 +72,13 @@ pub fn apply(
         return Ok(());
     }
 
-    let fs_result = match do_apply(config, project_dir, verbose) {
+    let fs_result = match do_apply(
+        config,
+        project_dir,
+        mounted_ro_paths,
+        mounted_rw_paths,
+        verbose,
+    ) {
         Ok(status) => match status {
             RulesetStatus::FullyEnforced => {
                 output::info("Landlock: fully enforced");
@@ -138,6 +148,8 @@ pub fn apply(
 fn do_apply(
     config: &Config,
     project_dir: &Path,
+    mounted_ro_paths: &[PathBuf],
+    mounted_rw_paths: &[PathBuf],
     verbose: bool,
 ) -> Result<RulesetStatus, landlock::RulesetError> {
     let access_all = AccessFs::from_all(ABI_VERSION);
@@ -146,7 +158,13 @@ fn do_apply(
     let (ro_paths, rw_paths) = if config.lockdown_enabled() {
         collect_lockdown_paths(config, project_dir, verbose)
     } else {
-        collect_normal_paths(config, project_dir, verbose)
+        collect_normal_paths_with_mounted_paths(
+            config,
+            project_dir,
+            mounted_ro_paths,
+            mounted_rw_paths,
+            verbose,
+        )
     };
 
     let status = Ruleset::default()
@@ -358,9 +376,44 @@ fn collect_lockdown_paths(
 /// two layers are complementary — Landlock prevents writes to
 /// ro-bind-mounted paths, bwrap prevents access to unmounted
 /// paths.
+#[cfg(test)]
 fn collect_normal_paths(
     config: &Config,
     project_dir: &Path,
+    verbose: bool,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let (mounted_ro_paths, mounted_rw_paths) =
+        if config.browser_profile().is_some() {
+            (Vec::new(), Vec::new())
+        } else {
+            let rw = config
+                .rw_maps
+                .iter()
+                .filter_map(|path| landlock_map_destination(path, "rw"))
+                .collect();
+            let ro = config
+                .ro_maps
+                .iter()
+                .filter_map(|path| landlock_map_destination(path, "ro"))
+                .collect();
+            (ro, rw)
+        };
+    collect_normal_paths_with_mounted_paths(
+        config,
+        project_dir,
+        &mounted_ro_paths,
+        &mounted_rw_paths,
+        verbose,
+    )
+}
+
+/// Collect normal-mode paths using destinations already mounted by bwrap.
+/// These paths are opaque and must never be reparsed as public map specs.
+fn collect_normal_paths_with_mounted_paths(
+    config: &Config,
+    project_dir: &Path,
+    mounted_ro_paths: &[PathBuf],
+    mounted_rw_paths: &[PathBuf],
     verbose: bool,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let home = super::home_dir();
@@ -575,33 +628,31 @@ fn collect_normal_paths(
     }
 
     // Extra user mounts: --rw-map and --ro-map from CLI/config.
-    // These extend the sandbox with user-specified paths. Missing
-    // paths are skipped with a warning (never crash on missing).
+    // These extend the sandbox with user-specified destinations.
+    // Missing paths are skipped with a warning (never crash on missing).
     if !browser_mode {
-        for p in &config.rw_maps {
-            if super::path_exists(p) {
-                rw.push(p.clone());
+        for destination in mounted_rw_paths {
+            if super::path_exists(destination) {
+                rw.push(destination.clone());
             } else {
                 output::warn(&format!(
                     "Landlock: rw map {} not found, skipping",
-                    p.display()
+                    destination.display()
                 ));
             }
         }
-        // NOTE: an ro map inside the project dir cannot be enforced by
-        // Landlock — access rights are unioned across rules with no
-        // deny semantics, so the project's read-write rule always wins
-        // for its subtree. Read-only enforcement for such paths comes
-        // from the bwrap mount layer, which binds them ro on top of the
-        // project mount (#83); the ro rule here still covers maps
-        // outside the project.
-        for p in &config.ro_maps {
-            if super::path_exists(p) {
-                ro.push(p.clone());
+        // NOTE: a read-only map destination inside the project dir cannot
+        // be enforced by Landlock — access rights are unioned across rules
+        // with no deny semantics, so the project's read-write rule always
+        // wins for its subtree. The bwrap read-only bind enforces it; this
+        // rule still covers destinations outside the project.
+        for destination in mounted_ro_paths {
+            if super::path_exists(destination) {
+                ro.push(destination.clone());
             } else {
                 output::warn(&format!(
                     "Landlock: ro map {} not found, skipping",
-                    p.display()
+                    destination.display()
                 ));
             }
         }
@@ -620,7 +671,8 @@ fn collect_normal_paths(
                 ));
             }
         }
-        if verbose && (!config.rw_maps.is_empty() || !config.ro_maps.is_empty())
+        if verbose
+            && (!mounted_rw_paths.is_empty() || !mounted_ro_paths.is_empty())
         {
             output::verbose("Landlock: extra maps");
         }
@@ -717,6 +769,28 @@ fn collect_normal_paths(
     }
 
     (ro, rw)
+}
+
+#[cfg(test)]
+fn landlock_map_destination(encoded: &Path, access: &str) -> Option<PathBuf> {
+    let spec = match MapSpec::parse(encoded) {
+        Ok(spec) => spec,
+        Err(reason) => {
+            output::warn(&format!(
+                "Landlock: invalid {access} map {}: {reason}; skipping",
+                encoded.display()
+            ));
+            return None;
+        }
+    };
+    if let Err(reason) = spec.validate() {
+        output::warn(&format!(
+            "Landlock: invalid {access} map {}: {reason}; skipping",
+            encoded.display()
+        ));
+        return None;
+    }
+    Some(spec.destination)
 }
 
 fn systemd_user_paths() -> Vec<PathBuf> {
@@ -847,7 +921,7 @@ mod tests {
             ..Config::default()
         };
         // Should return without error or panic
-        assert!(apply(&config, Path::new("/tmp"), false).is_ok());
+        assert!(apply(&config, Path::new("/tmp"), &[], &[], false).is_ok());
     }
 
     #[test]
@@ -857,7 +931,7 @@ mod tests {
         // On kernels without landlock this prints a warning;
         // on kernels with landlock it enforces rules.
         // Either way it must not panic.
-        assert!(apply(&config, Path::new("/tmp"), false).is_ok());
+        assert!(apply(&config, Path::new("/tmp"), &[], &[], false).is_ok());
     }
 
     #[test]
@@ -866,7 +940,7 @@ mod tests {
             lockdown: Some(true),
             ..Config::default()
         };
-        let _ = apply(&config, Path::new("/tmp"), false);
+        let _ = apply(&config, Path::new("/tmp"), &[], &[], false);
     }
 
     #[test]
@@ -876,7 +950,7 @@ mod tests {
             no_landlock: Some(true),
             ..Config::default()
         };
-        assert!(apply(&config, Path::new("/tmp"), false).is_err());
+        assert!(apply(&config, Path::new("/tmp"), &[], &[], false).is_err());
     }
 
     #[test]
@@ -1051,6 +1125,65 @@ mod tests {
 
         let _ = std::fs::remove_file(&ro_extra);
         let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn normal_paths_extra_maps_use_jail_destination() {
+        let destination = std::env::temp_dir().join(format!(
+            "ai-jail-landlock-map-destination-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&destination);
+        std::fs::create_dir_all(&destination).unwrap();
+        let source = PathBuf::from("/host/source-not-visible");
+        let config = Config {
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            rw_maps: vec![
+                crate::config::MapSpec {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                }
+                .encode(),
+            ],
+            ..Config::default()
+        };
+
+        let (_, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
+
+        assert!(rw.contains(&destination));
+        assert!(!rw.contains(&source));
+
+        let _ = std::fs::remove_dir_all(&destination);
+    }
+
+    #[test]
+    fn normal_paths_exact_mounted_destination_keeps_colon_opaque() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-landlock-colon-destination-{}",
+            std::process::id()
+        ));
+        let destination = root.join("name:/etc");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&destination).unwrap();
+        let config = Config {
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            ..Config::default()
+        };
+
+        let (_, rw) = collect_normal_paths_with_mounted_paths(
+            &config,
+            Path::new("/tmp"),
+            &[],
+            std::slice::from_ref(&destination),
+            false,
+        );
+
+        assert!(rw.contains(&destination));
+        assert!(!rw.contains(&PathBuf::from("/etc")));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

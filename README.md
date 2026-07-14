@@ -470,8 +470,8 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 
 | Flag | Description |
 |------|-------------|
-| `--rw-map <PATH>` | Mount PATH read-write (repeatable). Relative paths and `..` are resolved against the project directory, so `--rw-map ../sister-project` works from a project root. Mapping `/` is refused; map explicit subpaths instead. |
-| `--map <PATH>` | Mount PATH read-only (repeatable). Same path resolution as `--rw-map`. Works on paths **inside** the writable project too — `--map .git` keeps `.git` visible but read-only (enforced by mount ordering on Linux and a write-deny rule on macOS). Mapping `/` is refused; map explicit subpaths instead. |
+| `--rw-map <PATH\|SOURCE:DEST>` | Mount a path read-write, optionally at a different destination (repeatable). See [Map destinations](#map-destinations). |
+| `--map <PATH\|SOURCE:DEST>` | Mount a path read-only, optionally at a different destination (repeatable). Works on paths **inside** the writable project too — `--map .git` keeps `.git` visible but read-only. See [Map destinations](#map-destinations). |
 | `--overlay-map <PATH>` | Mount PATH **copy-on-write** (repeatable). The agent sees PATH read-write, but writes land on a side layer under `<project>/.ai-jail-overlays/` while PATH itself is never modified — so you can diff and selectively promote changes afterwards. Opt-in only. Linux/bwrap only; degrades to **read-only** (with a warning) on macOS, and is disabled under `--lockdown` / browser mode. See [Overlay maps](#overlay-maps). |
 | `--hide-dotdir <NAME>` | Never bind-mount the named home dotdir into the sandbox (e.g. `.my_secrets`). Leading dot is optional. Repeatable. Cannot hide dotdirs required for tool operation (`.cargo`, `.config`, `.cache`, etc.) — those emit a warning and stay visible. |
 | `--mask <PATH\|GLOB>` | Replace `PATH` or glob matches inside the sandbox with an empty file (or empty tmpfs if the path is a directory). Relative paths resolve against the project directory. Repeatable. Supports `*`, `?`, `[a-z]`, and recursive `**`; quote glob masks in your shell. Useful for hiding sensitive files like `.env`, `**/*.env`, `credentials.json` from AI agents while keeping the rest of the project accessible. Missing paths/unmatched globs are skipped with a warning. |
@@ -506,6 +506,30 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `-h`, `--help` | Show help |
 | `-V`, `--version` | Show version |
 
+### Map destinations
+
+`--map` and `--rw-map` accept either `PATH` or `SOURCE:DESTINATION`.
+`PATH` retains the existing same-path behavior: the host path appears at the
+same location inside the sandbox. `SOURCE:DESTINATION` mounts the host source
+at a different sandbox destination. The same syntax applies to the TOML
+`ro_maps` and `rw_maps` fields.
+
+The first colon always separates source from destination; any remaining
+colons belong to the destination. A source path containing a literal colon
+therefore cannot be represented with these options. This is an accepted
+syntax tradeoff.
+
+Both sides independently expand `~`, and relative paths plus `..` are resolved
+against the project directory. Mapping either the source or destination `/`
+is refused. Sources and destinations must be valid UTF-8. Malformed entries,
+non-UTF-8 paths, and entries whose source path is missing produce a warning
+and are skipped.
+
+Alternate destinations require Linux with bubblewrap. On macOS they cause a
+fatal error because `sandbox-exec` cannot remap paths. Same-path maps continue
+to work on macOS. `--overlay-map` does not support alternate destination
+syntax.
+
 ### Examples
 
 ```bash
@@ -514,6 +538,12 @@ ai-jail --rw-map ~/Projects/shared-lib claude
 
 # Read-only access to reference data
 ai-jail --map /opt/datasets claude
+
+# Expose a dedicated SSH directory as ~/.ssh inside the sandbox
+ai-jail --map ~/.ssh/ai-jail:~/.ssh claude
+
+# Mount project-relative data read-write at project-relative vendor/data
+ai-jail --rw-map data:vendor/data claude
 
 # Keep .git visible but read-only inside the writable project
 # (protects history and hooks from the agent)
@@ -629,7 +659,7 @@ Created in the project directory on first run. Example:
 
 command = ["claude"]
 rw_maps = ["/home/user/Projects/shared-lib"]
-ro_maps = []
+ro_maps = ["~/.ssh/ai-jail:~/.ssh"]
 mask = [".env", ".env.local", "**/*.env"]
 no_gpu = true
 ssh = true
@@ -642,7 +672,8 @@ lockdown = true
 When CLI flags and an existing config are both present:
 
 - `command`: CLI replaces config for the current run, but a CLI-passed command is **not** auto-persisted when the project already has a stored command — so `ai-jail codex` after `ai-jail claude` runs codex for that session without rewriting `.ai-jail`'s stored default. Use `ai-jail --init <command>` to explicitly change the stored command. First-run bootstrap (no stored command yet) still persists the CLI command as the new default.
-- `rw_maps` / `ro_maps` / `mask` / `deny_paths`: CLI values are appended (duplicates removed). Paths starting with `~/` or exactly `~` are expanded against `$HOME` at merge time, so you can write `ro_maps = ["~/.bashrc"]` in a config file. Relative paths in `rw_maps` / `ro_maps` (including `../sibling` style) are resolved against the project directory before being passed to the sandbox. Relative `mask` / `deny_paths` entries resolve against the project directory when the sandbox policy is built; glob masks/denies are expanded at that same point so committed configs can keep portable patterns.
+- `rw_maps` / `ro_maps`: CLI values are appended (duplicates removed). Each entry accepts `PATH` for a same-path map or `SOURCE:DESTINATION`; complete encoded entries are deduplicated. Both sides independently expand `~` against `$HOME` and resolve relative paths and `..` against the project directory. Alternate destinations require Linux/bubblewrap and fail on macOS.
+- `mask` / `deny_paths`: CLI values are appended (duplicates removed). Relative entries resolve against the project directory when the sandbox policy is built; glob masks/denies are expanded at that same point so committed configs can keep portable patterns.
 - Boolean flags: CLI overrides config (`--no-gpu` sets `no_gpu = true`)
 - `--save-config` / `--no-save-config` override `no_save_config`
 - Project config is updated in normal mode when config saving is enabled; inherited values from `$HOME/.ai-jail` are used at runtime but are not copied into the project `.ai-jail`. Lockdown skips auto-save.
@@ -666,8 +697,8 @@ The command key is selected from the first available command name: CLI command, 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `command` | string array | `["bash"]` | Default command to run inside sandbox. Set by first run or by `--init`; not overwritten when a different command is passed on the CLI. |
-| `rw_maps` | path array | `[]` | Extra read-write mounts. `/` is refused; map explicit subpaths instead. |
-| `ro_maps` | path array | `[]` | Extra read-only mounts. `/` is refused; map explicit subpaths instead. |
+| `rw_maps` | path array | `[]` | Extra read-write mounts using `PATH` or `SOURCE:DESTINATION`. Alternate destinations require Linux/bwrap. Source or destination `/` is refused. |
+| `ro_maps` | path array | `[]` | Extra read-only mounts using `PATH` or `SOURCE:DESTINATION`. Alternate destinations require Linux/bwrap. Source or destination `/` is refused. |
 | `overlay_maps` | path array | `[]` | Extra copy-on-write overlay mounts (see [Overlay maps](#overlay-maps)). Writes go to a side layer; the source stays untouched. Linux/bwrap only. |
 | `hide_dotdirs` | string array | `[]` | Extra home dotdirs to deny (e.g. `[".my_secrets"]`). Leading dot optional. Built-in deny list (`.ssh`, `.gnupg`, `.aws`, `.mozilla`, `.thunderbird`) always applies. |
 | `mask` | path array | `[]` | Paths or glob patterns to replace with empty files/tmpfs (e.g. `[".env", "**/*.env", "secrets.json"]`). Relative paths resolve against the project directory. |
