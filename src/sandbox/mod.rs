@@ -331,16 +331,19 @@ fn path_components_relative_to(path: &Path, base: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Expand mask entries that contain glob metacharacters (`*`, `?`, `[...]`).
-/// Literal entries keep their existing project-relative semantics. Globs are
-/// expanded at sandbox-policy time so config files can keep portable patterns.
+/// Expand include patterns, then subtract matching exceptions. Literal paths
+/// keep their project-relative semantics, including paths beginning with `!`;
+/// exceptions are always supplied explicitly rather than through gitignore
+/// syntax. Globs are expanded at sandbox-policy time so config files can keep
+/// portable patterns.
 pub(crate) fn expand_mask_patterns(
-    mask: &[PathBuf],
+    includes: &[PathBuf],
+    exceptions: &[PathBuf],
     project_dir: &Path,
 ) -> Vec<PathBuf> {
     let mut out = Vec::new();
 
-    for entry in mask {
+    for entry in includes {
         if !has_glob_meta(entry) {
             out.push(if entry.is_absolute() {
                 entry.clone()
@@ -369,7 +372,56 @@ pub(crate) fn expand_mask_patterns(
         }
     }
 
+    for entry in exceptions {
+        if !has_glob_meta(entry) {
+            let path = if entry.is_absolute() {
+                entry.clone()
+            } else {
+                project_dir.join(entry)
+            };
+            let path = crate::config::normalize_path(&path);
+            out.retain(|candidate| {
+                let candidate = crate::config::normalize_path(candidate);
+                candidate != path && !candidate.starts_with(&path)
+            });
+            continue;
+        }
+
+        let (base, pattern) = glob_base_and_pattern(entry, project_dir);
+        let base = crate::config::normalize_path(&base);
+        out.retain(|candidate| {
+            let candidate = crate::config::normalize_path(candidate);
+            !candidate.starts_with(&base)
+                || !glob_path_matches(
+                    &pattern,
+                    &path_components_relative_to(&candidate, &base),
+                )
+        });
+    }
+
     out
+}
+
+/// User masks with exceptions applied, followed by the mandatory project
+/// policy mask. Exceptions must never expose `.ai-jail`; only
+/// `--no-hide-config` may do that.
+pub(crate) fn effective_mask_patterns(
+    config: &Config,
+    project_dir: &Path,
+) -> Vec<PathBuf> {
+    let mut masks = expand_mask_patterns(
+        &config.mask,
+        &config.mask_exceptions,
+        project_dir,
+    );
+    let local_config = project_dir.join(".ai-jail");
+    if config.hide_config_enabled()
+        && path_exists(&local_config)
+        && !masks.contains(&local_config)
+    {
+        masks.push(local_config);
+    }
+    masks
 }
 
 fn browser_basename(program: &str) -> Option<&str> {
@@ -1053,7 +1105,8 @@ mod tests {
     #[test]
     fn expand_mask_patterns_keeps_literal_project_relative() {
         let project = PathBuf::from("/tmp/project");
-        let expanded = expand_mask_patterns(&[PathBuf::from(".env")], &project);
+        let expanded =
+            expand_mask_patterns(&[PathBuf::from(".env")], &[], &project);
 
         assert_eq!(expanded, vec![PathBuf::from("/tmp/project/.env")]);
     }
@@ -1072,7 +1125,7 @@ mod tests {
             .unwrap();
 
         let expanded =
-            expand_mask_patterns(&[PathBuf::from("**/*.env")], &project);
+            expand_mask_patterns(&[PathBuf::from("**/*.env")], &[], &project);
 
         assert_eq!(
             expanded,
@@ -1097,15 +1150,18 @@ mod tests {
         std::fs::write(project.join("app9.env"), "nine").unwrap();
         std::fs::write(project.join("app10.env"), "ten").unwrap();
 
-        let expanded =
-            expand_mask_patterns(&[PathBuf::from("app[1-2].env")], &project);
+        let expanded = expand_mask_patterns(
+            &[PathBuf::from("app[1-2].env")],
+            &[],
+            &project,
+        );
         assert_eq!(
             expanded,
             vec![project.join("app1.env"), project.join("app2.env")]
         );
 
         let expanded =
-            expand_mask_patterns(&[PathBuf::from("app?.env")], &project);
+            expand_mask_patterns(&[PathBuf::from("app?.env")], &[], &project);
         assert_eq!(
             expanded,
             vec![
@@ -1128,11 +1184,106 @@ mod tests {
         std::fs::write(shared.join("secret.env"), "secret").unwrap();
         std::fs::write(shared.join("public.txt"), "public").unwrap();
 
-        let expanded =
-            expand_mask_patterns(&[PathBuf::from("../shared/*.env")], &project);
+        let expanded = expand_mask_patterns(
+            &[PathBuf::from("../shared/*.env")],
+            &[],
+            &project,
+        );
 
         assert_eq!(expanded, vec![shared.join("secret.env")]);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn expand_mask_patterns_applies_scoped_exceptions_and_keeps_bangs_positive()
+    {
+        let root = temp_test_dir("mask-exceptions");
+        let project = root.join("project");
+        std::fs::create_dir_all(project.join("target")).unwrap();
+        std::fs::create_dir_all(project.join("other/target")).unwrap();
+        std::fs::write(project.join("app.key"), "key").unwrap();
+        std::fs::write(project.join("target/generated.key"), "key").unwrap();
+        std::fs::write(project.join("other/target/kept.key"), "key").unwrap();
+        std::fs::write(project.join("!secret.txt"), "key").unwrap();
+        std::fs::write(project.join("!glob.key"), "key").unwrap();
+
+        let expanded = expand_mask_patterns(
+            &[PathBuf::from("**/*.key"), PathBuf::from("!secret.txt")],
+            &[PathBuf::from("target/**")],
+            &project,
+        );
+
+        assert_eq!(
+            expanded,
+            vec![
+                project.join("!glob.key"),
+                project.join("app.key"),
+                project.join("other/target/kept.key"),
+                project.join("!secret.txt"),
+            ]
+        );
+
+        let issue_pattern = expand_mask_patterns(
+            &[PathBuf::from("**/*.key")],
+            &[PathBuf::from("**/target/**")],
+            &project,
+        );
+        assert_eq!(
+            issue_pattern,
+            vec![project.join("!glob.key"), project.join("app.key")]
+        );
+
+        let scoped = expand_mask_patterns(
+            &[PathBuf::from("**/*.key")],
+            &[PathBuf::from("target/**/*.key")],
+            &project,
+        );
+        assert!(!scoped.contains(&project.join("target/generated.key")));
+        assert!(scoped.contains(&project.join("other/target/kept.key")));
+
+        let literal = expand_mask_patterns(
+            &[PathBuf::from("target/generated.key")],
+            &[PathBuf::from("target")],
+            &project,
+        );
+        assert!(literal.is_empty());
+
+        let bang_glob =
+            expand_mask_patterns(&[PathBuf::from("!*.key")], &[], &project);
+        assert_eq!(bang_glob, vec![project.join("!glob.key")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exception_bases_are_scoped_for_absolute_parent_and_missing_paths() {
+        let root = temp_test_dir("exception-bases");
+        let project = root.join("repo/project");
+        let shared = root.join("repo/shared");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(project.join("local.key"), "key").unwrap();
+        std::fs::write(shared.join("shared.key"), "key").unwrap();
+        let includes =
+            vec![project.join("local.key"), shared.join("shared.key")];
+
+        let parent = expand_mask_patterns(
+            &includes,
+            &[PathBuf::from("../shared/**")],
+            &project,
+        );
+        assert_eq!(parent, vec![project.join("local.key")]);
+
+        let absolute =
+            expand_mask_patterns(&includes, &[shared.join("**")], &project);
+        assert_eq!(absolute, vec![project.join("local.key")]);
+
+        let missing = expand_mask_patterns(
+            &includes,
+            &[PathBuf::from("typo/**")],
+            &project,
+        );
+        assert_eq!(missing, includes);
         let _ = std::fs::remove_dir_all(&root);
     }
 

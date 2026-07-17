@@ -162,6 +162,10 @@ pub struct Config {
     pub mask: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mask_exceptions: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_path_exceptions: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_gpu: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -425,6 +429,10 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     dedup_paths(&mut c.mask);
     c.deny_paths.extend(local.deny_paths);
     dedup_paths(&mut c.deny_paths);
+    c.mask_exceptions.extend(local.mask_exceptions);
+    dedup_paths(&mut c.mask_exceptions);
+    c.deny_path_exceptions.extend(local.deny_path_exceptions);
+    dedup_paths(&mut c.deny_path_exceptions);
     // Each Option-typed field follows the same pattern: local
     // overrides global iff local explicitly set it. The macro is
     // local to the function so it stays scoped to this single use.
@@ -565,6 +573,8 @@ fn collapse_tilde_config(config: &mut Config) {
     collapse_tilde_vec(&mut config.overlay_maps);
     collapse_tilde_vec(&mut config.mask);
     collapse_tilde_vec(&mut config.deny_paths);
+    collapse_tilde_vec(&mut config.mask_exceptions);
+    collapse_tilde_vec(&mut config.deny_path_exceptions);
     if let Some(p) = config.claude_dir.take() {
         config.claude_dir = Some(collapse_tilde(&p));
     }
@@ -751,6 +761,14 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
 
     config.deny_paths.extend(cli.deny_paths.iter().cloned());
     dedup_paths(&mut config.deny_paths);
+    config
+        .mask_exceptions
+        .extend(cli.mask_exceptions.iter().cloned());
+    dedup_paths(&mut config.mask_exceptions);
+    config
+        .deny_path_exceptions
+        .extend(cli.deny_path_exceptions.iter().cloned());
+    dedup_paths(&mut config.deny_path_exceptions);
 
     // Boolean flags: CLI overrides config (--no-gpu => no_gpu=Some(true), --gpu => no_gpu=Some(false))
     // Three macros for the three patterns the CLI uses:
@@ -819,6 +837,8 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     expand_tilde_vec(&mut config.overlay_maps);
     expand_tilde_vec(&mut config.mask);
     expand_tilde_vec(&mut config.deny_paths);
+    expand_tilde_vec(&mut config.mask_exceptions);
+    expand_tilde_vec(&mut config.deny_path_exceptions);
     if let Some(p) = config.claude_dir.take() {
         config.claude_dir = Some(expand_tilde(p));
     }
@@ -866,6 +886,8 @@ pub fn display_status(config: &Config) {
     print_string_list("  Hide dotdirs", &config.hide_dotdirs);
     print_path_list("  Masked files", &config.mask);
     print_path_list("  Denied paths", &config.deny_paths);
+    print_path_list("  Mask exceptions", &config.mask_exceptions);
+    print_path_list("  Deny exceptions", &config.deny_path_exceptions);
 
     print_auto_tristate("  GPU", config.no_gpu);
     print_auto_tristate("  Docker", config.no_docker);
@@ -1441,6 +1463,8 @@ mask = [".env"]
 "#;
         let cfg = parse_toml(toml).unwrap();
         assert!(cfg.deny_paths.is_empty());
+        assert!(cfg.mask_exceptions.is_empty());
+        assert!(cfg.deny_path_exceptions.is_empty());
     }
 
     #[test]
@@ -1481,6 +1505,16 @@ deny_paths = [".env", "secrets/*.json"]
             cfg.deny_paths,
             vec![PathBuf::from(".env"), PathBuf::from("secrets/*.json")]
         );
+    }
+
+    #[test]
+    fn parse_mask_and_deny_path_exceptions() {
+        let cfg = parse_toml(
+            "mask_exceptions = [\"**/target/**\"]\ndeny_path_exceptions = [\"public.key\"]",
+        )
+        .unwrap();
+        assert_eq!(cfg.mask_exceptions, vec![PathBuf::from("**/target/**")]);
+        assert_eq!(cfg.deny_path_exceptions, vec![PathBuf::from("public.key")]);
     }
 
     #[test]
@@ -1528,6 +1562,8 @@ no_gpu = true
             hide_dotdirs: vec![".my_secrets".into(), ".proton".into()],
             mask: vec![PathBuf::from(".env")],
             deny_paths: vec![PathBuf::from("secrets.json")],
+            mask_exceptions: vec![PathBuf::from("target")],
+            deny_path_exceptions: vec![PathBuf::from("public.json")],
             no_gpu: Some(true),
             no_docker: None,
             tailscale: Some(true),
@@ -1558,6 +1594,11 @@ no_gpu = true
         assert_eq!(deserialized.ro_maps, config.ro_maps);
         assert_eq!(deserialized.hide_dotdirs, config.hide_dotdirs);
         assert_eq!(deserialized.deny_paths, config.deny_paths);
+        assert_eq!(deserialized.mask_exceptions, config.mask_exceptions);
+        assert_eq!(
+            deserialized.deny_path_exceptions,
+            config.deny_path_exceptions
+        );
         assert_eq!(deserialized.no_gpu, config.no_gpu);
         assert_eq!(deserialized.no_docker, config.no_docker);
         assert_eq!(deserialized.tailscale, config.tailscale);
@@ -1693,6 +1734,35 @@ no_gpu = true
         assert_eq!(
             merged.deny_paths,
             vec![PathBuf::from(".env"), PathBuf::from("secrets/*.json")]
+        );
+    }
+
+    #[test]
+    fn merge_exceptions_appended_and_deduplicated() {
+        let existing = Config {
+            mask_exceptions: vec![PathBuf::from("target")],
+            deny_path_exceptions: vec![PathBuf::from("public")],
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            mask_exceptions: vec![
+                PathBuf::from("target"),
+                PathBuf::from("build"),
+            ],
+            deny_path_exceptions: vec![
+                PathBuf::from("public"),
+                PathBuf::from("docs"),
+            ],
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(
+            merged.mask_exceptions,
+            vec![PathBuf::from("target"), PathBuf::from("build")]
+        );
+        assert_eq!(
+            merged.deny_path_exceptions,
+            vec![PathBuf::from("public"), PathBuf::from("docs")]
         );
     }
 
@@ -2939,6 +3009,8 @@ hide_dotdirs = [".my_secrets"]
             hide_dotdirs: vec![],
             mask: vec![],
             deny_paths: vec![PathBuf::from("secrets.json")],
+            mask_exceptions: vec![],
+            deny_path_exceptions: vec![],
             no_gpu: Some(true),
             no_docker: None,
             tailscale: Some(true),

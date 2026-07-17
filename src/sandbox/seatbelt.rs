@@ -180,9 +180,12 @@ fn generate_sbpl_profile(
     let restricted_files = lockdown || browser_mode || private_home;
     let exempt = super::dotdir_exemptions(config);
     let mut deny_paths = macos_read_deny_paths(&config.hide_dotdirs, &exempt);
-    deny_paths.extend(super::expand_mask_patterns(&config.mask, project_dir));
-    let explicit_deny_paths =
-        super::expand_mask_patterns(&config.deny_paths, project_dir);
+    deny_paths.extend(super::effective_mask_patterns(config, project_dir));
+    let explicit_deny_paths = super::expand_mask_patterns(
+        &config.deny_paths,
+        &config.deny_path_exceptions,
+        project_dir,
+    );
     deny_paths.extend(explicit_deny_paths.clone());
     let writable_paths = macos_writable_paths(project_dir, config, lockdown);
     let atomic_paths = macos_atomic_write_paths(config);
@@ -696,6 +699,36 @@ mod tests {
         assert!(profile.contains(
             "(deny file-write* (subpath \"/tmp/test-project/.env\"))"
         ));
+    }
+
+    #[test]
+    fn sbpl_profile_honors_exceptions_but_keeps_policy_hidden() {
+        let project = std::env::temp_dir().join("ai-jail-seatbelt-exceptions");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".ai-jail"), "mask = []").unwrap();
+        let config = Config {
+            mask: vec![PathBuf::from(".env")],
+            mask_exceptions: vec![PathBuf::from(".env")],
+            deny_paths: vec![PathBuf::from("secret")],
+            deny_path_exceptions: vec![PathBuf::from("secret")],
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile(&config, &project, false, false);
+        assert!(!profile.contains("/.env\"))"));
+        assert!(!profile.contains("/secret\"))"));
+        assert!(profile.contains(&format!("{}/.ai-jail", project.display())));
+
+        let visible = Config {
+            no_hide_config: Some(true),
+            ..Config::default()
+        };
+        let visible_profile =
+            generate_sbpl_profile(&visible, &project, false, false);
+        assert!(
+            !visible_profile
+                .contains(&format!("{}/.ai-jail", project.display()))
+        );
+        let _ = std::fs::remove_dir_all(project);
     }
 
     #[test]

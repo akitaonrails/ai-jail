@@ -26,6 +26,10 @@ OPTIONS:
     --hide-dotdir <NAME>           Never mount dotdir NAME (e.g., .my_secrets) (repeatable)
     --mask <PATH|GLOB>             Replace PATH/glob matches with empty files/tmpfs (repeatable)
     --deny-path <PATH|GLOB>        Deny access to PATH/glob with permission errors (repeatable)
+    --mask-except <PATH|GLOB>      Do not mask matches; other sandbox rules still apply
+                                   (weakens protection; repeatable; no ! negation)
+    --deny-path-except <PATH|GLOB> Do not deny matches; other sandbox rules still apply
+                                   (weakens protection; repeatable; no ! negation)
     --private-home / --no-private-home
                                    Disable/enable automatic host home dotdir passthrough
     --lockdown / --no-lockdown     Enable/disable strict read-only lockdown mode
@@ -72,6 +76,8 @@ pub struct CliArgs {
     pub hide_dotdirs: Vec<String>,
     pub mask: Vec<PathBuf>,
     pub deny_paths: Vec<PathBuf>,
+    pub mask_exceptions: Vec<PathBuf>,
+    pub deny_path_exceptions: Vec<PathBuf>,
     pub private_home: Option<bool>,
     pub lockdown: Option<bool>,
     pub landlock: Option<bool>,
@@ -150,6 +156,27 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     return Err("--deny-path requires a non-empty path".into());
                 }
                 args.deny_paths.push(PathBuf::from(s.into_owned()));
+            }
+            Long("mask-except") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let s = val.to_string_lossy();
+                if s.is_empty() {
+                    return Err(
+                        "--mask-except requires a non-empty path".into()
+                    );
+                }
+                args.mask_exceptions.push(PathBuf::from(s.into_owned()));
+            }
+            Long("deny-path-except") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let s = val.to_string_lossy();
+                if s.is_empty() {
+                    return Err(
+                        "--deny-path-except requires a non-empty path".into()
+                    );
+                }
+                args.deny_path_exceptions
+                    .push(PathBuf::from(s.into_owned()));
             }
             Long("hide-dotdir") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -668,6 +695,38 @@ mod tests {
             args.deny_paths,
             vec![PathBuf::from(".env"), PathBuf::from("secrets/*.json")]
         );
+    }
+
+    #[test]
+    fn parse_mask_and_deny_path_exceptions() {
+        let args = parse_test(&[
+            "--mask-except",
+            "**/target/**",
+            "--deny-path-except",
+            "public.key",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.mask_exceptions, vec![PathBuf::from("**/target/**")]);
+        assert_eq!(
+            args.deny_path_exceptions,
+            vec![PathBuf::from("public.key")]
+        );
+    }
+
+    #[test]
+    fn parse_exception_empty_and_missing_values_error() {
+        assert!(parse_test(&["--mask-except", "", "bash"]).is_err());
+        assert!(parse_test(&["--deny-path-except", "", "bash"]).is_err());
+        assert!(parse_test(&["--mask-except"]).is_err());
+        assert!(parse_test(&["--deny-path-except"]).is_err());
+    }
+
+    #[test]
+    fn help_describes_explicit_exceptions() {
+        assert!(HELP.contains("--mask-except <PATH|GLOB>"));
+        assert!(HELP.contains("weakens protection"));
+        assert!(HELP.contains("no ! negation"));
     }
 
     #[test]

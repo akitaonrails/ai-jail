@@ -1400,22 +1400,7 @@ fn discover_mask_mounts(
     empty_path: &Path,
     verbose: bool,
 ) -> Vec<Mount> {
-    let mut effective: Vec<PathBuf> = config.mask.clone();
-    if config.hide_config_enabled() {
-        let local_config = project_dir.join(".ai-jail");
-        let already_masked = config.mask.iter().any(|p| {
-            let resolved = if p.is_absolute() {
-                p.clone()
-            } else {
-                project_dir.join(p)
-            };
-            resolved == local_config
-        });
-        if !already_masked && super::path_exists(&local_config) {
-            effective.push(local_config);
-        }
-    }
-    let expanded = super::expand_mask_patterns(&effective, project_dir);
+    let expanded = super::effective_mask_patterns(config, project_dir);
     build_mask_mounts(&expanded, project_dir, empty_path, verbose)
 }
 
@@ -1426,7 +1411,11 @@ fn discover_deny_mounts(
     deny_dir_path: &Path,
     verbose: bool,
 ) -> Vec<Mount> {
-    let expanded = super::expand_mask_patterns(&config.deny_paths, project_dir);
+    let expanded = super::expand_mask_patterns(
+        &config.deny_paths,
+        &config.deny_path_exceptions,
+        project_dir,
+    );
     build_deny_mounts(
         &expanded,
         project_dir,
@@ -2717,7 +2706,51 @@ mod tests {
     }
 
     #[test]
-    fn deny_paths_emit_ro_bind_for_file_and_dir_in_dry_run() {
+    fn mask_glob_exception_keeps_maven_target_deletable() {
+        let project = std::env::temp_dir()
+            .join(format!("ai-jail-mask-maven-target-{}", std::process::id()));
+        let fixture = project.join("src/test/resources/crypto/private.key");
+        let generated = project.join("target/test-classes/crypto/private.key");
+        std::fs::create_dir_all(fixture.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        std::fs::write(&fixture, "fixture").unwrap();
+        std::fs::write(&generated, "generated").unwrap();
+
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            mask: vec![PathBuf::from("**/*.key")],
+            mask_exceptions: vec![PathBuf::from("**/target/**")],
+            no_hide_config: Some(true),
+            ..minimal_test_config()
+        };
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        let empty = guard.empty_path().display().to_string();
+        let is_masked = |path: &Path| {
+            let destination = path.display().to_string();
+            args.windows(3).any(|window| {
+                window[0] == "--ro-bind"
+                    && window[1] == empty
+                    && window[2] == destination
+            })
+        };
+        assert!(is_masked(&fixture));
+        assert!(!is_masked(&generated));
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn deny_paths_honor_exceptions_in_dry_run() {
         let project = std::env::temp_dir()
             .join(format!("ai-jail-deny-dry-run-{}", std::process::id()));
         let secrets_dir = project.join("secrets");
@@ -2729,6 +2762,7 @@ mod tests {
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let config = Config {
             deny_paths: vec![PathBuf::from(".env"), PathBuf::from("secrets")],
+            deny_path_exceptions: vec![PathBuf::from("secrets")],
             no_hide_config: Some(true),
             ..minimal_test_config()
         };
@@ -2741,7 +2775,7 @@ mod tests {
                 && w[1] == guard.deny_file_path().display().to_string()
                 && w[2] == env_file.display().to_string()
         }));
-        assert!(args.windows(3).any(|w| {
+        assert!(!args.windows(3).any(|w| {
             w[0] == "--ro-bind"
                 && w[1] == guard.deny_dir_path().display().to_string()
                 && w[2] == secrets_dir.display().to_string()
@@ -2877,7 +2911,9 @@ mod tests {
         let guard =
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
 
-        let config = minimal_test_config();
+        let mut config = minimal_test_config();
+        config.mask = vec![PathBuf::from(".ai-jail")];
+        config.mask_exceptions = vec![PathBuf::from(".ai-jail")];
         let args = build_dry_run_args(
             &config,
             &project,
