@@ -58,7 +58,7 @@ OPTIONS:
     --exec                         Direct execution mode (no PTY proxy, no status bar)
     --allow-tcp-port <PORT>        Allow outbound TCP to PORT in lockdown (repeatable)
     --claude-dir <PATH>            Use PATH as Claude config dir (sets CLAUDE_CONFIG_DIR)
-    --clean                        Ignore existing .ai-jail config, start fresh
+    --clean                        Ignore project .ai-jail config, start fresh
     --dry-run                      Print the sandbox command without executing
     --init                         Create/update .ai-jail config and exit
     --bootstrap                    Generate smart permission configs for AI tools

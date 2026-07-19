@@ -196,9 +196,9 @@ fn run() -> Result<i32, String> {
     let project_config = if cli.clean {
         config::Config::default()
     } else {
-        config::load()
+        config::load()?
     };
-    let global = config::load_global_for_command(&cli, &project_config);
+    let global = config::load_global_for_command(&cli, &project_config)?;
     let existing = config::merge_with_global(global, project_config.clone());
     let mut config = config::merge(&cli, existing);
     // Resolve any relative paths in rw_maps/ro_maps against the user's
@@ -218,7 +218,7 @@ fn run() -> Result<i32, String> {
 
     // Persist user-level preferences (status bar) to $HOME/.ai-jail
     if should_save_global_preferences(&cli) {
-        config::save_global(&config);
+        config::save_global(&config)?;
     }
 
     // Handle --init: save config and exit

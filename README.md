@@ -504,7 +504,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `-s`, `--status-bar[=STYLE]` | Enable persistent status line. `STYLE` is `pastel` (default, random palette per session), `dark`, or `light` |
 | `--no-status-bar` | Disable persistent status line |
 | `--exec` | Direct execution mode (no PTY proxy, no status bar) |
-| `--clean` | Ignore existing config, start fresh |
+| `--clean` | Ignore the project `.ai-jail` config and start fresh |
 | `--dry-run` | Print the bwrap command without executing |
 | `--init` | Create/update config and exit (don't run) |
 | `--bootstrap` | Generate permission configs for AI tools |
@@ -672,6 +672,12 @@ ssh = true
 private_home = true
 lockdown = true
 ```
+
+Configuration is fail-closed. If an existing project `.ai-jail` or global
+`$HOME/.ai-jail` cannot be read or parsed, ai-jail reports the error and exits
+without starting the sandbox or rewriting the file. Use `--clean --init` to
+intentionally replace a broken project config after reviewing it; `--clean`
+does not ignore the global config.
 
 ### Merge behavior
 

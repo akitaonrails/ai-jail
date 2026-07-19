@@ -306,9 +306,7 @@ fn config_path() -> PathBuf {
 }
 
 fn global_config_path() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(CONFIG_FILE))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(CONFIG_FILE))
 }
 
 pub fn parse_toml(contents: &str) -> Result<Config, String> {
@@ -319,52 +317,28 @@ fn parse_global_toml(contents: &str) -> Result<GlobalConfig, String> {
     toml::from_str(contents).map_err(|e| e.to_string())
 }
 
-fn load_from_path(path: &Path) -> Config {
-    if !path.exists() {
-        return Config::default();
-    }
+fn load_toml_from_path<T: Default>(
+    path: &Path,
+    parse: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
     match std::fs::read_to_string(path) {
-        Ok(contents) => match parse_toml(&contents) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                output::warn(&format!(
-                    "Failed to parse {}: {e}",
-                    path.display()
-                ));
-                Config::default()
-            }
-        },
-        Err(e) => {
-            output::warn(&format!("Failed to read {}: {e}", path.display()));
-            Config::default()
-        }
+        Ok(contents) => parse(&contents)
+            .map_err(|e| format!("Failed to parse {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(e) => Err(format!("Failed to read {}: {e}", path.display())),
     }
 }
 
-fn load_global_from_path(path: &Path) -> GlobalConfig {
-    if !path.exists() {
-        return GlobalConfig::default();
-    }
-    match std::fs::read_to_string(path) {
-        Ok(contents) => match parse_global_toml(&contents) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                output::warn(&format!(
-                    "Failed to parse {}: {e}",
-                    path.display()
-                ));
-                GlobalConfig::default()
-            }
-        },
-        Err(e) => {
-            output::warn(&format!("Failed to read {}: {e}", path.display()));
-            GlobalConfig::default()
-        }
-    }
+fn load_from_path(path: &Path) -> Result<Config, String> {
+    load_toml_from_path(path, parse_toml)
+}
+
+fn load_global_from_path(path: &Path) -> Result<GlobalConfig, String> {
+    load_toml_from_path(path, parse_global_toml)
 }
 
 /// Load project-level config from `.ai-jail` in the current dir.
-pub fn load() -> Config {
+pub fn load() -> Result<Config, String> {
     load_from_path(&config_path())
 }
 
@@ -372,10 +346,13 @@ pub fn load() -> Config {
 /// `[commands.<name>]` table when present. The selection key is based on the
 /// effective command before global command tables are merged: CLI command,
 /// then project command, then global base command.
-pub fn load_global_for_command(cli: &CliArgs, project: &Config) -> Config {
+pub fn load_global_for_command(
+    cli: &CliArgs,
+    project: &Config,
+) -> Result<Config, String> {
     match global_config_path() {
         Some(p) => load_global_for_command_from_path(&p, cli, project),
-        None => Config::default(),
+        None => Ok(Config::default()),
     }
 }
 
@@ -383,9 +360,9 @@ fn load_global_for_command_from_path(
     path: &Path,
     cli: &CliArgs,
     project: &Config,
-) -> Config {
-    let global = load_global_from_path(path);
-    global_config_for_command(global, cli, project)
+) -> Result<Config, String> {
+    let global = load_global_from_path(path)?;
+    Ok(global_config_for_command(global, cli, project))
 }
 
 fn global_config_for_command(
@@ -484,18 +461,18 @@ pub fn save(config: &Config) {
 
 /// Persist user-level preferences (status bar) to `$HOME/.ai-jail`.
 /// Loads the existing global config first so other fields are kept.
-pub fn save_global(config: &Config) {
+pub fn save_global(config: &Config) -> Result<(), String> {
     if config.no_status_bar.is_none() && config.status_bar_style.is_none() {
-        return;
+        return Ok(());
     }
     let Some(path) = global_config_path() else {
-        return;
+        return Ok(());
     };
-    save_global_to_path(&path, config);
+    save_global_to_path(&path, config)
 }
 
-fn save_global_to_path(path: &Path, config: &Config) {
-    let mut global = load_global_from_path(path);
+fn save_global_to_path(path: &Path, config: &Config) -> Result<(), String> {
+    let mut global = load_global_from_path(path)?;
     if config.no_status_bar.is_some() {
         global.base.no_status_bar = config.no_status_bar;
     }
@@ -503,6 +480,7 @@ fn save_global_to_path(path: &Path, config: &Config) {
         global.base.status_bar_style = config.status_bar_style.clone();
     }
     save_global_doc_to_path(path, &global);
+    Ok(())
 }
 
 /// Comment block written at the top of every saved `.ai-jail` file
@@ -2832,6 +2810,84 @@ allow_tcp_ports = [32000, 8080]
     // ── File I/O tests (using temp dirs) ───────────────────────
 
     #[test]
+    fn missing_config_file_uses_defaults() {
+        let dir = std::env::temp_dir()
+            .join(format!("ai-jail-missing-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config = load_from_path(&dir.join(".ai-jail")).unwrap();
+
+        assert!(config.command.is_empty());
+        assert!(config.rw_maps.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_config_file_is_fatal() {
+        let dir = std::env::temp_dir()
+            .join(format!("ai-jail-malformed-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".ai-jail");
+        std::fs::write(&path, "command = [\"bash\"\n").unwrap();
+
+        let error = load_from_path(&path).unwrap_err();
+
+        assert!(error.contains(&format!("Failed to parse {}", path.display())));
+        assert!(error.contains("TOML parse error"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_config_path_is_fatal() {
+        let dir = std::env::temp_dir()
+            .join(format!("ai-jail-unreadable-config-{}", std::process::id()));
+        let path = dir.join(".ai-jail");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let error = load_from_path(&path).unwrap_err();
+
+        assert!(error.contains(&format!("Failed to read {}", path.display())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_utf8_config_file_is_fatal() {
+        let dir = std::env::temp_dir()
+            .join(format!("ai-jail-non-utf8-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".ai-jail");
+        std::fs::write(&path, [0xff]).unwrap();
+
+        let error = load_from_path(&path).unwrap_err();
+
+        assert!(error.contains(&format!("Failed to read {}", path.display())));
+        assert_eq!(std::fs::read(&path).unwrap(), [0xff]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_preference_save_preserves_malformed_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-jail-malformed-global-config-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".ai-jail");
+        let original = "no_gpu = tru\n";
+        std::fs::write(&path, original).unwrap();
+        let config = Config {
+            status_bar_style: Some("dark".into()),
+            ..Config::default()
+        };
+
+        let error = save_global_to_path(&path, &config).unwrap_err();
+
+        assert!(error.contains(&format!("Failed to parse {}", path.display())));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn save_global_status_bar_theme_persists() {
         let dir = std::env::temp_dir()
             .join(format!("ai-jail-home-global-{}", std::process::id()));
@@ -2843,9 +2899,9 @@ allow_tcp_ports = [32000, 8080]
             status_bar_style: Some("dark".into()),
             ..Config::default()
         };
-        save_global_to_path(&path, &cfg);
+        save_global_to_path(&path, &cfg).unwrap();
 
-        let global = load_from_path(&path);
+        let global = load_from_path(&path).unwrap();
         assert_eq!(global.no_status_bar, None);
         assert_eq!(global.status_bar_style.as_deref(), Some("dark"));
 
@@ -2874,9 +2930,9 @@ allow_tcp_ports = [32000, 8080]
             status_bar_style: Some("dark".into()),
             ..Config::default()
         };
-        save_global_to_path(&path, &cfg);
+        save_global_to_path(&path, &cfg).unwrap();
 
-        let global = load_from_path(&path);
+        let global = load_from_path(&path).unwrap();
         assert_eq!(global.no_status_bar, Some(true));
         assert_eq!(global.status_bar_style.as_deref(), Some("dark"));
 
@@ -2910,9 +2966,9 @@ rw_maps = ["~/.claude"]
             status_bar_style: Some("dark".into()),
             ..Config::default()
         };
-        save_global_to_path(&path, &cfg);
+        save_global_to_path(&path, &cfg).unwrap();
 
-        let global = load_global_from_path(&path);
+        let global = load_global_from_path(&path).unwrap();
         assert_eq!(global.base.status_bar_style.as_deref(), Some("dark"));
         assert_eq!(global.base.rw_maps, vec![PathBuf::from("~/common")]);
         assert_eq!(global.commands.len(), 2);
@@ -2954,9 +3010,9 @@ hide_dotdirs = [".my_secrets"]
             status_bar_style: Some("dark".into()),
             ..Config::default()
         };
-        save_global_to_path(&path, &cfg);
+        save_global_to_path(&path, &cfg).unwrap();
 
-        let global = load_global_from_path(&path);
+        let global = load_global_from_path(&path).unwrap();
         assert_eq!(global.base.command, vec!["claude"]);
         assert_eq!(global.base.rw_maps, vec![PathBuf::from("~/shared")]);
         assert_eq!(global.base.no_gpu, Some(true));
@@ -3036,7 +3092,7 @@ hide_dotdirs = [".my_secrets"]
         };
         save(&config);
 
-        let loaded = load();
+        let loaded = load().unwrap();
         assert_eq!(loaded.command, vec!["codex"]);
         assert_eq!(loaded.rw_maps, vec![PathBuf::from("/tmp/shared")]);
         assert_eq!(loaded.no_gpu, Some(true));

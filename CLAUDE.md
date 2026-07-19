@@ -57,7 +57,7 @@ There are regression tests in `src/config.rs` that parse old config file formats
 - **Minimal dependencies.** Current deps: `lexopt`, `serde`, `toml`, `serde_json`, `vt100`, `nix`, `landlock`, `seccompiler` (Linux). Do not add new crates without a strong justification.
 - **No clap.** We use `lexopt` for argument parsing to keep the binary small.
 - **Raw ANSI for colors.** No color crate — `output.rs` handles this with raw escape codes.
-- **Warn and skip, never crash.** Missing paths, unreadable dirs, and non-critical errors produce a warning and continue. Only truly fatal errors (no bwrap, can't get cwd) should cause an exit.
+- **Warn and skip, never crash.** Missing paths, unreadable dirs, and non-critical errors produce a warning and continue. Existing `.ai-jail` files that cannot be read or parsed are fatal because silently dropping sandbox policy would fail open. Other fatal errors include no bwrap and an unavailable current directory.
 - **Signal safety.** The signal handler (`signals.rs`) must only use async-signal-safe operations. The current handler just calls `libc::kill` on the stored child PID.
 - **RAII for cleanup.** Temp files use a `Drop` guard, not manual cleanup.
 
