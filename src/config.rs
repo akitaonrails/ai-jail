@@ -1,4 +1,5 @@
 use crate::cli::CliArgs;
+use crate::command;
 use crate::output;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -370,16 +371,25 @@ fn global_config_for_command(
     cli: &CliArgs,
     project: &Config,
 ) -> Config {
-    let command_name = cli
-        .command
-        .first()
-        .or_else(|| project.command.first())
-        .or_else(|| global.base.command.first())
-        .cloned();
+    let selected_command = if !cli.command.is_empty() {
+        cli.command.clone()
+    } else if !project.command.is_empty() {
+        project.command.clone()
+    } else {
+        global.base.command.clone()
+    };
 
-    let mut base = global.base;
-    if let Some(name) = command_name
-        && let Some(command_config) = global.commands.get(&name)
+    let GlobalConfig { mut base, commands } = global;
+    if let Some(name) = selected_command.first()
+        && let Some(command_config) = commands.get(name)
+    {
+        base = merge_with_global(base, command_config.clone());
+    }
+    // `ai-memory run` is both a wrapper invocation and a harness launch.
+    // Preserve an existing [commands.ai-memory] layer, then let the selected
+    // harness add/override its own global preferences.
+    if let Some(harness) = command::managed_harness(&selected_command)
+        && let Some(command_config) = commands.get(harness.name)
     {
         base = merge_with_global(base, command_config.clone());
     }
@@ -2178,6 +2188,105 @@ tailscale = false
         assert_eq!(selected.no_gpu, Some(true));
         assert_eq!(selected.tailscale, Some(true));
         assert!(!selected.rw_maps.contains(&PathBuf::from("~/.claude")));
+    }
+
+    #[test]
+    fn managed_harness_layers_wrapper_then_harness_global_config() {
+        let global = parse_global_toml(
+            r#"
+rw_maps = ["~/common"]
+no_gpu = true
+
+[commands.ai-memory]
+rw_maps = ["~/.local/share/ai-memory"]
+tailscale = true
+no_docker = true
+
+[commands.codex]
+rw_maps = ["~/.codex"]
+tailscale = false
+"#,
+        )
+        .unwrap();
+        let cli = CliArgs {
+            command: vec![
+                "ai-memory".into(),
+                "run".into(),
+                "--project".into(),
+                "demo".into(),
+                "codex".into(),
+                "--yolo".into(),
+            ],
+            ..CliArgs::default()
+        };
+
+        let selected =
+            global_config_for_command(global, &cli, &Config::default());
+
+        assert_eq!(
+            selected.rw_maps,
+            vec![
+                PathBuf::from("~/common"),
+                PathBuf::from("~/.local/share/ai-memory"),
+                PathBuf::from("~/.codex"),
+            ]
+        );
+        assert_eq!(selected.no_gpu, Some(true));
+        assert_eq!(selected.no_docker, Some(true));
+        assert_eq!(selected.tailscale, Some(false));
+    }
+
+    #[test]
+    fn ai_memory_non_run_subcommand_does_not_apply_harness_scope() {
+        let global = parse_global_toml(
+            r#"
+[commands.ai-memory]
+no_docker = true
+
+[commands.codex]
+tailscale = true
+"#,
+        )
+        .unwrap();
+        let cli = CliArgs {
+            command: vec!["ai-memory".into(), "status".into(), "codex".into()],
+            ..CliArgs::default()
+        };
+
+        let selected =
+            global_config_for_command(global, &cli, &Config::default());
+
+        assert_eq!(selected.no_docker, Some(true));
+        assert_eq!(selected.tailscale, None);
+    }
+
+    #[test]
+    fn managed_harness_scope_uses_project_command_when_cli_absent() {
+        let global = parse_global_toml(
+            r#"
+[commands.ai-memory]
+no_docker = true
+
+[commands.claude]
+tailscale = true
+"#,
+        )
+        .unwrap();
+        let project = Config {
+            command: vec![
+                "ai-memory".into(),
+                "run".into(),
+                "--workspace=team".into(),
+                "claude".into(),
+            ],
+            ..Config::default()
+        };
+
+        let selected =
+            global_config_for_command(global, &CliArgs::default(), &project);
+
+        assert_eq!(selected.no_docker, Some(true));
+        assert_eq!(selected.tailscale, Some(true));
     }
 
     #[test]

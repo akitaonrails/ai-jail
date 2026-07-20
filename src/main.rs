@@ -3,6 +3,7 @@ compile_error!("ai-jail only supports Linux and macOS");
 
 mod bootstrap;
 mod cli;
+mod command;
 mod config;
 mod fsutil;
 mod output;
@@ -13,14 +14,6 @@ mod statusbar;
 
 #[cfg(test)]
 mod test_utils;
-
-fn command_basename(command: &[String]) -> Option<&str> {
-    command.first().and_then(|cmd| {
-        std::path::Path::new(cmd)
-            .file_name()
-            .and_then(|name| name.to_str())
-    })
-}
 
 fn command_needs_direct_tty(command: &[String]) -> bool {
     // Tools that must own the real terminal directly, bypassing the
@@ -37,11 +30,15 @@ fn command_needs_direct_tty(command: &[String]) -> bool {
     //     model, so there is no faithful reconstruction. Routing
     //     opencode straight through the terminal (no status bar)
     //     preserves its own absolute glyph positioning.
-    matches!(command_basename(command), Some("crush") | Some("opencode"))
+    matches!(
+        command::effective_name(command),
+        Some("crush") | Some("opencode")
+    )
 }
 
 fn command_is_browser(command: &[String]) -> bool {
-    command_basename(command).is_some_and(sandbox::is_browser_command_name)
+    command::effective_name(command)
+        .is_some_and(sandbox::is_browser_command_name)
 }
 
 fn resolve_browser_profile(
@@ -93,7 +90,7 @@ fn running_inside_multiplexer() -> Option<&'static str> {
 }
 
 fn default_resize_redraw_key(command: &[String]) -> Option<&'static str> {
-    match command_basename(command) {
+    match command::effective_name(command) {
         Some("codex") => Some("ctrl-shift-l"),
         _ => None,
     }
@@ -293,7 +290,8 @@ fn run() -> Result<i32, String> {
             if needs_direct_tty {
                 output::verbose(&format!(
                     "Status bar: skipped ({} requires direct terminal passthrough)",
-                    command_basename(&config.command).unwrap_or("command")
+                    command::effective_name(&config.command)
+                        .unwrap_or("command")
                 ));
             } else if multiplexer_skip {
                 output::verbose(&format!(
@@ -424,9 +422,9 @@ fn main() {
 mod tests {
     use super::{
         apply_browser_profile, command_is_browser, command_needs_direct_tty,
-        resolve_browser_profile, running_inside_multiplexer,
-        should_auto_save_project_config, should_save_global_preferences,
-        validate_write_flags,
+        default_resize_redraw_key, resolve_browser_profile,
+        running_inside_multiplexer, should_auto_save_project_config,
+        should_save_global_preferences, validate_write_flags,
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
@@ -446,6 +444,25 @@ mod tests {
         assert!(command_needs_direct_tty(&[
             "/home/x/.opencode/bin/opencode".into()
         ]));
+        assert!(command_needs_direct_tty(&[
+            "ai-memory".into(),
+            "run".into(),
+            "opencode".into(),
+        ]));
+    }
+
+    #[test]
+    fn managed_codex_uses_resize_redraw_default() {
+        assert_eq!(
+            default_resize_redraw_key(&[
+                "ai-memory".into(),
+                "run".into(),
+                "--project".into(),
+                "demo".into(),
+                "codex".into(),
+            ]),
+            Some("ctrl-shift-l")
+        );
     }
 
     #[test]

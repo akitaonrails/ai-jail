@@ -473,11 +473,17 @@ fn home_dir() -> PathBuf {
 /// so version payloads and launcher siblings resolve. Tools with needs
 /// beyond their install directory stay on the `--map` escape hatch.
 pub(crate) fn command_home_paths(config: &Config) -> Vec<PathBuf> {
-    let Some(cmd) = config.command.first() else {
-        return vec![];
-    };
     let path_env = std::env::var("PATH").unwrap_or_default();
-    command_home_paths_impl(cmd, &home_dir(), &path_env)
+    let home = home_dir();
+    let mut paths = Vec::new();
+    for executable in crate::command::executable_candidates(&config.command) {
+        for path in command_home_paths_impl(executable, &home, &path_env) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
 }
 
 fn command_home_paths_impl(
@@ -1722,6 +1728,48 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn command_home_paths_include_managed_outer_and_inner_executables() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-managed-cmd-home-{}", std::process::id()));
+        let outer_dir = home.join(".local/bin");
+        let inner_dir = home.join("tools/codex");
+        std::fs::create_dir_all(&outer_dir).unwrap();
+        std::fs::create_dir_all(&inner_dir).unwrap();
+        let outer = outer_dir.join("ai-memory");
+        let inner = inner_dir.join("codex-custom");
+        std::fs::write(&outer, "#!/bin/sh\n").unwrap();
+        std::fs::write(&inner, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &outer,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &inner,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path = EnvVarGuard::set("PATH", outer_dir.as_os_str());
+        let config = Config {
+            command: vec![
+                "ai-memory".into(),
+                "run".into(),
+                "--executable".into(),
+                inner.display().to_string(),
+                "codex".into(),
+            ],
+            ..Config::default()
+        };
+
+        assert_eq!(command_home_paths(&config), vec![outer_dir, inner_dir]);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

@@ -456,6 +456,7 @@ const CACHE_DENY: &[&str] = &[
 ];
 
 const LOCAL_SHARE_RW: &[&str] = &[
+    "ai-memory",
     "zoxide",
     "crush",
     "kiro-cli",
@@ -3227,6 +3228,26 @@ mod tests {
         )));
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn local_share_ai_memory_is_mounted_read_write() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-ai-memory-home-{}", std::process::id()));
+        let ai_memory = home.join(".local/share/ai-memory");
+        std::fs::create_dir_all(&ai_memory).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let mounts = discover_local_overrides();
+
+        assert!(mounts.iter().any(|mount| matches!(
+            mount,
+            Mount::Bind { src, dest }
+                if src == &ai_memory && dest == &ai_memory
+        )));
+
+        let _ = std::fs::remove_dir_all(home);
     }
 
     /// Index of the first exact `[flag, src, dest]` triple in the args.
