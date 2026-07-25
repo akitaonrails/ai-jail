@@ -651,9 +651,9 @@ fn collect_normal_paths_with_mounted_paths(
 
     // Docker socket: read-write — allows the agent to build and
     // run containers. This is a deliberate trust extension: the
-    // Docker socket grants effective root on the host. Controlled
-    // by --no-docker / config flag; auto-enabled if the socket
-    // exists on the host.
+    // Docker socket grants effective root on the host. Opt-in only
+    // (issue #88): exposed solely via --docker / `no_docker = false`,
+    // never by default.
     if config.docker_enabled() {
         let sock = PathBuf::from("/var/run/docker.sock");
         if super::path_exists(&sock) {

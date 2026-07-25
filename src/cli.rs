@@ -39,7 +39,7 @@ OPTIONS:
     --systemd-user / --no-systemd-user
                                    Expose host systemd --user bus (dangerous; default: off)
     --no-gpu / --gpu               Disable/enable GPU device passthrough (Linux only)
-    --no-docker / --docker         Disable/enable Docker socket passthrough
+    --no-docker / --docker         Disable/enable Docker socket passthrough (grants host root; default: off)
     --tailscale / --no-tailscale   Enable/disable Tailscale socket passthrough (default: off)
     --no-display / --display       Disable/enable X11/Wayland passthrough (Linux only)
     --worktree / --no-worktree     Enable/disable linked Git worktree metadata passthrough

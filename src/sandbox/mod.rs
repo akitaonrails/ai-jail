@@ -964,13 +964,37 @@ pub fn platform_notes(config: &Config) {
             "Lockdown mode enabled: read-only project, no host write mounts, no mise.",
         );
     }
+    warn_docker_passthrough(config);
     #[cfg(target_os = "macos")]
     {
         seatbelt::platform_notes(config);
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = config;
+}
+
+/// True when the raw host Docker socket will be exposed inside the
+/// sandbox. Passthrough is opt-in (issue #88): the socket grants
+/// effective root on the host, bypassing masks, deny-paths, and
+/// Landlock. Lockdown and browser profiles never expose it.
+fn docker_passthrough_active(config: &Config, socket_present: bool) -> bool {
+    socket_present
+        && config.docker_enabled()
+        && !config.lockdown_enabled()
+        && config.browser_profile().is_none()
+}
+
+fn warn_docker_passthrough(config: &Config) {
+    let candidates = [
+        PathBuf::from("/var/run/docker.sock"),
+        home_dir().join(".docker/run/docker.sock"),
+    ];
+    let socket_present = candidates.iter().any(|p| path_exists(p));
+    if docker_passthrough_active(config, socket_present) {
+        output::warn(
+            "Docker socket passthrough is enabled: the sandboxed process \
+             gets effective root on the host through the Docker daemon, \
+             bypassing --mask, --deny-path, and Landlock. \
+             Disable with --no-docker.",
+        );
     }
 }
 
@@ -1062,6 +1086,38 @@ mod tests {
             .unwrap_or(0);
         std::env::temp_dir()
             .join(format!("ai-jail-{prefix}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn docker_passthrough_requires_explicit_opt_in() {
+        // Issue #88: unset no_docker must not expose the socket even
+        // when it exists on the host.
+        let default_config = Config::default();
+        assert!(!docker_passthrough_active(&default_config, true));
+
+        let opted_in = Config {
+            no_docker: Some(false),
+            ..Config::default()
+        };
+        assert!(docker_passthrough_active(&opted_in, true));
+        assert!(!docker_passthrough_active(&opted_in, false));
+    }
+
+    #[test]
+    fn docker_passthrough_stays_off_in_lockdown_and_browser_modes() {
+        let lockdown = Config {
+            no_docker: Some(false),
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        assert!(!docker_passthrough_active(&lockdown, true));
+
+        let browser = Config {
+            no_docker: Some(false),
+            browser_profile: Some("hard".into()),
+            ..Config::default()
+        };
+        assert!(!docker_passthrough_active(&browser, true));
     }
 
     #[test]

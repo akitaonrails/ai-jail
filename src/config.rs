@@ -225,8 +225,11 @@ impl Config {
     pub fn gpu_enabled(&self) -> bool {
         self.no_gpu != Some(true)
     }
+    /// Docker socket passthrough is opt-in: the socket grants effective
+    /// root on the host, so it is only exposed when explicitly enabled
+    /// (`--docker` or `no_docker = false`). Unset means disabled.
     pub fn docker_enabled(&self) -> bool {
-        self.no_docker != Some(true)
+        self.no_docker == Some(false)
     }
     pub fn tailscale_enabled(&self) -> bool {
         self.tailscale == Some(true)
@@ -878,7 +881,7 @@ pub fn display_status(config: &Config) {
     print_path_list("  Deny exceptions", &config.deny_path_exceptions);
 
     print_auto_tristate("  GPU", config.no_gpu);
-    print_auto_tristate("  Docker", config.no_docker);
+    print_opt_in_tristate("  Docker", config.no_docker);
     print_shared_or_hidden("  Tailscale", config.tailscale);
     print_auto_tristate("  Display", config.no_display);
     print_auto_tristate("  Git worktree", config.no_worktree);
@@ -941,6 +944,17 @@ fn print_auto_tristate(label: &str, val: Option<bool>) {
         Some(true) => "disabled",
         Some(false) => "enabled",
         None => "auto",
+    };
+    output::status_header(label, v);
+}
+
+/// Render a `no_*` field that is disabled unless explicitly enabled:
+/// Some(true)/None → "disabled", Some(false) → "enabled".
+fn print_opt_in_tristate(label: &str, val: Option<bool>) {
+    let v = match val {
+        Some(false) => "enabled",
+        Some(true) => "disabled",
+        None => "disabled (default)",
     };
     output::status_header(label, v);
 }
@@ -2617,8 +2631,10 @@ allow_tcp_ports = [32000, 8080]
 
     #[test]
     fn docker_enabled_accessor() {
+        // Docker passthrough is opt-in: unset means disabled because the
+        // socket grants effective host root (issue #88).
         assert!(
-            Config {
+            !Config {
                 no_docker: None,
                 ..Config::default()
             }

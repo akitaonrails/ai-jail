@@ -174,9 +174,10 @@ If you run `ai-jail` from a linked Git worktree, it auto-detects the worktree's 
 
 The default mode favors usability over maximum lockdown. These are intentionally open by default:
 
-1. Docker socket passthrough auto-enables when `/var/run/docker.sock` exists (`--no-docker` disables it). On WSL 2 with Docker Desktop, ai-jail also exposes Docker Desktop's WSL CLI tools directory when present so the injected `docker` symlink keeps working.
-2. Display passthrough mounts `XDG_RUNTIME_DIR` on Linux, which can expose host IPC sockets.
-3. Environment variables are inherited (tokens/secrets in your shell env are visible in-jail).
+1. Display passthrough mounts `XDG_RUNTIME_DIR` on Linux, which can expose host IPC sockets.
+2. Environment variables are inherited (tokens/secrets in your shell env are visible in-jail).
+
+> ⚠️ **Docker socket passthrough is opt-in and dangerous.** When enabled (`--docker` or `no_docker = false`), ai-jail bind-mounts the host Docker socket read-write. The Docker daemon runs as root on the host, so a sandboxed agent can start a container with an arbitrary host bind mount — effective host root, bypassing tmpfs `$HOME`, `--mask`, `--deny-path`, and Landlock (`docker run -v /:/host ...`). Only enable it for workloads you fully trust. On WSL 2 with Docker Desktop, enabling it also exposes Docker Desktop's WSL CLI tools directory when present so the injected `docker` symlink keeps working.
 
 **Hiding project-level secrets**: the project directory is mounted in its entirety, so files like `.env`, `credentials.json`, or `secrets.yml` are visible to whatever runs inside. Use `--mask PATH` to replace them with empty files inside the sandbox, or `--deny-path PATH` when you want reads/listing/writes to fail with permission denied. Both options accept glob patterns (`*`, `?`, `[a-z]`, and recursive `**`) that are expanded when the sandbox policy is built. Examples:
 
@@ -373,7 +374,7 @@ Change the wrapper command to `exec ai-jail --browser=hard chromium "$@"` if des
 | Project directory (pwd) | **read-write** | The whole point |
 | Linked Git worktree metadata | auto passthrough | Validated `.git` gitfile targets are mounted when the current directory is a linked worktree |
 | GPU devices (`/dev/nvidia*`, `/dev/dri`) | device | For GPU-accelerated tools |
-| Docker socket | read-write | If `/var/run/docker.sock` exists |
+| Docker socket | read-write | Opt-in only (`--docker` / `no_docker = false`) — grants effective host root |
 | X11/Wayland | passthrough | Display server access |
 | `/dev/shm` | device | Shared memory (Chromium needs this) |
 
@@ -508,7 +509,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--rlimits` / `--no-rlimits` | Enable/disable resource limits (default: on) |
 | `--systemd-user` / `--no-systemd-user` | Dangerous opt-in: expose the host `systemd --user` bus so tools like `systemd-run --user` can talk to the host user manager. Linux normal mode only; skipped in lockdown and browser profile mode. With `--no-display`, only the narrow user-bus sockets are mounted. |
 | `--gpu` / `--no-gpu` | Enable/disable GPU passthrough |
-| `--docker` / `--no-docker` | Enable/disable Docker socket |
+| `--docker` / `--no-docker` | Enable/disable Docker socket passthrough (default: off). Grants effective host root — see Security notes. |
 | `--tailscale` / `--no-tailscale` | Enable/disable Tailscale socket passthrough (default: off). When enabled, maps `/var/run/tailscale/tailscaled.sock` for the `tailscale` CLI if it exists. |
 | `--display` / `--no-display` | Enable/disable X11/Wayland |
 | `--worktree` / `--no-worktree` | Enable/disable linked Git worktree metadata passthrough (default: on) |
@@ -751,7 +752,7 @@ ones.
 | `allow_tcp_ports` | u16 array | `[]` | TCP ports permitted outbound in lockdown mode (e.g. `[32000, 8080]`). Requires Linux ≥ 6.5 for Landlock V4. No effect outside lockdown. |
 | `private_home` | bool | not set (off) | `true` skips automatic host dotdir passthrough without enabling full lockdown. Project and explicit maps remain writable. Linux uses tmpfs `$HOME`; macOS uses seatbelt allowlists. |
 | `no_gpu` | bool | not set (auto) | `true` disables GPU passthrough |
-| `no_docker` | bool | not set (auto) | `true` disables Docker socket |
+| `no_docker` | bool | not set (off) | `false` enables Docker socket passthrough (opt-in; grants effective host root) |
 | `tailscale` | bool | not set (off) | `true` maps `/var/run/tailscale/tailscaled.sock` for the `tailscale` CLI if it exists. Opt-in for privacy/safety. |
 | `no_display` | bool | not set (auto) | `true` disables X11/Wayland |
 | `no_worktree` | bool | not set (auto) | `true` disables linked Git worktree metadata passthrough |
@@ -823,7 +824,7 @@ command -v docker
 readlink -f "$(command -v docker)"
 ```
 
-The socket is mounted automatically when it exists. Docker Desktop for Windows commonly injects `/usr/bin/docker` as a symlink to `/mnt/wsl/docker-desktop/cli-tools/usr/bin/docker`; ai-jail exposes that CLI tools directory read-only when it exists. If `docker` is still missing inside the jail, check Docker Desktop's WSL integration for your distro or install the Docker CLI package inside the WSL distro so the binary lives under `/usr/bin` directly.
+Docker passthrough is opt-in (`--docker` or `no_docker = false`); see the security note above before enabling it. When enabled, the socket is mounted whenever it exists. Docker Desktop for Windows commonly injects `/usr/bin/docker` as a symlink to `/mnt/wsl/docker-desktop/cli-tools/usr/bin/docker`; ai-jail exposes that CLI tools directory read-only when it exists. If `docker` is still missing inside the jail, check Docker Desktop's WSL integration for your distro or install the Docker CLI package inside the WSL distro so the binary lives under `/usr/bin` directly.
 
 ## License
 
