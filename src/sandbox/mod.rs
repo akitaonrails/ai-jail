@@ -1,10 +1,86 @@
 use crate::config::Config;
-#[cfg(any(target_os = "macos", test))]
 use crate::config::MapSpec;
 use crate::output;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Features that can be silently enabled by a project `.ai-jail` and
+/// materially weaken the sandbox. Used for the launch warning in
+/// `warn_project_config_opt_ins` and for focused tests.
+fn project_config_dangerous_opt_ins(
+    config: &Config,
+    project_dir: &Path,
+) -> Vec<String> {
+    let mut items = Vec::new();
+
+    if config.docker_enabled() {
+        items.push("Docker socket".into());
+    }
+    if config.tailscale_enabled() {
+        items.push("Tailscale socket".into());
+    }
+    if config.ssh == Some(true) {
+        items.push("SSH keys/agent".into());
+    }
+    if config.pictures == Some(true) {
+        items.push("Pictures directory".into());
+    }
+    if config.systemd_user == Some(true) {
+        items.push("systemd user bus".into());
+    }
+
+    let mut outside = 0usize;
+    for encoded in &config.rw_maps {
+        if let Ok(spec) = MapSpec::parse(encoded)
+            && is_outside_project(&spec.source, project_dir)
+        {
+            outside += 1;
+        }
+    }
+    for encoded in &config.ro_maps {
+        if let Ok(spec) = MapSpec::parse(encoded)
+            && is_outside_project(&spec.source, project_dir)
+        {
+            outside += 1;
+        }
+    }
+    for path in &config.overlay_maps {
+        if is_outside_project(path, project_dir) {
+            outside += 1;
+        }
+    }
+    if outside > 0 {
+        items.push(format!("{outside} host path map(s) outside the project"));
+    }
+
+    items
+}
+
+fn is_outside_project(path: &Path, project_dir: &Path) -> bool {
+    path.is_absolute() && !path.starts_with(project_dir)
+}
+
+/// Warn when a project `.ai-jail` enables dangerous passthroughs or
+/// broad host path maps. The caller passes the *project-level* config
+/// before global/CLI merging so the warning is tied to the untrusted
+/// file, not the user's own global preferences or explicit CLI flags.
+pub fn warn_project_config_opt_ins(config: &Config, project_dir: &Path) {
+    // Paths in the loaded config may be relative or use `~/...`; resolve
+    // them the same way the sandbox will before checking scope.
+    let mut resolved = config.clone();
+    crate::config::absolutize_user_paths(&mut resolved, project_dir);
+
+    let items = project_config_dangerous_opt_ins(&resolved, project_dir);
+    if items.is_empty() {
+        return;
+    }
+
+    output::warn(&format!(
+        "Project .ai-jail enables: {}. Review the file if you did not write it.",
+        items.join(", ")
+    ));
+}
 
 #[cfg(target_os = "linux")]
 pub(crate) mod bwrap;
@@ -1086,6 +1162,57 @@ mod tests {
             .unwrap_or(0);
         std::env::temp_dir()
             .join(format!("ai-jail-{prefix}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn project_config_dangerous_opt_ins_lists_enabled_features() {
+        let project = temp_test_dir("dangerous-optins");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let default = Config::default();
+        assert!(
+            project_config_dangerous_opt_ins(&default, &project).is_empty()
+        );
+
+        let all_on = Config {
+            no_docker: Some(false),
+            tailscale: Some(true),
+            ssh: Some(true),
+            pictures: Some(true),
+            systemd_user: Some(true),
+            ..Config::default()
+        };
+        let items = project_config_dangerous_opt_ins(&all_on, &project);
+        assert!(items.iter().any(|i| i.contains("Docker")));
+        assert!(items.iter().any(|i| i.contains("Tailscale")));
+        assert!(items.iter().any(|i| i.contains("SSH")));
+        assert!(items.iter().any(|i| i.contains("Pictures")));
+        assert!(items.iter().any(|i| i.contains("systemd")));
+    }
+
+    #[test]
+    fn project_config_dangerous_opt_ins_counts_outside_maps() {
+        let project = temp_test_dir("outside-maps");
+        std::fs::create_dir_all(&project).unwrap();
+        let outside = PathBuf::from("/tmp/ai-jail-audit-outside");
+
+        let cfg = Config {
+            rw_maps: vec![outside.clone()],
+            ro_maps: vec![outside.clone()],
+            overlay_maps: vec![outside.clone()],
+            ..Config::default()
+        };
+        let items = project_config_dangerous_opt_ins(&cfg, &project);
+        assert!(items.iter().any(|i| i.contains("3 host path map(s)")));
+
+        let inside = project.join("src");
+        let cfg = Config {
+            rw_maps: vec![inside.clone()],
+            ..Config::default()
+        };
+        assert!(project_config_dangerous_opt_ins(&cfg, &project).is_empty());
+
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]

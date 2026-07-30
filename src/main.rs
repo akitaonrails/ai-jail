@@ -205,6 +205,7 @@ fn run() -> Result<i32, String> {
     let invocation_cwd = std::env::current_dir()
         .map_err(|e| format!("Cannot determine current directory: {e}"))?;
     config::absolutize_user_paths(&mut config, &invocation_cwd);
+    sandbox::warn_project_config_opt_ins(&project_config, &invocation_cwd);
     apply_browser_profile(&mut config);
 
     // Handle status command

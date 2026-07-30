@@ -300,11 +300,23 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long("landlock-exec") => args.landlock_exec = true,
             Long("landlock-rw-path") => {
+                if !args.landlock_exec {
+                    return Err(
+                        "--landlock-rw-path is internal and only valid with --landlock-exec"
+                            .into(),
+                    );
+                }
                 let val: PathBuf =
                     parser.value().map_err(|e| e.to_string())?.into();
                 args.landlock_rw_paths.push(val);
             }
             Long("landlock-ro-path") => {
+                if !args.landlock_exec {
+                    return Err(
+                        "--landlock-ro-path is internal and only valid with --landlock-exec"
+                            .into(),
+                    );
+                }
                 let val: PathBuf =
                     parser.value().map_err(|e| e.to_string())?.into();
                 args.landlock_ro_paths.push(val);
@@ -967,11 +979,11 @@ mod tests {
         let rw = PathBuf::from("/jail/name:/etc");
         let ro = PathBuf::from("/jail/ro:name");
         let args = parse_test(&[
+            "--landlock-exec",
             "--landlock-rw-path",
             rw.to_str().unwrap(),
             "--landlock-ro-path",
             ro.to_str().unwrap(),
-            "--landlock-exec",
             "--",
             "bash",
         ])
@@ -981,6 +993,14 @@ mod tests {
         assert_eq!(args.landlock_ro_paths, vec![ro]);
         assert!(!HELP.contains("--landlock-rw-path"));
         assert!(!HELP.contains("--landlock-ro-path"));
+    }
+
+    #[test]
+    fn parse_internal_landlock_paths_rejected_without_exec() {
+        let result =
+            parse_test(&["--landlock-rw-path", "/jail/rw", "--", "bash"]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("internal"));
     }
 
     // ── Exec mode ──────────────────────────────────────────────
