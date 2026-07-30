@@ -5,9 +5,9 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Features that can be silently enabled by a project `.ai-jail` and
-/// materially weaken the sandbox. Used for the launch warning in
-/// `warn_project_config_opt_ins` and for focused tests.
+/// Dangerous capabilities a project `.ai-jail` can enable. Items are
+/// stable strings so we can diff the project config against a baseline
+/// (global config + CLI overrides) and warn only about new additions.
 fn project_config_dangerous_opt_ins(
     config: &Config,
     project_dir: &Path,
@@ -30,28 +30,24 @@ fn project_config_dangerous_opt_ins(
         items.push("systemd user bus".into());
     }
 
-    let mut outside = 0usize;
     for encoded in &config.rw_maps {
         if let Ok(spec) = MapSpec::parse(encoded)
             && is_outside_project(&spec.source, project_dir)
         {
-            outside += 1;
+            items.push(format!("rw-map {}", spec.source.display()));
         }
     }
     for encoded in &config.ro_maps {
         if let Ok(spec) = MapSpec::parse(encoded)
             && is_outside_project(&spec.source, project_dir)
         {
-            outside += 1;
+            items.push(format!("ro-map {}", spec.source.display()));
         }
     }
     for path in &config.overlay_maps {
         if is_outside_project(path, project_dir) {
-            outside += 1;
+            items.push(format!("overlay-map {}", path.display()));
         }
-    }
-    if outside > 0 {
-        items.push(format!("{outside} host path map(s) outside the project"));
     }
 
     items
@@ -61,24 +57,40 @@ fn is_outside_project(path: &Path, project_dir: &Path) -> bool {
     path.is_absolute() && !path.starts_with(project_dir)
 }
 
-/// Warn when a project `.ai-jail` enables dangerous passthroughs or
-/// broad host path maps. The caller passes the *project-level* config
-/// before global/CLI merging so the warning is tied to the untrusted
-/// file, not the user's own global preferences or explicit CLI flags.
-pub fn warn_project_config_opt_ins(config: &Config, project_dir: &Path) {
-    // Paths in the loaded config may be relative or use `~/...`; resolve
-    // them the same way the sandbox will before checking scope.
-    let mut resolved = config.clone();
-    crate::config::absolutize_user_paths(&mut resolved, project_dir);
+/// Warn when a project `.ai-jail` introduces dangerous passthroughs or
+/// host path maps that are not already enabled by the user's global
+/// config or explicit CLI flags. This keeps the trust-boundary signal
+/// without warning users who have already opted in globally.
+pub fn warn_project_config_opt_ins(
+    project_config: &Config,
+    baseline_config: &Config,
+    project_dir: &Path,
+) {
+    // Paths may be relative or use `~/...`; resolve them the same way the
+    // sandbox will before checking scope.
+    let mut project = project_config.clone();
+    let mut baseline = baseline_config.clone();
+    crate::config::absolutize_user_paths(&mut project, project_dir);
+    crate::config::absolutize_user_paths(&mut baseline, project_dir);
 
-    let items = project_config_dangerous_opt_ins(&resolved, project_dir);
-    if items.is_empty() {
+    let project_items = project_config_dangerous_opt_ins(&project, project_dir);
+    if project_items.is_empty() {
+        return;
+    }
+    let baseline_items =
+        project_config_dangerous_opt_ins(&baseline, project_dir);
+
+    let new_items: Vec<String> = project_items
+        .into_iter()
+        .filter(|item| !baseline_items.contains(item))
+        .collect();
+    if new_items.is_empty() {
         return;
     }
 
     output::warn(&format!(
-        "Project .ai-jail enables: {}. Review the file if you did not write it.",
-        items.join(", ")
+        "Project .ai-jail enables capabilities not in your global config or CLI flags: {}. Review the file if you did not write it.",
+        new_items.join(", ")
     ));
 }
 
@@ -1191,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn project_config_dangerous_opt_ins_counts_outside_maps() {
+    fn project_config_dangerous_opt_ins_lists_outside_maps() {
         let project = temp_test_dir("outside-maps");
         std::fs::create_dir_all(&project).unwrap();
         let outside = PathBuf::from("/tmp/ai-jail-audit-outside");
@@ -1203,7 +1215,9 @@ mod tests {
             ..Config::default()
         };
         let items = project_config_dangerous_opt_ins(&cfg, &project);
-        assert!(items.iter().any(|i| i.contains("3 host path map(s)")));
+        assert!(items.iter().any(|i| i.starts_with("rw-map ")));
+        assert!(items.iter().any(|i| i.starts_with("ro-map ")));
+        assert!(items.iter().any(|i| i.starts_with("overlay-map ")));
 
         let inside = project.join("src");
         let cfg = Config {
@@ -1211,6 +1225,54 @@ mod tests {
             ..Config::default()
         };
         assert!(project_config_dangerous_opt_ins(&cfg, &project).is_empty());
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn warn_project_config_opt_ins_diffs_against_baseline() {
+        let project = temp_test_dir("warn-diff");
+        std::fs::create_dir_all(&project).unwrap();
+        let outside = PathBuf::from("/tmp/ai-jail-warn-outside");
+
+        let project_cfg = Config {
+            ssh: Some(true),
+            pictures: Some(true),
+            rw_maps: vec![outside.clone()],
+            ..Config::default()
+        };
+        let baseline = Config::default();
+        let project_items =
+            project_config_dangerous_opt_ins(&project_cfg, &project);
+        let baseline_items =
+            project_config_dangerous_opt_ins(&baseline, &project);
+        let new_items: Vec<_> = project_items
+            .into_iter()
+            .filter(|item| !baseline_items.contains(item))
+            .collect();
+
+        assert!(new_items.iter().any(|i| i.contains("SSH")));
+        assert!(new_items.iter().any(|i| i.contains("Pictures")));
+        assert!(new_items.iter().any(|i| i.starts_with("rw-map ")));
+
+        // If the baseline already has the capability, it is not flagged.
+        let baseline_with_ssh = Config {
+            ssh: Some(true),
+            ..Config::default()
+        };
+        let baseline_items =
+            project_config_dangerous_opt_ins(&baseline_with_ssh, &project);
+        let new_items: Vec<_> = project_config_dangerous_opt_ins(
+            &Config {
+                ssh: Some(true),
+                ..Config::default()
+            },
+            &project,
+        )
+        .into_iter()
+        .filter(|item| !baseline_items.contains(item))
+        .collect();
+        assert!(!new_items.iter().any(|i| i.contains("SSH")));
 
         let _ = std::fs::remove_dir_all(&project);
     }

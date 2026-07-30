@@ -196,6 +196,7 @@ fn run() -> Result<i32, String> {
         config::load()?
     };
     let global = config::load_global_for_command(&cli, &project_config)?;
+    let baseline = config::merge(&cli, global.clone());
     let existing = config::merge_with_global(global, project_config.clone());
     let mut config = config::merge(&cli, existing);
     // Resolve any relative paths in rw_maps/ro_maps against the user's
@@ -205,7 +206,15 @@ fn run() -> Result<i32, String> {
     let invocation_cwd = std::env::current_dir()
         .map_err(|e| format!("Cannot determine current directory: {e}"))?;
     config::absolutize_user_paths(&mut config, &invocation_cwd);
-    sandbox::warn_project_config_opt_ins(&project_config, &invocation_cwd);
+    // Warn only when the project config introduces a dangerous opt-in
+    // that is not already present in the user's global config or on the
+    // CLI. This keeps the trust-boundary signal without annoying users
+    // who have already opted in globally.
+    sandbox::warn_project_config_opt_ins(
+        &project_config,
+        &baseline,
+        &invocation_cwd,
+    );
     apply_browser_profile(&mut config);
 
     // Handle status command
