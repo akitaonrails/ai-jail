@@ -4404,6 +4404,29 @@ mod tests {
     }
 
     #[test]
+    fn regression_kimi_code_home_dir_is_writable() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-kimi-code-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let kimi_code = home.join(".kimi-code");
+        std::fs::create_dir_all(kimi_code.join("sessions")).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let mounts = discover_home_dotfiles(false, &[], &[], false);
+
+        assert!(
+            mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { src, dest } if src == &kimi_code && dest == &kimi_code
+            )),
+            "~/.kimi-code must be mounted read-write so kimi can write sessions and logs"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn home_gitignore_is_mounted_read_only() {
         let _lock = ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir()
