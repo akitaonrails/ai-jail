@@ -214,6 +214,7 @@ const DOTDIR_RW: &[&str] = &[
     ".omp",
     ".pi",
     ".pi-lens",
+    ".kimi-code",
     ".config",
     ".cargo",
     ".cache",
@@ -1723,6 +1724,7 @@ mod tests {
             ".omp",
             ".pi",
             ".pi-lens",
+            ".kimi-code",
         ] {
             assert!(DOTDIR_RW.contains(name), "{name} should be in rw list");
         }
@@ -1795,8 +1797,16 @@ mod tests {
     #[test]
     fn cannot_deny_rw_required_dirs() {
         let required = [
-            ".cargo", ".cache", ".config", ".claude", ".gemini", ".kiro",
-            ".omp", ".pi", ".pi-lens",
+            ".cargo",
+            ".cache",
+            ".config",
+            ".claude",
+            ".gemini",
+            ".kiro",
+            ".omp",
+            ".pi",
+            ".pi-lens",
+            ".kimi-code",
         ];
         for name in required {
             let extra = vec![name.to_string()];
@@ -1821,6 +1831,8 @@ mod tests {
         assert!(is_dotdir_rw("pi"));
         assert!(is_dotdir_rw(".pi-lens"));
         assert!(is_dotdir_rw("pi-lens"));
+        assert!(is_dotdir_rw(".kimi-code"));
+        assert!(is_dotdir_rw("kimi-code"));
         assert!(!is_dotdir_rw(".aws"));
         assert!(!is_dotdir_rw(".my_secrets"));
     }
