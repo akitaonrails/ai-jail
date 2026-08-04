@@ -1797,8 +1797,16 @@ mod tests {
     #[test]
     fn cannot_deny_rw_required_dirs() {
         let required = [
-            ".cargo", ".cache", ".config", ".claude", ".gemini", ".kiro",
-            ".omp", ".pi", ".pi-lens", ".kimi-code",
+            ".cargo",
+            ".cache",
+            ".config",
+            ".claude",
+            ".gemini",
+            ".kiro",
+            ".omp",
+            ".pi",
+            ".pi-lens",
+            ".kimi-code",
         ];
         for name in required {
             let extra = vec![name.to_string()];
