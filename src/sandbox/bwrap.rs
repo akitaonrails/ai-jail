@@ -334,6 +334,7 @@ impl MountSet {
 struct MountSources<'a> {
     hosts_mount: (&'a Path, &'a Path),
     resolv_mount: Option<(&'a Path, &'a Path)>,
+    resolv_intermediate_mount: Option<(&'a Path, &'a Path)>,
     empty_path: &'a Path,
     deny_file_path: &'a Path,
     deny_dir_path: &'a Path,
@@ -344,6 +345,7 @@ impl<'a> MountSources<'a> {
         Self {
             hosts_mount: guard.hosts_mount(),
             resolv_mount: guard.resolv_mount(),
+            resolv_intermediate_mount: guard.resolv_intermediate_mount(),
             empty_path: guard.empty_path(),
             deny_file_path: guard.deny_file_path(),
             deny_dir_path: guard.deny_dir_path(),
@@ -359,6 +361,7 @@ impl<'a> MountSources<'a> {
         Self {
             hosts_mount,
             resolv_mount,
+            resolv_intermediate_mount: None,
             empty_path,
             deny_file_path: empty_path,
             deny_dir_path: empty_path,
@@ -379,6 +382,9 @@ pub struct SandboxGuard {
     /// so the symlink inside /etc (from --ro-bind /etc) resolves.
     /// If it's a regular file, this is /etc/resolv.conf itself.
     resolv_dest: Option<PathBuf>,
+    /// Additional mount point for intermediate symlink hops that live
+    /// under /run or /tmp (e.g. Fedora toolbox's /run/host/etc/resolv.conf).
+    resolv_intermediate_dest: Option<PathBuf>,
     /// Empty tempfile used as the source for --mask file overlays.
     empty_path: PathBuf,
     /// Mode-000 tempfile used as the source for --deny-path file overlays.
@@ -399,6 +405,13 @@ impl SandboxGuard {
 
     fn resolv_mount(&self) -> Option<(&Path, &Path)> {
         match (&self.resolv_path, &self.resolv_dest) {
+            (Some(src), Some(dest)) => Some((src, dest)),
+            _ => None,
+        }
+    }
+
+    fn resolv_intermediate_mount(&self) -> Option<(&Path, &Path)> {
+        match (&self.resolv_path, &self.resolv_intermediate_dest) {
             (Some(src), Some(dest)) => Some((src, dest)),
             _ => None,
         }
@@ -437,6 +450,7 @@ impl SandboxGuard {
             hosts_dest: PathBuf::from("/etc/hosts"),
             resolv_path: None,
             resolv_dest: None,
+            resolv_intermediate_dest: None,
             empty_path: PathBuf::from("/tmp/ai-jail-test-empty"),
             deny_file_path: PathBuf::from("/tmp/ai-jail-test-deny-file"),
             deny_dir_path: PathBuf::from("/tmp/ai-jail-test-deny-dir"),
@@ -608,7 +622,8 @@ pub fn prepare() -> Result<SandboxGuard, String> {
     file.sync_all()
         .map_err(|e| format!("Failed to sync temp hosts file: {e}"))?;
 
-    let (resolv_path, resolv_dest) = new_resolv_file();
+    let (resolv_path, resolv_dest, resolv_intermediate_dest) =
+        new_resolv_file();
     let empty_path = new_empty_file()?;
     let deny_file_path = new_deny_file()?;
     let deny_dir_path = new_deny_dir()?;
@@ -618,6 +633,7 @@ pub fn prepare() -> Result<SandboxGuard, String> {
         hosts_dest,
         resolv_path,
         resolv_dest,
+        resolv_intermediate_dest,
         empty_path,
         deny_file_path,
         deny_dir_path,
@@ -715,23 +731,41 @@ fn new_deny_dir() -> Result<PathBuf, String> {
 /// pure-Go resolver) fail to use it reliably inside a sandbox.
 /// When we detect the stub address we replace the contents with the
 /// real upstream nameservers from `/run/systemd/resolve/resolv.conf`.
-fn new_resolv_file() -> (Option<PathBuf>, Option<PathBuf>) {
+fn new_resolv_file() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
     let resolv = Path::new("/etc/resolv.conf");
 
     // canonicalize resolves all symlinks and normalizes ".." segments.
     // read_link only reads one level and can produce paths like
     // /etc/../run/systemd/resolve/stub-resolv.conf which may confuse
     // bwrap when creating intermediate mount-point directories.
-    let dest = match std::fs::canonicalize(resolv) {
+    let canonical_dest = match std::fs::canonicalize(resolv) {
         Ok(canonical) => canonical,
         Err(_) => resolv.to_path_buf(),
     };
+
+    // Detect intermediate symlink hops that live in tmpfs directories and
+    // would not survive the sandbox's private /run and /tmp mounts.
+    let intermediate_dest =
+        std::fs::read_link(resolv).ok().and_then(|target| {
+            let first_hop = if target.is_absolute() {
+                target
+            } else {
+                resolve_relative_symlink(resolv, &target)
+            };
+            let under_tmpfs = first_hop.starts_with("/run/")
+                || first_hop.starts_with("/tmp/");
+            if under_tmpfs && first_hop != canonical_dest {
+                Some(first_hop)
+            } else {
+                None
+            }
+        });
 
     let contents = match std::fs::read(resolv) {
         Ok(c) => c,
         Err(e) => {
             output::warn(&format!("Cannot read /etc/resolv.conf: {e}"));
-            return (None, None);
+            return (None, None, None);
         }
     };
 
@@ -751,20 +785,42 @@ fn new_resolv_file() -> (Option<PathBuf>, Option<PathBuf>) {
             if let Err(e) = f.write_all(&contents) {
                 output::warn(&format!("Cannot write temp resolv.conf: {e}"));
                 let _ = std::fs::remove_file(&path);
-                return (None, None);
+                return (None, None, None);
             }
             let _ = f.sync_all();
             let _ = std::fs::set_permissions(
                 &path,
                 std::fs::Permissions::from_mode(0o600),
             );
-            (Some(path), Some(dest))
+            (Some(path), Some(canonical_dest), intermediate_dest)
         }
         Err(e) => {
             output::warn(&format!("Cannot create temp resolv.conf: {e}"));
-            (None, None)
+            (None, None, None)
         }
     }
+}
+
+/// Resolve a symlink target that is relative to the symlink itself.
+fn resolve_relative_symlink(link: &Path, target: &Path) -> PathBuf {
+    let base = link.parent().unwrap_or(Path::new("/"));
+    normalize_path(&base.join(target))
+}
+
+/// Remove `.` and `..` components from a path without touching the filesystem.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::Normal(p) => out.push(p),
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::RootDir => out = PathBuf::from("/"),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// If `contents` references the systemd-resolved stub listener
@@ -1261,7 +1317,11 @@ fn discover_mounts_full(
         split_by_project(overlay_mounts_v, project_dir);
 
     MountSet {
-        base: discover_base(sources.hosts_mount, sources.resolv_mount),
+        base: discover_base(
+            sources.hosts_mount,
+            sources.resolv_mount,
+            sources.resolv_intermediate_mount,
+        ),
         sys_masks: discover_sys_masks(lockdown),
         home_dotfiles,
         config_hide: if private_home {
@@ -1600,13 +1660,20 @@ fn build_deny_mounts(
 fn discover_base(
     hosts_mount: (&Path, &Path),
     resolv_mount: Option<(&Path, &Path)>,
+    resolv_intermediate_mount: Option<(&Path, &Path)>,
 ) -> Vec<Mount> {
-    discover_base_with_nix_root(hosts_mount, resolv_mount, Path::new("/nix"))
+    discover_base_with_nix_root(
+        hosts_mount,
+        resolv_mount,
+        resolv_intermediate_mount,
+        Path::new("/nix"),
+    )
 }
 
 fn discover_base_with_nix_root(
     hosts_mount: (&Path, &Path),
     resolv_mount: Option<(&Path, &Path)>,
+    resolv_intermediate_mount: Option<(&Path, &Path)>,
     nix_root: &Path,
 ) -> Vec<Mount> {
     let (hosts_file, hosts_dest) = hosts_mount;
@@ -1686,24 +1753,17 @@ fn discover_base_with_nix_root(
     // Keep resolv mount after /run tmpfs. On WSL/systemd-resolved
     // `/etc/resolv.conf` often points into `/run`, which must not
     // be shadowed by a later tmpfs mount.
-    //
-    // Some container setups (e.g. Fedora toolbox) chain symlinks:
-    // /etc/resolv.conf -> /run/host/etc/resolv.conf -> .../stub-resolv.conf.
-    // We mount at the canonical target so the inherited symlink resolves,
-    // and also at /etc/resolv.conf directly so DNS works even when the
-    // intermediate symlink is lost inside the sandbox.
     if let Some((src, dest)) = resolv_mount {
         mounts.push(Mount::FileRoBind {
             src: src.to_path_buf(),
             dest: dest.to_path_buf(),
         });
-        let etc_resolv = Path::new("/etc/resolv.conf");
-        if dest != etc_resolv {
-            mounts.push(Mount::FileRoBind {
-                src: src.to_path_buf(),
-                dest: etc_resolv.to_path_buf(),
-            });
-        }
+    }
+    if let Some((src, dest)) = resolv_intermediate_mount {
+        mounts.push(Mount::FileRoBind {
+            src: src.to_path_buf(),
+            dest: dest.to_path_buf(),
+        });
     }
 
     mounts
@@ -4683,6 +4743,7 @@ mod tests {
                 Path::new("/tmp/test-resolv"),
                 Path::new("/run/resolvconf/resolv.conf"),
             )),
+            None,
         );
 
         let mut run_tmpfs_idx = None;
@@ -4710,17 +4771,21 @@ mod tests {
     }
 
     #[test]
-    fn resolv_symlink_also_mounted_at_etc_resolv_conf() {
+    fn resolv_intermediate_tmpfs_hop_is_mounted() {
         // Fedora toolbox chains symlinks:
         //   /etc/resolv.conf -> /run/host/etc/resolv.conf -> .../stub-resolv.conf
         // The canonical target is mounted, but the inherited /etc/resolv.conf
-        // symlink dangles because /run is a tmpfs. We must also bind the
-        // generated file directly at /etc/resolv.conf.
+        // symlink still dangles at the intermediate /run/host/etc hop. We must
+        // also bind the generated file at that intermediate path.
         let mounts = discover_base(
             (Path::new("/tmp/test-hosts"), Path::new("/etc/hosts")),
             Some((
                 Path::new("/tmp/test-resolv"),
                 Path::new("/run/host/run/systemd/resolve/stub-resolv.conf"),
+            )),
+            Some((
+                Path::new("/tmp/test-resolv"),
+                Path::new("/run/host/etc/resolv.conf"),
             )),
         );
 
@@ -4729,18 +4794,18 @@ mod tests {
             Mount::FileRoBind { dest, .. }
                 if dest == Path::new("/run/host/run/systemd/resolve/stub-resolv.conf")
         ));
-        let etc_overlay = mounts.iter().any(|m| {
+        let intermediate = mounts.iter().any(|m| {
             matches!(
                 m,
                 Mount::FileRoBind { dest, .. }
-                    if dest == Path::new("/etc/resolv.conf")
+                    if dest == Path::new("/run/host/etc/resolv.conf")
             )
         });
 
         assert!(canonical, "expected bind at canonical resolv target");
         assert!(
-            etc_overlay,
-            "expected bind at /etc/resolv.conf for dangling symlink cases"
+            intermediate,
+            "expected bind at intermediate /run hop for dangling symlink cases"
         );
     }
 
@@ -4754,6 +4819,7 @@ mod tests {
                 Path::new("/tmp/test-resolv"),
                 Path::new("/etc/resolv.conf"),
             )),
+            None,
         );
 
         let resolv_binds: Vec<_> = mounts
@@ -4785,8 +4851,12 @@ mod tests {
         std::fs::write(&hosts_dest, "host hosts").unwrap();
         std::fs::write(&hosts_src, "private hosts").unwrap();
 
-        let mounts =
-            discover_base_with_nix_root((&hosts_src, &hosts_dest), None, &nix);
+        let mounts = discover_base_with_nix_root(
+            (&hosts_src, &hosts_dest),
+            None,
+            None,
+            &nix,
+        );
 
         let nix_idx = mounts.iter().position(|m| {
             matches!(m, Mount::RoBind { src, dest } if src == &nix && dest == &nix)
