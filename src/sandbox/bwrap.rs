@@ -1686,11 +1686,24 @@ fn discover_base_with_nix_root(
     // Keep resolv mount after /run tmpfs. On WSL/systemd-resolved
     // `/etc/resolv.conf` often points into `/run`, which must not
     // be shadowed by a later tmpfs mount.
+    //
+    // Some container setups (e.g. Fedora toolbox) chain symlinks:
+    // /etc/resolv.conf -> /run/host/etc/resolv.conf -> .../stub-resolv.conf.
+    // We mount at the canonical target so the inherited symlink resolves,
+    // and also at /etc/resolv.conf directly so DNS works even when the
+    // intermediate symlink is lost inside the sandbox.
     if let Some((src, dest)) = resolv_mount {
         mounts.push(Mount::FileRoBind {
             src: src.to_path_buf(),
             dest: dest.to_path_buf(),
         });
+        let etc_resolv = Path::new("/etc/resolv.conf");
+        if dest != etc_resolv {
+            mounts.push(Mount::FileRoBind {
+                src: src.to_path_buf(),
+                dest: etc_resolv.to_path_buf(),
+            });
+        }
     }
 
     mounts
@@ -4693,6 +4706,70 @@ mod tests {
         assert!(
             run_tmpfs_idx.unwrap() < resolv_idx.unwrap(),
             "resolv bind must come after /run tmpfs"
+        );
+    }
+
+    #[test]
+    fn resolv_symlink_also_mounted_at_etc_resolv_conf() {
+        // Fedora toolbox chains symlinks:
+        //   /etc/resolv.conf -> /run/host/etc/resolv.conf -> .../stub-resolv.conf
+        // The canonical target is mounted, but the inherited /etc/resolv.conf
+        // symlink dangles because /run is a tmpfs. We must also bind the
+        // generated file directly at /etc/resolv.conf.
+        let mounts = discover_base(
+            (Path::new("/tmp/test-hosts"), Path::new("/etc/hosts")),
+            Some((
+                Path::new("/tmp/test-resolv"),
+                Path::new("/run/host/run/systemd/resolve/stub-resolv.conf"),
+            )),
+        );
+
+        let canonical = mounts.iter().any(|m| matches!(
+            m,
+            Mount::FileRoBind { dest, .. }
+                if dest == Path::new("/run/host/run/systemd/resolve/stub-resolv.conf")
+        ));
+        let etc_overlay = mounts.iter().any(|m| {
+            matches!(
+                m,
+                Mount::FileRoBind { dest, .. }
+                    if dest == Path::new("/etc/resolv.conf")
+            )
+        });
+
+        assert!(canonical, "expected bind at canonical resolv target");
+        assert!(
+            etc_overlay,
+            "expected bind at /etc/resolv.conf for dangling symlink cases"
+        );
+    }
+
+    #[test]
+    fn resolv_regular_file_does_not_double_mount() {
+        // When /etc/resolv.conf is a regular file, dest is /etc/resolv.conf
+        // itself; we should not emit a duplicate mount.
+        let mounts = discover_base(
+            (Path::new("/tmp/test-hosts"), Path::new("/etc/hosts")),
+            Some((
+                Path::new("/tmp/test-resolv"),
+                Path::new("/etc/resolv.conf"),
+            )),
+        );
+
+        let resolv_binds: Vec<_> = mounts
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    Mount::FileRoBind { dest, .. }
+                        if dest == Path::new("/etc/resolv.conf")
+                )
+            })
+            .collect();
+        assert_eq!(
+            resolv_binds.len(),
+            1,
+            "regular /etc/resolv.conf should produce exactly one bind"
         );
     }
 
