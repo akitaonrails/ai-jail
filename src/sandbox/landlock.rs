@@ -654,14 +654,13 @@ fn collect_normal_paths_with_mounted_paths(
     // Docker socket grants effective root on the host. Opt-in only
     // (issue #88): exposed solely via --docker / `no_docker = false`,
     // never by default.
-    if config.docker_enabled() {
-        let sock = PathBuf::from("/var/run/docker.sock");
-        if super::path_exists(&sock) {
-            if verbose {
-                output::verbose("Landlock: docker socket rw");
-            }
-            rw.push(sock);
+    if config.docker_enabled()
+        && let Some(sock) = super::docker_socket()
+    {
+        if verbose {
+            output::verbose("Landlock: docker socket rw");
         }
+        rw.push(sock);
     }
 
     // Tailscale socket: read-write — Landlock runs INSIDE the bwrap

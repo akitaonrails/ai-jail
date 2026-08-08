@@ -528,11 +528,10 @@ fn macos_atomic_write_paths(config: &Config) -> Vec<PathBuf> {
 }
 
 fn macos_docker_socket() -> Option<PathBuf> {
-    let candidates = [
-        PathBuf::from("/var/run/docker.sock"),
-        super::home_dir().join(".docker/run/docker.sock"),
-    ];
-    candidates.into_iter().find(|p| super::path_exists(p))
+    // Shared with Linux: honours $DOCKER_HOST before the well-known
+    // paths. Docker Desktop, Colima, and `podman machine` all place
+    // their socket under $HOME rather than /var/run/docker.sock.
+    super::docker_socket()
 }
 
 fn macos_lockdown_read_paths(
