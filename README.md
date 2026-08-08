@@ -380,6 +380,8 @@ Change the wrapper command to `exec ai-jail --browser=hard chromium "$@"` if des
 
 In `--lockdown`, project is mounted read-only and host write mounts are removed. For linked Git worktrees, validated external Git metadata is still exposed read-only unless disabled with `--no-worktree`.
 
+The Docker socket is the first of `$DOCKER_HOST` (when it is a `unix://` path), `/var/run/docker.sock`, or `~/.docker/run/docker.sock` that exists. Rootless Docker and Podman put their socket under `$XDG_RUNTIME_DIR`, so export `$DOCKER_HOST` to point at it — starting the service does not set it for you.
+
 In browser profile mode, the project is mounted read-only, `$HOME` is private tmpfs, normal host dotdirs are not mounted, and soft browser state is the only persistent browser-specific write mount.
 
 In `--private-home` mode, normal host dotdirs are not exposed, but the project remains read-write and explicit `--map` / `--rw-map` mounts still work. On Linux this is a private tmpfs `$HOME`; on macOS it is enforced with seatbelt read/write allowlists because `sandbox-exec` cannot create a replacement home mount. This is useful for non-agent or experimental workloads where you want normal project access without exposing your real `~/.config`, `~/.cache`, or tool state.
