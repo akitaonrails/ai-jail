@@ -2160,9 +2160,12 @@ mod tests {
         // Whatever is left is one of the well-known paths, or nothing
         // — this runs on hosts with and without a Docker socket.
         if let Some(p) = resolved {
+            let well_known = [
+                PathBuf::from("/var/run/docker.sock"),
+                home_dir().join(".docker/run/docker.sock"),
+            ];
             assert!(
-                p == PathBuf::from("/var/run/docker.sock")
-                    || p == home_dir().join(".docker/run/docker.sock"),
+                well_known.iter().any(|candidate| candidate == &p),
                 "unexpected fallback: {}",
                 p.display()
             );
