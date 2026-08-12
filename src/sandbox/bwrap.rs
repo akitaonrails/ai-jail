@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 const WSL_DOCKER_DESKTOP_CLI_TOOLS: &str = "/mnt/wsl/docker-desktop/cli-tools";
 /// Also granted read-write by Landlock (`collect_normal_paths`) —
 /// keep the two in sync via this shared constant.
@@ -1985,15 +1984,15 @@ fn discover_gpu(verbose: bool) -> Vec<Mount> {
 }
 
 fn discover_docker() -> Vec<Mount> {
-    discover_docker_paths(
-        Path::new(DOCKER_SOCKET),
-        Path::new(WSL_DOCKER_DESKTOP_CLI_TOOLS),
-    )
+    let Some(sock) = super::docker_socket() else {
+        return Vec::new();
+    };
+    discover_docker_paths(&sock, Path::new(WSL_DOCKER_DESKTOP_CLI_TOOLS))
 }
 
 fn discover_docker_paths(sock: &Path, wsl_cli_tools: &Path) -> Vec<Mount> {
     let mut mounts = Vec::new();
-    if super::path_exists(sock) {
+    if super::docker_socket_usable(sock) {
         mounts.push(Mount::Bind {
             src: sock.to_path_buf(),
             dest: sock.to_path_buf(),

@@ -666,6 +666,51 @@ fn path_exists(p: &Path) -> bool {
     p.exists() || p.symlink_metadata().is_ok()
 }
 
+/// Host path of the Docker/Podman socket to expose, if any: the
+/// first candidate we can actually reach.
+///
+/// `$DOCKER_HOST` leads because it outranks every other endpoint
+/// source in the Docker CLI's own resolution order, and rootless
+/// Docker's setup instructs exporting it. Rootless Podman keeps its
+/// socket under `$XDG_RUNTIME_DIR`, while the `podman-docker` compat
+/// package symlinks `/var/run/docker.sock` to the *rootful* socket
+/// under root-only `/run/podman` — the wrong daemon, and unreachable.
+///
+/// Docker contexts (`~/.docker/config.json`) are not consulted. That
+/// misses setups that register a context without exporting
+/// `$DOCKER_HOST` and whose socket is not one of the paths below
+/// (Colima's `~/.colima/<profile>/docker.sock`, for one); add context
+/// parsing if that turns up in practice.
+pub(crate) fn docker_socket() -> Option<PathBuf> {
+    let docker_host = std::env::var("DOCKER_HOST").ok();
+    let candidates = [
+        docker_host.as_deref().and_then(docker_host_socket_path),
+        Some(PathBuf::from("/var/run/docker.sock")),
+        Some(home_dir().join(".docker/run/docker.sock")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|p| docker_socket_usable(p))
+}
+
+/// `$DOCKER_HOST` as a bindable socket path, if it names one.
+/// `tcp://` and `ssh://` reach the daemon over the network and
+/// `npipe://` is a Windows named pipe; none of them is a path we can
+/// bind, so they drop out of the candidate list.
+fn docker_host_socket_path(value: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(value.strip_prefix("unix://")?);
+    path.is_absolute().then_some(path)
+}
+
+/// Unlike [`path_exists`], this rejects a symlink whose target cannot
+/// be stat'd. bwrap resolves the link itself and aborts the entire
+/// launch with `Can't find source path ...: Permission denied`, so an
+/// optional socket we cannot reach must be skipped, not mounted.
+pub(crate) fn docker_socket_usable(p: &Path) -> bool {
+    p.exists()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitWorktreePaths {
     pub git_dir: PathBuf,
@@ -1072,11 +1117,7 @@ fn docker_passthrough_active(config: &Config, socket_present: bool) -> bool {
 }
 
 fn warn_docker_passthrough(config: &Config) {
-    let candidates = [
-        PathBuf::from("/var/run/docker.sock"),
-        home_dir().join(".docker/run/docker.sock"),
-    ];
-    let socket_present = candidates.iter().any(|p| path_exists(p));
+    let socket_present = docker_socket().is_some();
     if docker_passthrough_active(config, socket_present) {
         output::warn(
             "Docker socket passthrough is enabled: the sandboxed process \
@@ -2075,6 +2116,142 @@ mod tests {
             command_home_paths_impl("./agent", &home, &path_env).is_empty()
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn docker_socket_fixture(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-docker-host-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn docker_socket_prefers_reachable_docker_host() {
+        let _lock = crate::test_utils::ENV_LOCK.lock().unwrap();
+        let root = docker_socket_fixture("host");
+        let sock = root.join("podman.sock");
+        std::fs::File::create(&sock).unwrap();
+        let _guard = crate::test_utils::EnvVarGuard::set(
+            "DOCKER_HOST",
+            format!("unix://{}", sock.display()),
+        );
+
+        // Wins over the well-known paths whether or not they exist.
+        assert_eq!(docker_socket(), Some(sock));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn docker_socket_skips_unreachable_docker_host() {
+        // Backward compat: a stale or unreachable $DOCKER_HOST must
+        // not suppress the candidates behind it.
+        let _lock = crate::test_utils::ENV_LOCK.lock().unwrap();
+        let root = docker_socket_fixture("stale");
+        let missing = root.join("gone.sock");
+        let _guard = crate::test_utils::EnvVarGuard::set(
+            "DOCKER_HOST",
+            format!("unix://{}", missing.display()),
+        );
+
+        let resolved = docker_socket();
+
+        assert_ne!(resolved, Some(missing));
+        // Whatever is left is one of the well-known paths, or nothing
+        // — this runs on hosts with and without a Docker socket.
+        if let Some(p) = resolved {
+            assert!(
+                p == PathBuf::from("/var/run/docker.sock")
+                    || p == home_dir().join(".docker/run/docker.sock"),
+                "unexpected fallback: {}",
+                p.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn docker_host_socket_path_accepts_only_absolute_unix_paths() {
+        assert_eq!(
+            docker_host_socket_path("unix:///run/user/1000/podman/podman.sock"),
+            Some(PathBuf::from("/run/user/1000/podman/podman.sock"))
+        );
+
+        // No socket path to bind for these: tcp/ssh reach the daemon
+        // over the network, npipe is Windows-only.
+        for value in [
+            "tcp://localhost:2375",
+            "ssh://user@host",
+            "npipe:////./pipe/docker_engine",
+            "/run/user/1000/podman/podman.sock",
+            // Relative path — not something we can bind.
+            "unix://run/user/1000/podman/podman.sock",
+        ] {
+            assert_eq!(docker_host_socket_path(value), None, "for {value}");
+        }
+    }
+
+    #[test]
+    fn docker_socket_ignores_non_unix_docker_host() {
+        // A tcp:// endpoint must resolve exactly as an unset
+        // $DOCKER_HOST does: to the well-known paths only.
+        let _lock = crate::test_utils::ENV_LOCK.lock().unwrap();
+
+        let guard = crate::test_utils::EnvVarGuard::remove("DOCKER_HOST");
+        let unset = docker_socket();
+        drop(guard);
+
+        let _guard = crate::test_utils::EnvVarGuard::set(
+            "DOCKER_HOST",
+            "tcp://localhost:2375",
+        );
+        assert_eq!(docker_socket(), unset);
+    }
+
+    #[test]
+    fn docker_socket_rejects_unfollowable_symlink() {
+        // Regression: /var/run/docker.sock -> /run/podman/podman.sock
+        // with /run/podman mode 0700 root. path_exists() accepts the
+        // dangling link, and bwrap then aborts the whole launch with
+        // "Can't find source path: Permission denied".
+        let _lock = crate::test_utils::ENV_LOCK.lock().unwrap();
+        let root = docker_socket_fixture("symlink");
+        let hidden = root.join("hidden");
+        std::fs::create_dir_all(&hidden).unwrap();
+        let target = hidden.join("podman.sock");
+        std::fs::File::create(&target).unwrap();
+        let link = root.join("docker.sock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::fs::set_permissions(
+            &hidden,
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .unwrap();
+
+        // Root traverses mode-000 directories; nothing to assert.
+        if std::fs::metadata(&target).is_ok() {
+            let _ = std::fs::set_permissions(
+                &hidden,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+
+        assert!(path_exists(&link), "lstat still succeeds on the link");
+        assert!(!docker_socket_usable(&link));
+
+        let _guard = crate::test_utils::EnvVarGuard::set(
+            "DOCKER_HOST",
+            format!("unix://{}", link.display()),
+        );
+        assert_ne!(docker_socket(), Some(link));
+
+        let _ = std::fs::set_permissions(
+            &hidden,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
