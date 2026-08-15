@@ -51,3 +51,9 @@ curl -fsSL "https://raw.githubusercontent.com/akitaonrails/ai-jail/v${version}/R
 ```
 
 `ai-jail-bin` is currently `x86_64` only because the release workflow publishes a Linux x86_64 binary. The source package includes `aarch64` because it compiles locally on Arch Linux ARM.
+
+Use Rust `1.97.1` when validating the source package or reproducing the
+release build. The PKGBUILD pins `RUSTUP_TOOLCHAIN=1.97.1` to match
+`rust-toolchain.toml`; do not switch it back to `stable`. Do not update
+`PKGBUILD` versions or checksums until the corresponding immutable upstream
+release and its checksums exist.

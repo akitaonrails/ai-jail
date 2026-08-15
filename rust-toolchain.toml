@@ -1,5 +1,5 @@
 [toolchain]
-channel = "stable"
+channel = "1.97.1"
 components = [
   "clippy",
   "llvm-tools-preview",

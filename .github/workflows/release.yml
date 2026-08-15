@@ -3,45 +3,140 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            artifact: ai-jail-linux-x86_64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: ai-jail-macos-aarch64
-
-    runs-on: ${{ matrix.os }}
-
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          targets: ${{ matrix.target }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate immutable release input
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Tag must be exact vX.Y.Z" >&2; exit 1;
+          }
+          version="${TAG#v}"
+          [ "$(printf '%s' "$version" | tr -cd '.' | wc -c | tr -d ' ')" = 2 ]
+          git cat-file -e "${TAG}^{tag}" || { echo "Lightweight tag refused" >&2; exit 1; }
+          git fetch origin master --no-tags
+          git merge-base --is-ancestor "$SHA" origin/master || {
+            echo "Tag commit is not reachable from origin/master" >&2; exit 1;
+          }
+          cargo_version="$(grep '^version = ' Cargo.toml | head -n 1 | cut -d '"' -f 2)"
+          [ "$cargo_version" = "$version" ] || {
+            echo "Cargo.toml version does not match tag" >&2; exit 1;
+          }
+          if ls .github/release-keyring/*.asc .github/release-keyring/*.gpg >/dev/null 2>&1; then
+            keyring_home="$(mktemp -d)"
+            pinned="$(mktemp)"
+            trap 'rm -rf "$keyring_home" "$pinned" verify-tag.log' EXIT
+            export GNUPGHOME="$keyring_home"
+            for key in .github/release-keyring/*.asc .github/release-keyring/*.gpg; do
+              [ -f "$key" ] || continue
+              gpg --batch --import "$key" >/dev/null 2>&1 || {
+                echo "Failed to import release key: $key" >&2; exit 1;
+              }
+            done
+            [ -s .github/release-keyring/fingerprints.txt ] || {
+              echo ".github/release-keyring/fingerprints.txt is required when release keys are checked in" >&2; exit 1;
+            }
+            grep -Ev '^[[:space:]]*(#|$)' .github/release-keyring/fingerprints.txt \
+              | tr -d ' \t' | tr '[:lower:]' '[:upper:]' > "$pinned"
+            git verify-tag -v "$TAG" >verify-tag.log 2>&1 || {
+              cat verify-tag.log >&2
+              echo "Tag signature verification failed" >&2; exit 1;
+            }
+            signer_fp="$(sed -n 's/^[[:space:]]*Primary key fingerprint:[[:space:]]*//p' verify-tag.log | head -n 1 | tr -d ' ' | tr '[:lower:]' '[:upper:]')"
+            [ -n "$signer_fp" ] || {
+              echo "No primary key fingerprint in tag verification output" >&2; exit 1;
+            }
+            grep -qx "$signer_fp" "$pinned" || {
+              echo "Tag signer fingerprint $signer_fp is not pinned in .github/release-keyring/fingerprints.txt" >&2; exit 1;
+            }
+            echo "Tag signature cryptographically verified against pinned release keys."
+            unset GNUPGHOME
+          else
+            echo "::warning title=tag signature NOT cryptographically verified::No trusted release keys are checked in under .github/release-keyring/, so the tag signature was NOT cryptographically verified by CI. Signature verification remains a release administrator requirement; see docs/RELEASE_SECURITY.md."
+          fi
 
-      - uses: Swatinem/rust-cache@v2
+  build-linux:
+    needs: preflight
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          key: ${{ matrix.target }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+      - name: Test and build unsigned Linux binary
+        run: cargo test --locked && cargo build --locked --release --target x86_64-unknown-linux-gnu
+      - name: Archive and checksum
+        run: |
+          tar czf ai-jail-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-gnu/release ai-jail
+          sha256sum ai-jail-linux-x86_64.tar.gz > ai-jail-linux-x86_64.tar.gz.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-release
+          path: |
+            ai-jail-linux-x86_64.tar.gz
+            ai-jail-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
 
-      - name: Run tests
-        run: cargo test
+  build-macos-unsigned:
+    needs: preflight
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-apple-darwin
+      - name: Build unsigned macOS binary
+        run: cargo build --locked --release --target aarch64-apple-darwin
+      - name: Archive and checksum unsigned binary
+        run: |
+          tar czf ai-jail-macos-aarch64-unsigned.tar.gz -C target/aarch64-apple-darwin/release ai-jail
+          shasum -a 256 ai-jail-macos-aarch64-unsigned.tar.gz > ai-jail-macos-aarch64-unsigned.tar.gz.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-unsigned
+          path: |
+            ai-jail-macos-aarch64-unsigned.tar.gz
+            ai-jail-macos-aarch64-unsigned.tar.gz.sha256
+          if-no-files-found: error
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Sign binary (macOS)
-        if: runner.os == 'macOS'
+  sign-macos:
+    needs: build-macos-unsigned
+    runs-on: macos-latest
+    environment: release-signing
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: macos-unsigned
+          path: input
+      - name: Verify unsigned artifact
+        run: cd input && shasum -a 256 -c ai-jail-macos-aarch64-unsigned.tar.gz.sha256
+      - name: Require signing credentials
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -50,199 +145,196 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [ -z "$APPLE_CERTIFICATE" ]; then
-            echo "::warning::Skipping code signing — no APPLE_CERTIFICATE secret set"
-            exit 0
-          fi
-
-          # Import certificate to keychain
-          echo "$APPLE_CERTIFICATE" | base64 --decode > cert.p12
-          KEYCHAIN_PWD=$(uuidgen)
-          security create-keychain -p "$KEYCHAIN_PWD" build.keychain
+          set -eu
+          for value in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            eval "test -n \"\${$value:-}\"" || { echo "$value is required" >&2; exit 1; }
+          done
+      - name: Sign, notarize, and archive
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -eu
+          mkdir work
+          tar xzf input/ai-jail-macos-aarch64-unsigned.tar.gz -C work
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > cert.p12
+          keychain_password="$(uuidgen)"
+          security create-keychain -p "$keychain_password" build.keychain
           security import cert.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" build.keychain
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" build.keychain
           security list-keychains -d user -s build.keychain login.keychain
-
-          # Sign binary
-          codesign --sign "$APPLE_SIGNING_IDENTITY" --options runtime --timestamp \
-            target/${{ matrix.target }}/release/ai-jail
-
-          # Notarize when Apple accepts the account state. If the Apple
-          # developer agreement is missing/expired, keep the signed binary
-          # artifact flowing instead of blocking Linux/crates/Homebrew release.
-          ditto -c -k target/${{ matrix.target }}/release/ai-jail ai-jail-notarize.zip
-          if ! xcrun notarytool submit ai-jail-notarize.zip \
-            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait; then
-            echo "::warning::Skipping notarization — Apple notary service rejected the submission"
-          fi
-
+          codesign --sign "$APPLE_SIGNING_IDENTITY" --options runtime --timestamp work/ai-jail
+          ditto -c -k work/ai-jail ai-jail-notarize.zip
+          xcrun notarytool submit ai-jail-notarize.zip --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          # `xcrun stapler staple` only attaches notarization tickets to
+          # .app bundles and pkg installers; it cannot staple the raw Mach-O
+          # binary shipped here. Notarization above is kept. If a bundle or
+          # pkg is ever introduced, add stapling for that artifact only.
+          tar czf ai-jail-macos-aarch64.tar.gz -C work ai-jail
+          shasum -a 256 ai-jail-macos-aarch64.tar.gz > ai-jail-macos-aarch64.tar.gz.sha256
           rm -f cert.p12 ai-jail-notarize.zip
-
-      - name: Create tarball
-        run: |
-          tar czf ${{ matrix.artifact }}.tar.gz \
-            -C target/${{ matrix.target }}/release ai-jail
-
-      - name: Compute SHA256
-        id: sha
-        run: |
-          if command -v shasum &>/dev/null; then
-            SHA=$(shasum -a 256 ${{ matrix.artifact }}.tar.gz | awk '{print $1}')
-          else
-            SHA=$(sha256sum ${{ matrix.artifact }}.tar.gz | awk '{print $1}')
-          fi
-          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
-          echo "$SHA  ${{ matrix.artifact }}.tar.gz" > ${{ matrix.artifact }}.tar.gz.sha256
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ matrix.artifact }}
+          name: macos-release
           path: |
-            ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.tar.gz.sha256
+            ai-jail-macos-aarch64.tar.gz
+            ai-jail-macos-aarch64.tar.gz.sha256
+          if-no-files-found: error
+
+  attest:
+    needs: [build-linux, sign-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-release
+          path: artifacts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: macos-release
+          path: artifacts
+      - name: Verify final artifacts
+        run: cd artifacts && sha256sum -c ai-jail-linux-x86_64.tar.gz.sha256 && sha256sum -c ai-jail-macos-aarch64.tar.gz.sha256
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: artifacts/ai-jail-linux-x86_64.tar.gz
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: artifacts/ai-jail-macos-aarch64.tar.gz
 
   release:
-    needs: build
+    needs: [preflight, build-linux, sign-macos, attest]
     runs-on: ubuntu-latest
+    environment: release-publish
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-release
           path: artifacts
-          merge-multiple: true
-
-      - name: Generate release body
-        run: |
-          echo "## Checksums (SHA256)" > body.md
-          echo '```' >> body.md
-          cat artifacts/*.sha256 >> body.md
-          echo '```' >> body.md
-          echo "" >> body.md
-          echo "## Install" >> body.md
-          echo '```bash' >> body.md
-          echo "# macOS (Homebrew)" >> body.md
-          echo "brew tap akitaonrails/tap && brew install ai-jail" >> body.md
-          echo "" >> body.md
-          echo "# Arch Linux (AUR)" >> body.md
-          echo "yay -S ai-jail-bin      # prebuilt Linux x86_64 binary" >> body.md
-          echo "yay -S ai-jail          # builds from source" >> body.md
-          echo "" >> body.md
-          echo "# From crates.io" >> body.md
-          echo "cargo install ai-jail" >> body.md
-          echo "" >> body.md
-          echo "# mise" >> body.md
-          echo "mise use -g github:akitaonrails/ai-jail" >> body.md
-          echo '```' >> body.md
-
-      - name: Create GitHub Release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: macos-release
+          path: artifacts
+      - name: Verify checksums and assemble release notes
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          gh release create "$TAG" artifacts/*.tar.gz artifacts/*.sha256 \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$TAG" \
-            --notes-file body.md \
-            --latest
+          set -eu
+          cd artifacts
+          sha256sum -c ai-jail-linux-x86_64.tar.gz.sha256
+          sha256sum -c ai-jail-macos-aarch64.tar.gz.sha256
+          cd ..
+          notes="releases/${TAG}.md"
+          [ -f "$notes" ] || {
+            echo "Missing $notes: every release tag requires curated notes committed in-repo" >&2; exit 1;
+          }
+          # The in-repo notes keep their "(unreleased)" header; strip those
+          # marker lines only at publish time.
+          sed '/unreleased/Id' "$notes" > body.md
+          cat >> body.md <<'EOF'
+
+          ## Checksums (SHA256)
+          ```
+          EOF
+          cat artifacts/*.sha256 >> body.md
+          cat >> body.md <<'EOF'
+          ```
+
+          ## Install
+          ```bash
+          brew tap akitaonrails/tap && brew install ai-jail
+          yay -S ai-jail-bin
+          cargo install --locked ai-jail
+          ```
+          EOF
+      - name: Publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" artifacts/*.tar.gz artifacts/*.sha256 --verify-tag --title "$TAG" --notes-file body.md
 
   crates-io:
-    needs: build
+    needs: [preflight, release]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    environment: release-publish
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "::warning::Skipping crates.io publish — no CARGO_REGISTRY_TOKEN secret set"
-            exit 0
-          fi
-          log="${RUNNER_TEMP:-/tmp}/cargo-publish.log"
-          set +e
-          cargo publish 2>&1 | tee "$log"
-          status=${PIPESTATUS[0]}
-          set -e
-          if [ "$status" -eq 0 ]; then
-            exit 0
-          fi
-          if grep -q "crate ai-jail@.* already exists on crates.io index" "$log"; then
-            echo "::warning::Skipping crates.io publish — ${GITHUB_REF_NAME#v} already exists"
-            exit 0
-          fi
-          exit "$status"
+          test -n "$CARGO_REGISTRY_TOKEN" || { echo "CARGO_REGISTRY_TOKEN is required until trusted publishing is configured" >&2; exit 1; }
+          cargo publish --locked
 
   homebrew:
-    needs: release
+    needs: [preflight, release]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    environment: release-publish
+    permissions:
+      contents: read
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-release
           path: artifacts
-          merge-multiple: true
-
-      - name: Compute SHA256 values
-        id: shas
-        run: |
-          LINUX_SHA=$(awk '{print $1}' artifacts/ai-jail-linux-x86_64.tar.gz.sha256)
-          MACOS_SHA=$(awk '{print $1}' artifacts/ai-jail-macos-aarch64.tar.gz.sha256)
-          echo "linux=$LINUX_SHA" >> "$GITHUB_OUTPUT"
-          echo "macos=$MACOS_SHA" >> "$GITHUB_OUTPUT"
-
-      - name: Update Homebrew tap
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: macos-release
+          path: artifacts
+      - name: Verify artifacts and update tap
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.ref_name }}
         run: |
-          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
-            echo "::warning::Skipping Homebrew tap update — no HOMEBREW_TAP_TOKEN secret set"
-            exit 0
-          fi
-
-          VERSION="${GITHUB_REF_NAME#v}"
+          set -eu
+          test -n "$HOMEBREW_TAP_TOKEN" || { echo "HOMEBREW_TAP_TOKEN is required" >&2; exit 1; }
+          cd artifacts
+          sha256sum -c ai-jail-linux-x86_64.tar.gz.sha256
+          sha256sum -c ai-jail-macos-aarch64.tar.gz.sha256
+          linux_sha="$(cut -d ' ' -f 1 ai-jail-linux-x86_64.tar.gz.sha256)"
+          macos_sha="$(cut -d ' ' -f 1 ai-jail-macos-aarch64.tar.gz.sha256)"
+          cd ..
+          version="${TAG#v}"
           git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/akitaonrails/homebrew-tap.git" tap
-
           mkdir -p tap/Formula
-          cat > tap/Formula/ai-jail.rb << 'FORMULA'
-          class AiJail < Formula
-            desc "Sandbox wrapper for AI coding agents"
-            homepage "https://github.com/akitaonrails/ai-jail"
-            version "VERSION_PLACEHOLDER"
-            license "GPL-3.0-only"
-
-            on_macos do
-              on_arm do
-                url "https://github.com/akitaonrails/ai-jail/releases/download/v#{version}/ai-jail-macos-aarch64.tar.gz"
-                sha256 "MACOS_SHA_PLACEHOLDER"
-              end
-            end
-
-            on_linux do
-              on_intel do
-                url "https://github.com/akitaonrails/ai-jail/releases/download/v#{version}/ai-jail-linux-x86_64.tar.gz"
-                sha256 "LINUX_SHA_PLACEHOLDER"
-              end
-            end
-
-            def install
-              bin.install "ai-jail"
-            end
-
-            test do
-              assert_match version.to_s, shell_output("#{bin}/ai-jail --version")
-            end
-          end
-          FORMULA
-
-          sed -i "s/VERSION_PLACEHOLDER/$VERSION/" tap/Formula/ai-jail.rb
-          sed -i "s/MACOS_SHA_PLACEHOLDER/${{ steps.shas.outputs.macos }}/" tap/Formula/ai-jail.rb
-          sed -i "s/LINUX_SHA_PLACEHOLDER/${{ steps.shas.outputs.linux }}/" tap/Formula/ai-jail.rb
-
+          cp dist/homebrew/ai-jail.rb tap/Formula/ai-jail.rb
+          python3 - <<PY
+          from pathlib import Path
+          path = Path("tap/Formula/ai-jail.rb")
+          text = path.read_text().replace('"VERSION"', '"$version"', 1)
+          text = text.replace('"PLACEHOLDER"', '"$macos_sha"', 1)
+          text = text.replace('"PLACEHOLDER"', '"$linux_sha"', 1)
+          path.write_text(text)
+          PY
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/ai-jail.rb
-          git diff --cached --quiet && exit 0
-          git commit -m "ai-jail $VERSION"
+          git diff --cached --quiet || git commit -m "ai-jail $version"
           git push

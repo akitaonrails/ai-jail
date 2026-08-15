@@ -5,28 +5,28 @@ on:
     branches: [main, master]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
           components: rustfmt, clippy
           targets: aarch64-apple-darwin
-
-      - uses: Swatinem/rust-cache@v2
-
       - name: Install sandbox prerequisites (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap build-essential
-
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
-      - run: cargo test
-      # Clippy (not just check) so macOS-only lint warnings can't drift
-      # past the Linux-only CI (#75). Subsumes the previous
-      # RUSTFLAGS="-D warnings" cargo check: clippy type-checks the same
-      # code and `-D warnings` denies rustc warnings as well.
-      - run: cargo clippy --target aarch64-apple-darwin --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Check macOS target
+        run: cargo clippy --locked --target aarch64-apple-darwin --all-targets -- -D warnings
