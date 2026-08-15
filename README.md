@@ -16,6 +16,13 @@ yay -S ai-jail           # build from source
 
 # crates.io
 cargo install --locked ai-jail
+
+# Nix (flake) — sets BWRAP_BIN automatically
+nix run github:akitaonrails/ai-jail -- claude
+nix profile install github:akitaonrails/ai-jail
+
+# GitHub Releases (signed archives, checksums alongside)
+# ai-jail-linux-x86_64.tar.gz / ai-jail-macos-aarch64.tar.gz
 ```
 
 Build from source with Rust `1.97.1`:
@@ -25,11 +32,12 @@ cargo build --release --locked
 install -Dm755 target/release/ai-jail ~/.local/bin/ai-jail
 ```
 
-Linux requires `bwrap` (`bubblewrap`). `BWRAP_BIN` is accepted only when it
-canonically resolves to a root-owned executable that is not group- or
-world-writable. A typical protected Nix-store executable is accepted. macOS
-uses Apple's deprecated `/usr/bin/sandbox-exec` interface. Windows is not
-supported; use WSL2 and the Linux backend inside it.
+Linux requires `bwrap` (`bubblewrap`): `pacman -S bubblewrap`,
+`apt install bubblewrap`, or `dnf install bubblewrap`. `BWRAP_BIN` is accepted
+only when it canonically resolves to a root-owned executable that is not
+group- or world-writable. A typical protected Nix-store executable is
+accepted. macOS uses Apple's deprecated `/usr/bin/sandbox-exec` interface.
+Windows is not supported; use WSL2 and the Linux backend inside it.
 
 ## Quick start
 
@@ -129,6 +137,13 @@ deny_paths = ["secrets/"]
 - `--deny-path PATH|GLOB` makes matching paths inaccessible entirely.
 - `--mask-except` / `--deny-path-except` carve out exceptions.
 
+Masks and denies apply to paths that **exist when the sandbox is built**.
+A literal path that is missing at launch, or a glob that matches nothing, is
+skipped with a warning — and a file created later, inside the session, is not
+covered. Create the file before launching (an empty `.env` is enough) when you
+need the rule enforced. Quote glob patterns so ai-jail receives the pattern
+instead of your shell expanding it first.
+
 ## Ephemeral home and temp
 
 The private home is a fresh tmpfs per launch. Nothing persists between runs
@@ -204,6 +219,50 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 Linked worktrees are opt-in. When requested, ai-jail validates gitfile and
 common-directory metadata and mounts the common metadata read-only. Kimi and
 other agent state stays command-specific under private home.
+
+## mise integration
+
+If [mise](https://mise.jdx.dev/) is on `$PATH`, the sandbox runs
+`mise trust -q`, `mise activate bash`, and `mise env` before your command, so
+agents get the project's language versions. Disable with `--no-mise` or
+`no_mise = true`. It is skipped automatically in `--lockdown` and browser
+profile modes.
+
+## Troubleshooting
+
+**`bwrap: setting up uid map: Permission denied` (Ubuntu 24.04+ / Debian 13+).**
+These distros ship an AppArmor policy denying unprivileged user namespaces,
+which is how `bwrap` isolates the sandbox. This affects every rootless
+user-namespace tool (Distrobox, rootless Podman, Flatpak from non-standard
+paths), not just ai-jail. Relax it system-wide:
+
+```bash
+echo 'kernel.apparmor_restrict_unprivileged_userns=0' \
+  | sudo tee /etc/sysctl.d/60-userns.conf
+sudo sysctl --system
+```
+
+Or keep the rest of the policy intact with an unconfined profile for `bwrap`
+only, in `/etc/apparmor.d/bwrap`:
+
+```
+abi <abi/4.0>,
+include <tunables/global>
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+}
+```
+
+Then `sudo apparmor_parser -r /etc/apparmor.d/bwrap`.
+
+**`Failed to create stream fd: No such file or directory` at startup.**
+This comes from mise setup, not from ai-jail. mise activation runs under a
+login shell, which sources `/etc/profile.d/*.sh`; on Ubuntu desktop one of
+those scripts (for example `im-config_wayland.sh`) logs through `systemd-cat`,
+and the journald socket does not exist inside the sandbox. It is harmless and
+mise still initializes. Silence it by masking the offending script
+(`mask = ["/etc/profile.d/im-config_wayland.sh"]`) or by skipping mise setup
+entirely with `--no-mise`.
 
 ## Platform and threat model
 
