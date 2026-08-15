@@ -23,6 +23,8 @@ src/
   signals.rs      -- signal forwarding + child process reaping
   output.rs       -- colored terminal output helpers (raw ANSI, no deps)
   bootstrap.rs    -- AI tool config generation (Claude, Codex, OpenCode)
+  command.rs      -- harness/ai-memory wrapper detection, effective command names
+  fsutil.rs       -- atomic file writes (0600), symlink-safe target checks
 ```
 
 ## Critical Rule: Backward Compatibility
@@ -46,6 +48,18 @@ This is the single most important invariant of the project. Users generate `.ai-
 - **Never change the meaning of an existing flag.** `--no-gpu` must always mean "disable GPU passthrough".
 - **New flags must not break existing invocations.** Defaults for new flags must preserve the prior behavior.
 - **Positional command behavior is sacred.** `ai-jail claude` must always mean "run claude inside the sandbox".
+
+### Security defaults and config authority
+
+- Private home is on by default. Command-specific state may be supplied by
+  global config; broad home exposure requires explicit `--no-private-home`.
+- Network, GPU, display, X11, host shared memory, terminal passthrough, macOS
+  host IPC, and worktree metadata are opt-in. Do not weaken these defaults.
+- Project `.ai-jail` is untrusted monotonic policy. It may tighten the effective
+  sandbox but cannot enable capabilities, outside maps, ports, `claude_dir`, or
+  exceptions. Capability opt-ins belong in global config or on the CLI.
+- Existing malformed config, bootstrap/wrapper setup, and overlay setup must
+  fail closed. Bootstrap files must remain mode `0600`.
 
 ### Testing backward compatibility
 
@@ -71,25 +85,25 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 4. Docker socket
 5. Tailscale socket
 6. Shared memory (`/dev/shm`)
-7. Display mounts (X11, Wayland, XDG_RUNTIME_DIR)
-8. systemd user bus mounts (`--systemd-user`, narrow XDG runtime sockets)
-9. Home directory (tmpfs `$HOME` first, then dotfiles on top)
+7. Display mounts (validated Wayland socket and optional X11; never the whole runtime directory)
+8. systemd user bus mounts (`--systemd-user`, narrow explicit runtime sockets)
+9. Home directory (tmpfs `$HOME` first, then command-specific state/dotfiles)
 10. Config hide (tmpfs over sensitive `~/.config/*` subdirs)
 11. Cache hide (tmpfs over sensitive `~/.cache/*` subdirs)
 12. Local overrides (`~/.local/state`, `~/.local/share/*` rw subdirs)
-13. Command binary exemption (private-home only: ro-binds of the invoked command's `$HOME` install paths, so `--private-home claude` can exec an agent installed under the home directory)
-14. Linked Git worktree metadata
+13. Command binary exemption (private-home only)
+14. Linked Git worktree metadata (validated, opt-in; common dir read-only, per-worktree git dir writable outside lockdown)
 15. SSH agent socket and `~/.ssh` exemption mounts
 16. Pictures mount
 17. Browser profile state mount
 18. Extra user mounts (`--map`, `--rw-map`)
 19. Overlay maps (`--overlay-map` — copy-on-write `--overlay-src`/`--overlay`)
 20. Project directory (pwd, rw or ro depending on mode)
-21. In-project user mounts (`--map`/`--rw-map` paths inside the project dir, after the project bind so it cannot shadow them)
-22. In-project overlay maps (`--overlay-map` paths inside the project dir, same shadowing rule)
+21. In-project user mounts (after the project bind)
+22. In-project overlay maps (after the project bind)
 23. Mask overlays (`--mask` and hidden project `.ai-jail`)
 24. Deny overlays (`--deny-path`, mode-000 file/dir placeholders)
-25. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last so it sits on top of the project mount that contains the upper/work layers)
+25. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last)
 
 Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts. Overlay maps come after the home/dotfile mounts (so an overlay on a home path sits on top). User mounts and overlay maps whose destination sits **inside** the project directory are emitted after the project mount — bwrap gives the later mount precedence, so emitting them earlier lets the project bind silently shadow them (issue #83: `--map .git` stayed writable and in-project overlay writes hit the real files). Mask and deny overlays come after those so they still win. Overlay storage hide comes last, after the project mount, so it masks the upper/work layers the project mount would otherwise expose.
 
