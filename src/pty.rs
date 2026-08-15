@@ -15,6 +15,10 @@
 //! On resize, the vt100 virtual terminal is resized first, then
 //! its state is re-rendered to the real terminal, giving ai-jail
 //! full control over screen recovery.
+//!
+//! By default output is rendered safely: terminal control queries and string
+//! commands are not passed from the sandbox to the host terminal. The
+//! `--terminal-passthrough` opt-in restores raw TUI terminal behavior.
 
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::termios::{self, SetArg, Termios};
@@ -24,6 +28,8 @@ use std::time::{Duration, Instant};
 
 /// Stored master raw FD for async-signal-safe resize from SIGWINCH.
 static MASTER_FD: AtomicI32 = AtomicI32::new(-1);
+/// Whether the current proxy reserves a row for the status bar.
+static STATUS_BAR_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Set by signal handler; IO loop clears screen + redraws status bar
 /// BEFORE forwarding SIGWINCH to the child, preventing ghost bars.
@@ -58,10 +64,15 @@ pub fn resize_pty() {
             &mut ws,
         )
     };
-    if ret != 0 || ws.ws_row < 2 || ws.ws_col == 0 {
+    if ret != 0 || ws.ws_row == 0 || ws.ws_col == 0 {
         return;
     }
-    ws.ws_row -= 1;
+    if STATUS_BAR_ACTIVE.load(Ordering::SeqCst) {
+        if ws.ws_row < 2 {
+            return;
+        }
+        ws.ws_row -= 1;
+    }
     unsafe {
         nix::libc::ioctl(master, nix::libc::TIOCSWINSZ, &ws);
     }
@@ -210,6 +221,9 @@ struct IoLoop<'a> {
     /// from the child stream so they survive the alt-screen vt100
     /// re-render (which drops them).
     osc: OscForwarder,
+    terminal_passthrough: bool,
+    primary_filter: TerminalFilter,
+    status_bar: bool,
 }
 
 impl<'a> IoLoop<'a> {
@@ -218,8 +232,10 @@ impl<'a> IoLoop<'a> {
         init_rows: u16,
         init_cols: u16,
         resize_redraw_key: Option<&'a [u8]>,
+        terminal_passthrough: bool,
+        status_bar: bool,
     ) -> Self {
-        let content_rows = init_rows - 1;
+        let content_rows = if status_bar { init_rows - 1 } else { init_rows };
         let content_cols = init_cols;
         let parser = vt100::Parser::new(content_rows, content_cols, 0);
         let prev_screen = parser.screen().clone();
@@ -236,7 +252,10 @@ impl<'a> IoLoop<'a> {
             init_rows,
             init_cols,
             resize_redraw_key,
-            osc: OscForwarder::new(),
+            osc: OscForwarder::new(terminal_passthrough),
+            terminal_passthrough,
+            primary_filter: TerminalFilter::new(),
+            status_bar,
         }
     }
 
@@ -244,6 +263,9 @@ impl<'a> IoLoop<'a> {
     /// visible area, and set the scroll region so the status bar
     /// row stays untouched by child output.
     fn prime_terminal(&self) {
+        if !self.status_bar {
+            return;
+        }
         let pos = format!("\x1b[{};1H", self.init_rows);
         write_all_raw(self.stdout, pos.as_bytes());
         for _ in 0..self.content_rows {
@@ -264,11 +286,11 @@ impl<'a> IoLoop<'a> {
         }
         let (rows, cols) =
             real_term_size().unwrap_or((self.init_rows, self.init_cols));
-        if rows < 2 {
+        if rows == 0 || (self.status_bar && rows < 2) {
             return;
         }
         let old_content_rows = self.content_rows;
-        self.content_rows = rows - 1;
+        self.content_rows = if self.status_bar { rows - 1 } else { rows };
         self.content_cols = cols;
         self.parser
             .screen_mut()
@@ -289,11 +311,13 @@ impl<'a> IoLoop<'a> {
             // the old status-bar ghost row, then let the child repaint
             // on its own after SIGWINCH.
             write_all_raw(self.stdout, b"\x1b[r");
-            if old_content_rows < self.content_rows {
+            if self.status_bar && old_content_rows < self.content_rows {
                 let seq = format!("\x1b[{};1H\x1b[2K", old_content_rows + 1);
                 write_all_raw(self.stdout, seq.as_bytes());
             }
-            set_scroll_region(self.stdout, self.content_rows);
+            if self.status_bar {
+                set_scroll_region(self.stdout, self.content_rows);
+            }
             let (row, col) = screen.cursor_position();
             let seq = format!("\x1b[{};{}H", row + 1, col + 1);
             write_all_raw(self.stdout, seq.as_bytes());
@@ -301,8 +325,10 @@ impl<'a> IoLoop<'a> {
 
         self.prev_screen = screen.clone();
         self.was_alt_screen = on_alt;
-        crate::statusbar::update_terminal_state(screen);
-        crate::statusbar::redraw();
+        if self.status_bar {
+            crate::statusbar::update_terminal_state(screen);
+            crate::statusbar::redraw();
+        }
         resize_pty();
         forward_sigwinch();
         if !on_alt && self.resize_redraw_key.is_some() {
@@ -311,7 +337,9 @@ impl<'a> IoLoop<'a> {
             self.pending_resize_redraw_at =
                 Some(Instant::now() + RESIZE_REDRAW_DELAY);
         }
-        let _ = crate::statusbar::take_requests();
+        if self.status_bar {
+            let _ = crate::statusbar::take_requests();
+        }
         self.pending_redraw = false;
     }
 
@@ -328,7 +356,9 @@ impl<'a> IoLoop<'a> {
         // drops (kitty keyboard protocol, Device Attributes, XTVERSION
         // capability queries). Only needed on alt screen paths — the
         // primary screen uses raw pass-through anyway.
-        if now_alt || now_alt != self.was_alt_screen {
+        if (now_alt || now_alt != self.was_alt_screen)
+            && self.terminal_passthrough
+        {
             forward_terminal_queries(self.stdout, buf);
         }
 
@@ -348,7 +378,9 @@ impl<'a> IoLoop<'a> {
             if now_alt {
                 write_all_raw(self.stdout, b"\x1b[r");
             } else {
-                set_scroll_region(self.stdout, self.content_rows);
+                if self.status_bar {
+                    set_scroll_region(self.stdout, self.content_rows);
+                }
             }
             write_all_raw(self.stdout, b"\x1b[H\x1b[J");
             let output = screen.state_formatted();
@@ -360,7 +392,12 @@ impl<'a> IoLoop<'a> {
             write_all_raw(self.stdout, &diff);
         } else {
             // Primary screen: raw pass-through for natural scrollback.
-            write_all_raw(self.stdout, buf);
+            if self.terminal_passthrough {
+                write_all_raw(self.stdout, buf);
+            } else {
+                let filtered = self.primary_filter.feed(buf);
+                write_all_raw(self.stdout, &filtered);
+            }
             // Re-establish scroll region in case child output contained
             // a reset. Only inject when the output ends at ground state
             // — otherwise our escapes corrupt an in-progress CSI/OSC.
@@ -368,7 +405,7 @@ impl<'a> IoLoop<'a> {
             // effect; restore via absolute CUP, NOT DECSC/DECRC (which
             // on macOS also save/restore scroll margins and would undo
             // the repair).
-            if ends_at_ground_state(buf) {
+            if self.status_bar && ends_at_ground_state(buf) {
                 let (row, col) = self.parser.screen().cursor_position();
                 set_scroll_region(self.stdout, self.content_rows);
                 let seq = format!("\x1b[{};{}H", row + 1, col + 1);
@@ -377,8 +414,10 @@ impl<'a> IoLoop<'a> {
         }
 
         self.prev_screen = screen.clone();
-        crate::statusbar::update_terminal_state(screen);
-        self.pending_redraw = true;
+        if self.status_bar {
+            crate::statusbar::update_terminal_state(screen);
+            self.pending_redraw = true;
+        }
         if self.resize_redraw_key.is_some()
             && self.pending_resize_redraw_at.is_some()
         {
@@ -406,13 +445,15 @@ impl<'a> IoLoop<'a> {
         let diff = screen.state_diff(&self.prev_screen);
         write_all_raw(self.stdout, &diff);
         write_all_raw(self.stdout, b"\x1b[r");
-        crate::statusbar::redraw();
+        if self.status_bar {
+            crate::statusbar::redraw();
+        }
     }
 
     /// Status bar / pending redraw-key flush, run when the child is
     /// quiet (no POLLIN on master).
     fn flush_when_idle(&mut self) {
-        if self.pending_redraw {
+        if self.status_bar && self.pending_redraw {
             crate::statusbar::redraw();
             self.pending_redraw = false;
         }
@@ -437,6 +478,8 @@ fn io_loop(
     init_rows: u16,
     init_cols: u16,
     resize_redraw_key: Option<&[u8]>,
+    terminal_passthrough: bool,
+    status_bar: bool,
 ) {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let master_raw = master.as_raw_fd();
@@ -444,9 +487,17 @@ fn io_loop(
     let master_bfd = unsafe { BorrowedFd::borrow_raw(master_raw) };
     let mut buf = [0u8; 8192];
 
-    let mut state =
-        IoLoop::new(master_raw, init_rows, init_cols, resize_redraw_key);
-    crate::statusbar::update_terminal_state(state.parser.screen());
+    let mut state = IoLoop::new(
+        master_raw,
+        init_rows,
+        init_cols,
+        resize_redraw_key,
+        terminal_passthrough,
+        status_bar,
+    );
+    if status_bar {
+        crate::statusbar::update_terminal_state(state.parser.screen());
+    }
     state.prime_terminal();
 
     loop {
@@ -456,7 +507,7 @@ fn io_loop(
             PollFd::new(stdin_bfd, PollFlags::POLLIN),
             PollFd::new(master_bfd, PollFlags::POLLIN),
         ];
-        if crate::statusbar::take_requests() {
+        if status_bar && crate::statusbar::take_requests() {
             state.pending_redraw = true;
         }
 
@@ -513,7 +564,13 @@ fn io_loop(
         {
             match nix::unistd::read(stdin_fd, &mut buf) {
                 Ok(0) => break,
-                Ok(n) => write_all_raw(master_raw, &buf[..n]),
+                Ok(n) => {
+                    if terminal_passthrough
+                        || !looks_like_terminal_reply(&buf[..n])
+                    {
+                        write_all_raw(master_raw, &buf[..n]);
+                    }
+                }
                 Err(nix::errno::Errno::EINTR) => {}
                 Err(_) => break,
             }
@@ -607,6 +664,117 @@ fn forward_terminal_queries(fd: i32, data: &[u8]) {
     }
 }
 
+/// Conservative recognition of terminal replies read from the real terminal.
+/// These are only useful after a query was deliberately forwarded.
+fn looks_like_terminal_reply(data: &[u8]) -> bool {
+    (data.starts_with(b"\x1b[") || data.starts_with(&[0x9b]))
+        && data.last().is_some_and(|b| matches!(b, b'R' | b'c' | b'n'))
+        || data.starts_with(b"\x1bP")
+        || data
+            .first()
+            .is_some_and(|b| matches!(b, 0x90 | 0x9d | 0x9e | 0x9f))
+}
+
+enum FilterState {
+    Ground,
+    Esc,
+    Csi,
+    String,
+    StringEsc,
+}
+
+/// Streaming primary-screen filter. It retains normal text and CSI display
+/// controls while dropping OSC, DCS, APC, PM and terminal capability queries.
+struct TerminalFilter {
+    state: FilterState,
+    pending: Vec<u8>,
+}
+
+impl TerminalFilter {
+    fn new() -> Self {
+        Self {
+            state: FilterState::Ground,
+            pending: Vec::new(),
+        }
+    }
+
+    fn feed(&mut self, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len());
+        for &b in data {
+            match self.state {
+                FilterState::Ground => {
+                    if b == 0x1b {
+                        self.pending.push(b);
+                        self.state = FilterState::Esc;
+                    } else if b == 0x9b {
+                        self.pending.push(b);
+                        self.state = FilterState::Csi;
+                    } else if matches!(b, 0x90 | 0x9d | 0x9e | 0x9f) {
+                        self.state = FilterState::String;
+                    } else {
+                        out.push(b);
+                    }
+                }
+                FilterState::Esc => match b {
+                    b'[' => {
+                        self.pending.push(b);
+                        self.state = FilterState::Csi;
+                    }
+                    b']' | b'P' | b'X' | b'^' | b'_' => {
+                        self.pending.clear();
+                        self.state = FilterState::String;
+                    }
+                    _ => {
+                        self.pending.push(b);
+                        out.extend_from_slice(&self.pending);
+                        self.pending.clear();
+                        self.state = FilterState::Ground;
+                    }
+                },
+                FilterState::Csi => {
+                    self.pending.push(b);
+                    if (0x40..=0x7e).contains(&b) {
+                        let prefix = self
+                            .pending
+                            .get(2)
+                            .copied()
+                            .filter(|p| matches!(p, b'>' | b'<' | b'?'));
+                        if !csi_final_forwardable(b, prefix) && b != b'n' {
+                            out.extend_from_slice(&self.pending);
+                        }
+                        self.pending.clear();
+                        self.state = FilterState::Ground;
+                    } else if self.pending.len() > OSC_MAX_LEN {
+                        self.pending.clear();
+                        self.state = FilterState::Ground;
+                    }
+                }
+                FilterState::String => match b {
+                    // 0x07 (BEL) and 0x9c (C1 ST) both terminate OSC.
+                    // Without the 0x9c arm a C1-introduced string (0x9d/
+                    // 0x90/0x9e/0x9f) closed by a C1 ST would swallow
+                    // every subsequent byte — a child-output DoS and a
+                    // filter-bypass surface.
+                    0x07 | 0x9c => self.state = FilterState::Ground,
+                    0x1b => self.state = FilterState::StringEsc,
+                    _ => {}
+                },
+                FilterState::StringEsc => {
+                    self.state = if b == b'\\' || b == 0x9c {
+                        // ESC \ (7-bit ST) or a raw C1 ST.
+                        FilterState::Ground
+                    } else if b == 0x1b {
+                        FilterState::StringEsc
+                    } else {
+                        FilterState::String
+                    };
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Hard cap on a single captured OSC sequence. Clipboard payloads
 /// (OSC 52) are base64 (~4/3 the raw size) and routinely span several
 /// read buffers; this guards against unbounded growth on malformed
@@ -652,13 +820,15 @@ enum OscState {
 struct OscForwarder {
     state: OscState,
     buf: Vec<u8>,
+    enabled: bool,
 }
 
 impl OscForwarder {
-    fn new() -> Self {
+    fn new(enabled: bool) -> Self {
         Self {
             state: OscState::Ground,
             buf: Vec::new(),
+            enabled,
         }
     }
 
@@ -670,7 +840,7 @@ impl OscForwarder {
     /// Forward the captured sequence only if its OSC command number is
     /// in the allowlist; always reset afterwards.
     fn flush(&mut self, fd: i32) {
-        if Self::is_forwardable(&self.buf) {
+        if self.enabled && Self::is_forwardable(&self.buf) {
             write_all_raw(fd, &self.buf);
         }
         self.reset();
@@ -811,18 +981,44 @@ fn write_all_raw(fd: i32, data: &[u8]) {
     }
 }
 
-/// Run the command through a PTY proxy with virtual terminal.
-/// Creates PTY pair, enters raw mode, spawns child with PTY slave
-/// as stdio, runs IO loop with hybrid rendering, waits for
-/// child, restores terminal. Returns exit code.
-pub fn run(
+/// Whether stdout is attached to a real terminal, i.e. child output
+/// must be filtered for hostile terminal control sequences before it
+/// reaches the host terminal. Pipes, files, and other non-terminal
+/// sinks do not interpret escape sequences, so filtering can be
+/// skipped on those paths.
+// Not yet referenced from main.rs (wired in a parallel lane); drop
+// this allow once a production caller exists.
+#[allow(dead_code)]
+pub fn stdout_needs_filter() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+}
+
+/// Config-aware PTY entry point for the explicit terminal passthrough opt-in.
+pub fn run_with_config(
     cmd: &mut std::process::Command,
     resize_redraw_key: Option<&[u8]>,
+    config: &crate::config::Config,
+    status_bar: bool,
+) -> Result<i32, String> {
+    run_with_passthrough(
+        cmd,
+        resize_redraw_key,
+        config.terminal_passthrough_enabled(),
+        status_bar,
+    )
+}
+
+fn run_with_passthrough(
+    cmd: &mut std::process::Command,
+    resize_redraw_key: Option<&[u8]>,
+    terminal_passthrough: bool,
+    status_bar: bool,
 ) -> Result<i32, String> {
     use std::os::unix::process::CommandExt;
 
     let (rows, cols) = real_term_size().unwrap_or((24, 80));
-    if rows < 2 {
+    if rows == 0 || (status_bar && rows < 2) {
         return Err("Terminal too small for status bar".into());
     }
 
@@ -843,8 +1039,8 @@ pub fn run(
         );
     }
 
-    // Set initial PTY size (rows-1 for status bar)
-    set_initial_size(&master, rows - 1, cols);
+    // Reserve a row only when the status overlay is active.
+    set_initial_size(&master, if status_bar { rows - 1 } else { rows }, cols);
 
     // Enter raw mode on real stdin
     let saved = enter_raw_mode()?;
@@ -883,15 +1079,24 @@ pub fn run(
     let pid = child.id() as i32;
     crate::signals::set_child_pid(pid);
     MASTER_FD.store(master_raw, Ordering::SeqCst);
+    STATUS_BAR_ACTIVE.store(status_bar, Ordering::SeqCst);
 
     // Close slave in parent — child has its own copy
     drop(slave);
 
     // Run IO loop (blocks until child exits / master HUP)
-    io_loop(&master, rows, cols, resize_redraw_key);
+    io_loop(
+        &master,
+        rows,
+        cols,
+        resize_redraw_key,
+        terminal_passthrough,
+        status_bar,
+    );
 
     // Clean up
     MASTER_FD.store(-1, Ordering::SeqCst);
+    STATUS_BAR_ACTIVE.store(false, Ordering::SeqCst);
     drop(master);
     drop(raw_mode_guard);
 
@@ -1052,11 +1257,28 @@ mod tests {
         out
     }
 
+    fn capture_kbd_forward_enabled(data: &[u8], enabled: bool) -> Vec<u8> {
+        let (r, w) = nix::unistd::pipe().unwrap();
+        if enabled {
+            forward_terminal_queries(w.as_raw_fd(), data);
+        }
+        drop(w);
+        let mut out = vec![0u8; 256];
+        let n = nix::unistd::read(r.as_raw_fd(), &mut out).unwrap_or(0);
+        out.truncate(n);
+        out
+    }
+
     #[test]
     fn kbd_push_mode_forwarded() {
         // CSI > 1 u  — push keyboard mode flags=1
         let out = capture_kbd_forward(b"\x1b[>1u");
         assert_eq!(out, b"\x1b[>1u");
+    }
+
+    #[test]
+    fn terminal_queries_are_denied_without_passthrough() {
+        assert!(capture_kbd_forward_enabled(b"\x1b[>1u", false).is_empty());
     }
 
     #[test]
@@ -1146,7 +1368,7 @@ mod tests {
 
     fn capture_osc52(chunks: &[&[u8]]) -> Vec<u8> {
         let (r, w) = nix::unistd::pipe().unwrap();
-        let mut fwd = super::OscForwarder::new();
+        let mut fwd = super::OscForwarder::new(true);
         for chunk in chunks {
             fwd.feed(w.as_raw_fd(), chunk);
         }
@@ -1241,6 +1463,90 @@ mod tests {
         seq.extend(std::iter::repeat_n(b'A', super::OSC_MAX_LEN + 16));
         seq.push(0x07);
         assert!(capture_osc52(&[&seq]).is_empty());
+    }
+
+    #[test]
+    fn osc_title_and_clipboard_denied_without_passthrough() {
+        let (r, w) = nix::unistd::pipe().unwrap();
+        let mut fwd = super::OscForwarder::new(false);
+        fwd.feed(w.as_raw_fd(), b"\x1b]2;title\x07\x1b]52;c;data\x07");
+        drop(w);
+        let mut out = [0; 1];
+        assert_eq!(nix::unistd::read(r.as_raw_fd(), &mut out).unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn primary_filter_keeps_display_controls_and_strips_queries() {
+        let mut filter = super::TerminalFilter::new();
+        let out =
+            filter.feed(b"text\x1b[31mred\x1b[2;4H\x1b]52;c;data\x07\x1b[c");
+        assert_eq!(out, b"text\x1b[31mred\x1b[2;4H");
+    }
+
+    #[test]
+    fn primary_filter_strips_c1_terminal_strings_and_queries() {
+        let mut filter = super::TerminalFilter::new();
+        let out = filter.feed(b"text\x9d52;c;data\x07\x9b?1;2cvisible");
+        assert_eq!(out, b"textvisible");
+        assert!(super::looks_like_terminal_reply(b"\x9b12;4R"));
+        assert!(super::looks_like_terminal_reply(b"\x9d52;c;reply\x07"));
+    }
+
+    #[test]
+    fn primary_filter_c1_st_terminates_c1_osc() {
+        // C1 OSC (0x9d) closed by C1 ST (0x9c): text after the
+        // terminator must survive instead of being swallowed forever.
+        let mut filter = super::TerminalFilter::new();
+        let out = filter.feed(b"text\x9d2;title\x9cafter");
+        assert_eq!(out, b"textafter");
+    }
+
+    #[test]
+    fn primary_filter_c1_st_terminates_all_c1_introducers() {
+        // DCS (0x90), OSC (0x9d), PM (0x9e), APC (0x9f): every C1
+        // string introducer must end on a raw C1 ST (0x9c).
+        for introducer in [0x90u8, 0x9d, 0x9e, 0x9f] {
+            let mut filter = super::TerminalFilter::new();
+            let seq = [introducer, b'p', b'!', 0x9c, b'o', b'k'];
+            assert_eq!(
+                filter.feed(&seq),
+                b"ok",
+                "introducer {introducer:#04x} not terminated by C1 ST"
+            );
+        }
+    }
+
+    #[test]
+    fn primary_filter_c1_st_split_across_reads() {
+        // The C1 ST may land in the next read buffer; the filter state
+        // must persist and still terminate the string.
+        let mut filter = super::TerminalFilter::new();
+        assert_eq!(filter.feed(b"\x9d0;evil"), b"");
+        assert_eq!(filter.feed(b"title\x9cresumed"), b"resumed");
+    }
+
+    #[test]
+    fn primary_filter_output_resumes_after_c1_st() {
+        // After a C1 ST terminator the filter is back at ground state:
+        // plain text and CSI display controls pass through again.
+        let mut filter = super::TerminalFilter::new();
+        let out = filter.feed(b"\x9fpayload\x9c\x1b[31mred");
+        assert_eq!(out, b"\x1b[31mred");
+    }
+
+    #[test]
+    fn primary_filter_c1_st_after_string_esc() {
+        // ESC inside a string followed by a raw C1 ST also terminates
+        // (treat 0x9c as ST in all string states).
+        let mut filter = super::TerminalFilter::new();
+        let out = filter.feed(b"\x9d0;t\x1b\x9cok");
+        assert_eq!(out, b"ok");
+    }
+
+    #[test]
+    fn terminal_reply_detection_is_conservative() {
+        assert!(super::looks_like_terminal_reply(b"\x1b[12;4R"));
+        assert!(!super::looks_like_terminal_reply(b"\x1b[A"));
     }
 
     #[test]

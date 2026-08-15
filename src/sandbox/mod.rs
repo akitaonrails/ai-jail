@@ -1,97 +1,54 @@
 use crate::config::Config;
+#[cfg(any(target_os = "macos", test))]
 use crate::config::MapSpec;
 use crate::output;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Dangerous capabilities a project `.ai-jail` can enable. Items are
-/// stable strings so we can diff the project config against a baseline
-/// (global config + CLI overrides) and warn only about new additions.
+#[cfg(test)]
 fn project_config_dangerous_opt_ins(
     config: &Config,
     project_dir: &Path,
 ) -> Vec<String> {
     let mut items = Vec::new();
-
-    if config.docker_enabled() {
-        items.push("Docker socket".into());
+    for (enabled, name) in [
+        (config.docker_enabled(), "Docker socket"),
+        (config.tailscale_enabled(), "Tailscale socket"),
+        (config.ssh_enabled(), "SSH keys/agent"),
+        (config.pictures_enabled(), "Pictures directory"),
+        (config.systemd_user_enabled(), "systemd user bus"),
+    ] {
+        if enabled {
+            items.push(name.into());
+        }
     }
-    if config.tailscale_enabled() {
-        items.push("Tailscale socket".into());
-    }
-    if config.ssh == Some(true) {
-        items.push("SSH keys/agent".into());
-    }
-    if config.pictures == Some(true) {
-        items.push("Pictures directory".into());
-    }
-    if config.systemd_user == Some(true) {
-        items.push("systemd user bus".into());
-    }
-
     for encoded in &config.rw_maps {
         if let Ok(spec) = MapSpec::parse(encoded)
-            && is_outside_project(&spec.source, project_dir)
+            && !crate::config::resolves_inside_project(
+                &spec.source,
+                project_dir,
+            )
         {
             items.push(format!("rw-map {}", spec.source.display()));
         }
     }
     for encoded in &config.ro_maps {
         if let Ok(spec) = MapSpec::parse(encoded)
-            && is_outside_project(&spec.source, project_dir)
+            && !crate::config::resolves_inside_project(
+                &spec.source,
+                project_dir,
+            )
         {
             items.push(format!("ro-map {}", spec.source.display()));
         }
     }
     for path in &config.overlay_maps {
-        if is_outside_project(path, project_dir) {
+        if !crate::config::resolves_inside_project(path, project_dir) {
             items.push(format!("overlay-map {}", path.display()));
         }
     }
-
     items
-}
-
-fn is_outside_project(path: &Path, project_dir: &Path) -> bool {
-    path.is_absolute() && !path.starts_with(project_dir)
-}
-
-/// Warn when a project `.ai-jail` introduces dangerous passthroughs or
-/// host path maps that are not already enabled by the user's global
-/// config or explicit CLI flags. This keeps the trust-boundary signal
-/// without warning users who have already opted in globally.
-pub fn warn_project_config_opt_ins(
-    project_config: &Config,
-    baseline_config: &Config,
-    project_dir: &Path,
-) {
-    // Paths may be relative or use `~/...`; resolve them the same way the
-    // sandbox will before checking scope.
-    let mut project = project_config.clone();
-    let mut baseline = baseline_config.clone();
-    crate::config::absolutize_user_paths(&mut project, project_dir);
-    crate::config::absolutize_user_paths(&mut baseline, project_dir);
-
-    let project_items = project_config_dangerous_opt_ins(&project, project_dir);
-    if project_items.is_empty() {
-        return;
-    }
-    let baseline_items =
-        project_config_dangerous_opt_ins(&baseline, project_dir);
-
-    let new_items: Vec<String> = project_items
-        .into_iter()
-        .filter(|item| !baseline_items.contains(item))
-        .collect();
-    if new_items.is_empty() {
-        return;
-    }
-
-    output::warn(&format!(
-        "Project .ai-jail enables capabilities not in your global config or CLI flags: {}. Review the file if you did not write it.",
-        new_items.join(", ")
-    ));
 }
 
 #[cfg(target_os = "linux")]
@@ -115,6 +72,7 @@ pub use seatbelt::SandboxGuard;
 
 pub(crate) const LOCKDOWN_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+#[cfg_attr(target_os = "macos", allow(dead_code))] // bwrap-only (Linux)
 pub(crate) const TERM_ENV_VARS: &[&str] =
     &["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"];
 pub(crate) const JAIL_PS1: &str = "(jail) \\w \\$ ";
@@ -128,10 +86,13 @@ const DOTDIR_DENY: &[&str] = &[
     ".thunderbird",
     ".basilisk-dev",
     ".sparrow",
+    ".docker",
+    ".kimi-code",
 ];
 
 /// Returns true if the dotdir name requires read-write access.
 /// `name` should be the dotdir name with or without leading dot (e.g., ".cargo" or "cargo").
+#[cfg(test)]
 fn is_dotdir_rw(name: &str) -> bool {
     let normalized = name.strip_prefix('.').unwrap_or(name);
     DOTDIR_RW
@@ -161,16 +122,10 @@ pub fn is_dotdir_denied(name: &str, extra: &[String], exempt: &[&str]) -> bool {
     {
         return true;
     }
-    // Check user-specified extras, but reject RW-required dirs
+    // User-selected hides always win, including tool state directories.
     for e in extra {
         let e_normalized = e.strip_prefix('.').unwrap_or(e);
         if e_normalized == normalized {
-            if is_dotdir_rw(normalized) {
-                crate::output::warn(&format!(
-                    "Cannot hide {e}: it is required for sandboxed tool operation"
-                ));
-                return false;
-            }
             return true;
         }
     }
@@ -214,11 +169,9 @@ const DOTDIR_RW: &[&str] = &[
     ".omp",
     ".pi",
     ".pi-lens",
-    ".kimi-code",
     ".config",
     ".cargo",
     ".cache",
-    ".docker",
     ".bundle",
     ".gem",
     ".rustup",
@@ -686,7 +639,6 @@ pub(crate) fn docker_socket() -> Option<PathBuf> {
     let candidates = [
         docker_host.as_deref().and_then(docker_host_socket_path),
         Some(PathBuf::from("/var/run/docker.sock")),
-        Some(home_dir().join(".docker/run/docker.sock")),
     ];
     candidates
         .into_iter()
@@ -708,7 +660,11 @@ fn docker_host_socket_path(value: &str) -> Option<PathBuf> {
 /// launch with `Can't find source path ...: Permission denied`, so an
 /// optional socket we cannot reach must be skipped, not mounted.
 pub(crate) fn docker_socket_usable(p: &Path) -> bool {
-    p.exists()
+    use std::os::unix::fs::FileTypeExt;
+
+    p.metadata()
+        .map(|metadata| metadata.file_type().is_socket())
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1119,7 +1075,7 @@ fn docker_passthrough_active(config: &Config, socket_present: bool) -> bool {
 fn warn_docker_passthrough(config: &Config) {
     let socket_present = docker_socket().is_some();
     if docker_passthrough_active(config, socket_present) {
-        output::warn(
+        output::security_warn(
             "Docker socket passthrough is enabled: the sandboxed process \
              gets effective root on the host through the Docker daemon, \
              bypassing --mask, --deny-path, and Landlock. \
@@ -1765,17 +1721,17 @@ mod tests {
             ".omp",
             ".pi",
             ".pi-lens",
-            ".kimi-code",
         ] {
             assert!(DOTDIR_RW.contains(name), "{name} should be in rw list");
         }
     }
 
     #[test]
-    fn rw_list_contains_tool_dirs() {
-        for name in &[".config", ".cargo", ".cache", ".docker"] {
+    fn rw_list_excludes_docker() {
+        for name in &[".config", ".cargo", ".cache"] {
             assert!(DOTDIR_RW.contains(name), "{name} should be in rw list");
         }
+        assert!(!DOTDIR_RW.contains(&".docker"));
     }
 
     #[test]
@@ -1836,26 +1792,9 @@ mod tests {
     }
 
     #[test]
-    fn cannot_deny_rw_required_dirs() {
-        let required = [
-            ".cargo",
-            ".cache",
-            ".config",
-            ".claude",
-            ".gemini",
-            ".kiro",
-            ".omp",
-            ".pi",
-            ".pi-lens",
-            ".kimi-code",
-        ];
-        for name in required {
-            let extra = vec![name.to_string()];
-            assert!(
-                !is_dotdir_denied(name, &extra, &[]),
-                "{name} should not be deniable - it's RW-required"
-            );
-        }
+    fn tool_dotdirs_can_be_denied_under_private_home() {
+        let extra = vec![".omp".to_string()];
+        assert!(is_dotdir_denied(".omp", &extra, &[]));
     }
 
     #[test]
@@ -1872,8 +1811,10 @@ mod tests {
         assert!(is_dotdir_rw("pi"));
         assert!(is_dotdir_rw(".pi-lens"));
         assert!(is_dotdir_rw("pi-lens"));
-        assert!(is_dotdir_rw(".kimi-code"));
-        assert!(is_dotdir_rw("kimi-code"));
+        assert!(!is_dotdir_rw(".kimi-code"));
+        assert!(!is_dotdir_rw(".docker"));
+        assert!(is_dotdir_denied(".kimi-code", &[], &[]));
+        assert!(is_dotdir_denied(".docker", &[], &[]));
         assert!(!is_dotdir_rw(".aws"));
         assert!(!is_dotdir_rw(".my_secrets"));
     }
@@ -2131,7 +2072,7 @@ mod tests {
         let _lock = crate::test_utils::ENV_LOCK.lock().unwrap();
         let root = docker_socket_fixture("host");
         let sock = root.join("podman.sock");
-        std::fs::File::create(&sock).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let _guard = crate::test_utils::EnvVarGuard::set(
             "DOCKER_HOST",
             format!("unix://{}", sock.display()),
@@ -2160,10 +2101,7 @@ mod tests {
         // Whatever is left is one of the well-known paths, or nothing
         // — this runs on hosts with and without a Docker socket.
         if let Some(p) = resolved {
-            let well_known = [
-                PathBuf::from("/var/run/docker.sock"),
-                home_dir().join(".docker/run/docker.sock"),
-            ];
+            let well_known = [PathBuf::from("/var/run/docker.sock")];
             assert!(
                 well_known.iter().any(|candidate| candidate == &p),
                 "unexpected fallback: {}",
@@ -2254,6 +2192,20 @@ mod tests {
             &hidden,
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn docker_socket_requires_a_unix_socket() {
+        let root = docker_socket_fixture("file-type");
+        let regular = root.join("docker.sock");
+        std::fs::write(&regular, "not a socket").unwrap();
+        assert!(!docker_socket_usable(&regular));
+
+        let socket = root.join("real.sock");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(docker_socket_usable(&socket));
         let _ = std::fs::remove_dir_all(&root);
     }
 

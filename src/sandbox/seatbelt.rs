@@ -64,18 +64,40 @@ pub fn build(config: &Config, project_dir: &Path, verbose: bool) -> Command {
     cmd.args(&launch.args);
     cmd.current_dir(project_dir);
 
-    if lockdown {
-        cmd.env_clear();
+    apply_child_env(&mut cmd, config);
+
+    // The profile only grants RW inside the dedicated session scratch
+    // dir; TMPDIR must point there or every temp operation in the
+    // child is denied.
+    if !lockdown && let Some(tmpdir) = macos_session_tmpdir() {
+        cmd.env("TMPDIR", tmpdir);
+    }
+
+    cmd
+}
+
+/// Build the child environment from the shared allowlist in
+/// `config.rs` instead of inheriting the host env wholesale (host env
+/// often carries tokens and machine-specific state). `env_pass`
+/// entries (`NAME` or `NAME=VALUE`) are always applied verbatim on
+/// top. Mirrors `bwrap::env_args` so both backends filter identically.
+fn apply_child_env(cmd: &mut Command, config: &Config) {
+    cmd.env_clear();
+
+    let host_env: Vec<(String, String)> = std::env::vars().collect();
+    let env = if config.inherit_env_enabled() {
+        let mut env = Vec::new();
+        crate::config::apply_env_pass(&mut env, config.env_pass(), &host_env);
+        env
+    } else {
+        crate::config::filtered_child_env(config.env_pass(), &host_env)
+    };
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+
+    if config.lockdown_enabled() {
         cmd.env("PATH", super::LOCKDOWN_PATH);
-        cmd.env("HOME", super::home_dir());
-        // Pass through terminal-related env vars so child
-        // programs can detect capabilities (truecolor, kitty
-        // keyboard protocol, etc.).
-        for &var in super::TERM_ENV_VARS {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
     }
 
     cmd.env("PS1", super::JAIL_PS1);
@@ -84,8 +106,6 @@ pub fn build(config: &Config, project_dir: &Path, verbose: bool) -> Command {
     if let Some(dir) = &config.claude_dir {
         cmd.env("CLAUDE_CONFIG_DIR", dir);
     }
-
-    cmd
 }
 
 pub fn dry_run(config: &Config, project_dir: &Path, verbose: bool) -> String {
@@ -103,12 +123,7 @@ pub fn dry_run(config: &Config, project_dir: &Path, verbose: bool) -> String {
 }
 
 fn build_profile(config: &Config, project_dir: &Path, verbose: bool) -> String {
-    let profile = generate_sbpl_profile(
-        config,
-        project_dir,
-        config.docker_enabled(),
-        config.lockdown_enabled(),
-    );
+    let profile = generate_sbpl_profile(config, project_dir);
 
     if verbose {
         output::verbose("SBPL profile:");
@@ -169,17 +184,20 @@ fn sbpl_path(p: &Path) -> String {
     sbpl_escape(canonicalize_or_keep(p).to_string_lossy().as_ref())
 }
 
-fn generate_sbpl_profile(
-    config: &Config,
-    project_dir: &Path,
-    enable_docker: bool,
-    lockdown: bool,
-) -> String {
-    let browser_mode = config.browser_profile().is_some();
-    let private_home = config.private_home_enabled();
-    let restricted_files = lockdown || browser_mode || private_home;
+fn generate_sbpl_profile(config: &Config, project_dir: &Path) -> String {
+    let lockdown = config.lockdown_enabled();
     let exempt = super::dotdir_exemptions(config);
+    let agent_state = agent_state_paths(config);
     let mut deny_paths = macos_read_deny_paths(&config.hide_dotdirs, &exempt);
+    if !agent_state.is_empty() {
+        // Agent-state passthrough is an explicit opt-in; like the
+        // Linux backend's per-command state binds, the mounted dirs
+        // outrank the generic dotdir-deny list (e.g. .kimi-code is a
+        // built-in hide) or the opt-in would be silently defeated.
+        // Explicit --deny-path/--mask entries still win: they are
+        // appended below, after this retain.
+        deny_paths.retain(|p| !agent_state.contains(p));
+    }
     deny_paths.extend(super::effective_mask_patterns(config, project_dir));
     let explicit_deny_paths = super::expand_mask_patterns(
         &config.deny_paths,
@@ -208,15 +226,9 @@ fn generate_sbpl_profile(
     profile.push_str("(version 1)\n");
     profile.push_str("(deny default)\n\n");
 
-    push_static_sections(&mut profile);
-    push_network_section(&mut profile, lockdown);
-    push_file_read_section(
-        &mut profile,
-        config,
-        project_dir,
-        restricted_files,
-        &deny_paths,
-    );
+    push_static_sections(&mut profile, config.macos_host_ipc_enabled());
+    push_network_section(&mut profile, config);
+    push_file_read_section(&mut profile, config, project_dir, &deny_paths);
     push_file_write_section(
         &mut profile,
         lockdown,
@@ -224,7 +236,7 @@ fn generate_sbpl_profile(
         &atomic_paths,
         &write_deny_paths,
     );
-    push_docker_section(&mut profile, lockdown, enable_docker);
+    push_docker_section(&mut profile, docker_active(config, lockdown));
 
     profile
 }
@@ -244,30 +256,59 @@ fn push_path_rule(profile: &mut String, verb: &str, action: &str, path: &Path) {
     profile.push_str(&format!("({verb} {action} ({pattern} \"{escaped}\"))\n"));
 }
 
-/// Sections that don't depend on config — process, IPC, ptys,
-/// devices, IOKit. Always emitted first so the file structure is
-/// predictable across modes.
-fn push_static_sections(profile: &mut String) {
+/// Sections that don't depend on filesystem policy. Always emitted first so
+/// the file structure is predictable across modes.
+fn push_static_sections(profile: &mut String, allow_host_ipc: bool) {
     profile.push_str("; Process operations\n");
     profile.push_str("(allow process-exec)\n");
     profile.push_str("(allow process-fork)\n");
     profile.push_str("(allow process-info* (target same-sandbox))\n");
-    profile.push_str("(allow signal)\n");
     profile.push_str("(allow sysctl-read)\n\n");
 
     profile.push_str("; IPC and Mach\n");
-    profile.push_str("(allow mach-lookup)\n");
-    profile.push_str("(allow mach-register)\n");
-    profile.push_str("(allow mach-host*)\n");
-    profile.push_str("(allow ipc-posix-shm-read-data)\n");
-    profile.push_str("(allow ipc-posix-shm-write-data)\n");
-    profile.push_str("(allow ipc-posix-shm-read-metadata)\n");
-    profile.push_str("(allow ipc-posix-shm-write-create)\n");
-    profile.push_str("(allow ipc-posix-sem)\n\n");
+    // Minimal literal bootstrap services required to exec an ordinary
+    // dynamically linked command. A global `(allow mach-lookup)` would
+    // expose arbitrary host services; only these two literals are
+    // permitted by default:
+    // - com.apple.cfprefsd.daemon: CFPreferences lookups nearly every
+    //   Apple-linked binary performs during startup (locale, system
+    //   directories, tool settings); hard failures abort some tools.
+    // - com.apple.system.logger: the unified logging service (os_log)
+    //   that libSystem itself initializes at exec.
+    for service in ["com.apple.cfprefsd.daemon", "com.apple.system.logger"] {
+        profile.push_str(&format!(
+            "(allow mach-lookup (global-name \"{service}\"))\n"
+        ));
+    }
+    profile.push('\n');
 
-    profile.push_str("; Pseudo-terminal and ioctl\n");
+    if allow_host_ipc {
+        // Explicit compatibility opt-in; nothing in this block is ever
+        // allowed by default because each rule is a broad host-IPC
+        // surface that escapes the file policy:
+        // - signal: signaling host processes outside the sandbox
+        // - ipc-posix-shm*: reading/writing/creating host-visible
+        //   POSIX shared-memory segments
+        // - ipc-posix-sem: host POSIX named semaphores
+        // - mach-lookup: every host bootstrap service
+        // - mach-host*: host statistics and privilege ports
+        // - file-ioctl / iokit-open: device ioctls and IOKit drivers
+        profile.push_str("; Explicit macOS host IPC compatibility opt-in\n");
+        profile.push_str("(allow signal)\n");
+        profile.push_str("(allow ipc-posix-shm-read-data)\n");
+        profile.push_str("(allow ipc-posix-shm-write-data)\n");
+        profile.push_str("(allow ipc-posix-shm-read-metadata)\n");
+        profile.push_str("(allow ipc-posix-shm-write-create)\n");
+        profile.push_str("(allow ipc-posix-sem)\n");
+        profile.push_str("(allow mach-lookup)\n");
+        profile.push_str("(allow mach-host*)\n");
+        profile.push_str("(allow file-ioctl)\n");
+        profile.push_str("(allow iokit-open)\n");
+        profile.push('\n');
+    }
+
+    profile.push_str("; Pseudo-terminal\n");
     profile.push_str("(allow pseudo-tty)\n");
-    profile.push_str("(allow file-ioctl)\n");
     profile
         .push_str("(allow file-read* file-write* (literal \"/dev/ptmx\"))\n");
     profile.push_str(
@@ -280,14 +321,14 @@ fn push_static_sections(profile: &mut String) {
     profile.push_str("(allow file-write* (literal \"/dev/random\"))\n");
     profile.push_str("(allow file-write* (literal \"/dev/urandom\"))\n\n");
 
-    profile.push_str("; IOKit (power management, hardware queries)\n");
-    profile.push_str("(allow iokit-open)\n\n");
+    profile.push('\n');
 }
 
-fn push_network_section(profile: &mut String, lockdown: bool) {
-    if lockdown {
+fn push_network_section(profile: &mut String, config: &Config) {
+    if !config.network_enabled() || config.lockdown_enabled() {
         return;
     }
+    // Full network can exfiltrate every file this profile permits reading.
     profile.push_str("; Network\n");
     profile.push_str("(allow network-outbound)\n");
     profile.push_str("(allow network-inbound)\n");
@@ -299,28 +340,16 @@ fn push_file_read_section(
     profile: &mut String,
     config: &Config,
     project_dir: &Path,
-    restricted_files: bool,
     deny_paths: &[PathBuf],
 ) {
-    if restricted_files {
-        profile.push_str("; File reads: restricted allow-list\n");
-        // The root node itself must be readable, or the dyld loader on
-        // macOS 26 (Tahoe) can't resolve absolute paths and every
-        // dynamically-linked process aborts with SIGABRT before it runs.
-        // This is a `literal` (not `subpath`) rule on purpose: it grants
-        // read of `/` alone — listing top-level names — without opening
-        // up any subtree the allow-list below hasn't already granted.
-        profile.push_str("(allow file-read* (literal \"/\"))\n");
-        for rd_path in macos_lockdown_read_paths(config, project_dir) {
-            push_path_rule(profile, "allow", "file-read*", &rd_path);
-        }
-        profile.push('\n');
-        profile.push_str("; Deny sensitive home paths explicitly\n");
-    } else {
-        profile
-            .push_str("; File reads: allow globally, deny sensitive paths\n");
-        profile.push_str("(allow file-read*)\n");
+    profile.push_str("; File reads: explicit allow-list\n");
+    // dyld needs the root node to resolve absolute paths. This literal rule
+    // does not grant any filesystem subtree.
+    profile.push_str("(allow file-read* (literal \"/\"))\n");
+    for rd_path in macos_read_paths(config, project_dir) {
+        push_path_rule(profile, "allow", "file-read*", &rd_path);
     }
+    profile.push('\n');
     for deny_path in deny_paths {
         push_path_rule(profile, "deny", "file-read*", deny_path);
     }
@@ -372,12 +401,12 @@ fn push_file_write_section(
     profile.push('\n');
 }
 
-fn push_docker_section(
-    profile: &mut String,
-    lockdown: bool,
-    enable_docker: bool,
-) {
-    if lockdown || !enable_docker {
+fn docker_active(config: &Config, lockdown: bool) -> bool {
+    config.docker_enabled() && config.browser_profile().is_none() && !lockdown
+}
+
+fn push_docker_section(profile: &mut String, active: bool) {
+    if !active {
         return;
     }
     let Some(sock) = macos_docker_socket() else {
@@ -387,6 +416,85 @@ fn push_docker_section(
     profile.push_str("; Docker socket\n");
     profile.push_str(&format!("(allow file-write* (literal \"{escaped}\"))\n"));
     profile.push('\n');
+}
+
+fn validated_macos_tmpdir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    // Only Darwin's trusted, per-user root is eligible. A TMPDIR value is
+    // accepted only when it canonicalizes to that exact directory.
+    let length = unsafe {
+        nix::libc::confstr(
+            nix::libc::_CS_DARWIN_USER_TEMP_DIR,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if length == 0 {
+        return None;
+    }
+    let mut bytes = vec![0_u8; length as usize];
+    if unsafe {
+        nix::libc::confstr(
+            nix::libc::_CS_DARWIN_USER_TEMP_DIR,
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+        )
+    } == 0
+    {
+        return None;
+    }
+    let trusted = PathBuf::from(std::ffi::OsStr::from_bytes(
+        &bytes[..bytes.len().saturating_sub(1)],
+    ));
+    let trusted = std::fs::canonicalize(trusted).ok()?;
+    let metadata = trusted.metadata().ok()?;
+    let mode = metadata.mode();
+    // Darwin's mode_t is u16, so S_ISVTX must widen to match mode().
+    let sticky = u32::from(nix::libc::S_ISVTX);
+    let unsafe_writable = mode & 0o022 != 0 && mode & sticky == 0;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { nix::libc::geteuid() }
+        || unsafe_writable
+    {
+        return None;
+    }
+    if let Some(tmpdir) = std::env::var_os("TMPDIR")
+        && std::fs::canonicalize(tmpdir).ok().as_ref() != Some(&trusted)
+    {
+        output::warn(
+            "ignoring TMPDIR that differs from Darwin's trusted per-user temporary directory",
+        );
+    }
+    Some(trusted)
+}
+
+/// Dedicated per-session scratch directory inside Darwin's trusted
+/// per-user temp root: `<tmp>/ai-jail-<pid>`, created with mode 0700.
+/// Allowing the whole validated root would expose every host temp
+/// file to the sandbox; the child only ever sees its own session
+/// subtree, and the child's TMPDIR is pointed at it in [`build`].
+fn macos_session_tmpdir() -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = validated_macos_tmpdir()?;
+    let session = root.join(format!("ai-jail-{}", std::process::id()));
+    if std::fs::create_dir(&session).is_err() && !session.is_dir() {
+        output::warn(&format!(
+            "cannot create session temp dir {}; temp access disabled",
+            session.display()
+        ));
+        return None;
+    }
+    // Enforce the mode on every call: a stale directory left by an
+    // earlier process that recycled this pid must not carry looser
+    // group/other bits.
+    let _ = std::fs::set_permissions(
+        &session,
+        std::fs::Permissions::from_mode(0o700),
+    );
+    Some(session)
 }
 
 fn format_dry_run_macos(command_line: &str, profile: &str) -> String {
@@ -423,6 +531,52 @@ fn macos_read_deny_paths(
         .collect()
 }
 
+/// Command-specific agent state paths (state directories plus
+/// claude's `~/.claude.json` status file) that are mounted read-write
+/// when agent-state passthrough is enabled. Returns an empty list
+/// otherwise — agent state never leaks in by default.
+///
+/// Mirrors the command-state list the Linux backend mounts so both
+/// platforms expose identical agent state. Kept local to this file
+/// because the bwrap-side list is private to that module.
+fn agent_state_paths(config: &Config) -> Vec<PathBuf> {
+    if !config.agent_state_enabled() {
+        return Vec::new();
+    }
+    let home = super::home_dir();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut push = |rel: &str| {
+        let path = home.join(rel);
+        if super::path_exists(&path) && !paths.contains(&path) {
+            paths.push(path);
+        }
+    };
+    match crate::command::effective_name(&config.command) {
+        Some("claude") => {
+            push(".claude");
+            push(".claude.json");
+        }
+        Some("codex") => push(".codex"),
+        Some("opencode") => {
+            push(".config/opencode");
+            push(".local/share/opencode");
+        }
+        Some("crush") => push(".crush"),
+        Some(name) if name.starts_with("kimi") => push(".kimi-code"),
+        Some("gemini") => push(".gemini"),
+        Some("grok") => push(".grok"),
+        Some("pi") => {
+            push(".pi");
+            push(".pi-lens");
+        }
+        Some("aider") => push(".aider"),
+        Some("soulforge") => push(".soulforge"),
+        Some("omp") => push(".omp"),
+        _ => {}
+    }
+    paths
+}
+
 fn macos_writable_paths(
     project_dir: &Path,
     config: &Config,
@@ -434,25 +588,22 @@ fn macos_writable_paths(
 
     let home = super::home_dir();
     let mut paths = Vec::new();
+    let agent_state = agent_state_paths(config);
 
     let browser_mode = config.browser_profile().is_some();
     let private_home = config.private_home_enabled();
 
     if browser_mode {
+        for p in &agent_state {
+            paths.push(p.clone());
+        }
         if let Some(state) = super::browser_state_dir(config) {
             let _ = std::fs::create_dir_all(&state);
             paths.push(state);
         }
-        paths.push(PathBuf::from("/tmp"));
-        paths.push(PathBuf::from("/private/tmp"));
-        paths.push(PathBuf::from("/private/var/tmp"));
-        if let Ok(tmpdir) = std::env::var("TMPDIR") {
-            let p = PathBuf::from(&tmpdir);
-            if super::path_exists(&p) {
-                paths.push(canonicalize_or_keep(&p));
-            }
+        if let Some(tmpdir) = macos_session_tmpdir() {
+            paths.push(tmpdir);
         }
-        paths.push(PathBuf::from("/private/var/folders"));
         return paths;
     }
 
@@ -461,7 +612,21 @@ fn macos_writable_paths(
     if let Some(worktree) =
         super::discover_git_worktree_paths(config, project_dir, false)
     {
-        paths.extend(worktree.unique_paths());
+        // Only the per-worktree git dir needs writes (HEAD, index,
+        // ORIG_HEAD, worktree-local refs). The shared common dir holds
+        // object storage and refs that sibling worktrees depend on —
+        // it stays read-only (macos_read_paths grants it reads).
+        paths.push(worktree.git_dir.clone());
+    }
+
+    // Explicit agent-state opt-in: mount the command's state dirs RW.
+    // Independent of --no-private-home below; an explicit
+    // --claude-dir is likewise its own opt-in and handled further
+    // down.
+    for p in agent_state {
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
     }
 
     if !private_home {
@@ -484,19 +649,11 @@ fn macos_writable_paths(
         paths.push(dir.clone());
     }
 
-    paths.push(PathBuf::from("/tmp"));
-    paths.push(PathBuf::from("/private/tmp"));
-    paths.push(PathBuf::from("/private/var/tmp"));
-
-    // macOS per-user temp dir ($TMPDIR -> /private/var/folders/.../T/)
-    if let Ok(tmpdir) = std::env::var("TMPDIR") {
-        let p = PathBuf::from(&tmpdir);
-        if super::path_exists(&p) {
-            paths.push(canonicalize_or_keep(&p));
-        }
+    // Grant only the dedicated session scratch dir, never the whole
+    // validated per-user temp root (host temp files stay invisible).
+    if let Some(tmpdir) = macos_session_tmpdir() {
+        paths.push(tmpdir);
     }
-    // Fallback: allow the entire /private/var/folders tree
-    paths.push(PathBuf::from("/private/var/folders"));
 
     // macOS-native caches (Xcode tooling, Homebrew, etc.)
     if !private_home {
@@ -516,7 +673,13 @@ fn macos_writable_paths(
 }
 
 fn macos_atomic_write_paths(config: &Config) -> Vec<PathBuf> {
-    if config.private_home_enabled() || config.lockdown_enabled() {
+    // ~/.claude.json is command agent state; without the agent-state
+    // opt-in the file stays host-private (the earlier
+    // --no-private-home allowance was retired with that opt-in).
+    if config.lockdown_enabled() || !config.agent_state_enabled() {
+        return Vec::new();
+    }
+    if crate::command::effective_name(&config.command) != Some("claude") {
         return Vec::new();
     }
     let claude_json = super::home_dir().join(".claude.json");
@@ -534,10 +697,7 @@ fn macos_docker_socket() -> Option<PathBuf> {
     super::docker_socket()
 }
 
-fn macos_lockdown_read_paths(
-    config: &Config,
-    project_dir: &Path,
-) -> Vec<PathBuf> {
+fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut push_unique = |p: PathBuf| {
         if !paths.contains(&p) {
@@ -545,7 +705,8 @@ fn macos_lockdown_read_paths(
         }
     };
 
-    // Always allow reading the project tree.
+    // Every mode may read its project tree, but only non-lockdown profiles
+    // receive write access through macos_writable_paths.
     push_unique(canonicalize_or_keep(project_dir));
 
     if let Some(worktree) =
@@ -576,13 +737,7 @@ fn macos_lockdown_read_paths(
         "/etc",
         "/private/etc",
         "/Library",
-        "/Applications",
         "/dev",
-        "/tmp",
-        "/private/tmp",
-        "/private/var/tmp",
-        "/private/var/folders",
-        "/private/var/db",
     ] {
         let pb = PathBuf::from(p);
         if super::path_exists(&pb) {
@@ -595,6 +750,14 @@ fn macos_lockdown_read_paths(
 
     if browser_mode && let Some(state) = super::browser_state_dir(config) {
         push_unique(canonicalize_or_keep(&state));
+    }
+
+    // Explicit agent-state opt-in: the command's state dirs must be
+    // readable as well as writable. Under private-home these are the
+    // only home paths exposed; under --no-private-home they are
+    // already covered by the compat list below.
+    for path in agent_state_paths(config) {
+        push_unique(canonicalize_or_keep(&path));
     }
 
     if !private_home {
@@ -614,7 +777,50 @@ fn macos_lockdown_read_paths(
         }
     }
 
-    if private_home && !browser_mode && !config.lockdown_enabled() {
+    if !private_home && !browser_mode {
+        // --no-private-home is explicit compatibility opt-in. Keep it to
+        // agent/tool state dotdirs rather than granting the whole home.
+        for name in [
+            ".gemini",
+            ".claude",
+            ".crush",
+            ".codex",
+            ".aider",
+            ".kiro",
+            ".soulforge",
+            ".grok",
+            ".agents",
+            ".omp",
+            ".pi",
+            ".pi-lens",
+            ".config",
+            ".cargo",
+            ".cache",
+            ".bundle",
+            ".gem",
+            ".rustup",
+            ".npm",
+            ".bun",
+            ".deno",
+            ".yarn",
+            ".pnpm",
+            ".m2",
+            ".gradle",
+            ".dotnet",
+            ".nuget",
+            ".pub-cache",
+            ".mix",
+            ".hex",
+            ".local",
+        ] {
+            let path = super::home_dir().join(name);
+            if path.is_dir() {
+                push_unique(canonicalize_or_keep(&path));
+            }
+        }
+    }
+
+    if !browser_mode && !config.lockdown_enabled() {
         for p in config.rw_maps.iter().chain(config.ro_maps.iter()) {
             if super::path_exists(p) {
                 push_unique(canonicalize_or_keep(p));
@@ -641,11 +847,30 @@ fn macos_lockdown_read_paths(
         }
     }
 
-    if let Ok(tmpdir) = std::env::var("TMPDIR") {
-        let p = PathBuf::from(tmpdir);
-        if super::path_exists(&p) {
-            push_unique(canonicalize_or_keep(&p));
+    // A command under /Applications needs its bundle, but do not expose all
+    // installed applications merely because one command is launched.
+    for command in crate::command::executable_candidates(&config.command) {
+        let path = PathBuf::from(command);
+        if path.starts_with("/Applications") && path.exists() {
+            push_unique(canonicalize_or_keep(&path));
         }
+    }
+
+    for p in config.rw_maps.iter().chain(config.ro_maps.iter()) {
+        let source = crate::config::map_source(p);
+        if super::path_exists(&source) {
+            push_unique(canonicalize_or_keep(&source));
+        }
+    }
+
+    // Only the dedicated session scratch dir is readable/writable in
+    // the temp area; the rest of the per-user temp root stays hidden.
+    // Lockdown gets no temp access at all (no writes anywhere, so a
+    // fresh TMPDIR would only mislead).
+    if !config.lockdown_enabled()
+        && let Some(tmpdir) = macos_session_tmpdir()
+    {
+        push_unique(tmpdir);
     }
 
     paths
@@ -670,18 +895,106 @@ mod tests {
             ..Config::default()
         };
         let project = PathBuf::from("/tmp/test-project");
-        let profile = generate_sbpl_profile(&config, &project, false, false);
+        let profile = generate_sbpl_profile(&config, &project);
         assert!(profile.contains("(deny default)"));
     }
 
     #[test]
-    fn sbpl_profile_allows_network_by_default() {
-        let config = Config::default();
+    fn docker_is_disabled_in_browser_and_lockdown_modes() {
+        let enabled = Config {
+            no_docker: Some(false),
+            ..Config::default()
+        };
+        assert!(docker_active(&enabled, false));
+        let browser = Config {
+            browser_profile: Some("soft".into()),
+            ..enabled.clone()
+        };
+        assert!(!docker_active(&browser, false));
+        assert!(!docker_active(&enabled, true));
+    }
+
+    #[test]
+    fn sbpl_profile_defaults_to_no_network_or_global_reads() {
+        let _env = ENV_LOCK.lock().unwrap();
+        // Empty fixture home: the --no-private-home mode below would
+        // otherwise add whatever dotdirs the invoking user happens to
+        // have, making the "no home subpath allows" assertion
+        // machine-dependent.
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-seatbelt-defaults-home-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
+
         let project = PathBuf::from("/tmp/test-project");
-        let profile = generate_sbpl_profile(&config, &project, false, false);
+        let modes = [
+            Config::default(),
+            Config {
+                private_home: Some(false),
+                ..Config::default()
+            },
+            Config {
+                lockdown: Some(true),
+                ..Config::default()
+            },
+            Config {
+                browser_profile: Some("soft".into()),
+                ..Config::default()
+            },
+        ];
+        for config in modes {
+            let profile = generate_sbpl_profile(&config, &project);
+            assert!(!profile.contains("(allow network-outbound)"));
+            assert!(!profile.contains("(allow file-read*)\n"));
+            assert!(!profile.contains("(subpath \"/Users/"));
+            assert!(!profile.contains("(allow mach-lookup)\n"));
+            assert!(!profile.contains("(allow mach-host*)"));
+            assert!(!profile.contains("(allow mach-register)"));
+            assert!(!profile.contains("(allow file-ioctl)"));
+            assert!(!profile.contains("(allow iokit-open)"));
+            // Broad host IPC is opt-in only: signaling host processes,
+            // POSIX shm, and POSIX semaphores stay denied by default.
+            assert!(!profile.contains("(allow signal)"));
+            assert!(!profile.contains("ipc-posix-shm"));
+            assert!(!profile.contains("(allow ipc-posix-sem)"));
+            // The only mach-lookup allowances are the two literal
+            // bootstrap services required for exec.
+            assert_eq!(
+                profile.matches("(allow mach-lookup").count(),
+                profile
+                    .matches("(allow mach-lookup (global-name \"")
+                    .count(),
+                "default profile must not allow non-literal mach-lookup"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn sbpl_network_and_host_ipc_require_explicit_opt_in() {
+        let config = Config {
+            network: Some(true),
+            macos_host_ipc: Some(true),
+            ..Config::default()
+        };
+        let profile =
+            generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
         assert!(profile.contains("(allow network-outbound)"));
-        assert!(profile.contains("(allow network-inbound)"));
-        assert!(profile.contains("(allow file-read*)"));
+        assert!(profile.contains("(allow mach-lookup)"));
+        assert!(profile.contains("(allow mach-host*)"));
+        assert!(profile.contains("(allow file-ioctl)"));
+        assert!(profile.contains("(allow iokit-open)"));
+        assert!(profile.contains("(allow signal)"));
+        assert!(profile.contains("(allow ipc-posix-shm-read-data)"));
+        assert!(profile.contains("(allow ipc-posix-shm-write-data)"));
+        assert!(profile.contains("(allow ipc-posix-shm-read-metadata)"));
+        assert!(profile.contains("(allow ipc-posix-shm-write-create)"));
+        assert!(profile.contains("(allow ipc-posix-sem)"));
+        assert!(!profile.contains("mach-register"));
     }
 
     #[test]
@@ -691,7 +1004,7 @@ mod tests {
             ..Config::default()
         };
         let project = PathBuf::from("/tmp/test-project");
-        let profile = generate_sbpl_profile(&config, &project, false, false);
+        let profile = generate_sbpl_profile(&config, &project);
         assert!(profile.contains(
             "(deny file-read* (subpath \"/tmp/test-project/.env\"))"
         ));
@@ -712,7 +1025,7 @@ mod tests {
             deny_path_exceptions: vec![PathBuf::from("secret")],
             ..Config::default()
         };
-        let profile = generate_sbpl_profile(&config, &project, false, false);
+        let profile = generate_sbpl_profile(&config, &project);
         assert!(!profile.contains("/.env\"))"));
         assert!(!profile.contains("/secret\"))"));
         assert!(profile.contains(&format!("{}/.ai-jail", project.display())));
@@ -721,8 +1034,7 @@ mod tests {
             no_hide_config: Some(true),
             ..Config::default()
         };
-        let visible_profile =
-            generate_sbpl_profile(&visible, &project, false, false);
+        let visible_profile = generate_sbpl_profile(&visible, &project);
         assert!(
             !visible_profile
                 .contains(&format!("{}/.ai-jail", project.display()))
@@ -737,7 +1049,7 @@ mod tests {
             ..Config::default()
         };
         let project = PathBuf::from("/tmp/test-project");
-        let profile = generate_sbpl_profile(&config, &project, false, true);
+        let profile = generate_sbpl_profile(&config, &project);
         assert!(!profile.contains("(allow network-outbound)"));
         assert!(!profile.contains("(allow file-read*)\n"));
         assert!(
@@ -789,16 +1101,16 @@ mod tests {
         fs::write(&claude_json, "{}").unwrap();
         let _home = EnvVarGuard::set("HOME", fake_home.as_os_str());
 
+        // ~/.claude.json is command agent state: the atomic-write rules
+        // only exist behind the explicit agent-state opt-in (secure
+        // default: private home on, agent state off).
         let config = Config {
+            command: vec!["claude".into()],
             no_mise: Some(true),
+            agent_state: Some(true),
             ..Config::default()
         };
-        let profile = generate_sbpl_profile(
-            &config,
-            Path::new("/tmp/proj"),
-            false,
-            false,
-        );
+        let profile = generate_sbpl_profile(&config, Path::new("/tmp/proj"));
 
         let canonical = canonicalize_or_keep(&claude_json);
         let path_str = canonical.to_string_lossy();
@@ -893,8 +1205,8 @@ mod tests {
             ..Config::default()
         };
         let project = PathBuf::from("/tmp/test-project");
-        let profile = generate_sbpl_profile(&config, &project, false, false);
-        assert!(profile.contains("; File reads: restricted allow-list"));
+        let profile = generate_sbpl_profile(&config, &project);
+        assert!(profile.contains("; File reads: explicit allow-list"));
         assert!(!profile.contains("(allow file-read*)\n"));
     }
 
@@ -918,7 +1230,7 @@ mod tests {
             overlay_maps: vec![project.join("vendor")],
             ..Config::default()
         };
-        let profile = generate_sbpl_profile(&config, &project, false, false);
+        let profile = generate_sbpl_profile(&config, &project);
 
         let allow_project = format!(
             "(allow file-write* (subpath \"{}\"))",
@@ -983,7 +1295,7 @@ mod tests {
             ..Config::default()
         };
         let project = home.join("project");
-        let profile = generate_sbpl_profile(&config, &project, false, false);
+        let profile = generate_sbpl_profile(&config, &project);
 
         // The versions dir surfaces as a subpath read allowance; the
         // PATH entry canonicalizes to the target file (literal rule).
@@ -1018,14 +1330,13 @@ mod tests {
             ..Config::default()
         };
         let cases = [
-            ("private-home", private_home, false),
-            ("lockdown", lockdown, true),
-            ("browser", browser, false),
+            ("private-home", private_home),
+            ("lockdown", lockdown),
+            ("browser", browser),
         ];
-        for (mode, config, lockdown) in cases {
+        for (mode, config) in cases {
             let project = PathBuf::from("/tmp/test-project");
-            let profile =
-                generate_sbpl_profile(&config, &project, false, lockdown);
+            let profile = generate_sbpl_profile(&config, &project);
             assert!(
                 profile.contains("(allow file-read* (literal \"/\"))"),
                 "restricted read profile must grant the root node ({mode})"
@@ -1038,9 +1349,9 @@ mod tests {
     }
 
     #[test]
-    fn lockdown_read_paths_include_project() {
+    fn read_paths_include_project() {
         let project = PathBuf::from("/tmp/test-project");
-        let paths = macos_lockdown_read_paths(&Config::default(), &project);
+        let paths = macos_read_paths(&Config::default(), &project);
         assert!(paths.contains(&project));
     }
 
@@ -1057,9 +1368,12 @@ mod tests {
         std::fs::write(&gitignore, b"target\n").unwrap();
         let _home = EnvVarGuard::set("HOME", home.as_os_str());
 
-        let paths = macos_lockdown_read_paths(
+        let paths = macos_read_paths(
             &Config {
                 lockdown: Some(true),
+                // Private home is the default; git config exposure is a
+                // --no-private-home compatibility opt-in.
+                private_home: Some(false),
                 ..Config::default()
             },
             Path::new("/tmp/test-project"),
@@ -1084,9 +1398,12 @@ mod tests {
         let _home = EnvVarGuard::set("HOME", home.as_os_str());
         let _xdg = EnvVarGuard::remove("XDG_CONFIG_HOME");
 
-        let paths = macos_lockdown_read_paths(
+        let paths = macos_read_paths(
             &Config {
                 lockdown: Some(true),
+                // Private home is the default; git config exposure is a
+                // --no-private-home compatibility opt-in.
+                private_home: Some(false),
                 ..Config::default()
             },
             Path::new("/tmp/test-project"),
@@ -1098,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn writable_paths_include_linked_worktree_git_dirs() {
+    fn writable_paths_grant_worktree_git_dir_not_common_dir() {
         let fixture = create_linked_worktree_fixture();
         let config = Config {
             no_mise: Some(true),
@@ -1113,8 +1430,14 @@ mod tests {
         let same = |a: &Path, b: &Path| {
             std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok()
         };
+        // Only the per-worktree git dir is writable (HEAD, index,
+        // worktree-local refs); the shared common dir that sibling
+        // worktrees depend on must stay read-only.
         assert!(paths.iter().any(|path| same(path, &fixture.git_dir)));
-        assert!(paths.iter().any(|path| same(path, &fixture.common_dir)));
+        assert!(
+            !paths.iter().any(|path| same(path, &fixture.common_dir)),
+            "common git dir must not be writable"
+        );
     }
 
     #[test]
@@ -1124,7 +1447,7 @@ mod tests {
             lockdown: Some(true),
             ..Config::default()
         };
-        let paths = macos_lockdown_read_paths(&config, &fixture.project_dir);
+        let paths = macos_read_paths(&config, &fixture.project_dir);
         assert!(
             paths
                 .iter()
@@ -1134,6 +1457,263 @@ mod tests {
             paths
                 .iter()
                 .any(|path| path == &canonicalize_or_keep(&fixture.common_dir))
+        );
+    }
+
+    /// Fake `$HOME` containing every command-state path, with the env
+    /// lock held and HOME pointed at the fixture.
+    struct AgentStateFixture {
+        home: PathBuf,
+        _home: EnvVarGuard,
+        _env: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn agent_state_fixture_home(prefix: &str) -> AgentStateFixture {
+        let _env = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-seatbelt-{prefix}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        for dir in [
+            ".claude",
+            ".codex",
+            ".config/opencode",
+            ".local/share/opencode",
+            ".crush",
+            ".kimi-code",
+            ".gemini",
+            ".grok",
+            ".pi",
+            ".pi-lens",
+            ".aider",
+            ".soulforge",
+            ".omp",
+        ] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        std::fs::write(home.join(".claude.json"), "{}").unwrap();
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
+        AgentStateFixture { home, _home, _env }
+    }
+
+    #[test]
+    fn agent_state_is_gated_off_by_default() {
+        let fixture = agent_state_fixture_home("state-default");
+        let home = &fixture.home;
+        let config = Config {
+            command: vec!["claude".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        assert!(agent_state_paths(&config).is_empty());
+        let project = PathBuf::from("/tmp/test-project");
+        let writable = macos_writable_paths(&project, &config, false);
+        assert!(!writable.contains(&home.join(".claude")));
+        assert!(!writable.contains(&home.join(".claude.json")));
+        let profile = generate_sbpl_profile(&config, &project);
+        assert!(!profile.contains(".claude.json"));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn agent_state_mounts_claude_state_read_write() {
+        let fixture = agent_state_fixture_home("state-claude");
+        let home = &fixture.home;
+        let config = Config {
+            command: vec!["claude".into()],
+            no_mise: Some(true),
+            agent_state: Some(true),
+            ..Config::default()
+        };
+        let expected = vec![home.join(".claude"), home.join(".claude.json")];
+        assert_eq!(agent_state_paths(&config), expected);
+
+        let project = PathBuf::from("/tmp/test-project");
+        let writable = macos_writable_paths(&project, &config, false);
+        assert!(writable.contains(&home.join(".claude")));
+        assert!(writable.contains(&home.join(".claude.json")));
+
+        let reads = macos_read_paths(&config, &project);
+        assert!(reads.contains(&canonicalize_or_keep(&home.join(".claude"))));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn agent_state_covers_full_command_list() {
+        let fixture = agent_state_fixture_home("state-list");
+        let home = &fixture.home;
+        for (command, expected) in [
+            (vec!["claude"], vec![".claude", ".claude.json"]),
+            (vec!["codex"], vec![".codex"]),
+            (
+                vec!["opencode"],
+                vec![".config/opencode", ".local/share/opencode"],
+            ),
+            (vec!["crush"], vec![".crush"]),
+            (vec!["kimi"], vec![".kimi-code"]),
+            (vec!["gemini"], vec![".gemini"]),
+            (vec!["grok"], vec![".grok"]),
+            (vec!["pi"], vec![".pi", ".pi-lens"]),
+            (vec!["aider"], vec![".aider"]),
+            (vec!["soulforge"], vec![".soulforge"]),
+            (vec!["omp"], vec![".omp"]),
+        ] {
+            let config = Config {
+                command: command
+                    .clone()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                no_mise: Some(true),
+                agent_state: Some(true),
+                ..Config::default()
+            };
+            let expected: Vec<PathBuf> =
+                expected.iter().map(|rel| home.join(rel)).collect();
+            assert_eq!(
+                agent_state_paths(&config),
+                expected,
+                "state mapping mismatch for {}",
+                command[0]
+            );
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn agent_state_opt_in_outranks_builtin_dotdir_deny() {
+        let fixture = agent_state_fixture_home("state-kimi");
+        let home = &fixture.home;
+        let config = Config {
+            command: vec!["kimi".into()],
+            no_mise: Some(true),
+            agent_state: Some(true),
+            ..Config::default()
+        };
+        let project = PathBuf::from("/tmp/test-project");
+        let profile = generate_sbpl_profile(&config, &project);
+        let kimi = home.join(".kimi-code");
+        assert!(
+            !profile.contains(&format!(
+                "(deny file-read* (subpath \"{}\"))",
+                sbpl_path(&kimi)
+            )),
+            ".kimi-code is a built-in hide, but the explicit state \
+             opt-in must outrank it"
+        );
+        assert!(profile.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            sbpl_path(&kimi)
+        )));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn writable_paths_use_dedicated_session_tmpdir() {
+        let Some(root) = validated_macos_tmpdir() else {
+            // Trusted temp root unavailable (unusual host setup);
+            // macos_session_tmpdir then disables temp access.
+            assert!(macos_session_tmpdir().is_none());
+            return;
+        };
+        let session = root.join(format!("ai-jail-{}", std::process::id()));
+        let config = Config::default();
+        let project = PathBuf::from("/tmp/test-project");
+        let writable = macos_writable_paths(&project, &config, false);
+        assert!(writable.contains(&session));
+        assert!(
+            !writable.contains(&root),
+            "the whole per-user temp root must not be writable"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = session.metadata().unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "session tmpdir must be mode 0700");
+    }
+
+    #[test]
+    fn build_sets_child_tmpdir_to_session_dir() {
+        let Some(root) = validated_macos_tmpdir() else {
+            return;
+        };
+        let config = Config {
+            command: vec!["bash".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let cmd = build(&config, Path::new("/tmp/test-project"), false);
+        let session = root.join(format!("ai-jail-{}", std::process::id()));
+        let tmpdir = cmd
+            .get_envs()
+            .find(|(key, _)| key == &std::ffi::OsStr::new("TMPDIR"))
+            .and_then(|(_, value)| value);
+        assert_eq!(tmpdir, Some(session.as_os_str()));
+    }
+
+    #[test]
+    fn build_child_env_is_allowlisted_with_env_pass() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _dropped = EnvVarGuard::set("AI_JAIL_HOST_STATE", "secret");
+        let _locale = EnvVarGuard::set("LC_CTYPE", "UTF-8");
+        let _xdg = EnvVarGuard::set("XDG_DATA_HOME", "/tmp/xdg-data");
+        let _passed = EnvVarGuard::set("AI_JAIL_TEST_SECRET", "hunter2");
+
+        let config = Config {
+            command: vec!["bash".into()],
+            no_mise: Some(true),
+            env_pass: vec![
+                "AI_JAIL_TEST_SECRET".into(),
+                "AI_JAIL_LITERAL=xyz".into(),
+            ],
+            ..Config::default()
+        };
+        let cmd = build(&config, Path::new("/tmp/test-project"), false);
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+
+        let get = |name: &str| {
+            env.get(&std::ffi::OsStr::new(name)).copied().flatten()
+        };
+        assert!(
+            get("AI_JAIL_HOST_STATE").is_none(),
+            "non-allowlisted host state must be dropped"
+        );
+        assert!(get("PATH").is_some());
+        assert!(get("HOME").is_some());
+        assert_eq!(get("LC_CTYPE"), Some(std::ffi::OsStr::new("UTF-8")));
+        assert_eq!(
+            get("XDG_DATA_HOME"),
+            Some(std::ffi::OsStr::new("/tmp/xdg-data"))
+        );
+        // env_pass: bare NAME passes the host value, NAME=VALUE sets it.
+        assert_eq!(
+            get("AI_JAIL_TEST_SECRET"),
+            Some(std::ffi::OsStr::new("hunter2"))
+        );
+        assert_eq!(get("AI_JAIL_LITERAL"), Some(std::ffi::OsStr::new("xyz")));
+        assert_eq!(
+            get("PS1"),
+            Some(std::ffi::OsStr::new(crate::sandbox::JAIL_PS1))
+        );
+    }
+
+    #[test]
+    fn inherit_env_opt_in_passes_host_environment() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _state = EnvVarGuard::set("AI_JAIL_HOST_STATE", "secret");
+
+        let config = Config {
+            command: vec!["bash".into()],
+            no_mise: Some(true),
+            inherit_env: Some(true),
+            ..Config::default()
+        };
+        let cmd = build(&config, Path::new("/tmp/test-project"), false);
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(
+            env.get(&std::ffi::OsStr::new("AI_JAIL_HOST_STATE"))
+                .copied()
+                .flatten(),
+            Some(std::ffi::OsStr::new("secret"))
         );
     }
 }

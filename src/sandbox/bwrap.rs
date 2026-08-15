@@ -2,7 +2,7 @@ use crate::config::{Config, MapSpec};
 use crate::output;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -247,7 +247,9 @@ impl MountSet {
         &self,
         project_dir: &Path,
         lockdown: bool,
-        allow_tcp_ports: &[u16],
+        network_enabled: bool,
+        inherit_env: bool,
+        env_pass: &[String],
     ) -> Vec<String> {
         let mut args = vec![
             "--chdir".into(),
@@ -264,10 +266,11 @@ impl MountSet {
             args.push("--new-session".into());
         }
 
+        if !network_enabled {
+            args.push("--unshare-net".into());
+        }
+
         if lockdown {
-            if allow_tcp_ports.is_empty() {
-                args.push("--unshare-net".into());
-            }
             args.push("--clearenv".into());
 
             args.extend([
@@ -289,6 +292,20 @@ impl MountSet {
                 }
             }
         } else {
+            for var in [
+                "SSH_AUTH_SOCK",
+                "GPG_AGENT_INFO",
+                "DOCKER_HOST",
+                "BWRAP_BIN",
+            ] {
+                args.extend(["--unsetenv".into(), var.into()]);
+            }
+            if self.systemd_env.is_empty() {
+                args.extend([
+                    "--unsetenv".into(),
+                    "DBUS_SESSION_BUS_ADDRESS".into(),
+                ]);
+            }
             for (key, val) in &self.display_env {
                 args.push("--setenv".into());
                 args.push(key.clone());
@@ -299,6 +316,12 @@ impl MountSet {
                 args.push(key.clone());
                 args.push(val.clone());
             }
+            // Environment hardening: by default the sandbox inherits
+            // only the safe allowlist (plus explicit env_pass
+            // entries); --inherit-env keeps the full host
+            // environment. Landlock-wrapper inner args are argv, not
+            // environment, and are unaffected.
+            args.extend(env_args(inherit_env, env_pass));
         }
 
         // SSH agent env (non-lockdown only — lockdown clears env)
@@ -328,6 +351,35 @@ impl MountSet {
 
         args
     }
+}
+
+/// bwrap environment arguments for normal (non-lockdown) mode.
+///
+/// Full inheritance (`--inherit-env`) keeps the host environment as
+/// bwrap would by default, with env_pass entries forced verbatim via
+/// `--setenv` (winning over the `--unsetenv` hardening above). The
+/// default filters to the safe allowlist: `--clearenv` followed by a
+/// `--setenv` per kept variable. `--setenv` values survive
+/// `--clearenv` regardless of argv order (bwrap applies them after
+/// clearing), so the later ssh/claude/PS1 setenvs are unaffected.
+fn env_args(inherit_env: bool, env_pass: &[String]) -> Vec<String> {
+    let host_env: Vec<(String, String)> = std::env::vars().collect();
+    let mut args = Vec::new();
+    if inherit_env {
+        let mut env = Vec::new();
+        crate::config::apply_env_pass(&mut env, env_pass, &host_env);
+        for (name, value) in env {
+            args.extend(["--setenv".into(), name, value]);
+        }
+    } else {
+        args.push("--clearenv".into());
+        for (name, value) in
+            crate::config::filtered_child_env(env_pass, &host_env)
+        {
+            args.extend(["--setenv".into(), name, value]);
+        }
+    }
+    args
 }
 
 struct MountSources<'a> {
@@ -507,19 +559,22 @@ pub(crate) fn bwrap_binary_path() -> Result<PathBuf, String> {
 
     if let Some(raw) = std::env::var_os(BWRAP_ENV_VAR) {
         let p = PathBuf::from(raw);
-        if p.is_absolute() && p.is_file() {
-            return Ok(p);
+        if let Some(path) = trusted_bwrap_path(&p) {
+            return Ok(path);
         }
+        output::security_warn(
+            "ignoring BWRAP_BIN: target failed trusted binary validation",
+        );
         override_error = Some(format!(
-            "{BWRAP_ENV_VAR} is set to {} but it is not an absolute existing file",
+            "{BWRAP_ENV_VAR} is set to {} but it is not a trusted executable",
             p.display()
         ));
     }
 
     for candidate in BWRAP_CANDIDATES {
         let p = PathBuf::from(candidate);
-        if p.is_file() {
-            return Ok(p);
+        if let Some(path) = trusted_bwrap_path(&p) {
+            return Ok(path);
         }
     }
 
@@ -559,8 +614,19 @@ fn should_use_new_session() -> bool {
     !crate::statusbar::is_active() && !std::io::stdin().is_terminal()
 }
 
-fn bwrap_program_for_exec() -> PathBuf {
-    bwrap_binary_path().unwrap_or_else(|_| PathBuf::from("/usr/bin/bwrap"))
+fn trusted_bwrap_path(path: &Path) -> Option<PathBuf> {
+    let canonical = path.canonicalize().ok()?;
+    let metadata = canonical.metadata().ok()?;
+    trusted_binary_metadata(
+        metadata.file_type().is_file(),
+        metadata.uid(),
+        metadata.mode(),
+    )
+    .then_some(canonical)
+}
+
+fn trusted_binary_metadata(is_file: bool, uid: u32, mode: u32) -> bool {
+    is_file && uid == 0 && mode & 0o111 != 0 && mode & 0o022 == 0
 }
 
 fn new_hosts_file() -> Result<(PathBuf, std::fs::File), String> {
@@ -940,17 +1006,19 @@ fn resolv_has_tailscale_magicdns_domain(contents: &[u8]) -> bool {
 fn resolve_landlock_wrapper(
     config: &Config,
 ) -> Result<Option<PathBuf>, String> {
-    if !config.landlock_enabled() {
+    if !config.landlock_enabled()
+        && !config.seccomp_enabled()
+        && !config.rlimits_enabled()
+    {
         return Ok(None);
     }
 
     match self_binary_path() {
         Some(path) => Ok(Some(path)),
-        None if config.lockdown_enabled() => Err(
-            "Cannot resolve ai-jail binary for inner Landlock wrapper in lockdown mode"
+        None => Err(
+            "Cannot resolve ai-jail binary for enabled sandbox wrapper controls"
                 .into(),
         ),
-        None => Ok(None),
     }
 }
 
@@ -962,7 +1030,11 @@ fn landlock_wrapper_args(
     let mut args = vec![
         LANDLOCK_WRAPPER_DEST.into(),
         "--landlock-exec".into(),
-        "--landlock".into(),
+        if config.landlock_enabled() {
+            "--landlock".into()
+        } else {
+            "--no-landlock".into()
+        },
     ];
 
     if config.lockdown_enabled() {
@@ -971,6 +1043,21 @@ fn landlock_wrapper_args(
     if config.private_home_enabled() {
         args.push("--private-home".into());
     }
+    // Forward the agent_state capability so the inner wrapper's
+    // Landlock rules match the outer bwrap state mounts.
+    if config.agent_state_enabled() {
+        args.push("--agent-state".into());
+    }
+    args.push(if config.seccomp_enabled() {
+        "--seccomp".into()
+    } else {
+        "--no-seccomp".into()
+    });
+    args.push(if config.rlimits_enabled() {
+        "--rlimits".into()
+    } else {
+        "--no-rlimits".into()
+    });
 
     args.push(if config.gpu_enabled() {
         "--gpu".into()
@@ -1053,12 +1140,12 @@ pub fn build(
 ) -> Result<Command, String> {
     let sources = MountSources::from_guard(guard);
     let mount_set =
-        discover_mounts_full(config, project_dir, &sources, verbose);
+        discover_mounts_full(config, project_dir, &sources, verbose)?;
     let map_args = mounted_map_args(
         mount_set.extra.iter().chain(mount_set.extra_inside.iter()),
     );
     let lockdown = config.lockdown_enabled();
-    let bwrap = bwrap_program_for_exec();
+    let bwrap = bwrap_binary_path()?;
     let launch = super::build_launch_command(config);
 
     // Landlock wrapper: bind-mount ai-jail into /tmp inside the
@@ -1086,7 +1173,9 @@ pub fn build(
     for arg in mount_set.isolation_args(
         project_dir,
         lockdown,
-        config.allow_tcp_ports(),
+        config.network_enabled(),
+        config.inherit_env_enabled(),
+        config.env_pass(),
     ) {
         cmd.arg(arg);
     }
@@ -1143,14 +1232,15 @@ fn build_dry_run_args_full(
     sources: &MountSources<'_>,
     verbose: bool,
 ) -> Result<Vec<String>, String> {
-    let mount_set = discover_mounts_full(config, project_dir, sources, verbose);
+    let mount_set =
+        discover_mounts_full(config, project_dir, sources, verbose)?;
     let map_args = mounted_map_args(
         mount_set.extra.iter().chain(mount_set.extra_inside.iter()),
     );
     let lockdown = config.lockdown_enabled();
     let launch = super::build_launch_command(config);
     let mut args: Vec<String> =
-        vec![bwrap_program_for_exec().display().to_string()];
+        vec![bwrap_binary_path()?.display().to_string()];
 
     args.extend(mount_set.all_mount_args());
 
@@ -1167,7 +1257,9 @@ fn build_dry_run_args_full(
     args.extend(mount_set.isolation_args(
         project_dir,
         lockdown,
-        config.allow_tcp_ports(),
+        config.network_enabled(),
+        config.inherit_env_enabled(),
+        config.env_pass(),
     ));
 
     args.push("--".into());
@@ -1243,7 +1335,7 @@ fn discover_mounts_full(
     project_dir: &Path,
     sources: &MountSources<'_>,
     verbose: bool,
-) -> MountSet {
+) -> Result<MountSet, String> {
     let lockdown = config.lockdown_enabled();
     let browser_profile = config.browser_profile();
     let browser_mode = browser_profile.is_some();
@@ -1256,7 +1348,7 @@ fn discover_mounts_full(
     let exempt = super::dotdir_exemptions(config);
 
     let (display_mounts, display_env) = if enable_display {
-        discover_display(verbose)
+        discover_display(config, verbose)
     } else {
         (vec![], vec![])
     };
@@ -1302,7 +1394,7 @@ fn discover_mounts_full(
         }
         (vec![], vec![])
     } else {
-        overlay_mounts(&config.overlay_maps, project_dir, verbose)
+        overlay_mounts(&config.overlay_maps, project_dir, verbose)?
     };
     let (extra_outside, extra_inside) = if lockdown || browser_mode {
         (vec![], vec![])
@@ -1315,13 +1407,28 @@ fn discover_mounts_full(
     let (overlay_outside, overlay_inside) =
         split_by_project(overlay_mounts_v, project_dir);
 
-    MountSet {
+    Ok(MountSet {
         base: discover_base(
             sources.hosts_mount,
             sources.resolv_mount,
             sources.resolv_intermediate_mount,
         ),
-        sys_masks: discover_sys_masks(lockdown),
+        sys_masks: {
+            let mut masks = discover_sys_masks(lockdown);
+            if (!display_mounts.is_empty() || !systemd_mounts.is_empty())
+                && let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR")
+            {
+                let runtime = PathBuf::from(runtime);
+                for name in
+                    ["bus", "systemd", "podman", "docker", "docker.sock"]
+                {
+                    masks.push(Mount::Tmpfs {
+                        dest: runtime.join(name),
+                    });
+                }
+            }
+            masks
+        },
         home_dotfiles,
         config_hide: if private_home {
             vec![]
@@ -1362,7 +1469,11 @@ fn discover_mounts_full(
         } else {
             vec![]
         },
-        shm: if lockdown { vec![] } else { discover_shm() },
+        shm: if lockdown {
+            vec![]
+        } else {
+            discover_shm(config.host_shm_enabled())
+        },
         display: display_mounts,
         display_env,
         systemd_user: systemd_mounts,
@@ -1380,7 +1491,7 @@ fn discover_mounts_full(
         mask: mask_mounts,
         deny: deny_mounts,
         overlay_hide: overlay_hide_v,
-    }
+    })
 }
 
 /// Split mounts into (outside, inside) the project directory. A mount
@@ -1513,12 +1624,88 @@ fn discover_home_dotfiles_full(
     lockdown: bool,
     verbose: bool,
 ) -> Vec<Mount> {
+    // Command-specific agent state (~/.claude, ~/.codex,
+    // ~/.claude.json, ...) is a trusted capability: mounted only when
+    // explicitly enabled. User hide_dotdirs always win over the
+    // capability ("user hides win").
+    let agent_state = config.agent_state_enabled();
     let mut mounts = discover_home_dotfiles(
         private_home,
         &config.hide_dotdirs,
         exempt,
         verbose,
     );
+    if private_home {
+        let home = super::home_dir();
+        if agent_state {
+            for relative in command_state_paths(config) {
+                if state_path_hidden(relative, &config.hide_dotdirs) {
+                    continue;
+                }
+                let path = home.join(relative);
+                if safe_state_dir(&path) {
+                    mounts.push(Mount::Bind {
+                        src: path.clone(),
+                        dest: path,
+                    });
+                }
+            }
+        }
+        for name in [".gitconfig", ".gitignore"] {
+            let path = home.join(name);
+            if safe_state_file(&path) {
+                mounts.push(Mount::RoBind {
+                    src: path.clone(),
+                    dest: path,
+                });
+            }
+        }
+        let claude_json = home.join(".claude.json");
+        if agent_state
+            && !state_path_hidden(".claude", &config.hide_dotdirs)
+            && crate::command::effective_name(&config.command) == Some("claude")
+            && safe_state_file(&claude_json)
+        {
+            mounts.push(Mount::Bind {
+                src: claude_json.clone(),
+                dest: claude_json,
+            });
+        }
+    } else if agent_state {
+        // Non-private-home passthrough still gates the command-state
+        // extras that the generic dotdir enumeration never mounts
+        // (.kimi-code is in DOTDIR_DENY; .claude.json is a file).
+        if crate::command::effective_name(&config.command)
+            .is_some_and(|name| name.starts_with("kimi"))
+            && !state_path_hidden(".kimi-code", &config.hide_dotdirs)
+        {
+            let path = super::home_dir().join(".kimi-code");
+            if safe_state_dir(&path) {
+                mounts.push(Mount::Bind {
+                    src: path.clone(),
+                    dest: path,
+                });
+            }
+        }
+        let claude_json = super::home_dir().join(".claude.json");
+        if !state_path_hidden(".claude", &config.hide_dotdirs)
+            && safe_state_file(&claude_json)
+        {
+            mounts.push(Mount::Bind {
+                src: claude_json.clone(),
+                dest: claude_json,
+            });
+        }
+    }
+    if !private_home && config.docker_enabled() {
+        let docker_config = super::home_dir().join(".docker/config.json");
+        if docker_config.is_file() {
+            mounts.push(Mount::RoBind {
+                src: docker_config.clone(),
+                dest: docker_config,
+            });
+        }
+    }
     if !lockdown
         && let Some(dir) = &config.claude_dir
         && super::path_exists(dir)
@@ -1532,6 +1719,52 @@ fn discover_home_dotfiles_full(
         });
     }
     mounts
+}
+
+fn command_state_paths(config: &Config) -> &'static [&'static str] {
+    match crate::command::effective_name(&config.command) {
+        Some("claude") => &[".claude"],
+        Some("codex") => &[".codex"],
+        Some("opencode") => &[".config/opencode", ".local/share/opencode"],
+        Some("crush") => &[".crush"],
+        Some(name) if name.starts_with("kimi") => &[".kimi-code"],
+        Some("gemini") => &[".gemini"],
+        Some("grok") => &[".grok"],
+        Some("pi") => &[".pi", ".pi-lens"],
+        Some("aider") => &[".aider"],
+        Some("soulforge") => &[".soulforge"],
+        Some("omp") => &[".omp"],
+        _ => &[],
+    }
+}
+
+/// User hide_dotdirs override for command agent-state mounts: hiding
+/// the state path's top-level dotdir wins over the agent_state
+/// capability opt-in. Unlike the generic dotdir rules, built-in
+/// DOTDIR_DENY does not apply here — these mounts exist precisely to
+/// expose the invoked agent's own state on an explicit opt-in
+/// (.kimi-code is in DOTDIR_DENY but is kimi's state dir).
+fn state_path_hidden(relative: &str, hide_dotdirs: &[String]) -> bool {
+    let top = relative.split('/').next().unwrap_or(relative);
+    let normalized = top.strip_prefix('.').unwrap_or(top);
+    hide_dotdirs.iter().any(|hide| {
+        let hide = hide.strip_prefix('.').unwrap_or(hide.as_str());
+        hide == normalized
+    })
+}
+
+fn safe_state_dir(path: &Path) -> bool {
+    path.symlink_metadata()
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn safe_state_file(path: &Path) -> bool {
+    path.symlink_metadata()
+        .map(|metadata| {
+            metadata.is_file() && !metadata.file_type().is_symlink()
+        })
+        .unwrap_or(false)
 }
 
 fn discover_browser_state_mount(
@@ -1797,7 +2030,7 @@ fn discover_home_dotfiles(
         }
 
         let path = entry.path();
-        if !path.is_dir() {
+        if !safe_state_dir(&path) {
             continue;
         }
 
@@ -1843,13 +2076,10 @@ fn discover_home_dotfiles(
             dest: xdg_git,
         });
     }
-    let claude_json = home.join(".claude.json");
-    if claude_json.is_file() {
-        mounts.push(Mount::Bind {
-            src: claude_json.clone(),
-            dest: claude_json,
-        });
-    }
+    // ~/.claude.json used to be mounted here unconditionally; it is
+    // Claude Code state (auth tokens) and now lives in
+    // `discover_home_dotfiles_full`, gated on the agent_state
+    // capability with the user's hide_dotdirs winning.
 
     mounts
 }
@@ -2027,56 +2257,83 @@ fn discover_tailscale_paths(sock: &Path) -> Vec<Mount> {
     }
 }
 
-fn discover_shm() -> Vec<Mount> {
+fn discover_shm(host_shared: bool) -> Vec<Mount> {
     let shm = PathBuf::from("/dev/shm");
-    if shm.is_dir() {
+    if host_shared && shm.is_dir() {
         vec![Mount::DevBind {
             src: shm.clone(),
             dest: shm,
         }]
     } else {
-        vec![]
+        vec![Mount::Tmpfs { dest: shm }]
     }
 }
 
-fn discover_display(verbose: bool) -> (Vec<Mount>, Vec<(String, String)>) {
+fn discover_display(
+    config: &Config,
+    verbose: bool,
+) -> (Vec<Mount>, Vec<(String, String)>) {
     let mut mounts = Vec::new();
     let mut env = Vec::new();
 
     let x11 = PathBuf::from("/tmp/.X11-unix");
-    if x11.is_dir() {
+    if config.x11_enabled() && x11.is_dir() {
         mounts.push(Mount::Bind {
             src: x11.clone(),
             dest: x11,
         });
     }
 
-    if let Ok(display) = std::env::var("DISPLAY") {
+    if config.x11_enabled()
+        && let Ok(display) = std::env::var("DISPLAY")
+    {
         env.push(("DISPLAY".into(), display));
     }
 
-    if let Ok(xauth) = std::env::var("XAUTHORITY") {
+    if config.x11_enabled()
+        && let Ok(xauth) = std::env::var("XAUTHORITY")
+    {
         let xauth_path = PathBuf::from(&xauth);
-        if super::path_exists(&xauth_path) {
+        if safe_xauthority(&xauth_path) {
             mounts.push(Mount::RoBind {
                 src: xauth_path.clone(),
                 dest: xauth_path,
             });
+            env.push(("XAUTHORITY".into(), xauth));
+        } else {
+            output::security_warn(
+                "ignoring XAUTHORITY mount: failed validation",
+            );
         }
-        env.push(("XAUTHORITY".into(), xauth));
     }
 
-    if let Ok(xdg_dir) = std::env::var("XDG_RUNTIME_DIR") {
+    if let (Ok(xdg_dir), Ok(wayland)) = (
+        std::env::var("XDG_RUNTIME_DIR"),
+        std::env::var("WAYLAND_DISPLAY"),
+    ) {
         let xdg_path = PathBuf::from(&xdg_dir);
-        if xdg_path.is_dir() {
-            mounts.push(Mount::Bind {
-                src: xdg_path.clone(),
-                dest: xdg_path,
-            });
-            env.push(("XDG_RUNTIME_DIR".into(), xdg_dir));
-            if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
-                env.push(("WAYLAND_DISPLAY".into(), wayland));
+        if is_safe_xdg_runtime(&xdg_path) {
+            if let Ok(runtime) = xdg_path.canonicalize()
+                && Path::new(&wayland).components().count() == 1
+            {
+                let socket = runtime.join(&wayland);
+                if socket
+                    .symlink_metadata()
+                    .map(|metadata| metadata.file_type().is_socket())
+                    .unwrap_or(false)
+                {
+                    mounts.push(Mount::Bind {
+                        src: socket.clone(),
+                        dest: socket,
+                    });
+                    env.push(("XDG_RUNTIME_DIR".into(), xdg_dir));
+                    env.push(("WAYLAND_DISPLAY".into(), wayland));
+                }
             }
+        } else {
+            output::security_warn(
+                "ignoring XDG_RUNTIME_DIR mount: failed validation",
+            );
         }
     }
 
@@ -2091,11 +2348,55 @@ fn discover_display(verbose: bool) -> (Vec<Mount>, Vec<(String, String)>) {
     (mounts, env)
 }
 
+pub(crate) fn is_safe_xdg_runtime(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    // nix's safe wrapper requires its optional `user` feature, which this
+    // binary deliberately does not enable.
+    let uid = unsafe { nix::libc::geteuid() };
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    let expected = PathBuf::from("/run/user").join(uid.to_string());
+    let Ok(expected) = expected.canonicalize() else {
+        return false;
+    };
+    let Ok(metadata) = canonical.metadata() else {
+        return false;
+    };
+    canonical == expected
+        && metadata.is_dir()
+        && metadata.uid() == uid
+        && metadata.mode() & 0o077 <= 0o055
+}
+
+fn safe_xauthority(path: &Path) -> bool {
+    if path
+        .symlink_metadata()
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    let Some(name) = canonical.file_name().and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    (name.starts_with(".x-") || name.contains("Xauthority"))
+        && canonical
+            .metadata()
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false)
+}
+
 fn discover_systemd_user(
     config: &Config,
     lockdown: bool,
     browser_mode: bool,
-    display_enabled: bool,
+    _display_enabled: bool,
     deny_file_path: &Path,
     verbose: bool,
 ) -> (Vec<Mount>, Vec<(String, String)>) {
@@ -2111,8 +2412,10 @@ fn discover_systemd_user(
         return (vec![], vec![]);
     };
     let xdg_path = PathBuf::from(&xdg_dir);
-    if !xdg_path.is_dir() {
-        output::warn("--systemd-user XDG_RUNTIME_DIR does not exist; skipping");
+    if !is_safe_xdg_runtime(&xdg_path) {
+        output::security_warn(
+            "--systemd-user XDG_RUNTIME_DIR failed validation; skipping",
+        );
         return (vec![], vec![]);
     }
 
@@ -2122,7 +2425,11 @@ fn discover_systemd_user(
         .collect();
     let existing_paths: Vec<&Path> = candidates
         .iter()
-        .filter(|path| super::path_exists(path))
+        .filter(|path| {
+            path.symlink_metadata()
+                .map(|metadata| metadata.file_type().is_socket())
+                .unwrap_or(false)
+        })
         .map(PathBuf::as_path)
         .collect();
     if existing_paths.is_empty() {
@@ -2148,26 +2455,16 @@ fn discover_systemd_user(
     }
 
     let mut env = Vec::new();
-    if !display_enabled {
-        env.push(("XDG_RUNTIME_DIR".into(), xdg_dir.clone()));
-    }
+    env.push(("XDG_RUNTIME_DIR".into(), xdg_dir.clone()));
 
-    // If display passthrough is enabled, it already bind-mounts the whole
-    // runtime dir. Do not add duplicate narrow binds, but still provide the
-    // DBus/systemd env for callers such as `systemd-run --user`.
-    if !display_enabled {
-        for path in existing_paths {
-            if verbose {
-                output::verbose(&format!(
-                    "systemd-user: {} rw",
-                    path.display()
-                ));
-            }
-            mounts.push(Mount::Bind {
-                src: path.to_path_buf(),
-                dest: path.to_path_buf(),
-            });
+    for path in existing_paths {
+        if verbose {
+            output::verbose(&format!("systemd-user: {} rw", path.display()));
         }
+        mounts.push(Mount::Bind {
+            src: path.to_path_buf(),
+            dest: path.to_path_buf(),
+        });
     }
 
     let bus = xdg_path.join(SYSTEMD_USER_BUS_SUBPATH);
@@ -2194,24 +2491,22 @@ fn git_worktree_mounts(
         return vec![];
     };
 
-    let readonly = config.lockdown_enabled();
-    paths
-        .unique_paths()
-        .into_iter()
-        .map(|path| {
-            if readonly {
-                Mount::RoBind {
-                    src: path.clone(),
-                    dest: path,
-                }
-            } else {
-                Mount::Bind {
-                    src: path.clone(),
-                    dest: path,
-                }
-            }
-        })
-        .collect()
+    let common = Mount::RoBind {
+        src: paths.common_dir.clone(),
+        dest: paths.common_dir,
+    };
+    let git_dir = if config.lockdown_enabled() {
+        Mount::RoBind {
+            src: paths.git_dir.clone(),
+            dest: paths.git_dir,
+        }
+    } else {
+        Mount::Bind {
+            src: paths.git_dir.clone(),
+            dest: paths.git_dir,
+        }
+    };
+    vec![common, git_dir]
 }
 
 fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
@@ -2229,10 +2524,14 @@ fn extra_mounts_with_check(
 ) -> Vec<Mount> {
     let mut mounts = Vec::new();
 
-    // Apply ro-maps first, then rw-maps on top. This lets a
-    // rw-subdirectory override an ro-parent, e.g.:
-    //   --map ~/Projects --rw-map ~/Projects/ai-jail
-    // makes ~/Projects read-only except the ai-jail subdir.
+    let trusted_ro_destinations: Vec<PathBuf> = ro_maps
+        .iter()
+        .filter_map(|encoded| MapSpec::parse_validated(encoded, "read-only"))
+        .map(|spec| spec.destination)
+        .collect();
+
+    // Read-only destinations are policy boundaries: no RW map may shadow
+    // them or a subtree beneath them.
     for encoded in ro_maps {
         let Some(spec) = MapSpec::parse_validated(encoded, "read-only") else {
             continue;
@@ -2254,6 +2553,20 @@ fn extra_mounts_with_check(
         let Some(spec) = MapSpec::parse_validated(encoded, "read-write") else {
             continue;
         };
+        // Overlap must be rejected in BOTH directions: an RW child
+        // under an RO destination would be shadowed read-only (the
+        // original check), and an RW parent over an RO destination
+        // would silently re-expose the read-only subtree as writable
+        // because the later RW bind wins in bwrap's mount order.
+        if trusted_ro_destinations.iter().any(|ro| {
+            spec.destination.starts_with(ro)
+                || ro.starts_with(&spec.destination)
+        }) {
+            output::security_warn(
+                "ignoring rw-map that overlaps a read-only map destination",
+            );
+            continue;
+        }
         if path_exists(&spec.source) {
             mounts.push(Mount::Bind {
                 src: spec.source,
@@ -2311,11 +2624,22 @@ fn overlay_mounts(
     overlay_maps: &[PathBuf],
     project_dir: &Path,
     verbose: bool,
-) -> (Vec<Mount>, Vec<Mount>) {
+) -> Result<(Vec<Mount>, Vec<Mount>), String> {
     if overlay_maps.is_empty() {
-        return (vec![], vec![]);
+        return Ok((vec![], vec![]));
     }
     let storage_root = project_dir.join(OVERLAY_STORAGE_DIR);
+    match storage_root.symlink_metadata() {
+        Ok(metadata)
+            if metadata.file_type().is_symlink() || !metadata.is_dir() =>
+        {
+            return Err("overlay storage root failed validation".into());
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err("overlay storage root failed validation".into());
+        }
+        _ => {}
+    }
     let mut mounts = Vec::new();
     let mut accepted: Vec<PathBuf> = Vec::new();
 
@@ -2345,8 +2669,8 @@ fn overlay_mounts(
         let base = storage_root.join(overlay_storage_name(dest));
         let upper = base.join("upper");
         let work = base.join("work");
-        if let Err(e) = std::fs::create_dir_all(&upper)
-            .and_then(|_| std::fs::create_dir_all(&work))
+        if let Err(e) =
+            create_safe_overlay_dirs(&[&storage_root, &base, &upper, &work])
         {
             output::warn(&format!(
                 "Overlay map {}: cannot create layer storage {}: {e}; \
@@ -2378,7 +2702,7 @@ fn overlay_mounts(
     }
 
     if mounts.is_empty() {
-        return (vec![], vec![]);
+        return Ok((vec![], vec![]));
     }
 
     // Drop a .gitignore so overlay layers never get committed by
@@ -2390,7 +2714,35 @@ fn overlay_mounts(
         output::verbose(&format!("Overlay maps: {} active", mounts.len()));
     }
     let hide = vec![Mount::Tmpfs { dest: storage_root }];
-    (mounts, hide)
+    Ok((mounts, hide))
+}
+
+/// Create each overlay component without ever following a pre-existing
+/// symlink. Overlay storage is host-writable state, so following one could
+/// write outside the project before bwrap starts.
+fn create_safe_overlay_dirs(paths: &[&Path]) -> std::io::Result<()> {
+    for path in paths {
+        match path.symlink_metadata() {
+            Ok(metadata)
+                if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(std::io::Error::other(
+                    "overlay storage component is not a directory",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(path)?;
+                let metadata = path.symlink_metadata()?;
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err(std::io::Error::other(
+                        "overlay storage component failed validation",
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Write a `.gitignore` into the overlay storage root so the layers
@@ -2491,7 +2843,7 @@ mod tests {
         let sock = root.join("docker.sock");
         let cli_tools = root.join("cli-tools");
         std::fs::create_dir_all(&cli_tools).unwrap();
-        std::fs::File::create(&sock).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
 
         let mounts = discover_docker_paths(&sock, &cli_tools);
 
@@ -2530,7 +2882,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let sock = root.join("tailscaled.sock");
-        std::fs::File::create(&sock).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
 
         let mounts = discover_tailscale_paths(&sock);
 
@@ -2564,7 +2916,8 @@ mod tests {
 
         // Disabled (the default) → the socket bind must never be
         // emitted, even on hosts running tailscaled.
-        let config = minimal_test_config();
+        let mut config = minimal_test_config();
+        config.no_worktree = Some(false);
         let args = build_dry_run_args(
             &config,
             &project,
@@ -2858,7 +3211,7 @@ mod tests {
     }
 
     #[test]
-    fn systemd_user_dry_run_binds_narrow_runtime_paths_and_env() {
+    fn systemd_user_dry_run_rejects_untrusted_runtime_paths() {
         let _env = ENV_LOCK.lock().unwrap();
         let runtime = std::env::temp_dir()
             .join(format!("ai-jail-systemd-user-{}", std::process::id()));
@@ -2887,25 +3240,8 @@ mod tests {
         )
         .unwrap();
 
-        for path in [&bus, &private] {
-            let path_str = path.display().to_string();
-            assert!(
-                args.windows(3).any(|w| w[0] == "--bind"
-                    && w[1] == path_str
-                    && w[2] == path_str),
-                "expected narrow systemd-user bind for {path_str}; args: {args:?}"
-            );
-        }
-        assert!(args.windows(3).any(|w| {
-            w[0] == "--setenv"
-                && w[1] == "XDG_RUNTIME_DIR"
-                && w[2] == runtime.display().to_string()
-        }));
-        assert!(args.windows(3).any(|w| {
-            w[0] == "--setenv"
-                && w[1] == "DBUS_SESSION_BUS_ADDRESS"
-                && w[2] == format!("unix:path={}", bus.display())
-        }));
+        assert!(!args.iter().any(|arg| arg == &bus.display().to_string()));
+        assert!(!args.iter().any(|arg| arg == &private.display().to_string()));
 
         let _ = std::fs::remove_dir_all(&runtime);
     }
@@ -2958,16 +3294,8 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(args.windows(3).any(|w| {
-            w[0] == "--ro-bind"
-                && w[1] == guard.deny_file_path().display().to_string()
-                && w[2] == bus_str
-        }));
-        assert!(args.windows(3).any(|w| {
-            w[0] == "--ro-bind"
-                && w[1] == guard.deny_file_path().display().to_string()
-                && w[2] == private_str
-        }));
+        assert!(!args.iter().any(|arg| arg == &bus_str));
+        assert!(!args.iter().any(|arg| arg == &private_str));
 
         let _ = std::fs::remove_dir_all(&runtime);
     }
@@ -3180,19 +3508,42 @@ mod tests {
         let ro = vec![PathBuf::from("/usr")];
         let rw = vec![PathBuf::from("/usr/bin")];
         let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
-        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts.len(), 1);
         match &mounts[0] {
             Mount::RoBind { src, .. } => {
                 assert_eq!(src, &PathBuf::from("/usr"));
             }
             _ => panic!("first mount must be RoBind of the ro-parent"),
         }
-        match &mounts[1] {
-            Mount::Bind { src, .. } => {
-                assert_eq!(src, &PathBuf::from("/usr/bin"));
-            }
-            _ => panic!("second mount must be Bind of the rw-child"),
-        }
+        assert!(matches!(&mounts[0], Mount::RoBind { .. }));
+    }
+
+    #[test]
+    fn extra_mounts_rw_parent_shadowing_ro_child_is_rejected() {
+        // The reverse overlap: an RW map of a PARENT directory would
+        // be mounted after the RO child (rw maps are emitted last),
+        // and bwrap's later mount wins — silently re-exposing the
+        // read-only subtree as writable. Must be rejected in both
+        // directions.
+        let ro = vec![PathBuf::from("/data/keys")];
+        let rw = vec![PathBuf::from("/data")];
+        let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
+        assert_eq!(
+            mounts.len(),
+            1,
+            "rw parent must be dropped, keeping only the ro child"
+        );
+        assert!(matches!(
+            &mounts[0],
+            Mount::RoBind { src, dest }
+                if src == Path::new("/data/keys")
+                    && dest == Path::new("/data/keys")
+        ));
+
+        // Component boundaries matter: /data-keys is NOT under /data.
+        let rw = vec![PathBuf::from("/data-keys")];
+        let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
+        assert_eq!(mounts.len(), 2);
     }
 
     #[test]
@@ -3263,7 +3614,7 @@ mod tests {
         let rw = vec![PathBuf::from("/"), PathBuf::from("/usr/bin")];
         let mounts = extra_mounts_with_check(&rw, &ro, |_| true);
 
-        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts.len(), 1);
         assert!(mounts.iter().all(|m| match m {
             Mount::Bind { src, dest } | Mount::RoBind { src, dest } => {
                 src != Path::new("/") && dest != Path::new("/")
@@ -3274,11 +3625,6 @@ mod tests {
             &mounts[0],
             Mount::RoBind { src, dest }
                 if src == Path::new("/usr") && dest == Path::new("/usr")
-        ));
-        assert!(matches!(
-            &mounts[1],
-            Mount::Bind { src, dest }
-                if src == Path::new("/usr/bin") && dest == Path::new("/usr/bin")
         ));
     }
 
@@ -3676,6 +4022,7 @@ mod tests {
     fn lockdown_project_is_read_only() {
         let mut config = minimal_test_config();
         config.lockdown = Some(true);
+        config.no_worktree = Some(false);
         let guard =
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let project = PathBuf::from("/home/user/project");
@@ -3723,8 +4070,8 @@ mod tests {
                 && w[2] == "/home/user/project"
         }));
         assert!(
-            !args.contains(&"--unshare-net".to_string()),
-            "browser profiles keep network access for browsing"
+            args.contains(&"--unshare-net".to_string()),
+            "network is isolated unless explicitly enabled"
         );
         assert!(
             !args.windows(3).any(|w| {
@@ -3778,7 +4125,7 @@ mod tests {
         assert!(args.windows(3).any(|w| {
             w[0] == "--bind" && w[1] == extra_s && w[2] == extra_s
         }));
-        assert!(!args.contains(&"--unshare-net".to_string()));
+        assert!(args.contains(&"--unshare-net".to_string()));
 
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -3975,7 +4322,8 @@ mod tests {
     fn overlay_mounts_creates_layers_and_hide() {
         let (project, source) = overlay_test_dirs("create");
         let (mounts, hide) =
-            overlay_mounts(std::slice::from_ref(&source), &project, false);
+            overlay_mounts(std::slice::from_ref(&source), &project, false)
+                .unwrap();
 
         assert_eq!(mounts.len(), 1);
         match &mounts[0] {
@@ -4016,7 +4364,7 @@ mod tests {
         std::fs::create_dir_all(&child).unwrap();
         // child overlaps source → only the first (source) is accepted.
         let maps = vec![source.clone(), child];
-        let (mounts, _hide) = overlay_mounts(&maps, &project, false);
+        let (mounts, _hide) = overlay_mounts(&maps, &project, false).unwrap();
         assert_eq!(mounts.len(), 1);
         let _ = std::fs::remove_dir_all(project.parent().unwrap());
     }
@@ -4026,9 +4374,27 @@ mod tests {
         let (project, _source) = overlay_test_dirs("missing");
         let missing = project.join("does-not-exist");
         let (mounts, hide) =
-            overlay_mounts(std::slice::from_ref(&missing), &project, false);
+            overlay_mounts(std::slice::from_ref(&missing), &project, false)
+                .unwrap();
         assert!(mounts.is_empty());
         assert!(hide.is_empty());
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+
+    #[test]
+    fn overlay_mounts_rejects_symlinked_storage_root() {
+        let (project, source) = overlay_test_dirs("symlink-storage");
+        let outside = project.parent().unwrap().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, project.join(OVERLAY_STORAGE_DIR))
+            .unwrap();
+
+        let err =
+            overlay_mounts(std::slice::from_ref(&source), &project, false)
+                .unwrap_err();
+        assert!(err.contains("storage root"));
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+
         let _ = std::fs::remove_dir_all(project.parent().unwrap());
     }
 
@@ -4090,7 +4456,8 @@ mod tests {
     #[test]
     fn linked_worktree_paths_are_rw_in_normal_mode() {
         let fixture = create_linked_worktree_fixture();
-        let config = minimal_test_config();
+        let mut config = minimal_test_config();
+        config.no_worktree = Some(false);
         let guard =
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
 
@@ -4116,7 +4483,7 @@ mod tests {
                 )
         }));
         assert!(args.windows(3).any(|w| {
-            w[0] == "--bind"
+            w[0] == "--ro-bind"
                 && super::super::paths_equivalent(
                     Path::new(&w[1]),
                     &fixture.common_dir,
@@ -4133,6 +4500,7 @@ mod tests {
         let fixture = create_linked_worktree_fixture();
         let mut config = minimal_test_config();
         config.lockdown = Some(true);
+        config.no_worktree = Some(false);
         let guard =
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
 
@@ -4242,8 +4610,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            !args.contains(&"--unshare-net".to_string()),
-            "lockdown with allowed ports must skip --unshare-net"
+            args.contains(&"--unshare-net".to_string()),
+            "allow-tcp-port does not re-enable host networking"
         );
         assert!(args.contains(&"--clearenv".to_string()));
     }
@@ -4476,7 +4844,7 @@ mod tests {
     }
 
     #[test]
-    fn regression_kimi_code_home_dir_is_writable() {
+    fn kimi_code_home_dir_is_writable_only_for_kimi_commands() {
         let _lock = ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir()
             .join(format!("ai-jail-kimi-code-home-{}", std::process::id()));
@@ -4485,7 +4853,11 @@ mod tests {
         std::fs::create_dir_all(kimi_code.join("sessions")).unwrap();
 
         let _home = EnvVarGuard::set("HOME", &home);
-        let mounts = discover_home_dotfiles(false, &[], &[], false);
+        let mut kimi = minimal_test_config();
+        kimi.command = vec!["kimi-code".into()];
+        kimi.agent_state = Some(true);
+        let mounts =
+            discover_home_dotfiles_full(&kimi, false, &[], false, false);
 
         assert!(
             mounts.iter().any(|m| matches!(
@@ -4495,7 +4867,242 @@ mod tests {
             "~/.kimi-code must be mounted read-write so kimi can write sessions and logs"
         );
 
+        // Without the agent_state opt-in the state dir stays hidden.
+        let gated = minimal_test_config();
+        let mounts =
+            discover_home_dotfiles_full(&gated, false, &[], false, false);
+        assert!(!mounts.iter().any(|m| matches!(
+            m,
+            Mount::Bind { src, dest } if src == &kimi_code && dest == &kimi_code
+        )));
+
+        let mut non_kimi = minimal_test_config();
+        non_kimi.command = vec!["claude".into()];
+        non_kimi.agent_state = Some(true);
+        let mounts =
+            discover_home_dotfiles_full(&non_kimi, false, &[], false, false);
+        assert!(!mounts.iter().any(|m| matches!(
+            m,
+            Mount::Bind { src, dest } if src == &kimi_code && dest == &kimi_code
+        )));
+
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── Agent-state capability gating ───────────────────────────
+
+    #[test]
+    fn claude_state_requires_agent_state_opt_in() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-agent-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
+        let claude_json = home.join(".claude.json");
+        std::fs::write(&claude_json, b"{}").unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        // Project command without opt-in: no ~/.claude or
+        // ~/.claude.json mounts.
+        let mut config = minimal_test_config();
+        config.command = vec!["claude".into()];
+        let mounts =
+            discover_home_dotfiles_full(&config, true, &[], false, false);
+        assert!(
+            !mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { src, dest }
+                    if src == &claude_dir && dest == &claude_dir
+            )),
+            "~/.claude must stay hidden without agent_state opt-in"
+        );
+        assert!(
+            !mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { src, dest }
+                    if src == &claude_json && dest == &claude_json
+            )),
+            "~/.claude.json must stay hidden without agent_state opt-in"
+        );
+
+        // With opt-in: state dir and state file are mounted rw.
+        config.agent_state = Some(true);
+        let mounts =
+            discover_home_dotfiles_full(&config, true, &[], false, false);
+        assert!(mounts.iter().any(|m| matches!(
+            m,
+            Mount::Bind { src, dest } if src == &claude_dir && dest == &claude_dir
+        )));
+        assert!(mounts.iter().any(|m| matches!(
+            m,
+            Mount::Bind { src, dest } if src == &claude_json && dest == &claude_json
+        )));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn hide_dotdir_overrides_agent_state_mounts() {
+        // "User hides win": --hide-dotdir .claude suppresses the
+        // agent-state mounts even with the capability enabled.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-agent-state-hide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let claude_json = home.join(".claude.json");
+        std::fs::write(&claude_json, b"{}").unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let mut config = minimal_test_config();
+        config.command = vec!["claude".into()];
+        config.agent_state = Some(true);
+        config.hide_dotdirs = vec![".claude".into()];
+        let mounts =
+            discover_home_dotfiles_full(&config, true, &[], false, false);
+
+        assert!(
+            !mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { src, dest }
+                    if src == &claude_dir && dest == &claude_dir
+            )),
+            "hidden ~/.claude must not be mounted even with agent_state"
+        );
+        assert!(
+            !mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { src, dest }
+                    if src == &claude_json && dest == &claude_json
+            )),
+            "hidden ~/.claude.json must not be mounted even with agent_state"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn opencode_state_paths_hide_under_top_level_dotdir() {
+        // Multi-component state paths (".config/opencode") hide via
+        // their top-level dotdir (".config").
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-agent-state-opencode-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let state = home.join(".config").join("opencode");
+        std::fs::create_dir_all(&state).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let mut config = minimal_test_config();
+        config.command = vec!["opencode".into()];
+        config.agent_state = Some(true);
+        config.hide_dotdirs = vec![".config".into()];
+        let mounts =
+            discover_home_dotfiles_full(&config, true, &[], false, false);
+
+        assert!(
+            !mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { src, dest } if src == &state && dest == &state
+            )),
+            "hidden top-level dotdir must suppress nested state mount"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn command_state_paths_cover_full_command_list() {
+        // Parity with the macOS seatbelt agent-state mapping
+        // (seatbelt.rs agent_state_paths): both platforms must map the
+        // same commands to the same state dirs, including soulforge
+        // and omp.
+        let cases: &[(&str, &[&str])] = &[
+            ("claude", &[".claude"]),
+            ("codex", &[".codex"]),
+            ("opencode", &[".config/opencode", ".local/share/opencode"]),
+            ("crush", &[".crush"]),
+            ("kimi", &[".kimi-code"]),
+            ("gemini", &[".gemini"]),
+            ("grok", &[".grok"]),
+            ("pi", &[".pi", ".pi-lens"]),
+            ("aider", &[".aider"]),
+            ("soulforge", &[".soulforge"]),
+            ("omp", &[".omp"]),
+        ];
+        for (command, expected) in cases {
+            let mut config = minimal_test_config();
+            config.command = vec![(*command).into()];
+            assert_eq!(
+                command_state_paths(&config),
+                *expected,
+                "state mapping mismatch for {command}"
+            );
+        }
+    }
+
+    // ── Sandbox environment filtering ───────────────────────────
+
+    #[test]
+    fn env_args_filters_credentials_by_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", "sk-ant-secret");
+        let _aws = EnvVarGuard::set("AWS_SECRET_ACCESS_KEY", "aws-secret");
+
+        let args = env_args(false, &[]);
+        assert!(args.contains(&"--clearenv".to_string()));
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| { w[0] == "--setenv" && w[1] == "ANTHROPIC_API_KEY" }),
+            "API keys must be dropped by default"
+        );
+        assert!(
+            !args.windows(3).any(|w| {
+                w[0] == "--setenv" && w[1] == "AWS_SECRET_ACCESS_KEY"
+            }),
+            "AWS credentials must be dropped by default"
+        );
+        // PATH is allowlisted and re-set after the clear.
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--setenv" && w[1] == "PATH")
+        );
+    }
+
+    #[test]
+    fn env_args_keeps_credentials_with_env_pass_and_inherit() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", "sk-ant-secret");
+        let _token = EnvVarGuard::set("GITHUB_TOKEN", "gh-token");
+
+        // --env ANTHROPIC_API_KEY passes the host value through the
+        // default filter.
+        let args = env_args(false, &["ANTHROPIC_API_KEY".to_string()]);
+        assert!(args.contains(&"--clearenv".to_string()));
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--setenv"
+                && w[1] == "ANTHROPIC_API_KEY"
+                && w[2] == "sk-ant-secret"
+        }));
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| w[0] == "--setenv" && w[1] == "GITHUB_TOKEN"),
+            "unlisted variables stay dropped"
+        );
+
+        // --inherit-env keeps the whole host environment; no clearenv.
+        let args = env_args(true, &["GITHUB_TOKEN=explicit".to_string()]);
+        assert!(!args.contains(&"--clearenv".to_string()));
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--setenv" && w[1] == "GITHUB_TOKEN" && w[2] == "explicit"
+        }));
     }
 
     #[test]
@@ -4644,10 +5251,11 @@ mod tests {
     }
 
     #[test]
-    fn regression_bwrap_exec_program_is_absolute() {
-        let p = bwrap_program_for_exec();
-        assert!(p.is_absolute(), "bwrap exec path must be absolute");
-        assert_eq!(p.file_name().and_then(|s| s.to_str()), Some("bwrap"));
+    fn trusted_bwrap_metadata_requires_root_nonwritable_executable() {
+        assert!(trusted_binary_metadata(true, 0, 0o755));
+        assert!(!trusted_binary_metadata(true, 1000, 0o755));
+        assert!(!trusted_binary_metadata(true, 0, 0o775));
+        assert!(!trusted_binary_metadata(true, 0, 0o644));
     }
 
     #[test]
@@ -4712,7 +5320,7 @@ mod tests {
     }
 
     #[test]
-    fn no_landlock_wrapper_when_disabled() {
+    fn wrapper_remains_when_landlock_disabled_for_seccomp_and_rlimits() {
         let mut config = minimal_test_config();
         config.no_landlock = Some(true);
         let guard =
@@ -4729,8 +5337,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            !args.contains(&"--landlock-exec".to_string()),
-            "dry-run must NOT include --landlock-exec when disabled"
+            args.contains(&"--landlock-exec".to_string()),
+            "wrapper must retain seccomp and rlimits when Landlock is disabled"
         );
     }
 
@@ -5045,33 +5653,33 @@ nameserver 8.8.8.8
     }
 
     #[test]
-    fn bwrap_bin_env_override_is_used() {
+    fn bwrap_bin_env_project_executable_is_rejected() {
         let _env = ENV_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir()
             .join(format!("ai-jail-bwrap.{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let bwrap = tmp.join("bwrap");
         std::fs::write(&bwrap, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            &bwrap,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
 
         let _bwrap_bin = EnvVarGuard::set(BWRAP_ENV_VAR, bwrap.as_os_str());
-        let selected = bwrap_program_for_exec();
-
-        assert_eq!(selected, bwrap);
+        assert_ne!(bwrap_binary_path().ok().as_ref(), Some(&bwrap));
         let _ = std::fs::remove_file(&bwrap);
         let _ = std::fs::remove_dir(&tmp);
     }
 
     #[test]
-    fn bwrap_bin_env_override_invalid_path_falls_back() {
+    fn bwrap_bin_env_override_invalid_path_is_not_selected() {
         let _env = ENV_LOCK.lock().unwrap();
         let _bwrap_bin =
             EnvVarGuard::set(BWRAP_ENV_VAR, "/definitely/not/a/real/bwrap");
-        let selected = bwrap_program_for_exec();
-
-        assert!(selected.is_absolute());
-        assert_eq!(
-            selected.file_name().and_then(|s| s.to_str()),
-            Some("bwrap")
+        assert_ne!(
+            bwrap_binary_path().ok().as_ref(),
+            Some(&PathBuf::from("/definitely/not/a/real/bwrap"))
         );
     }
 

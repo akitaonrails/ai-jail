@@ -31,17 +31,31 @@ pub fn info(msg: &str) {
     }
     let mut out = io::stderr().lock();
     if is_tty() {
-        let _ = writeln!(out, "{BOLD}{GREEN}▸{RESET} {msg}");
+        let _ = writeln!(
+            out,
+            "{BOLD}{GREEN}▸{RESET} {}",
+            escape_control_bytes(msg)
+        );
     } else {
-        let _ = writeln!(out, "▸ {msg}");
+        let _ = writeln!(out, "▸ {}", escape_control_bytes(msg));
     }
 }
 
 pub fn warn(msg: &str) {
-    if QUIET.load(Ordering::SeqCst) {
+    emit_warning(msg, true);
+}
+
+/// Print a security-relevant warning even in quiet (`--exec`) mode.
+pub fn security_warn(msg: &str) {
+    emit_warning(msg, false);
+}
+
+fn emit_warning(msg: &str, respect_quiet: bool) {
+    if !warning_should_emit(respect_quiet) {
         return;
     }
     let mut out = io::stderr().lock();
+    let msg = escape_control_bytes(msg);
     if is_tty() {
         let _ = writeln!(out, "{BOLD}{YELLOW}⚠{RESET} {msg}");
     } else {
@@ -49,21 +63,30 @@ pub fn warn(msg: &str) {
     }
 }
 
+fn warning_should_emit(respect_quiet: bool) -> bool {
+    !respect_quiet || !QUIET.load(Ordering::SeqCst)
+}
+
 pub fn error(msg: &str) {
     let mut out = io::stderr().lock();
     if is_tty() {
-        let _ = writeln!(out, "{BOLD}{RED}✗{RESET} {msg}");
+        let _ =
+            writeln!(out, "{BOLD}{RED}✗{RESET} {}", escape_control_bytes(msg));
     } else {
-        let _ = writeln!(out, "✗ {msg}");
+        let _ = writeln!(out, "✗ {}", escape_control_bytes(msg));
     }
 }
 
 pub fn ok(msg: &str) {
     let mut out = io::stderr().lock();
     if is_tty() {
-        let _ = writeln!(out, "{BOLD}{GREEN}✓{RESET} {msg}");
+        let _ = writeln!(
+            out,
+            "{BOLD}{GREEN}✓{RESET} {}",
+            escape_control_bytes(msg)
+        );
     } else {
-        let _ = writeln!(out, "✓ {msg}");
+        let _ = writeln!(out, "✓ {}", escape_control_bytes(msg));
     }
 }
 
@@ -73,25 +96,47 @@ pub fn verbose(msg: &str) {
     }
     let mut out = io::stderr().lock();
     if is_tty() {
-        let _ = writeln!(out, "{DIM}  {msg}{RESET}");
+        let _ = writeln!(out, "{DIM}  {}{RESET}", escape_control_bytes(msg));
     } else {
-        let _ = writeln!(out, "  {msg}");
+        let _ = writeln!(out, "  {}", escape_control_bytes(msg));
     }
 }
 
 pub fn status_header(label: &str, value: &str) {
     let mut out = io::stderr().lock();
     if is_tty() {
-        let _ = writeln!(out, "{BOLD}{CYAN}{label}{RESET}: {value}");
+        let _ = writeln!(
+            out,
+            "{BOLD}{CYAN}{}{RESET}: {}",
+            escape_control_bytes(label),
+            escape_control_bytes(value)
+        );
     } else {
-        let _ = writeln!(out, "{label}: {value}");
+        let _ = writeln!(
+            out,
+            "{}: {}",
+            escape_control_bytes(label),
+            escape_control_bytes(value)
+        );
     }
 }
 
 pub fn dry_run_line(line: &str) {
     let out = io::stdout();
     let mut out = out.lock();
-    let _ = writeln!(out, "{line}");
+    let _ = writeln!(out, "{}", escape_control_bytes(line));
+}
+
+/// Replace terminal control bytes in untrusted text with a visible-safe
+/// placeholder. Newlines, carriage returns, and tabs remain useful in normal
+/// diagnostics; all other C0 controls, DEL, and ESC are unsafe here.
+pub fn escape_control_bytes(s: &str) -> String {
+    s.chars()
+        .map(|ch| match ch {
+            '\n' | '\r' | '\t' | '\u{20}'..='\u{7e}' | '\u{80}'.. => ch,
+            _ => '?',
+        })
+        .collect()
 }
 
 /// Defensive terminal-mode reset emitted after the sandbox child
@@ -149,6 +194,22 @@ mod tests {
                 "reset sequence should disable mouse mode {mode}"
             );
         }
+    }
+
+    #[test]
+    fn escape_control_bytes_removes_terminal_escapes() {
+        assert_eq!(
+            escape_control_bytes("ok\x1b]52;secret\x07"),
+            "ok?]52;secret?"
+        );
+    }
+
+    #[test]
+    fn security_warning_bypasses_quiet_mode() {
+        set_quiet(true);
+        assert!(warning_should_emit(false));
+        assert!(!warning_should_emit(true));
+        set_quiet(false);
     }
 
     #[test]

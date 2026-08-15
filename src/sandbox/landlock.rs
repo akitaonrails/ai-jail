@@ -536,8 +536,15 @@ fn collect_normal_paths_with_mounted_paths(
     // $HOME/.claude.json: read-write — Claude Code stores its
     // auth token and settings here. Must be writable so the
     // agent can update its own config during bootstrap.
+    // Command-specific agent state is a trusted capability
+    // (bwrap only mounts the file with agent_state enabled) and a
+    // user hide of ".claude" wins over the capability.
     let claude_json = home.join(".claude.json");
-    if !private_home && claude_json.is_file() {
+    if !private_home
+        && config.agent_state_enabled()
+        && !super::is_dotdir_denied(".claude", &config.hide_dotdirs, &[])
+        && claude_json.is_file()
+    {
         if verbose {
             output::verbose("Landlock: ~/.claude.json rw");
         }
@@ -587,15 +594,8 @@ fn collect_normal_paths_with_mounted_paths(
         && let Some(paths) =
             super::discover_git_worktree_paths(config, project_dir, verbose)
     {
-        for path in paths.unique_paths() {
-            if verbose {
-                output::verbose(&format!(
-                    "Landlock: git worktree {} rw",
-                    path.display()
-                ));
-            }
-            rw.push(path);
-        }
+        ro.push(paths.common_dir);
+        rw.push(paths.git_dir);
     }
 
     // Extra user mounts: --rw-map and --ro-map from CLI/config.
@@ -683,22 +683,31 @@ fn collect_normal_paths_with_mounted_paths(
         collect_gpu_paths(&mut rw, verbose);
     }
 
-    // Display runtime: read-write — Wayland/X11 sockets live in
-    // XDG_RUNTIME_DIR. Needed for GUI apps the agent might
-    // launch (browsers for testing, display servers for
-    // screenshots). Controlled by --no-display.
+    // Display runtime: only the selected Wayland socket is exposed.
     if config.display_enabled()
         && let Ok(xdg_dir) = std::env::var("XDG_RUNTIME_DIR")
     {
         let xdg_path = PathBuf::from(&xdg_dir);
-        if xdg_path.is_dir() {
-            if verbose {
-                output::verbose(&format!(
-                    "Landlock: XDG runtime {} rw",
-                    xdg_path.display()
-                ));
+        if super::bwrap::is_safe_xdg_runtime(&xdg_path)
+            && let Ok(wayland) = std::env::var("WAYLAND_DISPLAY")
+            && let Ok(runtime) = xdg_path.canonicalize()
+            && Path::new(&wayland).components().count() == 1
+        {
+            let socket = runtime.join(wayland);
+            use std::os::unix::fs::FileTypeExt;
+            if socket
+                .symlink_metadata()
+                .map(|metadata| metadata.file_type().is_socket())
+                .unwrap_or(false)
+            {
+                if verbose {
+                    output::verbose(&format!(
+                        "Landlock: Wayland socket {} rw",
+                        socket.display()
+                    ));
+                }
+                rw.push(socket);
             }
-            rw.push(xdg_path);
         }
     }
 
@@ -707,10 +716,7 @@ fn collect_normal_paths_with_mounted_paths(
     // sockets and their parents so `systemd-run --user` can connect. Display
     // mode already grants the whole XDG runtime dir above. Never added in
     // lockdown because collect_lockdown_paths does not call this function.
-    if config.systemd_user_enabled()
-        && !browser_mode
-        && !config.display_enabled()
-    {
+    if config.systemd_user_enabled() && !browser_mode {
         for path in systemd_user_paths() {
             if super::path_exists(&path) {
                 if verbose {
@@ -973,6 +979,7 @@ mod tests {
         let config = Config {
             no_gpu: Some(true),
             no_docker: Some(true),
+            no_worktree: Some(false),
             ..Config::default()
         };
         let project = PathBuf::from("/tmp/test-proj");
@@ -1024,6 +1031,7 @@ mod tests {
         let config = Config {
             no_gpu: Some(true),
             no_docker: Some(true),
+            private_home: Some(false),
             ..Config::default()
         };
         let (ro, _) = collect_normal_paths(&config, Path::new("/tmp"), false);
@@ -1078,6 +1086,7 @@ mod tests {
         let config = Config {
             no_gpu: Some(true),
             no_docker: Some(true),
+            private_home: Some(false),
             ..Config::default()
         };
         let (_ro, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
@@ -1154,6 +1163,7 @@ mod tests {
         let config = Config {
             no_gpu: Some(true),
             no_docker: Some(true),
+            no_worktree: Some(false),
             ..Config::default()
         };
 
@@ -1227,6 +1237,7 @@ mod tests {
         let config = Config {
             no_gpu: Some(true),
             no_docker: Some(true),
+            private_home: Some(false),
             ..Config::default()
         };
         let (ro, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
@@ -1254,6 +1265,7 @@ mod tests {
         let config = Config {
             no_gpu: Some(true),
             no_docker: Some(true),
+            private_home: Some(false),
             ..Config::default()
         };
         let (ro, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
@@ -1279,7 +1291,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_paths_display_runtime_included_when_enabled() {
+    fn normal_paths_display_does_not_grant_whole_runtime_dir() {
         let _env = ENV_LOCK.lock().unwrap();
         let tmp_root = std::env::temp_dir()
             .join(format!("ai-jail-landlock-xdg-{}", std::process::id()));
@@ -1293,7 +1305,7 @@ mod tests {
             ..Config::default()
         };
         let (_, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
-        assert!(rw.contains(&tmp_root));
+        assert!(!rw.contains(&tmp_root));
 
         let _ = std::fs::remove_dir_all(&tmp_root);
     }
@@ -1391,6 +1403,7 @@ mod tests {
     fn apply_net_rules_lockdown_does_not_panic() {
         let config = Config {
             lockdown: Some(true),
+            no_worktree: Some(false),
             ..Config::default()
         };
         // On macOS / kernels without V4: Ok (ABI_NET is empty).
@@ -1459,6 +1472,7 @@ mod tests {
         let config = Config {
             no_gpu: Some(true),
             no_docker: Some(true),
+            no_worktree: Some(false),
             ..Config::default()
         };
 
@@ -1468,7 +1482,7 @@ mod tests {
             path,
             &fixture.git_dir
         )));
-        assert!(rw.iter().any(|path| {
+        assert!(!rw.iter().any(|path| {
             super::super::paths_equivalent(path, &fixture.common_dir)
         }));
     }
@@ -1478,6 +1492,7 @@ mod tests {
         let fixture = create_linked_worktree_fixture();
         let config = Config {
             lockdown: Some(true),
+            no_worktree: Some(false),
             ..Config::default()
         };
 

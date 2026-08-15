@@ -12,6 +12,7 @@ const NOFILE_NORMAL: u64 = 65536;
 #[cfg(target_os = "linux")]
 const NPROC_LOCKDOWN: u64 = 1024;
 const NOFILE_LOCKDOWN: u64 = 4096;
+const FSIZE_LOCKDOWN: u64 = 1024 * 1024 * 1024;
 
 struct Limit {
     resource: Resource,
@@ -21,7 +22,7 @@ struct Limit {
 
 fn limits_for(config: &Config) -> Vec<Limit> {
     let lockdown = config.lockdown_enabled();
-    let limits = vec![
+    let mut limits = vec![
         Limit {
             resource: Resource::RLIMIT_NOFILE,
             soft: if lockdown {
@@ -37,6 +38,17 @@ fn limits_for(config: &Config) -> Vec<Limit> {
             name: "CORE",
         },
     ];
+
+    if lockdown {
+        limits.push(Limit {
+            resource: Resource::RLIMIT_FSIZE,
+            soft: FSIZE_LOCKDOWN,
+            name: "FSIZE",
+        });
+    }
+
+    // RLIMIT_AS is intentionally not used: JVMs and Chromium reserve large
+    // virtual address spaces even when their physical use is modest.
 
     limits
 }
@@ -63,12 +75,12 @@ pub fn apply(config: &Config, verbose: bool) {
         // Never exceed the current hard limit.
         let effective = lim.soft.min(hard);
 
-        if let Err(e) = setrlimit(lim.resource, effective, hard) {
+        if let Err(e) = setrlimit(lim.resource, effective, effective) {
             output::warn(&format!("Failed to set RLIMIT_{}: {e}", lim.name));
         } else if verbose {
             output::verbose(&format!(
                 "RLIMIT_{}: {} (hard: {})",
-                lim.name, effective, hard
+                lim.name, effective, effective
             ));
         }
     }
@@ -90,6 +102,7 @@ pub fn apply_nproc(config: &Config, verbose: bool) {
         NPROC_NORMAL
     };
     let Ok((_, hard)) = getrlimit(Resource::RLIMIT_NPROC) else {
+        eprintln!("⚠ Failed to read RLIMIT_NPROC, skipping");
         return;
     };
     let effective = soft.min(hard);
@@ -176,6 +189,33 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn apply_pins_nofile_and_core_hard_equal_to_soft() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "sandbox::rlimits::tests::apply_pins_nofile_and_core_hard_equal_to_soft_child",
+            )
+            .arg("--ignored")
+            .env("AI_JAIL_RLIMIT_CHILD", "1")
+            .output()
+            .expect("spawn child rlimit test");
+        assert!(output.status.success(), "child rlimit test failed");
+    }
+
+    #[test]
+    #[ignore]
+    fn apply_pins_nofile_and_core_hard_equal_to_soft_child() {
+        if std::env::var_os("AI_JAIL_RLIMIT_CHILD").is_none() {
+            return;
+        }
+        apply(&Config::default(), false);
+        for resource in [Resource::RLIMIT_NOFILE, Resource::RLIMIT_CORE] {
+            let (soft, hard) = getrlimit(resource).expect("getrlimit");
+            assert_eq!(soft, hard, "{resource:?} hard limit must be pinned");
+        }
     }
 
     #[cfg(target_os = "linux")]

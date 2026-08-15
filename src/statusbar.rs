@@ -9,6 +9,11 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+fn safe_metadata_bytes(bytes: &[u8]) -> Vec<u8> {
+    crate::output::escape_control_bytes(&String::from_utf8_lossy(bytes))
+        .into_bytes()
+}
+
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STYLE_DARK: AtomicBool = AtomicBool::new(true);
 static STYLE_PASTEL: AtomicBool = AtomicBool::new(false);
@@ -210,7 +215,8 @@ pub fn setup(
         pick_pastel_palette();
     }
 
-    let dir_bytes = project_dir.as_os_str().as_bytes();
+    let safe_dir = safe_metadata_bytes(project_dir.as_os_str().as_bytes());
+    let dir_bytes = safe_dir.as_slice();
     let len = dir_bytes.len().min(MAX_DIR);
 
     // SAFETY: single-threaded at this point (before child spawn).
@@ -229,7 +235,8 @@ pub fn setup(
             }
             cmd_pos += 1;
         }
-        let bytes = arg.as_bytes();
+        let safe_arg = crate::output::escape_control_bytes(arg);
+        let bytes = safe_arg.as_bytes();
         let n = bytes.len().min(MAX_CMD - cmd_pos);
         unsafe {
             CMD_BUF[cmd_pos..cmd_pos + n].copy_from_slice(&bytes[..n]);
@@ -683,5 +690,12 @@ mod tests {
         assert!(!attr_state.is_empty());
         assert_eq!(attr_state[0], 0x1b);
         assert!(attr_state.ends_with(b"m"));
+    }
+
+    #[test]
+    fn metadata_escapes_terminal_control_bytes() {
+        let safe = safe_metadata_bytes(b"project\x1b]52;c;secret\x07");
+        assert!(!safe.contains(&0x1b));
+        assert_eq!(safe, b"project?]52;c;secret?");
     }
 }

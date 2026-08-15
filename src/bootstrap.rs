@@ -146,25 +146,70 @@ pub fn run(verbose: bool, claude_dir: Option<&Path>) -> Result<(), String> {
 // ── Safe file helpers ─────────────────────────────────────────────
 
 fn ensure_regular_file_or_absent(path: &Path) -> Result<(), String> {
+    crate::fsutil::ensure_no_symlink_parents(path)?;
     crate::fsutil::ensure_regular_file_or_absent(path)
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
-    crate::fsutil::write_atomic(path, contents, true, "bootstrap")
+    use std::os::unix::fs::PermissionsExt;
+
+    crate::fsutil::write_atomic(path, contents, true, "bootstrap")?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("Failed to secure {}: {e}", path.display()))
 }
 
 fn backup_file(path: &Path) -> Result<bool, String> {
     crate::fsutil::backup_file(path)
 }
 
+// ── HOME resolution (fail closed) ────────────────────────────────
+
+/// Resolve `$HOME` for bootstrap writes, failing closed.
+///
+/// Historically an unset HOME silently fell back to `/tmp`, producing
+/// world-writable paths like `/tmp/.claude/settings.json` that any
+/// local user could pre-create or race. Bootstrap now refuses to run
+/// without an absolute, existing, user-owned HOME.
+fn user_home_dir() -> Result<PathBuf, String> {
+    const REFUSAL: &str = "refusing to bootstrap AI tool configs \
+                           into a fallback location";
+    let raw = std::env::var("HOME")
+        .map_err(|_| format!("HOME is not set; {REFUSAL}"))?;
+    if raw.is_empty() {
+        return Err(format!("HOME is empty; {REFUSAL}"));
+    }
+    let home = PathBuf::from(&raw);
+    if !home.is_absolute() {
+        return Err(format!("HOME {raw:?} is not an absolute path; {REFUSAL}"));
+    }
+    let meta = fs::metadata(&home).map_err(|e| {
+        format!("HOME {} is not accessible ({e}); {REFUSAL}", home.display())
+    })?;
+    if !meta.is_dir() {
+        return Err(format!(
+            "HOME {} is not a directory; {REFUSAL}",
+            home.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = unsafe { nix::libc::getuid() };
+        if meta.uid() != uid {
+            return Err(format!(
+                "HOME {} is not owned by uid {uid}; {REFUSAL}",
+                home.display()
+            ));
+        }
+    }
+    Ok(home)
+}
+
 // ── Gemini ───────────────────────────────────────────────────────
 
-fn gemini_policy_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home)
-        .join(".gemini")
-        .join("policies")
-        .join("ai-jail.toml")
+fn gemini_policy_path() -> Result<PathBuf, String> {
+    let home = user_home_dir()?;
+    Ok(home.join(".gemini").join("policies").join("ai-jail.toml"))
 }
 
 fn toml_basic_string(value: &str) -> String {
@@ -277,7 +322,7 @@ fn build_gemini_policy() -> String {
 }
 
 fn bootstrap_gemini(verbose: bool) -> Result<(), String> {
-    let path = gemini_policy_path();
+    let path = gemini_policy_path()?;
     ensure_regular_file_or_absent(&path)?;
 
     if backup_file(&path)? && verbose {
@@ -293,12 +338,11 @@ fn bootstrap_gemini(verbose: bool) -> Result<(), String> {
 
 // ── Claude ───────────────────────────────────────────────────────
 
-fn claude_config_path(claude_dir: Option<&Path>) -> PathBuf {
+fn claude_config_path(claude_dir: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(dir) = claude_dir {
-        dir.join("settings.json")
+        Ok(dir.join("settings.json"))
     } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        PathBuf::from(home).join(".claude").join("settings.json")
+        Ok(user_home_dir()?.join(".claude").join("settings.json"))
     }
 }
 
@@ -328,7 +372,16 @@ fn bootstrap_claude(
     verbose: bool,
     claude_dir: Option<&Path>,
 ) -> Result<(), String> {
-    let path = claude_config_path(claude_dir);
+    if let Some(dir) = claude_dir
+        && !trusted_claude_dir(dir)
+    {
+        output::security_warn(&format!(
+            "Skipping Claude bootstrap for untrusted project path {}",
+            dir.display()
+        ));
+        return Ok(());
+    }
+    let path = claude_config_path(claude_dir)?;
     ensure_regular_file_or_absent(&path)?;
 
     let mut root = if path.exists() {
@@ -357,15 +410,38 @@ fn bootstrap_claude(
     Ok(())
 }
 
+fn trusted_claude_dir(dir: &Path) -> bool {
+    // HOME must be verifiable to reason about trust; when it is not,
+    // fail closed — bootstrap_claude then skips the write entirely.
+    let Ok(home) = user_home_dir() else {
+        return false;
+    };
+    if dir.starts_with(&home) {
+        return true;
+    }
+    // A configured path in the project is project-controlled. Other external
+    // explicit paths remain supported, but call attention to that choice.
+    match std::env::current_dir() {
+        Ok(project) if dir.starts_with(&project) => false,
+        _ => {
+            output::security_warn(&format!(
+                "Claude bootstrap path {} is outside HOME",
+                dir.display()
+            ));
+            true
+        }
+    }
+}
+
 // ── Codex ────────────────────────────────────────────────────────
 
-fn codex_config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".codex").join("config.toml")
+fn codex_config_path() -> Result<PathBuf, String> {
+    let home = user_home_dir()?;
+    Ok(home.join(".codex").join("config.toml"))
 }
 
 fn bootstrap_codex(verbose: bool) -> Result<(), String> {
-    let path = codex_config_path();
+    let path = codex_config_path()?;
     ensure_regular_file_or_absent(&path)?;
 
     let mut root = if path.exists() {
@@ -400,12 +476,9 @@ fn bootstrap_codex(verbose: bool) -> Result<(), String> {
 
 // ── OpenCode ─────────────────────────────────────────────────────
 
-fn opencode_config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home)
-        .join(".config")
-        .join("opencode")
-        .join("opencode.json")
+fn opencode_config_path() -> Result<PathBuf, String> {
+    let home = user_home_dir()?;
+    Ok(home.join(".config").join("opencode").join("opencode.json"))
 }
 
 fn build_opencode_permissions() -> serde_json::Value {
@@ -417,7 +490,7 @@ fn build_opencode_permissions() -> serde_json::Value {
 }
 
 fn bootstrap_opencode(verbose: bool) -> Result<(), String> {
-    let path = opencode_config_path();
+    let path = opencode_config_path()?;
     ensure_regular_file_or_absent(&path)?;
 
     let mut root = if path.exists() {
@@ -448,16 +521,13 @@ fn bootstrap_opencode(verbose: bool) -> Result<(), String> {
 
 // ── Crush ────────────────────────────────────────────────────────
 
-fn crush_config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home)
-        .join(".config")
-        .join("crush")
-        .join("crush.json")
+fn crush_config_path() -> Result<PathBuf, String> {
+    let home = user_home_dir()?;
+    Ok(home.join(".config").join("crush").join("crush.json"))
 }
 
 fn bootstrap_crush(verbose: bool) -> Result<(), String> {
-    let path = crush_config_path();
+    let path = crush_config_path()?;
 
     if path.exists() {
         ensure_regular_file_or_absent(&path)?;
@@ -882,7 +952,7 @@ sandbox_mode = "full"
     #[test]
     fn claude_config_path_uses_custom_dir() {
         let custom = PathBuf::from("/home/user/.claude-example");
-        let path = claude_config_path(Some(&custom));
+        let path = claude_config_path(Some(&custom)).unwrap();
         assert_eq!(
             path,
             PathBuf::from("/home/user/.claude-example/settings.json")
@@ -892,8 +962,127 @@ sandbox_mode = "full"
     #[test]
     fn claude_config_path_defaults_to_dot_claude() {
         let _env = ENV_LOCK.lock().unwrap();
-        let _home = EnvVarGuard::set("HOME", "/home/testuser");
-        let path = claude_config_path(None);
-        assert_eq!(path, PathBuf::from("/home/testuser/.claude/settings.json"));
+        let dir = test_dir();
+        let _home = EnvVarGuard::set("HOME", &dir);
+        let path = claude_config_path(None).unwrap();
+        assert_eq!(path, dir.join(".claude").join("settings.json"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── HOME fail-closed resolution ────────────────────────────
+
+    fn home_error_contains(msg: &str, needle: &str) {
+        assert!(msg.contains(needle), "error {msg:?} missing {needle:?}");
+    }
+
+    #[test]
+    fn config_paths_fail_closed_when_home_is_unset() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _removed = EnvVarGuard::remove("HOME");
+
+        // No /tmp fallback: every tool path must refuse to resolve.
+        for err in [
+            claude_config_path(None).unwrap_err(),
+            gemini_policy_path().unwrap_err(),
+            codex_config_path().unwrap_err(),
+            opencode_config_path().unwrap_err(),
+            crush_config_path().unwrap_err(),
+        ] {
+            home_error_contains(&err, "HOME is not set");
+            home_error_contains(&err, "refusing to bootstrap");
+        }
+
+        // Trust checks fail closed too: an unverifiable HOME means
+        // the custom dir is treated as untrusted and skipped.
+        let dir = test_dir();
+        assert!(!trusted_claude_dir(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_paths_fail_closed_on_empty_or_relative_home() {
+        let _env = ENV_LOCK.lock().unwrap();
+
+        let _empty = EnvVarGuard::set("HOME", "");
+        let err = claude_config_path(None).unwrap_err();
+        home_error_contains(&err, "HOME is empty");
+        drop(_empty);
+
+        let _relative = EnvVarGuard::set("HOME", "relative/home");
+        let err = claude_config_path(None).unwrap_err();
+        home_error_contains(&err, "not an absolute path");
+        assert!(codex_config_path().is_err());
+    }
+
+    #[test]
+    fn config_paths_fail_closed_on_nonexistent_home() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = test_dir();
+        // Sanity: an existing user-owned HOME resolves normally.
+        let _good = EnvVarGuard::set("HOME", &dir);
+        assert_eq!(
+            gemini_policy_path().unwrap(),
+            dir.join(".gemini/policies/ai-jail.toml")
+        );
+
+        let missing = dir.join("no-such-home");
+        let _bad = EnvVarGuard::set("HOME", &missing);
+        let err = claude_config_path(None).unwrap_err();
+        home_error_contains(&err, "not accessible");
+        assert!(opencode_config_path().is_err());
+        assert!(crush_config_path().is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_paths_fail_closed_on_foreign_owned_home() {
+        use std::os::unix::fs::MetadataExt;
+
+        let uid = unsafe { nix::libc::getuid() };
+        let root_meta = fs::metadata("/").unwrap();
+        if root_meta.uid() == uid {
+            // Running as root (or owning /): ownership check is not
+            // observable here.
+            return;
+        }
+        let _env = ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::set("HOME", "/");
+        let err = claude_config_path(None).unwrap_err();
+        home_error_contains(&err, "not owned by uid");
+        assert!(codex_config_path().is_err());
+    }
+
+    #[test]
+    fn claude_bootstrap_skips_project_controlled_directory() {
+        let project = std::env::current_dir().unwrap().join("untrusted-claude");
+        assert!(!trusted_claude_dir(&project));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_and_regenerate_keep_secret_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir();
+        let path = dir.join("settings.json");
+        fs::write(&path, "{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        backup_file(&path).unwrap();
+        write_atomic(&path, "{\"permissions\":{}}").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(path.with_extension("json.bak"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }

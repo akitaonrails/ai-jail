@@ -176,6 +176,18 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_display: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<bool>,
+    /// Permit macOS Seatbelt's broad host IPC compatibility rules. This is
+    /// intentionally opt-in because those rules weaken process isolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_host_ipc: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x11: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_shm: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_passthrough: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_worktree: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_mise: Option<bool>,
@@ -211,6 +223,31 @@ pub struct Config {
     pub allow_tcp_ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_dir: Option<PathBuf>,
+    /// Trusted capability: mount the invoked agent's own state
+    /// directories and files (`~/.claude`, `~/.codex`,
+    /// `~/.claude.json`, ...). Opt-in; the untrusted project
+    /// `.ai-jail` may only disable it, never enable it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_state: Option<bool>,
+    /// Trusted capability: inherit the full host environment into
+    /// the sandbox. Opt-in; by default only a safe allowlist
+    /// (see [`DEFAULT_ENV_ALLOWLIST`]) is passed. The project
+    /// `.ai-jail` may only disable it, never enable it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit_env: Option<bool>,
+    /// Environment variables passed into the sandbox in addition to
+    /// the default allowlist: `NAME` copies the current host value at
+    /// launch, `NAME=VALUE` sets an explicit value. Trusted layers
+    /// only (CLI `--env` / global config) — entries from the
+    /// untrusted project `.ai-jail` are ignored. Never serialized:
+    /// entries can carry secret values.
+    #[serde(default, skip_serializing)]
+    pub env_pass: Vec<String>,
+    /// Trusted capability: let the status bar check GitHub for a
+    /// newer ai-jail release. Opt-in (phones home); the project
+    /// `.ai-jail` may only disable it, never enable it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_check: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -223,7 +260,7 @@ struct GlobalConfig {
 
 impl Config {
     pub fn gpu_enabled(&self) -> bool {
-        self.no_gpu != Some(true)
+        self.no_gpu == Some(false)
     }
     /// Docker socket passthrough is opt-in: the socket grants effective
     /// root on the host, so it is only exposed when explicitly enabled
@@ -235,13 +272,28 @@ impl Config {
         self.tailscale == Some(true)
     }
     pub fn display_enabled(&self) -> bool {
-        self.no_display != Some(true)
+        self.no_display == Some(false)
+    }
+    pub fn x11_enabled(&self) -> bool {
+        self.x11 == Some(true)
+    }
+    pub fn host_shm_enabled(&self) -> bool {
+        self.host_shm == Some(true)
+    }
+    pub fn terminal_passthrough_enabled(&self) -> bool {
+        self.terminal_passthrough == Some(true)
+    }
+    pub fn network_enabled(&self) -> bool {
+        self.network == Some(true)
+    }
+    pub fn macos_host_ipc_enabled(&self) -> bool {
+        self.macos_host_ipc == Some(true)
     }
     pub fn mise_enabled(&self) -> bool {
         self.no_mise != Some(true)
     }
     pub fn worktree_enabled(&self) -> bool {
-        self.no_worktree != Some(true)
+        self.no_worktree == Some(false)
     }
     pub fn lockdown_enabled(&self) -> bool {
         self.lockdown == Some(true)
@@ -274,7 +326,7 @@ impl Config {
         )
     }
     pub fn private_home_enabled(&self) -> bool {
-        self.private_home == Some(true)
+        self.private_home != Some(false)
     }
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn landlock_enabled(&self) -> bool {
@@ -303,10 +355,119 @@ impl Config {
     pub fn allow_tcp_ports(&self) -> &[u16] {
         &self.allow_tcp_ports
     }
+    /// Command-specific agent state mounts (`~/.claude`, `~/.codex`,
+    /// `~/.claude.json`, ...) are a trusted capability: disabled
+    /// unless explicitly enabled via CLI or global config.
+    pub fn agent_state_enabled(&self) -> bool {
+        self.agent_state == Some(true)
+    }
+    /// Full host-environment inheritance is a trusted capability:
+    /// disabled unless explicitly enabled. Default keeps only the
+    /// safe allowlist plus `env_pass` entries.
+    pub fn inherit_env_enabled(&self) -> bool {
+        self.inherit_env == Some(true)
+    }
+    pub fn env_pass(&self) -> &[String] {
+        &self.env_pass
+    }
+    /// The status-bar update check phones home to GitHub; it is
+    /// disabled unless explicitly enabled via CLI or global config.
+    pub fn update_check_enabled(&self) -> bool {
+        self.update_check == Some(true)
+    }
 }
 
 fn config_path() -> PathBuf {
     Path::new(CONFIG_FILE).to_path_buf()
+}
+
+/// Environment variables the sandbox inherits by default in normal
+/// (non-lockdown) mode. Everything else — API keys, cloud
+/// credentials, tokens — is dropped unless the user passes it
+/// explicitly with `--env`/`env_pass` or enables `inherit_env`.
+pub const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "TERM",
+    "LANG",
+    "SHELL",
+    "TMPDIR",
+    "COLORTERM",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+];
+
+/// Variable-name prefixes whose whole family is inherited by
+/// default: locale (`LC_*`), XDG base dirs (`XDG_*`), and terminal
+/// program metadata (`TERM_PROGRAM`, `TERM_PROGRAM_VERSION`).
+pub const DEFAULT_ENV_PREFIXES: &[&str] = &["LC_", "XDG_", "TERM_PROGRAM"];
+
+/// Whether `name` is inherited into the sandbox by default.
+pub fn env_inherited_by_default(name: &str) -> bool {
+    DEFAULT_ENV_ALLOWLIST.contains(&name)
+        || DEFAULT_ENV_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Split an `--env` / `env_pass` entry into its variable name and
+/// optional explicit value: `NAME` copies the host value at launch,
+/// `NAME=VALUE` is verbatim. Errors on an empty variable name.
+pub fn parse_env_entry(entry: &str) -> Result<(&str, Option<&str>), String> {
+    let (name, value) = match entry.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (entry, None),
+    };
+    if name.is_empty() {
+        return Err(format!("env entry {entry:?} has an empty variable name"));
+    }
+    Ok((name, value))
+}
+
+/// Apply `env_pass` entries on top of `env` (in place): explicit
+/// `NAME=VALUE` entries verbatim, bare `NAME` entries copied from
+/// `host_env` when present there (missing host vars are skipped).
+pub fn apply_env_pass(
+    env: &mut Vec<(String, String)>,
+    env_pass: &[String],
+    host_env: &[(String, String)],
+) {
+    for entry in env_pass {
+        let Ok((name, explicit)) = parse_env_entry(entry) else {
+            output::warn(&format!("Ignoring invalid {entry:?}: bad name"));
+            continue;
+        };
+        let value = explicit.map(str::to_string).or_else(|| {
+            host_env
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        });
+        if let Some(value) = value {
+            env.retain(|(key, _)| key != name);
+            env.push((name.to_string(), value));
+        }
+    }
+}
+
+/// The sandbox environment for normal mode when full inheritance is
+/// off: the default allowlist (plus prefix families) present in
+/// `host_env`, plus explicit `env_pass` entries applied verbatim.
+pub fn filtered_child_env(
+    env_pass: &[String],
+    host_env: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = host_env
+        .iter()
+        .filter(|(name, _)| env_inherited_by_default(name))
+        .cloned()
+        .collect();
+    apply_env_pass(&mut env, env_pass, host_env);
+    env
 }
 
 fn global_config_path() -> Option<PathBuf> {
@@ -325,6 +486,19 @@ fn load_toml_from_path<T: Default>(
     path: &Path,
     parse: impl FnOnce(&str) -> Result<T, String>,
 ) -> Result<T, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "Refusing to read {}: path is a symlink",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!("Failed to stat {}: {e}", path.display()));
+        }
+    }
     match std::fs::read_to_string(path) {
         Ok(contents) => parse(&contents)
             .map_err(|e| format!("Failed to parse {}: {e}", path.display())),
@@ -347,9 +521,9 @@ pub fn load() -> Result<Config, String> {
 }
 
 /// Load global user config from `$HOME/.ai-jail`, applying a matching
-/// `[commands.<name>]` table when present. The selection key is based on the
-/// effective command before global command tables are merged: CLI command,
-/// then project command, then global base command.
+/// `[commands.<name>]` table when present. Only a CLI command can select a
+/// command table; otherwise the global base command is used. Project config is
+/// untrusted and may select what runs, but cannot activate global policy.
 pub fn load_global_for_command(
     cli: &CliArgs,
     project: &Config,
@@ -372,12 +546,10 @@ fn load_global_for_command_from_path(
 fn global_config_for_command(
     global: GlobalConfig,
     cli: &CliArgs,
-    project: &Config,
+    _project: &Config,
 ) -> Config {
     let selected_command = if !cli.command.is_empty() {
         cli.command.clone()
-    } else if !project.command.is_empty() {
-        project.command.clone()
     } else {
         global.base.command.clone()
     };
@@ -386,7 +558,7 @@ fn global_config_for_command(
     if let Some(name) = selected_command.first()
         && let Some(command_config) = commands.get(name)
     {
-        base = merge_with_global(base, command_config.clone());
+        base = merge_trusted(base, command_config.clone());
     }
     // `ai-memory run` is both a wrapper invocation and a harness launch.
     // Preserve an existing [commands.ai-memory] layer, then let the selected
@@ -394,15 +566,14 @@ fn global_config_for_command(
     if let Some(harness) = command::managed_harness(&selected_command)
         && let Some(command_config) = commands.get(harness.name)
     {
-        base = merge_with_global(base, command_config.clone());
+        base = merge_trusted(base, command_config.clone());
     }
     base
 }
 
-/// Merge global (user-level) and local (project-level) configs.
-/// Local overrides global for project settings; global provides
-/// user-level defaults (status bar + resize redraw preferences).
-pub fn merge_with_global(global: Config, local: Config) -> Config {
+/// Merge two trusted configuration layers, such as global base and a global
+/// command table.
+fn merge_trusted(global: Config, local: Config) -> Config {
     let mut c = global;
     if !local.command.is_empty() {
         c.command = local.command;
@@ -437,6 +608,11 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     take!(no_docker);
     take!(tailscale);
     take!(no_display);
+    take!(network);
+    take!(macos_host_ipc);
+    take!(x11);
+    take!(host_shm);
+    take!(terminal_passthrough);
     take!(no_mise);
     take!(no_worktree);
     take!(no_save_config);
@@ -450,6 +626,11 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     take!(no_seccomp);
     take!(no_rlimits);
     take!(systemd_user);
+    take!(agent_state);
+    take!(inherit_env);
+    take!(update_check);
+    c.env_pass.extend(local.env_pass);
+    dedup_strings(&mut c.env_pass);
     c.allow_tcp_ports.extend(local.allow_tcp_ports);
     c.allow_tcp_ports.sort_unstable();
     c.allow_tcp_ports.dedup();
@@ -457,6 +638,324 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
     // Status bar + resize redraw key stay from global — local should
     // not override user-level preferences.
     c
+}
+
+/// Returns whether `path` resolves inside `project_dir`. Existing
+/// paths use canonical resolution; paths which do not yet exist walk
+/// to their deepest existing ancestor (via `symlink_metadata`) and
+/// validate containment from there, rejecting ancestor chains that
+/// contain symlinks — a lexical prefix match alone would accept
+/// `project/link/tail` even when `project/link` points outside the
+/// project, silently redirecting sandbox mounts.
+pub fn resolves_inside_project(path: &Path, project_dir: &Path) -> bool {
+    let project = std::fs::canonicalize(project_dir).unwrap_or_else(|_| {
+        to_absolute(project_dir.to_path_buf(), project_dir)
+    });
+    let absolute = to_absolute(path.to_path_buf(), project_dir);
+    if let Ok(resolved) = std::fs::canonicalize(&absolute) {
+        return resolved.starts_with(&project);
+    }
+    // The mapped path does not exist yet: resolve the deepest
+    // existing ancestor and validate containment from there.
+    let Some((ancestor, tail)) = deepest_existing_ancestor(&absolute) else {
+        return false;
+    };
+    if ancestor_chain_has_symlink(&ancestor, &project) {
+        return false;
+    }
+    match std::fs::canonicalize(&ancestor) {
+        Ok(resolved_ancestor) => {
+            resolved_ancestor.join(tail).starts_with(&project)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Walk `path` up to the deepest ancestor that exists, returning it
+/// together with the non-existent tail. `symlink_metadata` is used so
+/// the returned ancestor may itself be a symlink (callers validate
+/// that). Fails closed (None) when a component cannot be stat'd or
+/// the filesystem root is reached without an existing component.
+fn deepest_existing_ancestor(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut existing = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&existing) {
+            Ok(_) => {
+                let mut resolved_tail = PathBuf::new();
+                for component in tail {
+                    resolved_tail.push(component);
+                }
+                return Some((existing, resolved_tail));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing.file_name()?.to_os_string();
+                tail.insert(0, name);
+                existing.pop();
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Whether the chain of existing components between `start` and the
+/// project root `stop` contains a symlink (or a component that
+/// cannot be stat'd — fail closed). Symlinks above the project root
+/// are irrelevant: the canonicalized `stop` already resolved them.
+fn ancestor_chain_has_symlink(start: &Path, stop: &Path) -> bool {
+    let mut current = start;
+    loop {
+        if current == stop {
+            return false;
+        }
+        match std::fs::symlink_metadata(current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return true;
+            }
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => return false,
+        }
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn map_source(path: &Path) -> PathBuf {
+    MapSpec::parse(path)
+        .map(|map| map.source)
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn same_map(left: &Path, right: &Path, project_dir: &Path) -> bool {
+    let resolve = |path: PathBuf| {
+        let path = to_absolute(path, project_dir);
+        std::fs::canonicalize(&path).unwrap_or(path)
+    };
+    let left = MapSpec::parse(left).unwrap_or_else(|_| MapSpec {
+        source: left.to_path_buf(),
+        destination: left.to_path_buf(),
+    });
+    let right = MapSpec::parse(right).unwrap_or_else(|_| MapSpec {
+        source: right.to_path_buf(),
+        destination: right.to_path_buf(),
+    });
+    resolve(left.source) == resolve(right.source)
+        && resolve(left.destination) == resolve(right.destination)
+}
+
+fn append_project_maps(
+    baseline: &mut Vec<PathBuf>,
+    project: Vec<PathBuf>,
+    project_dir: &Path,
+    warnings: &mut Vec<String>,
+) {
+    for map in project {
+        let map = match MapSpec::parse(&map) {
+            Ok(spec) => MapSpec {
+                source: expand_tilde(spec.source),
+                destination: expand_tilde(spec.destination),
+            }
+            .encode(),
+            Err(_) => expand_tilde(map),
+        };
+        let spec = MapSpec::parse(&map).ok();
+        let source = spec
+            .as_ref()
+            .map(|spec| spec.source.clone())
+            .unwrap_or_else(|| map.clone());
+        let destination = spec
+            .as_ref()
+            .map(|spec| spec.destination.clone())
+            .unwrap_or_else(|| map.clone());
+        let trusted_same_map = baseline
+            .iter()
+            .any(|allowed| same_map(allowed, &map, project_dir));
+        if (!resolves_inside_project(&source, project_dir)
+            || !resolves_inside_project(&destination, project_dir))
+            && !trusted_same_map
+        {
+            warnings.push(format!(
+                "project .ai-jail map {} outside project ignored (use --rw-map/--ro-map or global config)",
+                source.display()
+            ));
+            continue;
+        }
+        if trusted_same_map
+            || resolves_inside_project(&destination, project_dir)
+        {
+            baseline.push(map);
+        }
+    }
+    dedup_paths(baseline);
+}
+
+/// Merge untrusted project configuration into an already trusted baseline
+/// (global configuration plus CLI). Project configuration may add restrictions,
+/// but never grants a capability the baseline did not already grant.
+pub fn merge_with_global_report(
+    baseline: Config,
+    local: Config,
+    project_dir: &Path,
+) -> (Config, Vec<String>) {
+    let mut c = baseline;
+    let mut warnings = Vec::new();
+    if c.command.is_empty() && !local.command.is_empty() {
+        c.command = local.command;
+    }
+    let trusted_rw_maps = c.rw_maps.clone();
+    append_project_maps(
+        &mut c.ro_maps,
+        local.ro_maps,
+        project_dir,
+        &mut warnings,
+    );
+    append_project_maps(
+        &mut c.rw_maps,
+        local.rw_maps,
+        project_dir,
+        &mut warnings,
+    );
+    c.rw_maps.retain(|map| {
+        let destination = to_absolute(MapSpec::parse(map)
+            .map(|spec| spec.destination)
+            .unwrap_or_else(|_| map.clone()), project_dir);
+        let overlaps_ro = c.ro_maps.iter().any(|ro| {
+            let ro_destination = to_absolute(MapSpec::parse(ro)
+                .map(|spec| spec.destination)
+                .unwrap_or_else(|_| ro.clone()), project_dir);
+            destination.starts_with(&ro_destination)
+                || ro_destination.starts_with(&destination)
+        });
+        if overlaps_ro && trusted_rw_maps.contains(map) {
+            return true;
+        }
+        if overlaps_ro {
+            warnings.push(format!(
+                "project .ai-jail rw map {} ignored because it overlaps a trusted read-only map",
+                destination.display()
+            ));
+            return false;
+        }
+        true
+    });
+    append_project_maps(
+        &mut c.overlay_maps,
+        local.overlay_maps,
+        project_dir,
+        &mut warnings,
+    );
+    c.hide_dotdirs.extend(local.hide_dotdirs);
+    dedup_strings(&mut c.hide_dotdirs);
+    c.mask.extend(local.mask);
+    dedup_paths(&mut c.mask);
+    c.deny_paths.extend(local.deny_paths);
+    dedup_paths(&mut c.deny_paths);
+    for exception in local.mask_exceptions {
+        warnings.push(format!(
+            "project .ai-jail mask exception {} ignored",
+            exception.display()
+        ));
+    }
+    for exception in local.deny_path_exceptions {
+        warnings.push(format!(
+            "project .ai-jail deny-path exception {} ignored",
+            exception.display()
+        ));
+    }
+    dedup_paths(&mut c.mask_exceptions);
+    dedup_paths(&mut c.deny_path_exceptions);
+
+    macro_rules! monotonic {
+        ($field:ident, $enabled:expr) => {
+            if let Some(value) = local.$field {
+                let candidate = Config { $field: Some(value), ..c.clone() };
+                if !$enabled(&candidate) || $enabled(&c) {
+                    c.$field = Some(value);
+                } else {
+                    warnings.push(format!(
+                        "project .ai-jail {} ignored because it weakens the baseline sandbox",
+                        stringify!($field)
+                    ));
+                }
+            }
+        };
+    }
+    monotonic!(no_gpu, |config: &Config| config.gpu_enabled());
+    monotonic!(no_docker, |config: &Config| config.docker_enabled());
+    monotonic!(tailscale, |config: &Config| config.tailscale_enabled());
+    monotonic!(no_display, |config: &Config| config.display_enabled());
+    monotonic!(network, |config: &Config| config.network_enabled());
+    monotonic!(macos_host_ipc, |config: &Config| config
+        .macos_host_ipc_enabled());
+    monotonic!(x11, |config: &Config| config.x11_enabled());
+    monotonic!(host_shm, |config: &Config| config.host_shm_enabled());
+    monotonic!(terminal_passthrough, |config: &Config| {
+        config.terminal_passthrough_enabled()
+    });
+    monotonic!(no_hide_config, |config: &Config| !config
+        .hide_config_enabled());
+    monotonic!(ssh, |config: &Config| config.ssh_enabled());
+    monotonic!(pictures, |config: &Config| config.pictures_enabled());
+    monotonic!(private_home, |config: &Config| !config
+        .private_home_enabled());
+    monotonic!(lockdown, |config: &Config| !config.lockdown_enabled());
+    monotonic!(no_landlock, |config: &Config| !config.landlock_enabled());
+    monotonic!(no_seccomp, |config: &Config| !config.seccomp_enabled());
+    monotonic!(no_rlimits, |config: &Config| !config.rlimits_enabled());
+    monotonic!(systemd_user, |config: &Config| config
+        .systemd_user_enabled());
+    monotonic!(no_mise, |config: &Config| config.mise_enabled());
+    monotonic!(no_worktree, |config: &Config| config.worktree_enabled());
+    monotonic!(agent_state, |config: &Config| config.agent_state_enabled());
+    monotonic!(inherit_env, |config: &Config| config.inherit_env_enabled());
+    monotonic!(update_check, |config: &Config| config
+        .update_check_enabled());
+    if !local.env_pass.is_empty() {
+        warnings.push(
+            "project .ai-jail env_pass ignored (use --env or global config)"
+                .into(),
+        );
+    }
+    if local.no_save_config.is_some() {
+        c.no_save_config = local.no_save_config;
+    }
+    if let Some(profile) = local.browser_profile
+        && c.browser_profile.as_deref() != Some(profile.as_str())
+    {
+        warnings.push(
+            "project .ai-jail browser_profile ignored because it weakens the baseline sandbox"
+                .into(),
+        );
+    }
+    let dropped_ports: Vec<_> = local
+        .allow_tcp_ports
+        .into_iter()
+        .filter(|port| !c.allow_tcp_ports.contains(port))
+        .collect();
+    if !dropped_ports.is_empty() {
+        warnings.push(format!(
+            "project .ai-jail allow_tcp_ports ignored: {}",
+            dropped_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if local.claude_dir.is_some() {
+        warnings.push("project .ai-jail claude_dir ignored (set it in global config or --claude-dir)".into());
+    }
+    (c, warnings)
+}
+
+/// Compatibility helper for trusted config-layer callers. Runtime project
+/// merging must use [`merge_with_global_report`] with an explicit project dir.
+#[cfg(test)]
+pub fn merge_with_global(global: Config, local: Config) -> Config {
+    merge_trusted(global, local)
 }
 
 /// Save project-level config to `.ai-jail` in the current dir.
@@ -468,6 +967,10 @@ pub fn save(config: &Config) {
     local.no_status_bar = None;
     local.status_bar_style = None;
     local.resize_redraw_key = None;
+    // env_pass entries can carry secret values (--env NAME=VALUE) and
+    // the project config is untrusted at merge time anyway — never
+    // persist them to the project .ai-jail.
+    local.env_pass.clear();
 
     save_to_path(&config_path(), &local);
 }
@@ -793,6 +1296,14 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     invert!(docker, no_docker);
     direct!(tailscale);
     invert!(display, no_display);
+    direct!(network);
+    direct!(macos_host_ipc);
+    direct!(x11);
+    direct!(host_shm);
+    direct!(terminal_passthrough);
+    direct!(agent_state);
+    direct!(inherit_env);
+    direct!(update_check);
     invert!(mise, no_mise);
     invert!(save_config, no_save_config);
     invert!(hide_config, no_hide_config);
@@ -814,6 +1325,9 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
         .extend(cli.allow_tcp_ports.iter().copied());
     config.allow_tcp_ports.sort_unstable();
     config.allow_tcp_ports.dedup();
+
+    config.env_pass.extend(cli.env.iter().cloned());
+    dedup_strings(&mut config.env_pass);
 
     if let Some(p) = cli.claude_dir.clone() {
         config.claude_dir = Some(p);
@@ -880,11 +1394,20 @@ pub fn display_status(config: &Config) {
     print_path_list("  Mask exceptions", &config.mask_exceptions);
     print_path_list("  Deny exceptions", &config.deny_path_exceptions);
 
-    print_auto_tristate("  GPU", config.no_gpu);
+    print_opt_in_tristate("  GPU", config.no_gpu);
     print_opt_in_tristate("  Docker", config.no_docker);
     print_shared_or_hidden("  Tailscale", config.tailscale);
-    print_auto_tristate("  Display", config.no_display);
-    print_auto_tristate("  Git worktree", config.no_worktree);
+    print_opt_in_tristate("  Display", config.no_display);
+    print_opt_in_enabled("  Network", config.network);
+    print_opt_in_enabled("  macOS host IPC", config.macos_host_ipc);
+    print_opt_in_enabled("  X11", config.x11);
+    print_opt_in_enabled("  Host shared memory", config.host_shm);
+    print_opt_in_enabled("  Terminal passthrough", config.terminal_passthrough);
+    print_opt_in_enabled("  Agent state", config.agent_state);
+    print_opt_in_enabled("  Full env inherit", config.inherit_env);
+    print_string_list("  Env passthrough", &config.env_pass);
+    print_opt_in_enabled("  Update check", config.update_check);
+    print_opt_in_tristate("  Git worktree", config.no_worktree);
     print_auto_tristate("  Mise", config.no_mise);
     print_default_on_tristate("  Save config", config.no_save_config);
     print_default_on_tristate("  Hide .ai-jail", config.no_hide_config);
@@ -980,6 +1503,15 @@ fn print_shared_or_hidden(label: &str, val: Option<bool>) {
     output::status_header(label, v);
 }
 
+fn print_opt_in_enabled(label: &str, val: Option<bool>) {
+    let v = if val == Some(true) {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    output::status_header(label, v);
+}
+
 fn print_browser_profile(profile: Option<&str>) {
     let v = match profile {
         Some("off" | "none" | "disabled") => "disabled",
@@ -993,7 +1525,7 @@ fn print_private_home(val: Option<bool>) {
     let v = match val {
         Some(true) => "enabled",
         Some(false) => "disabled",
-        None => "auto",
+        None => "enabled (default)",
     };
     output::status_header("  Private home", v);
 }
@@ -1138,6 +1670,518 @@ mod tests {
         assert_eq!(cfg.no_gpu, None);
         assert_eq!(cfg.no_save_config, None);
         assert_eq!(cfg.lockdown, None);
+        assert_eq!(cfg.macos_host_ipc, None);
+        assert!(!cfg.macos_host_ipc_enabled());
+    }
+
+    #[test]
+    fn macos_host_ipc_is_opt_in_and_project_cannot_enable_it() {
+        let baseline = Config::default();
+        let project = Config {
+            macos_host_ipc: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert!(!merged.macos_host_ipc_enabled());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("macos_host_ipc"))
+        );
+
+        let enabled = Config {
+            macos_host_ipc: Some(true),
+            ..Config::default()
+        };
+        assert!(enabled.macos_host_ipc_enabled());
+        assert!(
+            serialize_config(&enabled)
+                .unwrap()
+                .contains("macos_host_ipc = true")
+        );
+    }
+
+    // ── Trusted capabilities: agent_state / env / update_check ──
+
+    #[test]
+    fn parse_trusted_capabilities_and_env_pass() {
+        let cfg = parse_toml(
+            r#"
+command = ["claude"]
+agent_state = true
+inherit_env = false
+update_check = true
+env_pass = ["ANTHROPIC_API_KEY", "CUSTOM_TOKEN=abc"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.agent_state, Some(true));
+        assert!(cfg.agent_state_enabled());
+        assert_eq!(cfg.inherit_env, Some(false));
+        assert!(!cfg.inherit_env_enabled());
+        assert_eq!(cfg.update_check, Some(true));
+        assert!(cfg.update_check_enabled());
+        assert_eq!(
+            cfg.env_pass(),
+            &[
+                "ANTHROPIC_API_KEY".to_string(),
+                "CUSTOM_TOKEN=abc".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn regression_v1_17_0_config_without_trusted_capabilities() {
+        // Configs written before agent_state / inherit_env / env_pass /
+        // update_check existed must still parse, defaulting each new
+        // field to its safe default (capabilities off, no env pass).
+        let toml = r#"
+command = ["claude"]
+rw_maps = []
+ro_maps = []
+no_gpu = false
+no_docker = false
+lockdown = false
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.agent_state, None);
+        assert!(!cfg.agent_state_enabled());
+        assert_eq!(cfg.inherit_env, None);
+        assert!(!cfg.inherit_env_enabled());
+        assert!(cfg.env_pass().is_empty());
+        assert_eq!(cfg.update_check, None);
+        assert!(!cfg.update_check_enabled());
+    }
+
+    #[test]
+    fn trusted_capability_accessors_default_off() {
+        let config = Config::default();
+        assert!(!config.agent_state_enabled());
+        assert!(!config.inherit_env_enabled());
+        assert!(!config.update_check_enabled());
+        assert!(
+            !Config {
+                agent_state: Some(false),
+                inherit_env: Some(false),
+                update_check: Some(false),
+                ..Config::default()
+            }
+            .agent_state_enabled()
+        );
+    }
+
+    #[test]
+    fn merge_cli_trusted_capability_flags_and_env() {
+        let existing = Config::default();
+        let cli = CliArgs {
+            agent_state: Some(true),
+            inherit_env: Some(true),
+            update_check: Some(false),
+            env: vec![
+                "ANTHROPIC_API_KEY".into(),
+                "CUSTOM=value".into(),
+                "ANTHROPIC_API_KEY".into(),
+            ],
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(merged.agent_state, Some(true));
+        assert_eq!(merged.inherit_env, Some(true));
+        assert_eq!(merged.update_check, Some(false));
+        assert_eq!(
+            merged.env_pass,
+            vec!["ANTHROPIC_API_KEY".to_string(), "CUSTOM=value".to_string()]
+        );
+    }
+
+    #[test]
+    fn project_config_cannot_enable_trusted_capabilities() {
+        let project = Config {
+            agent_state: Some(true),
+            inherit_env: Some(true),
+            update_check: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(!merged.agent_state_enabled());
+        assert!(!merged.inherit_env_enabled());
+        assert!(!merged.update_check_enabled());
+        for field in ["agent_state", "inherit_env", "update_check"] {
+            assert!(
+                warnings.iter().any(|warning| warning.contains(field)),
+                "missing warning for {field}"
+            );
+        }
+
+        // Explicitly disabling is a tightening: always accepted.
+        let project = Config {
+            agent_state: Some(false),
+            inherit_env: Some(false),
+            update_check: Some(false),
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config {
+                agent_state: Some(true),
+                inherit_env: Some(true),
+                update_check: Some(true),
+                ..Config::default()
+            },
+            project,
+            Path::new("/project"),
+        );
+        assert!(!merged.agent_state_enabled());
+        assert!(!merged.inherit_env_enabled());
+        assert!(!merged.update_check_enabled());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn project_env_pass_is_ignored() {
+        let project = Config {
+            env_pass: vec!["AWS_SESSION_TOKEN".into()],
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(merged.env_pass.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("env_pass ignored"))
+        );
+    }
+
+    #[test]
+    fn global_command_table_layers_trusted_capabilities() {
+        let global = parse_global_toml(
+            r#"
+[commands.claude]
+agent_state = true
+env_pass = ["ANTHROPIC_API_KEY"]
+"#,
+        )
+        .unwrap();
+        let cli = CliArgs {
+            command: vec!["claude".into()],
+            ..CliArgs::default()
+        };
+        let selected =
+            global_config_for_command(global, &cli, &Config::default());
+        assert!(selected.agent_state_enabled());
+        assert_eq!(selected.env_pass, vec!["ANTHROPIC_API_KEY".to_string()]);
+    }
+
+    #[test]
+    fn save_does_not_persist_env_pass() {
+        let config = Config {
+            command: vec!["claude".into()],
+            env_pass: vec!["ANTHROPIC_API_KEY=sk-secret".into()],
+            ..Config::default()
+        };
+        let serialized = serialize_config(&config).unwrap();
+        assert!(!serialized.contains("env_pass"));
+        assert!(!serialized.contains("sk-secret"));
+    }
+
+    // ── Sandbox environment filtering ──────────────────────────
+
+    fn sample_host_env() -> Vec<(String, String)> {
+        vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("HOME".to_string(), "/home/u".to_string()),
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("LANG".to_string(), "en_US.UTF-8".to_string()),
+            ("LC_ALL".to_string(), "C".to_string()),
+            ("XDG_RUNTIME_DIR".to_string(), "/run/user/1".to_string()),
+            ("TERM_PROGRAM_VERSION".to_string(), "3.4".to_string()),
+            ("http_proxy".to_string(), "http://proxy:3128".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "sk-ant-secret".to_string()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "aws-secret".to_string(),
+            ),
+            ("GITHUB_TOKEN".to_string(), "gh-token".to_string()),
+        ]
+    }
+
+    #[test]
+    fn filtered_child_env_drops_credentials_by_default() {
+        let env = filtered_child_env(&[], &sample_host_env());
+        for leaked in ["ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY"] {
+            assert!(
+                !env.iter().any(|(name, _)| name == leaked),
+                "{leaked} must not be inherited by default"
+            );
+        }
+    }
+
+    #[test]
+    fn filtered_child_env_keeps_allowlist_and_prefix_families() {
+        let env = filtered_child_env(&[], &sample_host_env());
+        for kept in [
+            "PATH",
+            "HOME",
+            "TERM",
+            "LANG",
+            "LC_ALL",
+            "XDG_RUNTIME_DIR",
+            "TERM_PROGRAM_VERSION",
+            "http_proxy",
+        ] {
+            assert!(
+                env.iter().any(|(name, _)| name == kept),
+                "{kept} must be inherited by default"
+            );
+        }
+    }
+
+    #[test]
+    fn env_pass_keeps_credentials_with_name_and_literal() {
+        // Bare NAME copies the host value; NAME=VALUE is verbatim and
+        // overrides any host value.
+        let env = filtered_child_env(
+            &[
+                "ANTHROPIC_API_KEY".to_string(),
+                "GITHUB_TOKEN=explicit-token".to_string(),
+            ],
+            &sample_host_env(),
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(name, _)| name == "ANTHROPIC_API_KEY")
+                .map(|(_, value)| value.as_str()),
+            Some("sk-ant-secret")
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(name, _)| name == "GITHUB_TOKEN")
+                .map(|(_, value)| value.as_str()),
+            Some("explicit-token")
+        );
+    }
+
+    #[test]
+    fn env_pass_missing_host_variable_is_skipped() {
+        let env = filtered_child_env(
+            &["NOT_SET_ANYWHERE".to_string()],
+            &sample_host_env(),
+        );
+        assert!(!env.iter().any(|(name, _)| name == "NOT_SET_ANYWHERE"));
+    }
+
+    #[test]
+    fn parse_env_entry_rejects_empty_name() {
+        assert!(parse_env_entry("").is_err());
+        assert!(parse_env_entry("=value").is_err());
+        assert_eq!(parse_env_entry("NAME").unwrap(), ("NAME", None));
+        assert_eq!(
+            parse_env_entry("NAME=value").unwrap(),
+            ("NAME", Some("value"))
+        );
+    }
+
+    // ── Project-map symlink containment ────────────────────────
+
+    #[test]
+    fn resolves_inside_project_accepts_missing_tail_under_real_dir() {
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-resolve-real-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+
+        assert!(resolves_inside_project(
+            &project.join("src/newdir/nested"),
+            &project
+        ));
+        assert!(resolves_inside_project(&project.join("newdir"), &project));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolves_inside_project_rejects_symlink_escape_via_missing_tail() {
+        // Regression: a non-existent path whose deepest existing
+        // ancestor is a symlink pointing outside the project used to
+        // pass the lexical check and redirect sandbox mounts.
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-resolve-evil-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, project.join("link")).unwrap();
+
+        assert!(
+            !resolves_inside_project(&project.join("link/newdir"), &project),
+            "missing tail under a symlink must be rejected"
+        );
+        // The symlink itself (existing path) is resolved canonically.
+        assert!(!resolves_inside_project(&project.join("link"), &project));
+
+        let _ = std::fs::remove_file(project.join("link"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolves_inside_project_rejects_internal_symlink_ancestor_too() {
+        // Fail closed: even a symlink that currently resolves inside
+        // the project is rejected for missing-tail paths — it can be
+        // retargeted after the check, and mount destinations should
+        // use the real path instead.
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-resolve-internal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        std::fs::create_dir_all(project.join("data")).unwrap();
+        std::os::unix::fs::symlink("data", project.join("alias")).unwrap();
+
+        assert!(
+            !resolves_inside_project(&project.join("alias/file"), &project),
+            "missing tail under a symlink must fail closed"
+        );
+
+        let _ = std::fs::remove_file(project.join("alias"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn regression_old_config_with_claude_dir_and_outside_map_parses() {
+        let old = r#"
+claude_dir = "/home/user/.claude"
+rw_maps = ["/home/user/.ssh"]
+"#;
+        let project = parse_toml(old).unwrap();
+        assert_eq!(
+            project.claude_dir,
+            Some(PathBuf::from("/home/user/.claude"))
+        );
+        assert_eq!(project.rw_maps, vec![PathBuf::from("/home/user/.ssh")]);
+
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(merged.claude_dir.is_none());
+        assert!(merged.rw_maps.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("claude_dir ignored"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("outside project ignored"))
+        );
+    }
+
+    #[test]
+    fn project_merge_cannot_expand_baseline_capabilities() {
+        let baseline = Config {
+            no_gpu: Some(true),
+            no_display: Some(true),
+            lockdown: Some(true),
+            private_home: Some(true),
+            ssh: Some(false),
+            allow_tcp_ports: vec![443],
+            ..Config::default()
+        };
+        let project = Config {
+            no_gpu: Some(false),
+            no_display: Some(false),
+            network: Some(true),
+            lockdown: Some(false),
+            private_home: Some(false),
+            no_worktree: Some(false),
+            ssh: Some(true),
+            allow_tcp_ports: vec![22, 443],
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert!(!merged.gpu_enabled());
+        assert!(!merged.display_enabled());
+        assert!(!merged.ssh_enabled());
+        assert!(merged.lockdown_enabled());
+        assert!(merged.private_home_enabled());
+        assert!(!merged.network_enabled());
+        assert!(!merged.worktree_enabled());
+        assert_eq!(merged.allow_tcp_ports, vec![443]);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("allow_tcp_ports"))
+        );
+    }
+
+    #[test]
+    fn project_maps_cannot_escape_destinations_or_override_trusted_ro() {
+        let baseline = Config {
+            ro_maps: vec![PathBuf::from("/project/read-only")],
+            mask: vec![PathBuf::from("/project/.env")],
+            ..Config::default()
+        };
+        let project = Config {
+            rw_maps: vec![
+                PathBuf::from("src:/etc"),
+                PathBuf::from("read-only/subdir"),
+            ],
+            mask: vec![PathBuf::from("*")],
+            mask_exceptions: vec![PathBuf::from("*")],
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert!(merged.rw_maps.is_empty());
+        assert!(merged.mask.contains(&PathBuf::from("/project/.env")));
+        assert_eq!(merged.mask_exceptions.len(), 0);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("outside project"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("read-only map"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("mask exception"))
+        );
+    }
+
+    #[test]
+    fn gpu_and_new_opt_in_accessors_default_to_disabled() {
+        let config = Config::default();
+        assert!(!config.gpu_enabled());
+        assert!(!config.x11_enabled());
+        assert!(!config.host_shm_enabled());
+        assert!(!config.terminal_passthrough_enabled());
+        let enabled = Config {
+            no_gpu: Some(false),
+            x11: Some(true),
+            host_shm: Some(true),
+            terminal_passthrough: Some(true),
+            ..Config::default()
+        };
+        assert!(enabled.gpu_enabled());
+        assert!(enabled.x11_enabled());
+        assert!(enabled.host_shm_enabled());
+        assert!(enabled.terminal_passthrough_enabled());
     }
 
     #[test]
@@ -1407,7 +2451,7 @@ allow_tcp_ports = []
 "#;
         let cfg = parse_toml(toml).unwrap();
         assert_eq!(cfg.no_worktree, None);
-        assert!(cfg.worktree_enabled());
+        assert!(!cfg.worktree_enabled());
     }
 
     #[test]
@@ -1436,7 +2480,7 @@ allow_tcp_ports = []
 "#;
         let cfg = parse_toml(toml).unwrap();
         assert_eq!(cfg.private_home, None);
-        assert!(!cfg.private_home_enabled());
+        assert!(cfg.private_home_enabled());
     }
 
     #[test]
@@ -1570,6 +2614,11 @@ no_gpu = true
             no_docker: None,
             tailscale: Some(true),
             no_display: Some(false),
+            network: None,
+            macos_host_ipc: None,
+            x11: Some(true),
+            host_shm: Some(true),
+            terminal_passthrough: Some(true),
             no_worktree: Some(false),
             no_mise: None,
             no_save_config: Some(true),
@@ -1588,6 +2637,10 @@ no_gpu = true
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000, 8080],
             claude_dir: None,
+            agent_state: Some(true),
+            inherit_env: None,
+            env_pass: vec!["ANTHROPIC_API_KEY".into()],
+            update_check: Some(false),
         };
         let serialized = serialize_config(&config).unwrap();
         let deserialized = parse_toml(&serialized).unwrap();
@@ -1618,6 +2671,15 @@ no_gpu = true
         assert_eq!(deserialized.systemd_user, config.systemd_user);
         assert_eq!(deserialized.allow_tcp_ports, config.allow_tcp_ports);
         assert_eq!(deserialized.claude_dir, config.claude_dir);
+        assert_eq!(deserialized.agent_state, config.agent_state);
+        assert_eq!(deserialized.inherit_env, config.inherit_env);
+        // env_pass is intentionally NOT round-tripped: entries may
+        // carry `NAME=secret` literals and must never be written to
+        // a config file (see save_does_not_persist_env_pass).
+        // Deserialization of hand-written `env_pass` is covered by
+        // parse tests.
+        assert!(deserialized.env_pass.is_empty());
+        assert_eq!(deserialized.update_check, config.update_check);
     }
 
     #[test]
@@ -1865,6 +2927,8 @@ tailscale = true
             no_docker: Some(false),
             tailscale: Some(true),
             no_display: None,
+            network: None,
+            macos_host_ipc: None,
             no_worktree: Some(true),
             no_mise: Some(true),
             no_save_config: Some(true),
@@ -2205,6 +3269,26 @@ tailscale = false
     }
 
     #[test]
+    fn project_command_does_not_select_global_command_table() {
+        let global = parse_global_toml(
+            r#"
+command = ["bash"]
+
+[commands.claude]
+ssh = true
+"#,
+        )
+        .unwrap();
+        let project = Config {
+            command: vec!["claude".into()],
+            ..Config::default()
+        };
+        let selected =
+            global_config_for_command(global, &CliArgs::default(), &project);
+        assert!(!selected.ssh_enabled());
+    }
+
+    #[test]
     fn managed_harness_layers_wrapper_then_harness_global_config() {
         let global = parse_global_toml(
             r#"
@@ -2275,7 +3359,7 @@ tailscale = true
     }
 
     #[test]
-    fn managed_harness_scope_uses_project_command_when_cli_absent() {
+    fn managed_harness_scope_ignores_project_command_when_cli_absent() {
         let global = parse_global_toml(
             r#"
 [commands.ai-memory]
@@ -2299,12 +3383,12 @@ tailscale = true
         let selected =
             global_config_for_command(global, &CliArgs::default(), &project);
 
-        assert_eq!(selected.no_docker, Some(true));
-        assert_eq!(selected.tailscale, Some(true));
+        assert_eq!(selected.no_docker, None);
+        assert_eq!(selected.tailscale, None);
     }
 
     #[test]
-    fn command_scoped_global_uses_project_command_when_cli_absent() {
+    fn command_scoped_global_ignores_project_command_when_cli_absent() {
         let global = parse_global_toml(
             r#"
 rw_maps = ["~/common"]
@@ -2323,11 +3407,8 @@ tailscale = true
         let selected =
             global_config_for_command(global, &CliArgs::default(), &project);
 
-        assert_eq!(
-            selected.rw_maps,
-            vec![PathBuf::from("~/common"), PathBuf::from("~/.pi")]
-        );
-        assert_eq!(selected.tailscale, Some(true));
+        assert_eq!(selected.rw_maps, vec![PathBuf::from("~/common")]);
+        assert_eq!(selected.tailscale, None);
     }
 
     #[test]
@@ -2606,13 +3687,7 @@ allow_tcp_ports = [32000, 8080]
 
     #[test]
     fn gpu_enabled_accessor() {
-        assert!(
-            Config {
-                no_gpu: None,
-                ..Config::default()
-            }
-            .gpu_enabled()
-        );
+        assert!(!Config::default().gpu_enabled());
         assert!(
             !Config {
                 no_gpu: Some(true),
@@ -2677,13 +3752,7 @@ allow_tcp_ports = [32000, 8080]
 
     #[test]
     fn display_enabled_accessor() {
-        assert!(
-            Config {
-                no_display: None,
-                ..Config::default()
-            }
-            .display_enabled()
-        );
+        assert!(!Config::default().display_enabled());
         assert!(
             !Config {
                 no_display: Some(true),
@@ -2702,13 +3771,7 @@ allow_tcp_ports = [32000, 8080]
 
     #[test]
     fn worktree_enabled_accessor() {
-        assert!(
-            Config {
-                no_worktree: None,
-                ..Config::default()
-            }
-            .worktree_enabled()
-        );
+        assert!(!Config::default().worktree_enabled());
         assert!(
             !Config {
                 no_worktree: Some(true),
@@ -2722,6 +3785,33 @@ allow_tcp_ports = [32000, 8080]
                 ..Config::default()
             }
             .worktree_enabled()
+        );
+    }
+
+    #[test]
+    fn network_and_private_home_accessors_are_opt_in_safe() {
+        assert!(!Config::default().network_enabled());
+        assert!(
+            !Config {
+                network: Some(false),
+                ..Config::default()
+            }
+            .network_enabled()
+        );
+        assert!(
+            Config {
+                network: Some(true),
+                ..Config::default()
+            }
+            .network_enabled()
+        );
+        assert!(Config::default().private_home_enabled());
+        assert!(
+            !Config {
+                private_home: Some(false),
+                ..Config::default()
+            }
+            .private_home_enabled()
         );
     }
 
@@ -3196,6 +4286,11 @@ hide_dotdirs = [".my_secrets"]
             no_docker: None,
             tailscale: Some(true),
             no_display: None,
+            network: None,
+            macos_host_ipc: None,
+            x11: None,
+            host_shm: None,
+            terminal_passthrough: None,
             no_worktree: None,
             no_mise: None,
             no_save_config: Some(true),
@@ -3214,6 +4309,10 @@ hide_dotdirs = [".my_secrets"]
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000],
             claude_dir: None,
+            agent_state: None,
+            inherit_env: None,
+            env_pass: vec![],
+            update_check: None,
         };
         save(&config);
 

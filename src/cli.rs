@@ -42,6 +42,26 @@ OPTIONS:
     --no-docker / --docker         Disable/enable Docker socket passthrough (grants host root; default: off)
     --tailscale / --no-tailscale   Enable/disable Tailscale socket passthrough (default: off)
     --no-display / --display       Disable/enable X11/Wayland passthrough (Linux only)
+    --network / --no-network       Enable/disable unrestricted network access (default: off)
+    --macos-host-ipc / --no-macos-host-ipc
+                                    Enable/disable broad macOS host IPC compatibility (default: off)
+    --x11 / --no-x11               Enable/disable X11 socket passthrough (default: off)
+    --host-shm / --no-host-shm     Enable/disable host shared-memory passthrough (default: off)
+    --terminal-passthrough / --no-terminal-passthrough
+                                     Enable/disable terminal passthrough (default: off)
+    --agent-state / --no-agent-state
+                                    Enable/disable mounting the agent's own state
+                                    dirs (~/.claude, ~/.codex, ~/.claude.json, ...;
+                                    default: off; project .ai-jail cannot enable)
+    --env <NAME[=VALUE]>            Pass environment variable NAME (value copied from
+                                    the host) or NAME=VALUE into the sandbox
+                                    (repeatable; not persisted to .ai-jail)
+    --inherit-env / --no-inherit-env
+                                    Inherit the full host environment (default: off —
+                                    only a safe allowlist is passed)
+    --update-check / --no-update-check
+                                    Enable/disable the status bar's GitHub update
+                                    check (default: off)
     --worktree / --no-worktree     Enable/disable linked Git worktree metadata passthrough
     --no-mise / --mise             Disable/enable mise integration
     --ssh / --no-ssh               Share ~/.ssh read-only + forward SSH_AUTH_SOCK (default: off)
@@ -88,6 +108,11 @@ pub struct CliArgs {
     pub docker: Option<bool>,
     pub tailscale: Option<bool>,
     pub display: Option<bool>,
+    pub network: Option<bool>,
+    pub macos_host_ipc: Option<bool>,
+    pub x11: Option<bool>,
+    pub host_shm: Option<bool>,
+    pub terminal_passthrough: Option<bool>,
     pub worktree: Option<bool>,
     pub mise: Option<bool>,
     pub save_config: Option<bool>,
@@ -99,6 +124,10 @@ pub struct CliArgs {
     pub status_bar_style: Option<String>,
     pub allow_tcp_ports: Vec<u16>,
     pub claude_dir: Option<PathBuf>,
+    pub agent_state: Option<bool>,
+    pub inherit_env: Option<bool>,
+    pub update_check: Option<bool>,
+    pub env: Vec<String>,
     pub exec: bool,
     pub clean: bool,
     pub dry_run: bool,
@@ -239,6 +268,41 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long(s @ ("display" | "no-display")) => {
                 args.display = Some(s == "display");
             }
+            Long(s @ ("network" | "no-network")) => {
+                args.network = Some(s == "network");
+            }
+            Long(s @ ("macos-host-ipc" | "no-macos-host-ipc")) => {
+                args.macos_host_ipc = Some(s == "macos-host-ipc");
+            }
+            Long(s @ ("x11" | "no-x11")) => {
+                args.x11 = Some(s == "x11");
+            }
+            Long(s @ ("host-shm" | "no-host-shm")) => {
+                args.host_shm = Some(s == "host-shm");
+            }
+            Long(s @ ("terminal-passthrough" | "no-terminal-passthrough")) => {
+                args.terminal_passthrough = Some(s == "terminal-passthrough");
+            }
+            Long(s @ ("agent-state" | "no-agent-state")) => {
+                args.agent_state = Some(s == "agent-state");
+            }
+            Long(s @ ("inherit-env" | "no-inherit-env")) => {
+                args.inherit_env = Some(s == "inherit-env");
+            }
+            Long(s @ ("update-check" | "no-update-check")) => {
+                args.update_check = Some(s == "update-check");
+            }
+            Long("env") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let s = val.to_string_lossy();
+                let name = s.split('=').next().unwrap_or("");
+                if s.is_empty() || name.is_empty() {
+                    return Err(
+                        "--env requires a non-empty NAME or NAME=VALUE".into(),
+                    );
+                }
+                args.env.push(s.into_owned());
+            }
             Long(s @ ("worktree" | "no-worktree")) => {
                 args.worktree = Some(s == "worktree");
             }
@@ -342,8 +406,20 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     args.command.push(s);
                     // Consume ALL remaining args as part of the command
                     // (including --flags that belong to the sub-command)
+                    let mut after_separator = false;
                     for raw in parser.raw_args().map_err(|e| e.to_string())? {
-                        args.command.push(raw.to_string_lossy().into_owned());
+                        let raw = raw.to_string_lossy().into_owned();
+                        if raw == "--" {
+                            after_separator = true;
+                            args.command.push(raw);
+                            continue;
+                        }
+                        if !after_separator && is_sandbox_long_flag(&raw) {
+                            return Err(format!(
+                                "flag {raw} after command would be passed to the child; put sandbox flags before the command or use --"
+                            ));
+                        }
+                        args.command.push(raw);
                     }
                 }
             }
@@ -353,6 +429,83 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
     }
 
     Ok(args)
+}
+
+fn is_sandbox_long_flag(arg: &str) -> bool {
+    let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
+    matches!(
+        flag,
+        "--private-home"
+            | "--no-private-home"
+            | "--lockdown"
+            | "--no-lockdown"
+            | "--no-display"
+            | "--display"
+            | "--network"
+            | "--no-network"
+            | "--macos-host-ipc"
+            | "--no-macos-host-ipc"
+            | "--no-gpu"
+            | "--gpu"
+            | "--no-docker"
+            | "--docker"
+            | "--tailscale"
+            | "--no-tailscale"
+            | "--landlock"
+            | "--no-landlock"
+            | "--seccomp"
+            | "--no-seccomp"
+            | "--rlimits"
+            | "--no-rlimits"
+            | "--ssh"
+            | "--no-ssh"
+            | "--pictures"
+            | "--no-pictures"
+            | "--clean"
+            | "--exec"
+            | "--dry-run"
+            | "--rw-map"
+            | "--ro-map"
+            | "--overlay-map"
+            | "--map"
+            | "--mask"
+            | "--deny-path"
+            | "--mask-except"
+            | "--deny-path-except"
+            | "--hide-dotdir"
+            | "--allow-tcp-port"
+            | "--systemd-user"
+            | "--no-systemd-user"
+            | "--worktree"
+            | "--no-worktree"
+            | "--browser"
+            | "--no-browser"
+            | "--claude-dir"
+            | "--x11"
+            | "--no-x11"
+            | "--host-shm"
+            | "--no-host-shm"
+            | "--terminal-passthrough"
+            | "--no-terminal-passthrough"
+            | "--agent-state"
+            | "--no-agent-state"
+            | "--inherit-env"
+            | "--no-inherit-env"
+            | "--update-check"
+            | "--no-update-check"
+            | "--env"
+            | "--mise"
+            | "--no-mise"
+            | "--save-config"
+            | "--no-save-config"
+            | "--hide-config"
+            | "--no-hide-config"
+            | "--status-bar"
+            | "--no-status-bar"
+            | "--init"
+            | "--bootstrap"
+            | "--verbose"
+    )
 }
 
 #[cfg(test)]
@@ -556,6 +709,64 @@ mod tests {
     fn parse_display() {
         let args = parse_test(&["--display", "bash"]).unwrap();
         assert_eq!(args.display, Some(true));
+    }
+
+    #[test]
+    fn parse_network_last_wins() {
+        let args = parse_test(&["--network", "--no-network", "bash"]).unwrap();
+        assert_eq!(args.network, Some(false));
+    }
+
+    #[test]
+    fn parse_macos_host_ipc_last_wins() {
+        let args =
+            parse_test(&["--macos-host-ipc", "--no-macos-host-ipc", "bash"])
+                .unwrap();
+        assert_eq!(args.macos_host_ipc, Some(false));
+    }
+
+    #[test]
+    fn sandbox_flag_with_value_after_command_is_rejected() {
+        let error = parse_test(&["claude", "--browser=soft"]).unwrap_err();
+        assert!(error.contains("flag --browser=soft after command"));
+        let error =
+            parse_test(&["claude", "--allow-tcp-port=443"]).unwrap_err();
+        assert!(error.contains("flag --allow-tcp-port=443 after command"));
+    }
+
+    #[test]
+    fn parse_x11() {
+        let args = parse_test(&["--x11", "--no-x11", "bash"]).unwrap();
+        assert_eq!(args.x11, Some(false));
+    }
+
+    #[test]
+    fn parse_host_shm() {
+        let args = parse_test(&["--host-shm", "bash"]).unwrap();
+        assert_eq!(args.host_shm, Some(true));
+    }
+
+    #[test]
+    fn parse_terminal_passthrough() {
+        let args = parse_test(&[
+            "--terminal-passthrough",
+            "--no-terminal-passthrough",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.terminal_passthrough, Some(false));
+    }
+
+    #[test]
+    fn sandbox_flag_after_command_is_rejected() {
+        let error = parse_test(&["claude", "--private-home"]).unwrap_err();
+        assert!(error.contains("flag --private-home after command"));
+    }
+
+    #[test]
+    fn unknown_child_flag_after_command_is_preserved() {
+        let args = parse_test(&["claude", "--foo"]).unwrap();
+        assert_eq!(args.command, vec!["claude", "--foo"]);
     }
 
     #[test]
@@ -1190,5 +1401,68 @@ mod tests {
         let args =
             parse_test(&["--save-config", "--no-save-config", "bash"]).unwrap();
         assert_eq!(args.save_config, Some(false));
+    }
+
+    // ── Trusted capability flags (agent state / env / update) ──
+
+    #[test]
+    fn parse_agent_state_last_wins() {
+        let args = parse_test(&["--agent-state", "bash"]).unwrap();
+        assert_eq!(args.agent_state, Some(true));
+        let args =
+            parse_test(&["--agent-state", "--no-agent-state", "bash"]).unwrap();
+        assert_eq!(args.agent_state, Some(false));
+        let args =
+            parse_test(&["--no-agent-state", "--agent-state", "bash"]).unwrap();
+        assert_eq!(args.agent_state, Some(true));
+    }
+
+    #[test]
+    fn parse_inherit_env_last_wins() {
+        let args =
+            parse_test(&["--inherit-env", "--no-inherit-env", "bash"]).unwrap();
+        assert_eq!(args.inherit_env, Some(false));
+        let args =
+            parse_test(&["--no-inherit-env", "--inherit-env", "bash"]).unwrap();
+        assert_eq!(args.inherit_env, Some(true));
+    }
+
+    #[test]
+    fn parse_update_check_last_wins() {
+        let args = parse_test(&["--update-check", "--no-update-check", "bash"])
+            .unwrap();
+        assert_eq!(args.update_check, Some(false));
+        let args = parse_test(&["--no-update-check", "--update-check", "bash"])
+            .unwrap();
+        assert_eq!(args.update_check, Some(true));
+    }
+
+    #[test]
+    fn parse_env_flag_repeatable_with_name_and_assignment() {
+        let args = parse_test(&[
+            "--env",
+            "ANTHROPIC_API_KEY",
+            "--env",
+            "CUSTOM=value",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.env,
+            vec!["ANTHROPIC_API_KEY".to_string(), "CUSTOM=value".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_env_flag_rejects_empty_name() {
+        assert!(parse_test(&["--env", "", "bash"]).is_err());
+        assert!(parse_test(&["--env", "=value", "bash"]).is_err());
+        assert!(parse_test(&["--env"]).is_err());
+    }
+
+    #[test]
+    fn env_flag_after_command_is_rejected() {
+        let error = parse_test(&["claude", "--env", "SECRET"]).unwrap_err();
+        assert!(error.contains("flag --env after command"));
     }
 }

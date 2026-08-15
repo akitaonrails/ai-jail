@@ -31,7 +31,10 @@
 use crate::config::Config;
 use crate::output;
 use nix::libc;
-use seccompiler::{SeccompAction, SeccompFilter};
+use seccompiler::{
+    SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
+    SeccompFilter, SeccompRule,
+};
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 
@@ -116,14 +119,17 @@ const DENY_ALWAYS: &[i64] = &[
     // access controls — the classic Docker/container escape
     // (CVE-2015-1335). unshare/setns create or join namespaces,
     // potentially escaping the bwrap-created sandbox.
-    // NOTE: clone3 is intentionally NOT blocked here. glibc 2.34+
-    // uses clone3 for pthread_create/fork. Blocking it with EPERM
-    // (not ENOSYS) prevents glibc's fallback to clone(), breaking
-    // all multi-threaded programs. bwrap's namespace isolation
-    // already prevents the clone3 escape vector.
+    // clone3 is blocked separately with ENOSYS below. glibc 2.34+ uses it for
+    // pthread_create/fork and falls back safely to clone() only on ENOSYS;
+    // EPERM would break multi-threaded programs.
     libc::SYS_open_by_handle_at,
     libc::SYS_unshare,
     libc::SYS_setns,
+    // Threat: personality can weaken exploit mitigations by selecting legacy
+    // execution domains or changing address-layout behavior.
+    libc::SYS_personality,
+    // Threat: duplicate another process's fd without a path-based access check.
+    libc::SYS_pidfd_getfd,
     // -- Time modification --
     // Threat: modifying the system clock can break TLS
     // certificate validation (replay attacks), corrupt
@@ -188,10 +194,14 @@ pub fn apply(config: &Config, verbose: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let (bpf, count) = compile_filter(config)?;
+    let (bpf, clone3_bpf, count) = compile_filter(config)?;
 
     seccompiler::apply_filter(&bpf)
         .map_err(|e| format!("Seccomp: failed to install filter: {e}"))?;
+    // glibc falls back to clone() on ENOSYS, but not EPERM, from clone3.
+    seccompiler::apply_filter(&clone3_bpf).map_err(|e| {
+        format!("Seccomp: failed to install clone3 filter: {e}")
+    })?;
 
     if verbose {
         output::verbose(&format!(
@@ -210,7 +220,7 @@ pub fn apply(config: &Config, verbose: bool) -> Result<(), String> {
 
 fn compile_filter(
     config: &Config,
-) -> Result<(seccompiler::BpfProgram, usize), String> {
+) -> Result<(seccompiler::BpfProgram, seccompiler::BpfProgram, usize), String> {
     let lockdown = config.lockdown_enabled();
 
     // Build the syscall → empty rules map (empty vec = match
@@ -230,7 +240,38 @@ fn compile_filter(
         }
     }
 
-    let count = rules.len();
+    // SeccompCondition::new compares Dword syscall arguments. MaskedEq(0xF)
+    // matches SOCK_RAW despite SOCK_CLOEXEC or SOCK_NONBLOCK type flags.
+    let socket_rules = [
+        SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 17),
+        SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 31),
+        SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 15),
+        SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(0xF),
+            libc::SOCK_RAW as u64,
+        ),
+    ]
+    .into_iter()
+    .map(|condition| {
+        condition.and_then(|condition| SeccompRule::new(vec![condition]))
+    })
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| format!("Seccomp: failed to build socket rules: {e}"))?;
+    rules.insert(libc::SYS_socket, socket_rules);
+
+    let tiocsti = SeccompCondition::new(
+        1,
+        SeccompCmpArgLen::Qword,
+        SeccompCmpOp::Eq,
+        libc::TIOCSTI,
+    )
+    .and_then(|condition| SeccompRule::new(vec![condition]))
+    .map_err(|e| format!("Seccomp: failed to build ioctl rules: {e}"))?;
+    rules.insert(libc::SYS_ioctl, vec![tiocsti]);
+
+    let count = rules.len() + 1;
     let arch: seccompiler::TargetArch =
         std::env::consts::ARCH.try_into().map_err(|_| {
             format!(
@@ -253,7 +294,18 @@ fn compile_filter(
         .try_into()
         .map_err(|e| format!("Seccomp: failed to compile BPF: {e}"))?;
 
-    Ok((bpf, count))
+    let clone3_filter = SeccompFilter::new(
+        BTreeMap::from([(libc::SYS_clone3, vec![])]),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        arch,
+    )
+    .map_err(|e| format!("Seccomp: failed to build clone3 filter: {e}"))?;
+    let clone3_bpf = clone3_filter
+        .try_into()
+        .map_err(|e| format!("Seccomp: failed to compile clone3 BPF: {e}"))?;
+
+    Ok((bpf, clone3_bpf, count))
 }
 
 #[cfg(test)]
@@ -263,8 +315,10 @@ mod tests {
     #[test]
     fn filter_compiles_normal_mode() {
         let config = Config::default();
-        let (_, count) = compile_filter(&config).unwrap();
-        assert!(count >= DENY_ALWAYS.len());
+        let (bpf, clone3_bpf, count) = compile_filter(&config).unwrap();
+        assert!(!bpf.is_empty());
+        assert!(!clone3_bpf.is_empty());
+        assert!(count >= DENY_ALWAYS.len() + 2);
     }
 
     #[test]
@@ -273,7 +327,7 @@ mod tests {
             lockdown: Some(true),
             ..Config::default()
         };
-        let (_, count) = compile_filter(&config).unwrap();
+        let (_, _, count) = compile_filter(&config).unwrap();
         assert!(count >= DENY_ALWAYS.len() + DENY_LOCKDOWN.len());
     }
 
@@ -306,5 +360,13 @@ mod tests {
     #[test]
     fn lockdown_blocks_more_than_normal() {
         assert!(!DENY_LOCKDOWN.is_empty());
+    }
+
+    #[test]
+    fn filter_includes_new_deny_rules() {
+        assert!(DENY_ALWAYS.contains(&libc::SYS_personality));
+        assert!(DENY_ALWAYS.contains(&libc::SYS_pidfd_getfd));
+        let (_, clone3_bpf, _) = compile_filter(&Config::default()).unwrap();
+        assert!(!clone3_bpf.is_empty());
     }
 }
