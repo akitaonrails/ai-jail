@@ -416,21 +416,24 @@ fn trusted_claude_dir(dir: &Path) -> bool {
     let Ok(home) = user_home_dir() else {
         return false;
     };
+    // A configured path in the project is project-controlled. This must be
+    // checked before HOME: projects commonly live under HOME (~/Projects/x),
+    // and testing HOME first would trust every in-project path there.
+    if let Ok(project) = std::env::current_dir()
+        && dir.starts_with(&project)
+    {
+        return false;
+    }
     if dir.starts_with(&home) {
         return true;
     }
-    // A configured path in the project is project-controlled. Other external
-    // explicit paths remain supported, but call attention to that choice.
-    match std::env::current_dir() {
-        Ok(project) if dir.starts_with(&project) => false,
-        _ => {
-            output::security_warn(&format!(
-                "Claude bootstrap path {} is outside HOME",
-                dir.display()
-            ));
-            true
-        }
-    }
+    // Other external explicit paths remain supported, but call attention to
+    // that choice.
+    output::security_warn(&format!(
+        "Claude bootstrap path {} is outside HOME",
+        dir.display()
+    ));
+    true
 }
 
 // ── Codex ────────────────────────────────────────────────────────
@@ -1058,6 +1061,23 @@ sandbox_mode = "full"
     fn claude_bootstrap_skips_project_controlled_directory() {
         let project = std::env::current_dir().unwrap().join("untrusted-claude");
         assert!(!trusted_claude_dir(&project));
+    }
+
+    // Regression: HOME containment used to be checked before project
+    // containment, so every in-project path was trusted whenever the
+    // project lived under HOME (~/Projects/x) — the common layout.
+    #[test]
+    fn claude_bootstrap_skips_project_directory_under_home() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let project = std::env::current_dir().unwrap();
+        let Some(parent) = project.parent() else {
+            return;
+        };
+        let _home = EnvVarGuard::set("HOME", parent);
+        // A sibling under HOME stays trusted, which also proves HOME
+        // resolved rather than taking the fail-closed path.
+        assert!(trusted_claude_dir(&parent.join("trusted-claude")));
+        assert!(!trusted_claude_dir(&project.join("untrusted-claude")));
     }
 
     #[cfg(unix)]
