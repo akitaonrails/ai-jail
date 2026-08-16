@@ -1812,8 +1812,10 @@ fn build_mask_mounts(
             project_dir.join(p)
         };
         if !super::path_exists(&target) {
-            output::warn(&format!(
-                "Mask: {} not found, skipping",
+            // A skipped mask is a dropped confidentiality control, so it
+            // must stay visible even under --exec quiet.
+            output::security_warn(&format!(
+                "Mask: {} does not exist; rule not applied",
                 target.display()
             ));
             continue;
@@ -1856,8 +1858,10 @@ fn build_deny_mounts(
             project_dir.join(p)
         };
         if !super::path_exists(&target) {
-            output::warn(&format!(
-                "Deny: {} not found, skipping",
+            // A skipped deny is a dropped confidentiality control, so it
+            // must stay visible even under --exec quiet.
+            output::security_warn(&format!(
+                "Deny: {} does not exist; rule not applied",
                 target.display()
             ));
             continue;
