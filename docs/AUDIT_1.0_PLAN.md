@@ -14,14 +14,14 @@ Goal: ship every Tier 1 + Tier 2 item from `AUDIT_1.0.md` without breaking any o
 
 Six small commits. None of them change observable behavior; all of them are caught by the existing test suite.
 
-| # | Commit | Touches | Net LOC |
-|---|---|---|---|
-| 1 | Add `merge_field!` macro + apply to `config::merge_with_global` | `src/config.rs` | −30 |
-| 2 | Apply `merge_field!` to `config::merge` (CLI → config side) | `src/config.rs` | −20 |
-| 3 | Add CLI `paired_bool_flag!` macro for `--foo / --no-foo` pairs | `src/cli.rs` | −20 |
-| 4 | Have `sbpl_regex_escape` delegate to `sbpl_escape` for the shared char table | `src/sandbox/seatbelt.rs` | −10 |
-| 5 | Lift `LinkedWorktreeFixture` into a shared `tests` submodule in `sandbox/mod.rs` | `src/sandbox/mod.rs`, `seatbelt.rs`, `landlock.rs`, `bwrap.rs` | −60 |
-| 6 | Run all PathBuf fields through `expand_tilde` in one pass in `config::merge` | `src/config.rs` | −5 |
+| #   | Commit                                                                           | Touches                                                        | Net LOC |
+| --- | -------------------------------------------------------------------------------- | -------------------------------------------------------------- | ------- |
+| 1   | Add `merge_field!` macro + apply to `config::merge_with_global`                  | `src/config.rs`                                                | −30     |
+| 2   | Apply `merge_field!` to `config::merge` (CLI → config side)                      | `src/config.rs`                                                | −20     |
+| 3   | Add CLI `paired_bool_flag!` macro for `--foo / --no-foo` pairs                   | `src/cli.rs`                                                   | −20     |
+| 4   | Have `sbpl_regex_escape` delegate to `sbpl_escape` for the shared char table     | `src/sandbox/seatbelt.rs`                                      | −10     |
+| 5   | Lift `LinkedWorktreeFixture` into a shared `tests` submodule in `sandbox/mod.rs` | `src/sandbox/mod.rs`, `seatbelt.rs`, `landlock.rs`, `bwrap.rs` | −60     |
+| 6   | Run all PathBuf fields through `expand_tilde` in one pass in `config::merge`     | `src/config.rs`                                                | −5      |
 
 Expected: ~145 LOC removed, no behavior change. Each commit ends with the full suite green.
 
@@ -29,12 +29,12 @@ Expected: ~145 LOC removed, no behavior change. Each commit ends with the full s
 
 These are rearrangements of existing logic. Each split keeps the same control flow; only function boundaries move. Review visually after each split.
 
-| # | Commit | Function | Approach |
-|---|---|---|---|
-| 7 | Split `config::display_status` | 130 LOC | Each `match config.X { … }` block becomes a `print_X(config)` helper. |
-| 8 | Split `sandbox::seatbelt::generate_sbpl_profile` | 174 LOC | One helper per section (process, IPC, network, reads, writes, atomic, deny). Each helper takes `&mut String` and pushes its own block. |
-| 9 | Split `sandbox::bwrap::discover_mounts` | 178 LOC | Each `let foo_mount = if … { build_foo() } else { vec![] }` block already exists implicitly. Lift each computation into a named `fn discover_foo(config, …) -> Vec<Mount>` helper. |
-| 10 | Split `pty::io_loop` | 277 LOC | Higher risk. Approach: extract `handle_sigwinch`, `handle_master_read`, `handle_stdin_read`, `redraw_when_idle` into private helpers taking `&mut IoState` (a new struct holding the loop's mutable state). The for-loop body becomes ~25 lines calling them. Visually verify against current version. |
+| #   | Commit                                           | Function | Approach                                                                                                                                                                                                                                                                                               |
+| --- | ------------------------------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 7   | Split `config::display_status`                   | 130 LOC  | Each `match config.X { … }` block becomes a `print_X(config)` helper.                                                                                                                                                                                                                                  |
+| 8   | Split `sandbox::seatbelt::generate_sbpl_profile` | 174 LOC  | One helper per section (process, IPC, network, reads, writes, atomic, deny). Each helper takes `&mut String` and pushes its own block.                                                                                                                                                                 |
+| 9   | Split `sandbox::bwrap::discover_mounts`          | 178 LOC  | Each `let foo_mount = if … { build_foo() } else { vec![] }` block already exists implicitly. Lift each computation into a named `fn discover_foo(config, …) -> Vec<Mount>` helper.                                                                                                                     |
+| 10  | Split `pty::io_loop`                             | 277 LOC  | Higher risk. Approach: extract `handle_sigwinch`, `handle_master_read`, `handle_stdin_read`, `redraw_when_idle` into private helpers taking `&mut IoState` (a new struct holding the loop's mutable state). The for-loop body becomes ~25 lines calling them. Visually verify against current version. |
 
 `pty::io_loop` is the riskiest item in this plan. If the split looks like it might subtly change ordering, I'll commit the IoState struct first, run the full suite, then move helpers out one at a time.
 
@@ -42,13 +42,13 @@ These are rearrangements of existing logic. Each split keeps the same control fl
 
 Pure additions; no existing code changes.
 
-| # | Commit | What |
-|---|---|---|
-| 11 | `signals.rs` unit tests | Handler installation succeeds; `forward_signal(SIGWINCH)` flips the PTY pending flag without touching `CHILD_PID`; `forward_signal(SIGINT)` calls into the stored PID branch (mocked via a recordable hook). |
-| 12 | `rlimits::apply_nproc` test | Pin a low NPROC, then call `apply_nproc` and assert via `getrlimit` that hard == soft. Linux-only test, gated `#[cfg(target_os = "linux")]`. |
-| 13 | `hide_config` dedup test | When user already has `.ai-jail` in their `mask`, the auto-append step doesn't produce a duplicate `--ro-bind` triple. |
-| 14 | Browser-profile soft-mode mount existence test | Unit test: given `browser_profile = "soft"`, `discover_mounts` returns a `browser_state` mount pointing at `~/.local/share/ai-jail/browsers/<name>`. |
-| 15 | Lockdown + `allow_tcp_ports` + V4-unavailable failure-mode test | Use the existing apply_net_rules code path; assert the error message contains "Landlock V4" and "lockdown" when V4 is detected as unavailable. Hard to mock cleanly — may have to settle for documenting the path manually. |
+| #   | Commit                                                          | What                                                                                                                                                                                                                        |
+| --- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 11  | `signals.rs` unit tests                                         | Handler installation succeeds; `forward_signal(SIGWINCH)` flips the PTY pending flag without touching `CHILD_PID`; `forward_signal(SIGINT)` calls into the stored PID branch (mocked via a recordable hook).                |
+| 12  | `rlimits::apply_nproc` test                                     | Pin a low NPROC, then call `apply_nproc` and assert via `getrlimit` that hard == soft. Linux-only test, gated `#[cfg(target_os = "linux")]`.                                                                                |
+| 13  | `hide_config` dedup test                                        | When user already has `.ai-jail` in their `mask`, the auto-append step doesn't produce a duplicate `--ro-bind` triple.                                                                                                      |
+| 14  | Browser-profile soft-mode mount existence test                  | Unit test: given `browser_profile = "soft"`, `discover_mounts` returns a `browser_state` mount pointing at `~/.local/share/ai-jail/browsers/<name>`.                                                                        |
+| 15  | Lockdown + `allow_tcp_ports` + V4-unavailable failure-mode test | Use the existing apply_net_rules code path; assert the error message contains "Landlock V4" and "lockdown" when V4 is detected as unavailable. Hard to mock cleanly — may have to settle for documenting the path manually. |
 
 ## Phase 4 — Tier 2 cleanup
 
@@ -78,18 +78,18 @@ If everything's green: bump `Cargo.toml` to `1.0.0`, commit, tag, push, manually
 
 Conservatively, working sequentially with full test cycles between commits:
 
-| Phase | Commits | Estimate |
-|---|---|---|
-| 1 — boilerplate | 6 | 1 h |
-| 2 — function splits | 4 | 2 h (most of which is `io_loop`) |
-| 3 — test gaps | 5 | 1 h |
-| 4 — Tier 2 cleanup | 1 | 45 min |
-| 5 — release | 1 | 15 min |
-| **total** | **17 commits** | **~5 h** |
+| Phase               | Commits        | Estimate                         |
+| ------------------- | -------------- | -------------------------------- |
+| 1 — boilerplate     | 6              | 1 h                              |
+| 2 — function splits | 4              | 2 h (most of which is `io_loop`) |
+| 3 — test gaps       | 5              | 1 h                              |
+| 4 — Tier 2 cleanup  | 1              | 45 min                           |
+| 5 — release         | 1              | 15 min                           |
+| **total**           | **17 commits** | **~5 h**                         |
 
 Suggested workflow: run this end-to-end and report at the end of each phase (4 reports + a final tag-ready summary). At any phase boundary, review the master diff and stop or redo if needed.
 
-## What I'm explicitly *not* doing
+## What I'm explicitly _not_ doing
 
 - Async rewrite of `io_loop` (Tier 3)
 - Typed error enum replacing `Result<_, String>` (Tier 3)
