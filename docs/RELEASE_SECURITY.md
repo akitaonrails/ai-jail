@@ -5,15 +5,15 @@ Before enabling a release, repository administrators must:
 1. Protect `master` and require reviewed, passing changes.
 2. Add a `v*` tag ruleset that restricts tag creation and mutation.
 3. Require signed annotated release tags and make tags/releases immutable.
-4. Create protected `release-signing` and `release-publish` environments with
-   required reviewers. Keep Apple credentials only in `release-signing`; keep
-   publishing credentials only in `release-publish`. Restrict both to a `v*`
-   tag deployment branch policy so no other ref can reach those secrets.
-   `prevent_self_review` requires a reviewer who is not the actor, so it is
-   only usable once a second trusted maintainer exists; with a single
-   maintainer the approval gate is still valuable (it stops an automated or
-   compromised push from publishing unattended) but cannot be self-review
-   free.
+4. Create separate `release-signing` and `release-publish` environments and
+   restrict both to a `v*` tag deployment branch policy, so no branch or
+   other ref can reach their secrets. Keep Apple credentials only in
+   `release-signing`; keep publishing credentials only in `release-publish`.
+   Required reviewers are deliberately **not** used: this project has a
+   single owner and maintainer, so an approval gate could only ever be
+   self-approved, adding a manual pause to every release for no security
+   gain. Add reviewers (and `prevent_self_review`) only if a second trusted
+   maintainer ever exists.
 5. Restrict GitHub Actions to an allowlist, review action SHA updates, and keep
    workflow permissions minimal.
 6. Configure automated cryptographic tag verification: place ASCII-armored
@@ -42,37 +42,53 @@ keyring is configured.
 
 ## Current status (as of v1.18.0)
 
-Done:
+Configured:
 
-- Item 4, partially: both environments exist with a required reviewer and a
-  `v*` tag deployment branch policy, so only `v*` tag runs can reach them.
-- Item 8: enforced by the publish job.
-- Tag-only triggers, SHA-pinned actions, pinned toolchain, and `--locked`
-  builds are in the workflows.
+- **Item 4 (structure).** `release-signing` and `release-publish` exist, with
+  no approval gate and a `v*` tag deployment branch policy, so only `v*` tag
+  runs can reach them.
+- **Item 5.** Actions are restricted to an allowlist: GitHub-owned actions
+  (which also covers CodeQL default setup) plus `dtolnay/rust-toolchain@*`.
+  Every `uses:` in this repository is SHA-pinned. Default workflow
+  permissions are read-only.
+- **Item 8.** Enforced by the publish job.
+- Tag-only release triggers, a pinned toolchain, and `--locked` builds.
+
+Deliberately skipped for a single-maintainer project:
+
+- **Item 1, requiring reviewed pull requests on `master`.** Releases commit
+  directly to `master`; a self-approved PR gate adds friction without
+  changing who can push.
+- **A `v*` tag mutation ruleset.** The owner would hold bypass, so it would
+  not constrain the only actor who can push tags, while blocking the
+  legitimate re-tagging a failed release run requires.
+
+Revisit both if a second maintainer or an untrusted CI identity is ever
+added.
 
 Outstanding, in the order worth doing:
 
 1. **Scope the secrets (finishes item 4).** All eight secrets are still
    repository-level, so every job in every workflow can read them; the
-   environments gate *deployment*, not secret visibility. Secret values
-   cannot be copied by tooling — they are write-only — so re-enter them at
-   environment scope and delete the repository copies:
+   environments gate *deployment*, not secret visibility. This is the
+   highest-value remaining step. Secret values cannot be copied by tooling —
+   they are write-only — so re-enter them at environment scope and delete the
+   repository copies:
    `gh secret set APPLE_CERTIFICATE --env release-signing` (and
    `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`,
    `APPLE_PASSWORD`, `APPLE_TEAM_ID`), then `CARGO_REGISTRY_TOKEN` and
    `HOMEBREW_TAP_TOKEN` with `--env release-publish`, then
    `gh secret delete <NAME>` for each repository-level copy.
 2. **Item 6, the release keyring.** Until it exists every release logs
-   "tag signature NOT cryptographically verified". Generate or choose a
-   signing key, `git config user.signingkey` and `tag.gpgsign true`, export
-   the public key to `.github/release-keyring/<name>.asc`, and list the
-   40-hex primary fingerprint in `.github/release-keyring/fingerprints.txt`.
-   Releases before this are unsigned, including v1.18.0.
-3. **Items 1-3, branch and tag rulesets.** Note that releases currently
-   commit straight to `master`, so requiring pull requests changes that
-   workflow; a ruleset restricting `v*` tag creation and mutation, plus
-   immutable releases, is the higher-value half and does not disrupt it.
-4. **Item 5, Actions allowlist.** Restrict to the SHA-pinned actions already
-   in use.
-5. **Item 7, crates.io trusted publishing.** Migrate to OIDC and drop
+   "tag signature NOT cryptographically verified". Choose a signing key,
+   `git config user.signingkey <id>` and `git config tag.gpgsign true`,
+   export the public key to `.github/release-keyring/<name>.asc`, and list
+   the 40-hex primary fingerprint in
+   `.github/release-keyring/fingerprints.txt`. Releases before this are
+   unsigned, including v1.18.0. Once signing is in place, a `v*` ruleset
+   requiring signed tags becomes worthwhile even solo, because it turns the
+   convention into an enforced invariant.
+3. **Item 3, immutable releases.** Not settable through the REST API on this
+   repository; enable it in Settings if and when GitHub exposes it here.
+4. **Item 7, crates.io trusted publishing.** Migrate to OIDC and drop
    `CARGO_REGISTRY_TOKEN` entirely; until then rotate it.
