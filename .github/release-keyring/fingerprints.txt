@@ -1,0 +1,3 @@
+# Pinned ai-jail release signing keys (40-hex primary fingerprints).
+# AkitaOnRails (ai-jail release signing) <boss@akitaonrails.com>, ed25519, expires 2028-08-15
+268CBE5E8B2D39185E982A51025FFD4C6B0A7DB9

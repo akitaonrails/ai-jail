@@ -51,6 +51,12 @@ Configured:
   (which also covers CodeQL default setup) plus `dtolnay/rust-toolchain@*`.
   Every `uses:` in this repository is SHA-pinned. Default workflow
   permissions are read-only.
+- **Item 6.** A pinned release key lives in `.github/release-keyring/`
+  (`ai-jail-release.asc` plus its 40-hex fingerprint in `fingerprints.txt`),
+  and `tag.gpgsign` is enabled for this repository, so CI cryptographically
+  verifies each `v*` tag against that key. First verified release: v1.18.1.
+  The key expires 2028-08-15 — rotate before then by adding the replacement
+  fingerprint to `fingerprints.txt` alongside the old one.
 - **Item 8.** Enforced by the publish job.
 - Tag-only release triggers, a pinned toolchain, and `--locked` builds.
 
@@ -79,15 +85,11 @@ Outstanding, in the order worth doing:
    `APPLE_PASSWORD`, `APPLE_TEAM_ID`), then `CARGO_REGISTRY_TOKEN` and
    `HOMEBREW_TAP_TOKEN` with `--env release-publish`, then
    `gh secret delete <NAME>` for each repository-level copy.
-2. **Item 6, the release keyring.** Until it exists every release logs
-   "tag signature NOT cryptographically verified". Choose a signing key,
-   `git config user.signingkey <id>` and `git config tag.gpgsign true`,
-   export the public key to `.github/release-keyring/<name>.asc`, and list
-   the 40-hex primary fingerprint in
-   `.github/release-keyring/fingerprints.txt`. Releases before this are
-   unsigned, including v1.18.0. Once signing is in place, a `v*` ruleset
-   requiring signed tags becomes worthwhile even solo, because it turns the
-   convention into an enforced invariant.
+2. **A `v*` ruleset requiring signed tags.** Now that signing is in place
+   this is worth adding even with one maintainer, because it turns the
+   signing convention into an enforced invariant rather than a habit. Add it
+   once the current release flow has settled, since it also blocks the
+   re-tagging a failed release run needs.
 3. **Item 3, immutable releases.** Not settable through the REST API on this
    repository; enable it in Settings if and when GitHub exposes it here.
 4. **Item 7, crates.io trusted publishing.** Migrate to OIDC and drop
