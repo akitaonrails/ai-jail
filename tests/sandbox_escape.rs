@@ -194,6 +194,12 @@ fn lockdown_run(args: &[&str]) -> Output {
 fn assert_blocked(output: &Output, test_name: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(2)
+        && (stdout.contains("SKIPPED") || stderr.contains("SKIPPED"))
+    {
+        eprintln!("SKIPPED: {test_name} (prerequisites not available)");
+        return;
+    }
     assert!(
         stdout.contains("BLOCKED"),
         "{test_name}: expected BLOCKED, got stdout={stdout:?} \

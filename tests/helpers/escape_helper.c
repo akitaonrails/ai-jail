@@ -26,9 +26,16 @@
 #include <sys/personality.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+static int is_directory(const char *path)
+{
+    struct stat st;
+    return (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+}
 
 #define BLOCKED() \
     do { puts("BLOCKED"); exit(0); } while (0)
@@ -208,21 +215,34 @@ static void test_network(void)
 }
 
 /*
- * Try to create a file in /usr (read-only system directory).
- * Blocked by bwrap ro-bind mount + Landlock ro rules.
+ * Attempt to create a file in a read-only system directory (/usr, /nix, or /etc).
+ * Blocked by bwrap ro-bind mount and Landlock ro rules.
  */
 static void test_write_sys(void)
 {
     errno = 0;
-    FILE *f = fopen("/usr/.sandbox_test", "w");
+    const char *target = NULL;
+    if (is_directory("/usr"))
+        target = "/usr/.sandbox_test";
+    else if (is_directory("/nix"))
+        target = "/nix/.sandbox_test";
+    else if (is_directory("/etc"))
+        target = "/etc/.sandbox_test";
+
+    if (target == NULL) {
+        fprintf(stderr, "SKIPPED: no system directory (/usr, /nix, /etc) available to test\n");
+        exit(2);
+    }
+
+    FILE *f = fopen(target, "w");
     if (f == NULL) {
         if (errno == EPERM || errno == EACCES || errno == EROFS)
             BLOCKED();
         ALLOWED("(fopen errno=%d)", errno);
     }
     fclose(f);
-    unlink("/usr/.sandbox_test");
-    ALLOWED("(file created in /usr!)");
+    unlink(target);
+    ALLOWED("(file created in %s!)", target);
 }
 
 int main(int argc, char *argv[])

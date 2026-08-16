@@ -7,22 +7,22 @@ hostile workloads.
 
 ## Defaults and explicit capabilities
 
-| Capability | Linux default | macOS default | Explicit opt-in and risk |
-|---|---|---|---|
-| Private home | on | on | `--no-private-home` grants broad host-home visibility; prefer command-specific state or maps. |
-| Network | off | off | `--network` permits unrestricted traffic and therefore full network exfiltration of readable data. |
-| GPU | off | n/a | `--gpu` exposes host GPU devices/driver attack surface. |
-| Wayland | off | n/a | `--display` exposes only the validated Wayland socket, not all of `XDG_RUNTIME_DIR`. |
-| X11 | off | n/a | `--x11` permits X11 keylogging and screenshots. |
-| Host shared memory | off | n/a | `--host-shm` enables host cross-process IPC. |
-| Raw terminal protocol | filtered | filtered | `--terminal-passthrough` restores clipboard/query/parser surface; agent output passes through a filtering VT parser by default. |
-| Agent credential state | off | off | `--agent-state` mounts the invoked agent's credential state (for example Claude's `~/.claude`) on Linux and macOS; anything in the sandbox can then use those credentials. |
-| Environment variables | minimal allowlist | minimal allowlist | `--env NAME[=VALUE]` adds named variables; `--inherit-env` passes the entire parent environment, secrets included. |
-| Update check | off | off | `--update-check` enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active; all other launches make no network requests. |
-| macOS host IPC | n/a | off | `--macos-host-ipc` permits Mach, IOKit, and host IPC exposure. |
-| Linked-worktree metadata | off | off | `--worktree` exposes validated common metadata read-only. |
-| Docker | off | off | `--docker` is root-equivalent through the daemon. |
-| systemd user bus | off | n/a | `--systemd-user` can ask the host user manager to run services. |
+| Capability               | Linux default     | macOS default     | Explicit opt-in and risk                                                                                                                                                                     |
+| ------------------------ | ----------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Private home             | on                | on                | `--no-private-home` grants broad host-home visibility; prefer command-specific state or maps.                                                                                                |
+| Network                  | off               | off               | `--network` permits unrestricted traffic and therefore full network exfiltration of readable data.                                                                                           |
+| GPU                      | off               | n/a               | `--gpu` exposes host GPU devices/driver attack surface.                                                                                                                                      |
+| Wayland                  | off               | n/a               | `--display` exposes only the validated Wayland socket, not all of `XDG_RUNTIME_DIR`.                                                                                                         |
+| X11                      | off               | n/a               | `--x11` permits X11 keylogging and screenshots.                                                                                                                                              |
+| Host shared memory       | off               | n/a               | `--host-shm` enables host cross-process IPC.                                                                                                                                                 |
+| Raw terminal protocol    | filtered          | filtered          | `--terminal-passthrough` restores clipboard/query/parser surface; agent output passes through a filtering VT parser by default.                                                              |
+| Agent credential state   | off               | off               | `--agent-state` mounts the invoked agent's credential state (for example Claude's `~/.claude`) on Linux and macOS; anything in the sandbox can then use those credentials.                   |
+| Environment variables    | minimal allowlist | minimal allowlist | `--env NAME[=VALUE]` adds named variables; `--inherit-env` passes the entire parent environment, secrets included.                                                                           |
+| Update check             | off               | off               | `--update-check` enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active; all other launches make no network requests. |
+| macOS host IPC           | n/a               | off               | `--macos-host-ipc` permits Mach, IOKit, and host IPC exposure.                                                                                                                               |
+| Linked-worktree metadata | off               | off               | `--worktree` exposes validated common metadata read-only.                                                                                                                                    |
+| Docker                   | off               | off               | `--docker` is root-equivalent through the daemon.                                                                                                                                            |
+| systemd user bus         | off               | n/a               | `--systemd-user` can ask the host user manager to run services.                                                                                                                              |
 
 `--display` does not imply X11: X11 needs `--x11`. `--browser` reuses an
 isolated profile but still requires explicit `--network` and, on Linux,
@@ -54,9 +54,9 @@ settable per command in `~/.ai-jail`). Use
 ## Platform notes and residual risks
 
 Linux combines bubblewrap namespaces with Landlock, seccomp, and resource
-limits where available. `BWRAP_BIN` must resolve canonically to a root-owned,
-executable file that is not group- or world-writable. A normally protected Nix
-store executable satisfies this requirement.
+limits where available. `BWRAP_BIN` must resolve canonically either to a
+root-owned executable with no group- or world-write bits, or to a non-root
+executable under `/nix/store` with no write bits at all.
 
 macOS starts with no global reads, network, or host IPC, and supports the same
 opt-in `--agent-state` credential mounts as Linux; `--overlay-map` is honored

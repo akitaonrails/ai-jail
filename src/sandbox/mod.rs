@@ -1609,6 +1609,7 @@ mod tests {
 
     #[test]
     fn browser_soft_profile_uses_ai_jail_state_dir() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let cfg = Config {
             command: vec!["chromium".into()],
             browser_profile: Some("soft".into()),

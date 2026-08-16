@@ -539,8 +539,13 @@ const LOCAL_SHARE_RW: &[&str] = &[
 ];
 
 const BWRAP_ENV_VAR: &str = "BWRAP_BIN";
-const BWRAP_CANDIDATES: &[&str] =
-    &["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"];
+const BWRAP_CANDIDATES: &[&str] = &[
+    "/usr/bin/bwrap",
+    "/bin/bwrap",
+    "/usr/local/bin/bwrap",
+    "/run/wrappers/bin/bwrap",
+    "/run/current-system/sw/bin/bwrap",
+];
 
 /// Fixed path inside the sandbox where ai-jail is bind-mounted
 /// for the Landlock wrapper.  Lives under /tmp (always a fresh
@@ -575,6 +580,15 @@ pub(crate) fn bwrap_binary_path() -> Result<PathBuf, String> {
         let p = PathBuf::from(candidate);
         if let Some(path) = trusted_bwrap_path(&p) {
             return Ok(path);
+        }
+    }
+
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("bwrap");
+            if let Some(path) = trusted_bwrap_path(&candidate) {
+                return Ok(path);
+            }
         }
     }
 
@@ -617,16 +631,32 @@ fn should_use_new_session() -> bool {
 fn trusted_bwrap_path(path: &Path) -> Option<PathBuf> {
     let canonical = path.canonicalize().ok()?;
     let metadata = canonical.metadata().ok()?;
+    let in_nix_store = canonical.starts_with("/nix/store");
     trusted_binary_metadata(
         metadata.file_type().is_file(),
         metadata.uid(),
         metadata.mode(),
+        in_nix_store,
     )
     .then_some(canonical)
 }
 
-fn trusted_binary_metadata(is_file: bool, uid: u32, mode: u32) -> bool {
-    is_file && uid == 0 && mode & 0o111 != 0 && mode & 0o022 == 0
+fn trusted_binary_metadata(
+    is_file: bool,
+    uid: u32,
+    mode: u32,
+    in_nix_store: bool,
+) -> bool {
+    if !is_file || mode & 0o111 == 0 {
+        return false;
+    }
+    if uid == 0 {
+        mode & 0o022 == 0
+    } else if in_nix_store {
+        mode & 0o222 == 0
+    } else {
+        false
+    }
 }
 
 fn new_hosts_file() -> Result<(PathBuf, std::fs::File), String> {
@@ -1893,6 +1923,33 @@ fn build_deny_mounts(
     mounts
 }
 
+fn optional_ro_bind(path: &Path) -> Option<Mount> {
+    if path.is_dir() {
+        let path = path.to_path_buf();
+        Some(Mount::RoBind {
+            src: path.clone(),
+            dest: path,
+        })
+    } else {
+        None
+    }
+}
+
+fn path_resolves_under(path: &Path, prefix: &Path) -> bool {
+    path.starts_with(prefix)
+        || path
+            .canonicalize()
+            .is_ok_and(|canonical| canonical.starts_with(prefix))
+}
+
+fn needs_nix_mount(hosts_dest: &Path, nix_root: &Path) -> bool {
+    path_resolves_under(hosts_dest, nix_root)
+        || std::env::current_exe()
+            .is_ok_and(|p| path_resolves_under(&p, nix_root))
+        || std::env::var_os(BWRAP_ENV_VAR)
+            .is_some_and(|p| path_resolves_under(Path::new(&p), nix_root))
+}
+
 fn discover_base(
     hosts_mount: (&Path, &Path),
     resolv_mount: Option<(&Path, &Path)>,
@@ -1913,10 +1970,11 @@ fn discover_base_with_nix_root(
     nix_root: &Path,
 ) -> Vec<Mount> {
     let (hosts_file, hosts_dest) = hosts_mount;
-    let mut mounts = vec![Mount::RoBind {
-        src: "/usr".into(),
-        dest: "/usr".into(),
-    }];
+    let mut mounts = Vec::new();
+
+    if let Some(m) = optional_ro_bind(Path::new("/usr")) {
+        mounts.push(m);
+    }
 
     // /bin, /lib, /lib64, /sbin: on merged-/usr distros these are
     // symlinks to /usr/* and we recreate the symlink inside the
@@ -1944,34 +2002,28 @@ fn discover_base_with_nix_root(
         // else: does not exist, skip
     }
 
-    // On NixOS, /etc/hosts can be a symlink into /nix/store.
-    // The private hosts bind below is in the base group, before user
-    // --map/ro_maps are applied, so mount /nix early when the resolved
-    // destination needs it.
-    if hosts_dest.starts_with(nix_root) && nix_root.is_dir() {
-        mounts.push(Mount::RoBind {
-            src: nix_root.to_path_buf(),
-            dest: nix_root.to_path_buf(),
-        });
+    // On NixOS and Nix environments, /etc/hosts can be a symlink into /nix/store,
+    // or ai-jail/bwrap itself runs from /nix/store and requires its dynamic
+    // dependencies.
+    if needs_nix_mount(hosts_dest, nix_root) {
+        mounts.extend(optional_ro_bind(nix_root));
     }
 
+    if let Some(m) = optional_ro_bind(Path::new("/etc")) {
+        mounts.push(m);
+    }
+    mounts.push(Mount::FileRoBind {
+        src: hosts_file.to_path_buf(),
+        dest: hosts_dest.to_path_buf(),
+    });
+    // /opt is optional on some hosts; bwrap rejects missing bind sources.
+    if let Some(m) = optional_ro_bind(Path::new("/opt")) {
+        mounts.push(m);
+    }
+    if let Some(m) = optional_ro_bind(Path::new("/sys")) {
+        mounts.push(m);
+    }
     mounts.extend([
-        Mount::RoBind {
-            src: "/etc".into(),
-            dest: "/etc".into(),
-        },
-        Mount::FileRoBind {
-            src: hosts_file.to_path_buf(),
-            dest: hosts_dest.to_path_buf(),
-        },
-        Mount::RoBind {
-            src: "/opt".into(),
-            dest: "/opt".into(),
-        },
-        Mount::RoBind {
-            src: "/sys".into(),
-            dest: "/sys".into(),
-        },
         Mount::Dev {
             dest: "/dev".into(),
         },
@@ -2813,6 +2865,28 @@ mod tests {
             dest: "/tmp".into(),
         };
         assert_eq!(m.to_args(), vec!["--bind", "/tmp", "/tmp"]);
+    }
+
+    #[test]
+    fn optional_ro_bind_mounts_directories_and_skips_other_paths() {
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-optional-ro-bind-{}", std::process::id()));
+        let directory = root.join("directory");
+        let file = root.join("file");
+        let missing = root.join("missing");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(&file, b"not a directory").unwrap();
+
+        assert!(matches!(
+            optional_ro_bind(&directory),
+            Some(Mount::RoBind { src, dest })
+                if src == directory && dest == directory
+        ));
+        assert!(optional_ro_bind(&file).is_none());
+        assert!(optional_ro_bind(&missing).is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3893,6 +3967,17 @@ mod tests {
             .any(|w| w[0] == "--ro-bind" && w[1] == p && w[2] == p)
     }
 
+    fn prepend_path(dir: &Path) -> std::ffi::OsString {
+        std::env::var_os("PATH").map_or_else(
+            || dir.as_os_str().to_os_string(),
+            |old| {
+                let mut paths = vec![dir.to_path_buf()];
+                paths.extend(std::env::split_paths(&old));
+                std::env::join_paths(paths).unwrap()
+            },
+        )
+    }
+
     #[test]
     fn private_home_binds_command_binary_from_home() {
         // Regression for #81: `ai-jail --private-home claude` must be
@@ -3901,7 +3986,7 @@ mod tests {
         let home = installer_layout_home("private");
         let _home = EnvVarGuard::set("HOME", &home);
         let _path =
-            EnvVarGuard::set("PATH", home.join(".local/bin").as_os_str());
+            EnvVarGuard::set("PATH", prepend_path(&home.join(".local/bin")));
 
         let config = Config {
             command: vec!["agent".into()],
@@ -3937,7 +4022,7 @@ mod tests {
         let home = installer_layout_home("lockdown");
         let _home = EnvVarGuard::set("HOME", &home);
         let _path =
-            EnvVarGuard::set("PATH", home.join(".local/bin").as_os_str());
+            EnvVarGuard::set("PATH", prepend_path(&home.join(".local/bin")));
 
         let config = Config {
             command: vec!["agent".into()],
@@ -5255,11 +5340,33 @@ mod tests {
     }
 
     #[test]
-    fn trusted_bwrap_metadata_requires_root_nonwritable_executable() {
-        assert!(trusted_binary_metadata(true, 0, 0o755));
-        assert!(!trusted_binary_metadata(true, 1000, 0o755));
-        assert!(!trusted_binary_metadata(true, 0, 0o775));
-        assert!(!trusted_binary_metadata(true, 0, 0o644));
+    fn trusted_bwrap_metadata_requires_root_or_nix_store_nonwritable_executable()
+     {
+        assert!(trusted_binary_metadata(true, 0, 0o755, false));
+        assert!(trusted_binary_metadata(true, 1000, 0o555, true));
+        assert!(!trusted_binary_metadata(true, 1000, 0o755, true));
+        assert!(!trusted_binary_metadata(true, 1000, 0o555, false));
+        assert!(!trusted_binary_metadata(true, 0, 0o775, false));
+        assert!(!trusted_binary_metadata(true, 0, 0o644, false));
+    }
+
+    #[test]
+    fn needs_nix_mount_triggers_for_nix_hosts_dest() {
+        let nix = Path::new("/nix");
+        let hosts_in_nix = Path::new("/nix/store/1234-hosts/hosts");
+        assert!(needs_nix_mount(hosts_in_nix, nix));
+
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-nix-mount-test-{}", std::process::id()));
+        let nix_dir = root.join("nix/store/pkg");
+        let symlink = root.join("symlink-to-nix");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&nix_dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&nix_dir, &symlink).unwrap();
+
+        assert!(path_resolves_under(&symlink, &root.join("nix")));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
