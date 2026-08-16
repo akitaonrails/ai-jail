@@ -44,7 +44,12 @@ jobs:
           [ "$cargo_version" = "$version" ] || {
             echo "Cargo.toml version does not match tag" >&2; exit 1;
           }
-          if ls .github/release-keyring/*.asc .github/release-keyring/*.gpg >/dev/null 2>&1; then
+          # Do not use `ls a.asc *.gpg`: an unmatched glob stays literal and
+          # makes ls exit non-zero even when the other key file exists, which
+          # silently skipped verification whenever only one format was present.
+          release_keys="$(find .github/release-keyring -maxdepth 1 -type f \
+            \( -name '*.asc' -o -name '*.gpg' \) 2>/dev/null)"
+          if [ -n "$release_keys" ]; then
             keyring_home="$(mktemp -d)"
             pinned="$(mktemp)"
             trap 'rm -rf "$keyring_home" "$pinned" verify-tag.log' EXIT
