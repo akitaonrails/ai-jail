@@ -28,7 +28,14 @@ jobs:
           }
           version="${TAG#v}"
           [ "$(printf '%s' "$version" | tr -cd '.' | wc -c | tr -d ' ')" = 2 ]
-          git cat-file -e "${TAG}^{tag}" || { echo "Lightweight tag refused" >&2; exit 1; }
+          # actions/checkout materializes the checked-out tag as a local
+          # lightweight tag, so fetch the real object before inspecting it.
+          # Without this, annotated tags look lightweight and git verify-tag
+          # below has no tag object to check.
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          git cat-file -e "${TAG}^{tag}" 2>/dev/null || {
+            echo "Lightweight tag refused" >&2; exit 1;
+          }
           git fetch origin master --no-tags
           git merge-base --is-ancestor "$SHA" origin/master || {
             echo "Tag commit is not reachable from origin/master" >&2; exit 1;
