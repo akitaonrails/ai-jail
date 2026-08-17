@@ -312,8 +312,20 @@ fn push_static_sections(profile: &mut String, allow_host_ipc: bool) {
     profile
         .push_str("(allow file-read* file-write* (literal \"/dev/ptmx\"))\n");
     profile.push_str(
-        "(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+\"))\n\n",
+        "(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+\"))\n",
     );
+    // Scoped to the PTY device nodes only (not the broad
+    // --macos-host-ipc file-ioctl grant below). Without this, any
+    // ioctl on the child's own controlling terminal -- including
+    // TIOCGETD/TIOCSETA, which Node's tty.setRawMode() and libc's
+    // stty/tcsetattr need -- is denied under (deny default). The
+    // child then can't switch its stdin into raw mode: canonical
+    // (cooked) line discipline still delivers plain Enter as a
+    // normal line, but special key encodings (e.g. Shift+Enter's
+    // xterm/kitty CSI sequences) are never intercepted and instead
+    // show up as literal bytes in whatever reads the line.
+    profile.push_str("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+\"))\n");
+    profile.push_str("(allow file-ioctl (literal \"/dev/ptmx\"))\n\n");
 
     profile.push_str("; Standard devices\n");
     profile.push_str("(allow file-write* (literal \"/dev/null\"))\n");
@@ -1346,6 +1358,61 @@ mod tests {
                 "must not grant subpath / (would expose everything, {mode})"
             );
         }
+    }
+
+    #[test]
+    fn static_section_grants_ioctl_on_pty_devices() {
+        // Without this, any ioctl on the child's own controlling
+        // terminal (TIOCGETD/TIOCSETA -- what tty.setRawMode() and
+        // stty/tcsetattr need) is denied under (deny default). The
+        // child then can't switch its stdin into raw mode: canonical
+        // line discipline still delivers plain Enter as a normal
+        // line, but special key encodings (Shift+Enter's xterm/kitty
+        // CSI sequences) are never intercepted and show up as
+        // literal bytes instead.
+        let profile = generate_sbpl_profile(
+            &Config::default(),
+            &PathBuf::from("/tmp/test-project"),
+        );
+        assert!(
+            profile
+                .contains("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+\"))")
+        );
+        assert!(profile.contains("(allow file-ioctl (literal \"/dev/ptmx\"))"));
+    }
+
+    #[test]
+    fn stty_ioctl_on_pty_succeeds_under_generated_profile() {
+        // Regression for the bug above, exercised for real: allocate
+        // an actual PTY, attach it as the sandboxed child's stdin, and
+        // confirm `stty -a` can query it (TIOCGETD et al.) instead of
+        // failing with "Operation not permitted".
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let config = Config::default();
+        let project = PathBuf::from("/tmp/test-project");
+        let profile = generate_sbpl_profile(&config, &project);
+
+        let pty = nix::pty::openpty(None, None).expect("openpty");
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("--")
+            .arg("/bin/stty")
+            .arg("-a")
+            .stdin(pty.slave)
+            .output()
+            .expect("failed to run sandbox-exec");
+        drop(pty.master);
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Operation not permitted"),
+            "stty ioctl on the child's controlling PTY was denied: \
+             status={:?} stderr={stderr} profile:\n{profile}",
+            output.status,
+        );
     }
 
     #[test]
