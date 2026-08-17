@@ -235,6 +235,7 @@ fn generate_sbpl_profile(config: &Config, project_dir: &Path) -> String {
         &writable_paths,
         &atomic_paths,
         &write_deny_paths,
+        crate::command::effective_name(&config.command) == Some("claude"),
     );
     push_docker_section(&mut profile, docker_active(config, lockdown));
 
@@ -358,6 +359,17 @@ fn push_file_read_section(
     // dyld needs the root node to resolve absolute paths. This literal rule
     // does not grant any filesystem subtree.
     profile.push_str("(allow file-read* (literal \"/\"))\n");
+    if crate::command::effective_name(&config.command) == Some("claude") {
+        // /tmp is a symlink into /private/tmp; push_path_rule
+        // canonicalizes every path it emits, so the write grant for
+        // Claude Code's /tmp/claude-<uid> below never covers the /tmp
+        // symlink node itself -- only its resolved target. Resolving
+        // a symlink needs a separate kernel read-metadata check on
+        // the symlink node, so without this, the mkdir Claude Code
+        // does via the literal "/tmp/..." path (not "/private/tmp/...")
+        // still gets EPERM even with the write rule below in place.
+        profile.push_str("(allow file-read* (literal \"/tmp\"))\n");
+    }
     for rd_path in macos_read_paths(config, project_dir) {
         push_path_rule(profile, "allow", "file-read*", &rd_path);
     }
@@ -374,6 +386,7 @@ fn push_file_write_section(
     writable_paths: &[PathBuf],
     atomic_paths: &[PathBuf],
     deny_paths: &[PathBuf],
+    is_claude: bool,
 ) {
     if lockdown {
         for deny_path in deny_paths {
@@ -385,6 +398,23 @@ fn push_file_write_section(
     profile.push_str("; File writes: allow specific paths\n");
     for wr_path in writable_paths {
         push_path_rule(profile, "allow", "file-write*", wr_path);
+    }
+    if is_claude {
+        // Claude Code hardcodes a working directory at
+        // /tmp/claude-<uid> (session/tool-output scratch state) and
+        // creates it unconditionally at startup -- ignoring $TMPDIR,
+        // which is otherwise how this sandbox hands out scratch
+        // space (see macos_session_tmpdir). Without *some* write
+        // access to that exact path, that first mkdir throws and
+        // Claude Code never gets past its own startup, regardless of
+        // --rw-map:
+        //   EPERM: operation not permitted, mkdir '/tmp/claude-501'
+        // Scoped to just this one Claude-specific naming pattern
+        // (not a general /private/tmp grant) so it doesn't require
+        // -- or interact with -- --rw-map /tmp at all.
+        profile.push_str(
+            "(allow file-write* (regex #\"^/private/tmp/claude-[0-9]+(/.*)?$\"))\n",
+        );
     }
     if !atomic_paths.is_empty() {
         profile.push('\n');
@@ -1412,6 +1442,80 @@ mod tests {
             "stty ioctl on the child's controlling PTY was denied: \
              status={:?} stderr={stderr} profile:\n{profile}",
             output.status,
+        );
+    }
+
+    #[test]
+    fn claude_profile_grants_tmp_claude_dir_write_and_tmp_symlink_read() {
+        // Claude Code hardcodes mkdir('/tmp/claude-<uid>') at startup,
+        // unconditionally, ignoring $TMPDIR -- with neither of these
+        // two rules, that first mkdir throws EPERM before the agent
+        // does anything. Scoped to the "claude" command only: a
+        // different command has no reason to touch this path.
+        let claude_profile = generate_sbpl_profile(
+            &Config {
+                command: vec!["claude".into()],
+                ..Config::default()
+            },
+            &PathBuf::from("/tmp/test-project"),
+        );
+        assert!(claude_profile.contains(
+            "(allow file-write* (regex #\"^/private/tmp/claude-[0-9]+(/.*)?$\"))"
+        ));
+        assert!(
+            claude_profile.contains("(allow file-read* (literal \"/tmp\"))")
+        );
+
+        let other_profile = generate_sbpl_profile(
+            &Config {
+                command: vec!["bash".into()],
+                ..Config::default()
+            },
+            &PathBuf::from("/tmp/test-project"),
+        );
+        assert!(!other_profile.contains("claude-[0-9]+"));
+        assert!(
+            !other_profile.contains("(allow file-read* (literal \"/tmp\"))")
+        );
+    }
+
+    #[test]
+    fn mkdir_tmp_claude_dir_succeeds_under_generated_claude_profile() {
+        // Real end-to-end reproduction of the reported failure:
+        //   EPERM: operation not permitted, mkdir '/tmp/claude-501'
+        // Uses a throwaway numeric suffix so it can't collide with a
+        // real Claude Code session's own /tmp/claude-<uid> directory.
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let profile = generate_sbpl_profile(
+            &Config {
+                command: vec!["claude".into()],
+                ..Config::default()
+            },
+            &PathBuf::from("/tmp/test-project"),
+        );
+
+        let target = format!("/tmp/claude-{}999", std::process::id());
+        let _ = std::fs::remove_dir(format!("/private{target}"));
+
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("--")
+            .arg("/bin/mkdir")
+            .arg(&target)
+            .output()
+            .expect("failed to run sandbox-exec");
+
+        let _ = std::fs::remove_dir(format!("/private{target}"));
+
+        assert!(
+            output.status.success(),
+            "mkdir of Claude Code's /tmp/claude-<uid> dir was denied: \
+             status={:?} stderr={} profile:\n{profile}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 
