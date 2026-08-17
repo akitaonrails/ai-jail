@@ -228,6 +228,35 @@ agents get the project's language versions. Disable with `--no-mise` or
 `no_mise = true`. It is skipped automatically in `--lockdown` and browser
 profile modes.
 
+## Herdr
+
+[Herdr](https://herdr.dev/) runs outside the sandbox, one `ai-jail` per pane,
+the same as tmux. Two things are automatic:
+
+- The status bar is auto-disabled, as under tmux and zellij. Herdr classifies
+  agent state from the pane's bottom screen buffer, which is exactly where the
+  status bar draws. Pass `-s` to force it back on.
+- The working directory needs nothing: the project is bound at its real path
+  and the sandbox `chdir`s there, so the pane's cwd matches inside and out.
+
+Agent detection needs one variable. Herdr identifies the agent from the pane's
+foreground process, and ai-jail's PTY proxy and PID namespace hide it, so name
+the agent explicitly:
+
+```bash
+HERDR_AGENT=claude ai-jail claude
+```
+
+If Herdr still cannot resolve the process group through the sandbox, set
+`HERDR_PROCESS_DETECTION=child-groups` in the Herdr environment.
+
+**Do not mount the Herdr control socket into the sandbox.** `HERDR_*` variables
+and `~/.config/herdr/herdr.sock` are not passed in, and that is deliberate:
+`herdr tab create` runs a command on the host, so an agent that can reach the
+socket can execute outside the jail. Hook-based state reporting from inside the
+sandbox would require exactly that, and it trades away the sandbox — leave
+detection to `HERDR_AGENT` and screen manifests instead.
+
 ## Troubleshooting
 
 **`bwrap: setting up uid map: Permission denied` (Ubuntu 24.04+ / Debian 13+).**
