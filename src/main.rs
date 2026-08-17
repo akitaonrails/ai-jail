@@ -83,12 +83,6 @@ fn running_inside_multiplexer() -> Option<&'static str> {
         Some("tmux")
     } else if std::env::var_os("ZELLIJ").is_some() {
         Some("zellij")
-    } else if std::env::var_os("HERDR_ENV").is_some()
-        || std::env::var_os("HERDR_PANE_ID").is_some()
-    {
-        // Herdr classifies agent state by reading the pane's bottom
-        // screen buffer, which is exactly where the status bar draws.
-        Some("herdr")
     } else {
         None
     }
@@ -552,33 +546,10 @@ mod tests {
     }
 
     #[test]
-    fn multiplexer_detects_herdr() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _tmux = EnvVarGuard::remove("TMUX");
-        let _zellij = EnvVarGuard::remove("ZELLIJ");
-        let _pane = EnvVarGuard::remove("HERDR_PANE_ID");
-        let _herdr = EnvVarGuard::set("HERDR_ENV", "1");
-        assert_eq!(running_inside_multiplexer(), Some("herdr"));
-    }
-
-    #[test]
-    fn multiplexer_detects_herdr_by_pane_id() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _tmux = EnvVarGuard::remove("TMUX");
-        let _zellij = EnvVarGuard::remove("ZELLIJ");
-        let _herdr = EnvVarGuard::remove("HERDR_ENV");
-        let _pane = EnvVarGuard::set("HERDR_PANE_ID", "w4:p8");
-        assert_eq!(running_inside_multiplexer(), Some("herdr"));
-    }
-
-    #[test]
     fn multiplexer_none_when_neither_set() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _tmux = EnvVarGuard::remove("TMUX");
         let _zellij = EnvVarGuard::remove("ZELLIJ");
-        // Cleared explicitly: this suite may itself run inside Herdr.
-        let _herdr = EnvVarGuard::remove("HERDR_ENV");
-        let _pane = EnvVarGuard::remove("HERDR_PANE_ID");
         assert_eq!(running_inside_multiplexer(), None);
     }
 

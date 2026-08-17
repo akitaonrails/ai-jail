@@ -231,13 +231,9 @@ profile modes.
 ## Herdr
 
 [Herdr](https://herdr.dev/) runs outside the sandbox, one `ai-jail` per pane,
-the same as tmux. Two things are automatic:
-
-- The status bar is auto-disabled, as under tmux and zellij. Herdr classifies
-  agent state from the pane's bottom screen buffer, which is exactly where the
-  status bar draws. Pass `-s` to force it back on.
-- The working directory needs nothing: the project is bound at its real path
-  and the sandbox `chdir`s there, so the pane's cwd matches inside and out.
+the same as tmux. ai-jail needs no configuration for this, and the working
+directory already lines up: the project is bound at its real path and the
+sandbox `chdir`s there, so the pane's cwd matches inside and out.
 
 Agent detection needs one variable. Herdr identifies the agent from the pane's
 foreground process, and ai-jail's PTY proxy and PID namespace hide it, so name
@@ -249,6 +245,10 @@ HERDR_AGENT=claude ai-jail claude
 
 If Herdr still cannot resolve the process group through the sandbox, set
 `HERDR_PROCESS_DETECTION=child-groups` in the Herdr environment.
+
+If agent state is reported incorrectly, note that Herdr classifies state from
+the pane's bottom screen rows, which is also where ai-jail's status bar draws;
+`--no-status-bar` removes that overlap.
 
 **Do not mount the Herdr control socket into the sandbox.** `HERDR_*` variables
 and `~/.config/herdr/herdr.sock` are not passed in, and that is deliberate:
