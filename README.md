@@ -93,7 +93,7 @@ user bus are also off by default.
 | `--inherit-env` / `--no-inherit-env` | Default is a minimal environment allowlist. `--inherit-env` passes the full parent environment, secrets included. |
 | `--update-check` / `--no-update-check` | Enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active (default off; all other launches make no network requests). |
 | `--macos-host-ipc` / `--no-macos-host-ipc` | Enables/disables macOS Mach, IOKit, and host IPC exposure. |
-| `--worktree` / `--no-worktree` | Enables/disables validated linked-worktree common metadata, mounted read-only when enabled. |
+| `--worktree` / `--no-worktree` | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only. |
 | `--private-home` / `--no-private-home` | Enables/disables the default private home. Disabling it is broad host-home access. |
 
 `--allow-tcp-port` remains accepted for backward compatibility, but launch

@@ -20,7 +20,7 @@ hostile workloads.
 | Environment variables | minimal allowlist | minimal allowlist | `--env NAME[=VALUE]` adds named variables; `--inherit-env` passes the entire parent environment, secrets included. |
 | Update check | off | off | `--update-check` enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active; all other launches make no network requests. |
 | macOS host IPC | n/a | off | `--macos-host-ipc` permits Mach, IOKit, and host IPC exposure. |
-| Linked-worktree metadata | off | off | `--worktree` exposes validated common metadata read-only. |
+| Linked-worktree metadata | off | off | `--worktree` exposes validated worktree metadata read-write so git can write objects and refs; the common dir may sit outside the project. `--lockdown` keeps it read-only. |
 | Docker | off | off | `--docker` is root-equivalent through the daemon. |
 | systemd user bus | off | n/a | `--systemd-user` can ask the host user manager to run services. |
 

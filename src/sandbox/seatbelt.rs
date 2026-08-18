@@ -612,11 +612,16 @@ fn macos_writable_paths(
     if let Some(worktree) =
         super::discover_git_worktree_paths(config, project_dir, false)
     {
-        // Only the per-worktree git dir needs writes (HEAD, index,
-        // ORIG_HEAD, worktree-local refs). The shared common dir holds
-        // object storage and refs that sibling worktrees depend on —
-        // it stays read-only (macos_read_paths grants it reads).
-        paths.push(worktree.git_dir.clone());
+        // Both the per-worktree git dir (HEAD, index, ORIG_HEAD,
+        // worktree-local refs) and the shared common dir need writes:
+        // the common dir holds the object database, refs, and
+        // packed-refs, so `git add` and `git commit` write there.
+        // Granting only the git dir made every write fail with
+        // "Read-only file system" (issue #101). Lockdown returns
+        // early above, so these stay read-only there.
+        for path in worktree.unique_paths() {
+            paths.push(path);
+        }
     }
 
     // Explicit agent-state opt-in: mount the command's state dirs RW.
@@ -1415,7 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn writable_paths_grant_worktree_git_dir_not_common_dir() {
+    fn writable_paths_grant_worktree_git_dir_and_common_dir() {
         let fixture = create_linked_worktree_fixture();
         let config = Config {
             no_mise: Some(true),
@@ -1430,13 +1435,14 @@ mod tests {
         let same = |a: &Path, b: &Path| {
             std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok()
         };
-        // Only the per-worktree git dir is writable (HEAD, index,
-        // worktree-local refs); the shared common dir that sibling
-        // worktrees depend on must stay read-only.
+        // Regression for #101: the per-worktree git dir carries HEAD,
+        // index and worktree-local refs, but the object database and
+        // shared refs live in the common dir, so both must be
+        // writable or `git add` fails with "Read-only file system".
         assert!(paths.iter().any(|path| same(path, &fixture.git_dir)));
         assert!(
-            !paths.iter().any(|path| same(path, &fixture.common_dir)),
-            "common git dir must not be writable"
+            paths.iter().any(|path| same(path, &fixture.common_dir)),
+            "common git dir must be writable so git can write objects"
         );
     }
 

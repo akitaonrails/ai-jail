@@ -92,7 +92,7 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 11. Cache hide (tmpfs over sensitive `~/.cache/*` subdirs)
 12. Local overrides (`~/.local/state`, `~/.local/share/*` rw subdirs)
 13. Command binary exemption (private-home only)
-14. Linked Git worktree metadata (validated, opt-in; common dir read-only, per-worktree git dir writable outside lockdown)
+14. Linked Git worktree metadata (validated, opt-in; common dir mounted first, then the nested per-worktree git dir — both writable outside lockdown, both read-only under it)
 15. SSH agent socket and `~/.ssh` exemption mounts
 16. Pictures mount
 17. Browser profile state mount
