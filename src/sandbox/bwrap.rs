@@ -660,7 +660,11 @@ fn nix_store_is_protected(store: &Path) -> bool {
 }
 
 fn nix_store_metadata_is_protected(uid: u32, mode: u32) -> bool {
-    uid == 0 || mode & 0o222 == 0
+    if uid == 0 || uid == 65534 {
+        mode & 0o002 == 0
+    } else {
+        mode & 0o222 == 0
+    }
 }
 
 fn trusted_binary_metadata(
@@ -5403,7 +5407,12 @@ mod tests {
     fn nix_store_metadata_must_be_unwritable_by_this_user() {
         // Multi-user store: root-owned, group-writable for nixbld.
         assert!(nix_store_metadata_is_protected(0, 0o1775));
+        assert!(nix_store_metadata_is_protected(65534, 0o1775));
         assert!(nix_store_metadata_is_protected(0, 0o755));
+        // World-writable stores are rejected even under root / overflowuid.
+        assert!(!nix_store_metadata_is_protected(0, 0o1777));
+        assert!(!nix_store_metadata_is_protected(65534, 0o1777));
+        assert!(!nix_store_metadata_is_protected(65534, 0o777));
         // Read-only store owned by someone else is still fine.
         assert!(nix_store_metadata_is_protected(1000, 0o555));
         // Single-user store the invoking user can write: the
