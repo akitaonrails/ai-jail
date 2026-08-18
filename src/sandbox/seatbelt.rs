@@ -228,14 +228,22 @@ fn generate_sbpl_profile(config: &Config, project_dir: &Path) -> String {
 
     push_static_sections(&mut profile, config.macos_host_ipc_enabled());
     push_network_section(&mut profile, config);
-    push_file_read_section(&mut profile, config, project_dir, &deny_paths);
+    let is_claude =
+        crate::command::effective_name(&config.command) == Some("claude");
+    push_file_read_section(
+        &mut profile,
+        config,
+        project_dir,
+        &deny_paths,
+        is_claude,
+    );
     push_file_write_section(
         &mut profile,
         lockdown,
         &writable_paths,
         &atomic_paths,
         &write_deny_paths,
-        crate::command::effective_name(&config.command) == Some("claude"),
+        is_claude,
     );
     push_docker_section(&mut profile, docker_active(config, lockdown));
 
@@ -354,12 +362,13 @@ fn push_file_read_section(
     config: &Config,
     project_dir: &Path,
     deny_paths: &[PathBuf],
+    is_claude: bool,
 ) {
     profile.push_str("; File reads: explicit allow-list\n");
     // dyld needs the root node to resolve absolute paths. This literal rule
     // does not grant any filesystem subtree.
     profile.push_str("(allow file-read* (literal \"/\"))\n");
-    if crate::command::effective_name(&config.command) == Some("claude") {
+    if is_claude {
         // /tmp is a symlink into /private/tmp; push_path_rule
         // canonicalizes every path it emits, so the write grant for
         // Claude Code's /tmp/claude-<uid> below never covers the /tmp
@@ -409,12 +418,14 @@ fn push_file_write_section(
         // Claude Code never gets past its own startup, regardless of
         // --rw-map:
         //   EPERM: operation not permitted, mkdir '/tmp/claude-501'
-        // Scoped to just this one Claude-specific naming pattern
-        // (not a general /private/tmp grant) so it doesn't require
-        // -- or interact with -- --rw-map /tmp at all.
-        profile.push_str(
-            "(allow file-write* (regex #\"^/private/tmp/claude-[0-9]+(/.*)?$\"))\n",
-        );
+        // Scoped to this user's own directory (not `claude-[0-9]+`,
+        // which would also cover another account's scratch dir on a
+        // shared machine) and not a general /private/tmp grant, so it
+        // doesn't require -- or interact with -- --rw-map /tmp at all.
+        let uid = unsafe { nix::libc::getuid() };
+        profile.push_str(&format!(
+            "(allow file-write* (regex #\"^/private/tmp/claude-{uid}(/.*)?$\"))\n"
+        ));
     }
     if !atomic_paths.is_empty() {
         profile.push('\n');
@@ -1459,9 +1470,10 @@ mod tests {
             },
             &PathBuf::from("/tmp/test-project"),
         );
-        assert!(claude_profile.contains(
-            "(allow file-write* (regex #\"^/private/tmp/claude-[0-9]+(/.*)?$\"))"
-        ));
+        let uid = unsafe { nix::libc::getuid() };
+        assert!(claude_profile.contains(&format!(
+            "(allow file-write* (regex #\"^/private/tmp/claude-{uid}(/.*)?$\"))"
+        )));
         assert!(
             claude_profile.contains("(allow file-read* (literal \"/tmp\"))")
         );
@@ -1473,7 +1485,7 @@ mod tests {
             },
             &PathBuf::from("/tmp/test-project"),
         );
-        assert!(!other_profile.contains("claude-[0-9]+"));
+        assert!(!other_profile.contains("/private/tmp/claude-"));
         assert!(
             !other_profile.contains("(allow file-read* (literal \"/tmp\"))")
         );
@@ -1483,8 +1495,10 @@ mod tests {
     fn mkdir_tmp_claude_dir_succeeds_under_generated_claude_profile() {
         // Real end-to-end reproduction of the reported failure:
         //   EPERM: operation not permitted, mkdir '/tmp/claude-501'
-        // Uses a throwaway numeric suffix so it can't collide with a
-        // real Claude Code session's own /tmp/claude-<uid> directory.
+        // Probes a throwaway subdirectory of the real uid-scoped path
+        // rather than the path itself: the rule covers descendants, so
+        // this still exercises the grant without disturbing a live
+        // Claude Code session's own /tmp/claude-<uid> directory.
         if !Path::new("/usr/bin/sandbox-exec").is_file() {
             return;
         }
@@ -1496,7 +1510,9 @@ mod tests {
             &PathBuf::from("/tmp/test-project"),
         );
 
-        let target = format!("/tmp/claude-{}999", std::process::id());
+        // Must match the uid-scoped rule the profile emits.
+        let parent = format!("/tmp/claude-{}", unsafe { nix::libc::getuid() });
+        let target = format!("{parent}/ai-jail-probe-{}", std::process::id());
         let _ = std::fs::remove_dir(format!("/private{target}"));
 
         let output = Command::new("/usr/bin/sandbox-exec")
@@ -1504,11 +1520,15 @@ mod tests {
             .arg(&profile)
             .arg("--")
             .arg("/bin/mkdir")
+            .arg("-p")
             .arg(&target)
             .output()
             .expect("failed to run sandbox-exec");
 
+        // Remove only what this probe created; the parent may belong to
+        // a real session, and remove_dir leaves it alone unless empty.
         let _ = std::fs::remove_dir(format!("/private{target}"));
+        let _ = std::fs::remove_dir(format!("/private{parent}"));
 
         assert!(
             output.status.success(),

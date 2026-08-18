@@ -62,7 +62,12 @@ macOS starts with no global reads, network, or host IPC, and supports the same
 opt-in `--agent-state` credential mounts as Linux; `--overlay-map` is honored
 as a read-only map because copy-on-write overlays are Linux-only.
 `sandbox-exec` is deprecated by Apple and is not equivalent to Linux
-isolation; use a disposable VM for hostile workloads. On both platforms,
+isolation; use a disposable VM for hostile workloads. The macOS profile
+allows `file-ioctl` on pty device nodes, which agents need to put their own
+stdin into raw mode. SBPL cannot filter by ioctl request, so that grant
+covers every `/dev/ttys*` this user can already open, not only the sandbox's
+own terminal; a compromised agent could use it to inject input into another
+of your terminals. Linux denies `TIOCSTI` outright through seccomp. On both platforms,
 kernel and driver bugs, terminal emulator bugs (especially after terminal
 passthrough), and sandbox backend defects remain residual risk.
 
