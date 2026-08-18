@@ -194,18 +194,33 @@ fn lockdown_run(args: &[&str]) -> Output {
 fn assert_blocked(output: &Output, test_name: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if output.status.code() == Some(2)
-        && (stdout.contains("SKIPPED") || stderr.contains("SKIPPED"))
-    {
-        eprintln!("SKIPPED: {test_name} (prerequisites not available)");
-        return;
-    }
     assert!(
         stdout.contains("BLOCKED"),
         "{test_name}: expected BLOCKED, got stdout={stdout:?} \
          stderr={stderr:?} exit={:?}",
         output.status.code()
     );
+}
+
+/// Like [`assert_blocked`], but tolerates the helper reporting SKIPPED
+/// (exit code 2).
+///
+/// Only the read-only-system-directory probes may legitimately skip: a host
+/// without /usr, /nix or /etc has no such directory to attempt a write into.
+/// Every other escape probe must reach a real BLOCKED verdict, so the skip
+/// path is deliberately NOT in `assert_blocked` itself — a shared skip would
+/// let any future breakage that makes the helper exit 2 turn this whole
+/// security suite into silent passes.
+fn assert_blocked_or_skipped(output: &Output, test_name: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(2)
+        && (stdout.contains("SKIPPED") || stderr.contains("SKIPPED"))
+    {
+        eprintln!("SKIPPED: {test_name} (no read-only system directory)");
+        return;
+    }
+    assert_blocked(output, test_name);
 }
 
 /// Helper: run the compiled C helper inside normal sandbox.
@@ -280,7 +295,7 @@ fn sandbox_blocks_write_to_usr() {
     require_bwrap!();
     require_helper!();
     let out = helper_normal("write_sys");
-    assert_blocked(&out, "write to /usr/");
+    assert_blocked_or_skipped(&out, "write to /usr/");
 }
 
 #[test]
@@ -362,5 +377,5 @@ fn lockdown_blocks_write_to_usr() {
     require_bwrap_net!();
     require_helper!();
     let out = helper_lockdown("write_sys");
-    assert_blocked(&out, "write to /usr/ in lockdown");
+    assert_blocked_or_skipped(&out, "write to /usr/ in lockdown");
 }

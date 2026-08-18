@@ -35,8 +35,8 @@ install -Dm755 target/release/ai-jail ~/.local/bin/ai-jail
 Linux requires `bwrap` (`bubblewrap`): `pacman -S bubblewrap`,
 `apt install bubblewrap`, or `dnf install bubblewrap`. `BWRAP_BIN` is accepted
 only when it canonically resolves to a root-owned executable that is not
-group- or world-writable, or to a non-root `/nix/store` executable with no
-write bits.
+group- or world-writable, or to an executable with no write bits under a
+`/nix/store` that this user cannot write (a multi-user, root-owned store).
 macOS uses Apple's deprecated `/usr/bin/sandbox-exec` interface. Windows is not
 supported; use WSL2 and the Linux backend inside it.
 

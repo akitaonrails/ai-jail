@@ -539,6 +539,7 @@ const LOCAL_SHARE_RW: &[&str] = &[
 ];
 
 const BWRAP_ENV_VAR: &str = "BWRAP_BIN";
+const NIX_STORE: &str = "/nix/store";
 const BWRAP_CANDIDATES: &[&str] = &[
     "/usr/bin/bwrap",
     "/bin/bwrap",
@@ -631,7 +632,8 @@ fn should_use_new_session() -> bool {
 fn trusted_bwrap_path(path: &Path) -> Option<PathBuf> {
     let canonical = path.canonicalize().ok()?;
     let metadata = canonical.metadata().ok()?;
-    let in_nix_store = canonical.starts_with("/nix/store");
+    let in_nix_store = canonical.starts_with(NIX_STORE)
+        && nix_store_is_protected(Path::new(NIX_STORE));
     trusted_binary_metadata(
         metadata.file_type().is_file(),
         metadata.uid(),
@@ -639,6 +641,26 @@ fn trusted_bwrap_path(path: &Path) -> Option<PathBuf> {
         in_nix_store,
     )
     .then_some(canonical)
+}
+
+/// Whether the Nix store itself is beyond the reach of whoever runs
+/// ai-jail.
+///
+/// `trusted_binary_metadata` trusts a *non-root-owned* executable purely
+/// because it lives in the store, so that relaxation is only sound while the
+/// store cannot be written by this user. A multi-user Nix store is root-owned
+/// (typically `root:nixbld`, mode 1775) and qualifies; a single-user store
+/// owned by the invoking user does not, because anyone able to run code as
+/// that user could then drop in a fake bwrap and silently disable the
+/// sandbox.
+fn nix_store_is_protected(store: &Path) -> bool {
+    store.metadata().is_ok_and(|m| {
+        m.is_dir() && nix_store_metadata_is_protected(m.uid(), m.mode())
+    })
+}
+
+fn nix_store_metadata_is_protected(uid: u32, mode: u32) -> bool {
+    uid == 0 || mode & 0o222 == 0
 }
 
 fn trusted_binary_metadata(
@@ -5348,6 +5370,20 @@ mod tests {
         assert!(!trusted_binary_metadata(true, 1000, 0o555, false));
         assert!(!trusted_binary_metadata(true, 0, 0o775, false));
         assert!(!trusted_binary_metadata(true, 0, 0o644, false));
+    }
+
+    #[test]
+    fn nix_store_metadata_must_be_unwritable_by_this_user() {
+        // Multi-user store: root-owned, group-writable for nixbld.
+        assert!(nix_store_metadata_is_protected(0, 0o1775));
+        assert!(nix_store_metadata_is_protected(0, 0o755));
+        // Read-only store owned by someone else is still fine.
+        assert!(nix_store_metadata_is_protected(1000, 0o555));
+        // Single-user store the invoking user can write: the
+        // non-root-owned relaxation must not apply, or anyone running
+        // as that user could drop in a fake bwrap.
+        assert!(!nix_store_metadata_is_protected(1000, 0o755));
+        assert!(!nix_store_metadata_is_protected(1000, 0o775));
     }
 
     #[test]
