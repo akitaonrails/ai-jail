@@ -1121,21 +1121,34 @@ fn prepare_seatbelt_config(config: &Config) -> Result<Config, String> {
     Ok(prepared)
 }
 
+/// Build the sandbox command.
+///
+/// `sandbox_tty` is the device the child will use as its terminal, when
+/// ai-jail is proxying a PTY. macOS scopes its terminal `file-ioctl` grant to
+/// that exact device; Linux does not need it, because seccomp denies TIOCSTI
+/// outright there.
 pub fn build(
     guard: &SandboxGuard,
     config: &Config,
     project_dir: &Path,
     verbose: bool,
+    sandbox_tty: Option<&Path>,
 ) -> Result<Command, String> {
     #[cfg(target_os = "linux")]
     {
+        let _ = sandbox_tty;
         bwrap::build(guard, config, project_dir, verbose)
     }
     #[cfg(target_os = "macos")]
     {
         let _ = guard;
         let prepared = prepare_seatbelt_config(config)?;
-        Ok(seatbelt::build(&prepared, project_dir, verbose))
+        Ok(seatbelt::build(
+            &prepared,
+            project_dir,
+            verbose,
+            sandbox_tty,
+        ))
     }
 }
 
