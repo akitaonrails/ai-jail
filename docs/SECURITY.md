@@ -62,7 +62,12 @@ running as them could otherwise supply a fake bwrap and silently disable the
 sandbox.
 
 macOS starts with no global reads, network, or host IPC, and supports the same
-opt-in `--agent-state` credential mounts as Linux; `--overlay-map` is honored
+opt-in `--agent-state` credential mounts as Linux. Temp access is limited to a
+private per-launch session directory pointed to by `TMPDIR`, with one
+command-specific exception: `claude` is also granted write access to
+`/private/tmp/claude-<uid>`, scoped to the invoking uid, because Claude Code
+creates that path unconditionally at startup and ignores `TMPDIR`. It is
+outside the project and persists between runs; `--overlay-map` is honored
 as a read-only map because copy-on-write overlays are Linux-only.
 `sandbox-exec` is deprecated by Apple and is not equivalent to Linux
 isolation; use a disposable VM for hostile workloads. Agents need `file-ioctl`
