@@ -54,9 +54,12 @@ settable per command in `~/.ai-jail`). Use
 ## Platform notes and residual risks
 
 Linux combines bubblewrap namespaces with Landlock, seccomp, and resource
-limits where available. `BWRAP_BIN` must resolve canonically to a root-owned,
-executable file that is not group- or world-writable. A normally protected Nix
-store executable satisfies this requirement.
+limits where available. `BWRAP_BIN` must resolve canonically either to a
+root-owned executable with no group- or world-write bits, or to an executable
+with no write bits at all under a `/nix/store` that the invoking user cannot
+write. A single-user Nix store owned by that user does not qualify: anything
+running as them could otherwise supply a fake bwrap and silently disable the
+sandbox.
 
 macOS starts with no global reads, network, or host IPC, and supports the same
 opt-in `--agent-state` credential mounts as Linux; `--overlay-map` is honored

@@ -8,13 +8,13 @@ Findings sorted by **impact**, not file. Each item is written as a TODO. Nothing
 
 ### Long functions that have outgrown their original shape
 
-| Function | Lines | File | What to do |
-|---|---|---|---|
-| `pty::io_loop` | 277 | `src/pty.rs:178` | Split: SIGWINCH handling, master-read branch, stdin-read branch, status-bar redraw. The current function juggles 5 mutable state machines. |
-| `sandbox::bwrap::discover_mounts` | 178 | `src/sandbox/bwrap.rs:851` | Each `let foo_mount = if … { … }` block (ssh_agent, pictures, mask, browser_state, home_dotfiles + claude_dir, …) is a candidate for its own `fn discover_X`. |
-| `sandbox::seatbelt::generate_sbpl_profile` | 174 | `src/sandbox/seatbelt.rs:158` | Six logically distinct sections (process, IPC, network, reads, writes, atomic). Extract per-section emit helpers; the function then reads as policy structure. |
-| `config::display_status` | 130 | `src/config.rs` | Mostly `match` + `bool_opt` calls. Lift each block into a small printer helper to make the output schema obvious. |
-| `config::merge` | 97 | `src/config.rs` | Most of the body is repetitive CLI→config boolean transfer. See dedup item below. |
+| Function                                   | Lines | File                          | What to do                                                                                                                                                     |
+| ------------------------------------------ | ----- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pty::io_loop`                             | 277   | `src/pty.rs:178`              | Split: SIGWINCH handling, master-read branch, stdin-read branch, status-bar redraw. The current function juggles 5 mutable state machines.                     |
+| `sandbox::bwrap::discover_mounts`          | 178   | `src/sandbox/bwrap.rs:851`    | Each `let foo_mount = if … { … }` block (ssh_agent, pictures, mask, browser_state, home_dotfiles + claude_dir, …) is a candidate for its own `fn discover_X`.  |
+| `sandbox::seatbelt::generate_sbpl_profile` | 174   | `src/sandbox/seatbelt.rs:158` | Six logically distinct sections (process, IPC, network, reads, writes, atomic). Extract per-section emit helpers; the function then reads as policy structure. |
+| `config::display_status`                   | 130   | `src/config.rs`               | Mostly `match` + `bool_opt` calls. Lift each block into a small printer helper to make the output schema obvious.                                              |
+| `config::merge`                            | 97    | `src/config.rs`               | Most of the body is repetitive CLI→config boolean transfer. See dedup item below.                                                                              |
 
 ### Repetition that compounds with every new flag
 
@@ -37,15 +37,15 @@ Findings sorted by **impact**, not file. Each item is written as a TODO. Nothing
 
 ### Style / clippy-pedantic findings (cargo clippy -- -W clippy::pedantic counts)
 
-| Category | Count | Notes |
-|---|---|---|
-| Docstrings missing backticks around identifiers | 25 | Cosmetic; cherry-pick the most-visible public APIs. |
-| Module name repetition (e.g. `bwrap::BwrapMount`) | 10 | Worth doing if we ever re-export across modules. |
-| `.map(...).unwrap_or(...)` on `Result` | 5 | Replace with `.unwrap_or_else` or `?` where appropriate. |
-| `format!` appended to existing `String` | 4 | Use `write!`. |
-| Identical match arms with `\|` patterns | 4 | Merge. |
-| Variables can be inlined into `format!` strings | 4 | `format!("{x}")` instead of `format!("{}", x)`. |
-| Lossy/sign-changing casts (`as`) | 6 total | Audit individually — some are intentional (e.g. `u8 → u16` for terminal sizing). |
+| Category                                          | Count   | Notes                                                                            |
+| ------------------------------------------------- | ------- | -------------------------------------------------------------------------------- |
+| Docstrings missing backticks around identifiers   | 25      | Cosmetic; cherry-pick the most-visible public APIs.                              |
+| Module name repetition (e.g. `bwrap::BwrapMount`) | 10      | Worth doing if we ever re-export across modules.                                 |
+| `.map(...).unwrap_or(...)` on `Result`            | 5       | Replace with `.unwrap_or_else` or `?` where appropriate.                         |
+| `format!` appended to existing `String`           | 4       | Use `write!`.                                                                    |
+| Identical match arms with `\|` patterns           | 4       | Merge.                                                                           |
+| Variables can be inlined into `format!` strings   | 4       | `format!("{x}")` instead of `format!("{}", x)`.                                  |
+| Lossy/sign-changing casts (`as`)                  | 6 total | Audit individually — some are intentional (e.g. `u8 → u16` for terminal sizing). |
 
 ### Specific micro-issues worth fixing
 
@@ -58,7 +58,7 @@ Findings sorted by **impact**, not file. Each item is written as a TODO. Nothing
 - **The two existing `#[allow(dead_code)]` markers** in `src/sandbox/mod.rs:45` and `:81` are legitimate platform splits — keep.
 - **No other dead code surfaced** in clippy/grep passes.
 
-## Tier 3 — explicitly *not* worth doing right now
+## Tier 3 — explicitly _not_ worth doing right now
 
 - Rewriting `io_loop` into an async state machine. Tempting, but the project's "no tokio" CLAUDE.md rule is load-bearing. Sync loop with manual state is the right shape; just split it into smaller fns.
 - Switching `Result<_, String>` to a typed error enum. Useful for a future library extraction, irrelevant for a CLI that prints strings to a human.

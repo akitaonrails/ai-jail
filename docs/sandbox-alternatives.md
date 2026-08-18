@@ -26,28 +26,28 @@ For this use case, nothing else fits as well.
 
 **Landlock** (`landlock` crate v0.4) -- Linux Security Module, kernel 5.13+. Restricts filesystem access per-path and (since kernel 6.2) network bind/connect per-port. Works unprivileged. But it can't create namespaces, can't do bind mounts, can't set a custom hostname. It restricts what syscalls can do, not the environment the process sees.
 
-| Capability | Support |
-|---|---|
+| Capability                        | Support            |
+| --------------------------------- | ------------------ |
 | Filesystem restriction (per-path) | Yes (kernel 5.13+) |
-| Network restriction (per-port) | Yes (kernel 6.2+) |
-| Unprivileged | Yes |
-| PID/UTS/IPC namespaces | No |
-| Bind mounts | No |
-| Custom hostname / /etc/hosts | No |
-| macOS | No |
+| Network restriction (per-port)    | Yes (kernel 6.2+)  |
+| Unprivileged                      | Yes                |
+| PID/UTS/IPC namespaces            | No                 |
+| Bind mounts                       | No                 |
+| Custom hostname / /etc/hosts      | No                 |
+| macOS                             | No                 |
 
 It cannot replace bwrap, but it makes a good second barrier. If bwrap's namespace setup ever has a bug, Landlock still gives kernel-level enforcement. About 50 lines of Rust to add, and it degrades cleanly on older kernels. Worth doing eventually.
 
 **Birdcage** (`birdcage` crate, Phylum) -- wraps Landlock on Linux and sandbox-exec on macOS behind one API. The cross-platform part is appealing, but it's designed for restricting the calling process, not for launching a child in an isolated environment with custom mounts. Doesn't fit our execution model.
 
-| Capability | Support |
-|---|---|
-| Filesystem restriction | Yes |
-| Network restriction | Partial |
-| Unprivileged | Yes |
-| Namespaces | No |
-| Bind mounts | No |
-| Cross-platform | Yes (Linux + macOS) |
+| Capability             | Support             |
+| ---------------------- | ------------------- |
+| Filesystem restriction | Yes                 |
+| Network restriction    | Partial             |
+| Unprivileged           | Yes                 |
+| Namespaces             | No                  |
+| Bind mounts            | No                  |
+| Cross-platform         | Yes (Linux + macOS) |
 
 **Extrasafe** (`extrasafe` crate) -- friendly Rust API over seccomp-bpf. Filters which syscalls a process can make. Complementary to namespaces, not a replacement. bwrap already drops capabilities and sets `PR_SET_NO_NEW_PRIVS`, so the marginal benefit is small for the added complexity.
 

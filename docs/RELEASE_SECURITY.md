@@ -80,7 +80,7 @@ Outstanding, in the order worth doing:
 
 1. **Scope the secrets (finishes item 4).** All eight secrets are still
    repository-level, so every job in every workflow can read them; the
-   environments gate *deployment*, not secret visibility. This is the
+   environments gate _deployment_, not secret visibility. This is the
    highest-value remaining step. Secret values cannot be copied by tooling —
    they are write-only — so re-enter them at environment scope and delete the
    repository copies:

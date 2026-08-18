@@ -73,7 +73,7 @@
 
           hooks = {
             deadnix.enable = true;
-            nixfmt-rfc-style.enable = true;
+            nixfmt.enable = true;
             treefmt = {
               enable = true;
               package = formatter;
@@ -87,8 +87,12 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
-          buildInputs = [ pkgs.bubblewrap ];
-          nativeBuildInputs = [ pkgs.makeWrapper ];
+          nativeBuildInputs = [
+            pkgs.makeWrapper
+            pkgs.bubblewrap
+          ];
+
+          BWRAP_BIN = "${pkgs.bubblewrap}/bin/bwrap";
 
           postFixup = ''
             wrapProgram "$out/bin/ai-jail" \
