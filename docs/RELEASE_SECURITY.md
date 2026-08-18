@@ -54,7 +54,7 @@ Configured:
 - **Item 6.** A pinned release key lives in `.github/release-keyring/`
   (`ai-jail-release.asc` plus its 40-hex fingerprint in `fingerprints.txt`),
   and `tag.gpgsign` is enabled for this repository, so CI cryptographically
-  verifies each `v*` tag against that key. v1.18.1 is the first *signed*
+  verifies each `v*` tag against that key. v1.18.1 is the first _signed_
   tag, but CI did not verify it: the keyring detection used
   `ls <file>.asc *.gpg`, whose unmatched glob made `ls` exit non-zero and
   silently selected the "not verified" branch. Fixed with a `find` test
