@@ -228,13 +228,22 @@ fn generate_sbpl_profile(config: &Config, project_dir: &Path) -> String {
 
     push_static_sections(&mut profile, config.macos_host_ipc_enabled());
     push_network_section(&mut profile, config);
-    push_file_read_section(&mut profile, config, project_dir, &deny_paths);
+    let is_claude =
+        crate::command::effective_name(&config.command) == Some("claude");
+    push_file_read_section(
+        &mut profile,
+        config,
+        project_dir,
+        &deny_paths,
+        is_claude,
+    );
     push_file_write_section(
         &mut profile,
         lockdown,
         &writable_paths,
         &atomic_paths,
         &write_deny_paths,
+        is_claude,
     );
     push_docker_section(&mut profile, docker_active(config, lockdown));
 
@@ -312,8 +321,20 @@ fn push_static_sections(profile: &mut String, allow_host_ipc: bool) {
     profile
         .push_str("(allow file-read* file-write* (literal \"/dev/ptmx\"))\n");
     profile.push_str(
-        "(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+\"))\n\n",
+        "(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+\"))\n",
     );
+    // Scoped to the PTY device nodes only (not the broad
+    // --macos-host-ipc file-ioctl grant below). Without this, any
+    // ioctl on the child's own controlling terminal -- including
+    // TIOCGETD/TIOCSETA, which Node's tty.setRawMode() and libc's
+    // stty/tcsetattr need -- is denied under (deny default). The
+    // child then can't switch its stdin into raw mode: canonical
+    // (cooked) line discipline still delivers plain Enter as a
+    // normal line, but special key encodings (e.g. Shift+Enter's
+    // xterm/kitty CSI sequences) are never intercepted and instead
+    // show up as literal bytes in whatever reads the line.
+    profile.push_str("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+\"))\n");
+    profile.push_str("(allow file-ioctl (literal \"/dev/ptmx\"))\n\n");
 
     profile.push_str("; Standard devices\n");
     profile.push_str("(allow file-write* (literal \"/dev/null\"))\n");
@@ -341,11 +362,23 @@ fn push_file_read_section(
     config: &Config,
     project_dir: &Path,
     deny_paths: &[PathBuf],
+    is_claude: bool,
 ) {
     profile.push_str("; File reads: explicit allow-list\n");
     // dyld needs the root node to resolve absolute paths. This literal rule
     // does not grant any filesystem subtree.
     profile.push_str("(allow file-read* (literal \"/\"))\n");
+    if is_claude {
+        // /tmp is a symlink into /private/tmp; push_path_rule
+        // canonicalizes every path it emits, so the write grant for
+        // Claude Code's /tmp/claude-<uid> below never covers the /tmp
+        // symlink node itself -- only its resolved target. Resolving
+        // a symlink needs a separate kernel read-metadata check on
+        // the symlink node, so without this, the mkdir Claude Code
+        // does via the literal "/tmp/..." path (not "/private/tmp/...")
+        // still gets EPERM even with the write rule below in place.
+        profile.push_str("(allow file-read* (literal \"/tmp\"))\n");
+    }
     for rd_path in macos_read_paths(config, project_dir) {
         push_path_rule(profile, "allow", "file-read*", &rd_path);
     }
@@ -362,6 +395,7 @@ fn push_file_write_section(
     writable_paths: &[PathBuf],
     atomic_paths: &[PathBuf],
     deny_paths: &[PathBuf],
+    is_claude: bool,
 ) {
     if lockdown {
         for deny_path in deny_paths {
@@ -373,6 +407,25 @@ fn push_file_write_section(
     profile.push_str("; File writes: allow specific paths\n");
     for wr_path in writable_paths {
         push_path_rule(profile, "allow", "file-write*", wr_path);
+    }
+    if is_claude {
+        // Claude Code hardcodes a working directory at
+        // /tmp/claude-<uid> (session/tool-output scratch state) and
+        // creates it unconditionally at startup -- ignoring $TMPDIR,
+        // which is otherwise how this sandbox hands out scratch
+        // space (see macos_session_tmpdir). Without *some* write
+        // access to that exact path, that first mkdir throws and
+        // Claude Code never gets past its own startup, regardless of
+        // --rw-map:
+        //   EPERM: operation not permitted, mkdir '/tmp/claude-501'
+        // Scoped to this user's own directory (not `claude-[0-9]+`,
+        // which would also cover another account's scratch dir on a
+        // shared machine) and not a general /private/tmp grant, so it
+        // doesn't require -- or interact with -- --rw-map /tmp at all.
+        let uid = unsafe { nix::libc::getuid() };
+        profile.push_str(&format!(
+            "(allow file-write* (regex #\"^/private/tmp/claude-{uid}(/.*)?$\"))\n"
+        ));
     }
     if !atomic_paths.is_empty() {
         profile.push('\n');
@@ -612,11 +665,16 @@ fn macos_writable_paths(
     if let Some(worktree) =
         super::discover_git_worktree_paths(config, project_dir, false)
     {
-        // Only the per-worktree git dir needs writes (HEAD, index,
-        // ORIG_HEAD, worktree-local refs). The shared common dir holds
-        // object storage and refs that sibling worktrees depend on —
-        // it stays read-only (macos_read_paths grants it reads).
-        paths.push(worktree.git_dir.clone());
+        // Both the per-worktree git dir (HEAD, index, ORIG_HEAD,
+        // worktree-local refs) and the shared common dir need writes:
+        // the common dir holds the object database, refs, and
+        // packed-refs, so `git add` and `git commit` write there.
+        // Granting only the git dir made every write fail with
+        // "Read-only file system" (issue #101). Lockdown returns
+        // early above, so these stay read-only there.
+        for path in worktree.unique_paths() {
+            paths.push(path);
+        }
     }
 
     // Explicit agent-state opt-in: mount the command's state dirs RW.
@@ -1349,6 +1407,144 @@ mod tests {
     }
 
     #[test]
+    fn static_section_grants_ioctl_on_pty_devices() {
+        // Without this, any ioctl on the child's own controlling
+        // terminal (TIOCGETD/TIOCSETA -- what tty.setRawMode() and
+        // stty/tcsetattr need) is denied under (deny default). The
+        // child then can't switch its stdin into raw mode: canonical
+        // line discipline still delivers plain Enter as a normal
+        // line, but special key encodings (Shift+Enter's xterm/kitty
+        // CSI sequences) are never intercepted and show up as
+        // literal bytes instead.
+        let profile = generate_sbpl_profile(
+            &Config::default(),
+            &PathBuf::from("/tmp/test-project"),
+        );
+        assert!(
+            profile
+                .contains("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+\"))")
+        );
+        assert!(profile.contains("(allow file-ioctl (literal \"/dev/ptmx\"))"));
+    }
+
+    #[test]
+    fn stty_ioctl_on_pty_succeeds_under_generated_profile() {
+        // Regression for the bug above, exercised for real: allocate
+        // an actual PTY, attach it as the sandboxed child's stdin, and
+        // confirm `stty -a` can query it (TIOCGETD et al.) instead of
+        // failing with "Operation not permitted".
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let config = Config::default();
+        let project = PathBuf::from("/tmp/test-project");
+        let profile = generate_sbpl_profile(&config, &project);
+
+        let pty = nix::pty::openpty(None, None).expect("openpty");
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("--")
+            .arg("/bin/stty")
+            .arg("-a")
+            .stdin(pty.slave)
+            .output()
+            .expect("failed to run sandbox-exec");
+        drop(pty.master);
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Operation not permitted"),
+            "stty ioctl on the child's controlling PTY was denied: \
+             status={:?} stderr={stderr} profile:\n{profile}",
+            output.status,
+        );
+    }
+
+    #[test]
+    fn claude_profile_grants_tmp_claude_dir_write_and_tmp_symlink_read() {
+        // Claude Code hardcodes mkdir('/tmp/claude-<uid>') at startup,
+        // unconditionally, ignoring $TMPDIR -- with neither of these
+        // two rules, that first mkdir throws EPERM before the agent
+        // does anything. Scoped to the "claude" command only: a
+        // different command has no reason to touch this path.
+        let claude_profile = generate_sbpl_profile(
+            &Config {
+                command: vec!["claude".into()],
+                ..Config::default()
+            },
+            &PathBuf::from("/tmp/test-project"),
+        );
+        let uid = unsafe { nix::libc::getuid() };
+        assert!(claude_profile.contains(&format!(
+            "(allow file-write* (regex #\"^/private/tmp/claude-{uid}(/.*)?$\"))"
+        )));
+        assert!(
+            claude_profile.contains("(allow file-read* (literal \"/tmp\"))")
+        );
+
+        let other_profile = generate_sbpl_profile(
+            &Config {
+                command: vec!["bash".into()],
+                ..Config::default()
+            },
+            &PathBuf::from("/tmp/test-project"),
+        );
+        assert!(!other_profile.contains("/private/tmp/claude-"));
+        assert!(
+            !other_profile.contains("(allow file-read* (literal \"/tmp\"))")
+        );
+    }
+
+    #[test]
+    fn mkdir_tmp_claude_dir_succeeds_under_generated_claude_profile() {
+        // Real end-to-end reproduction of the reported failure:
+        //   EPERM: operation not permitted, mkdir '/tmp/claude-501'
+        // Probes a throwaway subdirectory of the real uid-scoped path
+        // rather than the path itself: the rule covers descendants, so
+        // this still exercises the grant without disturbing a live
+        // Claude Code session's own /tmp/claude-<uid> directory.
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let profile = generate_sbpl_profile(
+            &Config {
+                command: vec!["claude".into()],
+                ..Config::default()
+            },
+            &PathBuf::from("/tmp/test-project"),
+        );
+
+        // Must match the uid-scoped rule the profile emits.
+        let parent = format!("/tmp/claude-{}", unsafe { nix::libc::getuid() });
+        let target = format!("{parent}/ai-jail-probe-{}", std::process::id());
+        let _ = std::fs::remove_dir(format!("/private{target}"));
+
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("--")
+            .arg("/bin/mkdir")
+            .arg("-p")
+            .arg(&target)
+            .output()
+            .expect("failed to run sandbox-exec");
+
+        // Remove only what this probe created; the parent may belong to
+        // a real session, and remove_dir leaves it alone unless empty.
+        let _ = std::fs::remove_dir(format!("/private{target}"));
+        let _ = std::fs::remove_dir(format!("/private{parent}"));
+
+        assert!(
+            output.status.success(),
+            "mkdir of Claude Code's /tmp/claude-<uid> dir was denied: \
+             status={:?} stderr={} profile:\n{profile}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
     fn read_paths_include_project() {
         let project = PathBuf::from("/tmp/test-project");
         let paths = macos_read_paths(&Config::default(), &project);
@@ -1415,7 +1611,7 @@ mod tests {
     }
 
     #[test]
-    fn writable_paths_grant_worktree_git_dir_not_common_dir() {
+    fn writable_paths_grant_worktree_git_dir_and_common_dir() {
         let fixture = create_linked_worktree_fixture();
         let config = Config {
             no_mise: Some(true),
@@ -1430,13 +1626,14 @@ mod tests {
         let same = |a: &Path, b: &Path| {
             std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok()
         };
-        // Only the per-worktree git dir is writable (HEAD, index,
-        // worktree-local refs); the shared common dir that sibling
-        // worktrees depend on must stay read-only.
+        // Regression for #101: the per-worktree git dir carries HEAD,
+        // index and worktree-local refs, but the object database and
+        // shared refs live in the common dir, so both must be
+        // writable or `git add` fails with "Read-only file system".
         assert!(paths.iter().any(|path| same(path, &fixture.git_dir)));
         assert!(
-            !paths.iter().any(|path| same(path, &fixture.common_dir)),
-            "common git dir must not be writable"
+            paths.iter().any(|path| same(path, &fixture.common_dir)),
+            "common git dir must be writable so git can write objects"
         );
     }
 

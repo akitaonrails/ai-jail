@@ -2569,22 +2569,35 @@ fn git_worktree_mounts(
         return vec![];
     };
 
-    let common = Mount::RoBind {
-        src: paths.common_dir.clone(),
-        dest: paths.common_dir,
-    };
-    let git_dir = if config.lockdown_enabled() {
-        Mount::RoBind {
-            src: paths.git_dir.clone(),
-            dest: paths.git_dir,
+    // A linked worktree keeps its object database, refs, and
+    // packed-refs in the shared common dir, not in the per-worktree
+    // git dir, so `git add` and `git commit` write there. Mounting
+    // the common dir read-only made every write fail with
+    // "Read-only file system" (issue #101), which left --worktree
+    // unable to do the one thing it exists for. Both are writable
+    // outside lockdown; lockdown keeps both read-only.
+    let readonly = config.lockdown_enabled();
+    let mount = |path: PathBuf| {
+        if readonly {
+            Mount::RoBind {
+                src: path.clone(),
+                dest: path,
+            }
+        } else {
+            Mount::Bind {
+                src: path.clone(),
+                dest: path,
+            }
         }
-    } else {
-        Mount::Bind {
-            src: paths.git_dir.clone(),
-            dest: paths.git_dir,
-        }
     };
-    vec![common, git_dir]
+
+    // Common dir first: the per-worktree git dir nests inside it and
+    // bwrap gives the later mount precedence.
+    let mut mounts = vec![mount(paths.common_dir.clone())];
+    if !super::paths_equivalent(&paths.common_dir, &paths.git_dir) {
+        mounts.push(mount(paths.git_dir));
+    }
+    mounts
 }
 
 fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
@@ -4593,8 +4606,12 @@ mod tests {
                     &fixture.git_dir,
                 )
         }));
+        // Regression for #101: the common dir holds the object
+        // database and shared refs, so it must be read-write outside
+        // lockdown. Mounting it --ro-bind made `git add` fail with
+        // "Read-only file system" inside a linked worktree.
         assert!(args.windows(3).any(|w| {
-            w[0] == "--ro-bind"
+            w[0] == "--bind"
                 && super::super::paths_equivalent(
                     Path::new(&w[1]),
                     &fixture.common_dir,
@@ -4604,6 +4621,16 @@ mod tests {
                     &fixture.common_dir,
                 )
         }));
+        assert!(
+            !args.windows(3).any(|w| {
+                w[0] == "--ro-bind"
+                    && super::super::paths_equivalent(
+                        Path::new(&w[1]),
+                        &fixture.common_dir,
+                    )
+            }),
+            "common dir must not also be mounted read-only"
+        );
     }
 
     #[test]

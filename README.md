@@ -82,20 +82,20 @@ worktree metadata, X11, host shared memory, terminal passthrough, update
 check, and macOS host IPC. Docker, SSH, Pictures, Tailscale, and the systemd
 user bus are also off by default.
 
-| Flag pair                                              | Effect and security consequence                                                                                                                                                           |
-| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--network` / `--no-network`                           | Enables/disables unrestricted network. `--network` permits full network exfiltration of any readable data.                                                                                |
-| `--gpu` / `--no-gpu`                                   | Enables/disables GPU device access.                                                                                                                                                       |
-| `--display` / `--no-display`                           | Enables/disables display access. Only the validated Wayland socket is mounted; ai-jail never mounts all of `XDG_RUNTIME_DIR`. X11 is separate (`--x11`).                                  |
-| `--x11` / `--no-x11`                                   | Enables/disables X11 separately. X11 access permits keylogging and screenshots.                                                                                                           |
-| `--host-shm` / `--no-host-shm`                         | Enables/disables host `/dev/shm`; enabling it opens host cross-process IPC.                                                                                                               |
-| `--terminal-passthrough` / `--no-terminal-passthrough` | Enables/disables raw terminal forwarding. Output is filtered through a VT parser by default; raw forwarding exposes terminal clipboard, query, and parser surface.                        |
-| `--agent-state` / `--no-agent-state`                   | Enables/disables mounting the invoked command's credential state (default off). Enables the agent to authenticate — and lets anything in the sandbox use those credentials.               |
-| `--inherit-env` / `--no-inherit-env`                   | Default is a minimal environment allowlist. `--inherit-env` passes the full parent environment, secrets included.                                                                         |
-| `--update-check` / `--no-update-check`                 | Enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active (default off; all other launches make no network requests). |
-| `--macos-host-ipc` / `--no-macos-host-ipc`             | Enables/disables macOS Mach, IOKit, and host IPC exposure.                                                                                                                                |
-| `--worktree` / `--no-worktree`                         | Enables/disables validated linked-worktree common metadata, mounted read-only when enabled.                                                                                               |
-| `--private-home` / `--no-private-home`                 | Enables/disables the default private home. Disabling it is broad host-home access.                                                                                                        |
+| Flag pair | Effect and security consequence |
+|---|---|
+| `--network` / `--no-network` | Enables/disables unrestricted network. `--network` permits full network exfiltration of any readable data. |
+| `--gpu` / `--no-gpu` | Enables/disables GPU device access. |
+| `--display` / `--no-display` | Enables/disables display access. Only the validated Wayland socket is mounted; ai-jail never mounts all of `XDG_RUNTIME_DIR`. X11 is separate (`--x11`). |
+| `--x11` / `--no-x11` | Enables/disables X11 separately. X11 access permits keylogging and screenshots. |
+| `--host-shm` / `--no-host-shm` | Enables/disables host `/dev/shm`; enabling it opens host cross-process IPC. |
+| `--terminal-passthrough` / `--no-terminal-passthrough` | Enables/disables raw terminal forwarding. Output is filtered through a VT parser by default; raw forwarding exposes terminal clipboard, query, and parser surface. |
+| `--agent-state` / `--no-agent-state` | Enables/disables mounting the invoked command's credential state (default off). Enables the agent to authenticate — and lets anything in the sandbox use those credentials. |
+| `--inherit-env` / `--no-inherit-env` | Default is a minimal environment allowlist. `--inherit-env` passes the full parent environment, secrets included. |
+| `--update-check` / `--no-update-check` | Enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active (default off; all other launches make no network requests). |
+| `--macos-host-ipc` / `--no-macos-host-ipc` | Enables/disables macOS Mach, IOKit, and host IPC exposure. |
+| `--worktree` / `--no-worktree` | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only. |
+| `--private-home` / `--no-private-home` | Enables/disables the default private home. Disabling it is broad host-home access. |
 
 `--allow-tcp-port` remains accepted for backward compatibility, but launch
 fails closed because UDP cannot be securely constrained through this option.
@@ -228,6 +228,35 @@ If [mise](https://mise.jdx.dev/) is on `$PATH`, the sandbox runs
 agents get the project's language versions. Disable with `--no-mise` or
 `no_mise = true`. It is skipped automatically in `--lockdown` and browser
 profile modes.
+
+## Herdr
+
+[Herdr](https://herdr.dev/) runs outside the sandbox, one `ai-jail` per pane,
+the same as tmux. ai-jail needs no configuration for this, and the working
+directory already lines up: the project is bound at its real path and the
+sandbox `chdir`s there, so the pane's cwd matches inside and out.
+
+Agent detection needs one variable. Herdr identifies the agent from the pane's
+foreground process, and ai-jail's PTY proxy and PID namespace hide it, so name
+the agent explicitly:
+
+```bash
+HERDR_AGENT=claude ai-jail claude
+```
+
+If Herdr still cannot resolve the process group through the sandbox, set
+`HERDR_PROCESS_DETECTION=child-groups` in the Herdr environment.
+
+If agent state is reported incorrectly, note that Herdr classifies state from
+the pane's bottom screen rows, which is also where ai-jail's status bar draws;
+`--no-status-bar` removes that overlap.
+
+**Do not mount the Herdr control socket into the sandbox.** `HERDR_*` variables
+and `~/.config/herdr/herdr.sock` are not passed in, and that is deliberate:
+`herdr tab create` runs a command on the host, so an agent that can reach the
+socket can execute outside the jail. Hook-based state reporting from inside the
+sandbox would require exactly that, and it trades away the sandbox — leave
+detection to `HERDR_AGENT` and screen manifests instead.
 
 ## Troubleshooting
 
