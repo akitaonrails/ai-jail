@@ -381,7 +381,18 @@ fn run() -> Result<i32, String> {
     // When Landlock is enabled, the inner command is wrapped with
     // `ai-jail --landlock-exec` so Landlock is applied INSIDE the
     // sandbox after bwrap finishes mount namespace setup.
-    let mut cmd = sandbox::build(&guard, &config, &project_dir, cli.verbose)?;
+    // Allocate the PTY before building the command: the macOS profile scopes
+    // its terminal ioctl grant to this exact device, so the slave path must be
+    // known while the sandbox profile is still being generated.
+    let pty = if use_pty { Some(pty::open()?) } else { None };
+    let sandbox_tty = pty.as_ref().and_then(pty::Pty::slave_path);
+    let mut cmd = sandbox::build(
+        &guard,
+        &config,
+        &project_dir,
+        cli.verbose,
+        sandbox_tty.as_deref(),
+    )?;
 
     // Apply NOFILE and CORE limits on the parent (inherited by child
     // across fork+exec). NPROC is applied inside the sandbox instead
@@ -427,7 +438,10 @@ fn run() -> Result<i32, String> {
 
         // PTY proxy path: ai-jail owns the real terminal, child gets a PTY
         // slave. The overlay remains optional, but output filtering is not.
+        // `use_pty` is what put a PTY in `pty` above.
+        let pty = pty.expect("PTY allocated when use_pty is set");
         match pty::run_with_config(
+            pty,
             &mut cmd,
             resize_redraw_key.as_deref(),
             &config,

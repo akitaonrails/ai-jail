@@ -995,13 +995,53 @@ pub fn stdout_needs_filter() -> bool {
 }
 
 /// Config-aware PTY entry point for the explicit terminal passthrough opt-in.
+/// A PTY pair allocated before the sandbox command is built.
+///
+/// The macOS profile scopes its terminal `file-ioctl` grant to this exact
+/// device, so the slave path has to be known while the SBPL profile is still
+/// being generated — hence allocating here rather than inside [`run`].
+pub struct Pty(nix::pty::OpenptyResult);
+
+/// Allocate the PTY pair the sandboxed child will use as its terminal.
+pub fn open() -> Result<Pty, String> {
+    nix::pty::openpty(None, None)
+        .map(Pty)
+        .map_err(|e| format!("openpty: {e}"))
+}
+
+impl Pty {
+    /// Device path of the slave side (for example `/dev/ttys003`).
+    ///
+    /// `None` when it cannot be resolved; callers then grant no terminal
+    /// ioctl access at all rather than widening the rule to every terminal.
+    /// Duplicate of the slave fd, for handing to a child as stdio while
+    /// this `Pty` stays alive.
+    #[cfg(all(test, target_os = "macos"))]
+    pub fn slave_try_clone(&self) -> std::io::Result<OwnedFd> {
+        self.0.slave.try_clone()
+    }
+
+    pub fn slave_path(&self) -> Option<std::path::PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        // ptsname returns a pointer into static storage, copied immediately.
+        let raw = unsafe { nix::libc::ptsname(self.0.master.as_raw_fd()) };
+        if raw.is_null() {
+            return None;
+        }
+        let bytes = unsafe { std::ffi::CStr::from_ptr(raw) }.to_bytes();
+        Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+    }
+}
+
 pub fn run_with_config(
+    pty: Pty,
     cmd: &mut std::process::Command,
     resize_redraw_key: Option<&[u8]>,
     config: &crate::config::Config,
     status_bar: bool,
 ) -> Result<i32, String> {
     run_with_passthrough(
+        pty,
         cmd,
         resize_redraw_key,
         config.terminal_passthrough_enabled(),
@@ -1010,6 +1050,7 @@ pub fn run_with_config(
 }
 
 fn run_with_passthrough(
+    pty: Pty,
     cmd: &mut std::process::Command,
     resize_redraw_key: Option<&[u8]>,
     terminal_passthrough: bool,
@@ -1022,11 +1063,9 @@ fn run_with_passthrough(
         return Err("Terminal too small for status bar".into());
     }
 
-    // Create PTY pair
-    let pty =
-        nix::pty::openpty(None, None).map_err(|e| format!("openpty: {e}"))?;
-    let master = pty.master;
-    let slave = pty.slave;
+    // PTY pair was allocated by the caller (see [`open`]).
+    let master = pty.0.master;
+    let slave = pty.0.slave;
 
     // Set FD_CLOEXEC on master so child doesn't inherit it
     let master_raw = master.as_raw_fd();
@@ -1609,6 +1648,25 @@ mod tests {
         assert!(ends_at_ground_state(
             b"\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\x1b[r"
         ));
+    }
+
+    #[test]
+    fn allocated_pty_resolves_a_slave_device_path() {
+        // macOS scopes its terminal file-ioctl grant to exactly this path.
+        // If ptsname ever stopped resolving, the profile would silently
+        // emit no terminal ioctl rule and agents could not enter raw mode.
+        let pty = super::open().expect("openpty");
+        let path = pty.slave_path().expect("slave path");
+        assert!(
+            path.starts_with("/dev/"),
+            "unexpected slave device path: {}",
+            path.display()
+        );
+        assert!(
+            path.exists(),
+            "slave device does not exist: {}",
+            path.display()
+        );
     }
 
     #[test]

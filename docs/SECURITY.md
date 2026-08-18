@@ -62,15 +62,23 @@ running as them could otherwise supply a fake bwrap and silently disable the
 sandbox.
 
 macOS starts with no global reads, network, or host IPC, and supports the same
-opt-in `--agent-state` credential mounts as Linux; `--overlay-map` is honored
+opt-in `--agent-state` credential mounts as Linux. Temp access is limited to a
+private per-launch session directory pointed to by `TMPDIR`, with one
+command-specific exception: `claude` is also granted write access to
+`/private/tmp/claude-<uid>`, scoped to the invoking uid, because Claude Code
+creates that path unconditionally at startup and ignores `TMPDIR`. It is
+outside the project and persists between runs; `--overlay-map` is honored
 as a read-only map because copy-on-write overlays are Linux-only.
 `sandbox-exec` is deprecated by Apple and is not equivalent to Linux
-isolation; use a disposable VM for hostile workloads. The macOS profile
-allows `file-ioctl` on pty device nodes, which agents need to put their own
-stdin into raw mode. SBPL cannot filter by ioctl request, so that grant
-covers every `/dev/ttys*` this user can already open, not only the sandbox's
-own terminal; a compromised agent could use it to inject input into another
-of your terminals. Linux denies `TIOCSTI` outright through seccomp. On both platforms,
+isolation; use a disposable VM for hostile workloads. Agents need `file-ioctl`
+on their own terminal to enter raw mode, and SBPL cannot filter by ioctl
+request, so the grant is scoped by path to the single PTY ai-jail allocated
+for that run — never a pattern covering every `/dev/ttys*`, which would let a
+compromised agent use `TIOCSTI` to inject input into another of your shells.
+When ai-jail is not proxying a PTY, no terminal ioctl is granted at all.
+`/dev/ptmx` stays available so the sandbox can allocate its own PTYs; a PTY
+created inside the sandbox is not covered by the path-scoped rule. Linux
+denies `TIOCSTI` outright through seccomp. On both platforms,
 kernel and driver bugs, terminal emulator bugs (especially after terminal
 passthrough), and sandbox backend defects remain residual risk.
 

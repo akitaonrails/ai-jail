@@ -1468,6 +1468,7 @@ fn discover_mounts_full(
             sources.hosts_mount,
             sources.resolv_mount,
             sources.resolv_intermediate_mount,
+            verbose,
         ),
         sys_masks: {
             let mut masks = discover_sys_masks(lockdown);
@@ -1949,16 +1950,26 @@ fn build_deny_mounts(
     mounts
 }
 
-fn optional_ro_bind(path: &Path) -> Option<Mount> {
+/// Read-only bind for a base directory that may not exist on every host
+/// (NixOS has no `/usr`; plenty of systems have no `/opt`). bwrap refuses a
+/// missing bind source, so these are skipped rather than fatal — but say so
+/// under `--verbose`, since a silently absent `/etc` or `/usr` changes what
+/// the sandbox contains and is otherwise invisible.
+fn optional_ro_bind(path: &Path, verbose: bool) -> Option<Mount> {
     if path.is_dir() {
         let path = path.to_path_buf();
-        Some(Mount::RoBind {
+        return Some(Mount::RoBind {
             src: path.clone(),
             dest: path,
-        })
-    } else {
-        None
+        });
     }
+    if verbose {
+        output::verbose(&format!(
+            "Base mount: {} is not a directory, skipping",
+            path.display()
+        ));
+    }
+    None
 }
 
 fn path_resolves_under(path: &Path, prefix: &Path) -> bool {
@@ -1980,12 +1991,14 @@ fn discover_base(
     hosts_mount: (&Path, &Path),
     resolv_mount: Option<(&Path, &Path)>,
     resolv_intermediate_mount: Option<(&Path, &Path)>,
+    verbose: bool,
 ) -> Vec<Mount> {
     discover_base_with_nix_root(
         hosts_mount,
         resolv_mount,
         resolv_intermediate_mount,
         Path::new("/nix"),
+        verbose,
     )
 }
 
@@ -1994,11 +2007,12 @@ fn discover_base_with_nix_root(
     resolv_mount: Option<(&Path, &Path)>,
     resolv_intermediate_mount: Option<(&Path, &Path)>,
     nix_root: &Path,
+    verbose: bool,
 ) -> Vec<Mount> {
     let (hosts_file, hosts_dest) = hosts_mount;
     let mut mounts = Vec::new();
 
-    if let Some(m) = optional_ro_bind(Path::new("/usr")) {
+    if let Some(m) = optional_ro_bind(Path::new("/usr"), verbose) {
         mounts.push(m);
     }
 
@@ -2032,10 +2046,10 @@ fn discover_base_with_nix_root(
     // or ai-jail/bwrap itself runs from /nix/store and requires its dynamic
     // dependencies.
     if needs_nix_mount(hosts_dest, nix_root) {
-        mounts.extend(optional_ro_bind(nix_root));
+        mounts.extend(optional_ro_bind(nix_root, verbose));
     }
 
-    if let Some(m) = optional_ro_bind(Path::new("/etc")) {
+    if let Some(m) = optional_ro_bind(Path::new("/etc"), verbose) {
         mounts.push(m);
     }
     mounts.push(Mount::FileRoBind {
@@ -2043,10 +2057,10 @@ fn discover_base_with_nix_root(
         dest: hosts_dest.to_path_buf(),
     });
     // /opt is optional on some hosts; bwrap rejects missing bind sources.
-    if let Some(m) = optional_ro_bind(Path::new("/opt")) {
+    if let Some(m) = optional_ro_bind(Path::new("/opt"), verbose) {
         mounts.push(m);
     }
-    if let Some(m) = optional_ro_bind(Path::new("/sys")) {
+    if let Some(m) = optional_ro_bind(Path::new("/sys"), verbose) {
         mounts.push(m);
     }
     mounts.extend([
@@ -2918,12 +2932,16 @@ mod tests {
         std::fs::write(&file, b"not a directory").unwrap();
 
         assert!(matches!(
-            optional_ro_bind(&directory),
+            optional_ro_bind(&directory, false),
             Some(Mount::RoBind { src, dest })
                 if src == directory && dest == directory
         ));
-        assert!(optional_ro_bind(&file).is_none());
-        assert!(optional_ro_bind(&missing).is_none());
+        assert!(optional_ro_bind(&file, false).is_none());
+        assert!(optional_ro_bind(&missing, false).is_none());
+        // Reporting must not change the outcome, only its visibility.
+        assert!(optional_ro_bind(&missing, true).is_none());
+        assert!(optional_ro_bind(&file, true).is_none());
+        assert!(optional_ro_bind(&directory, true).is_some());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5534,6 +5552,7 @@ mod tests {
                 Path::new("/run/resolvconf/resolv.conf"),
             )),
             None,
+            false,
         );
 
         let mut run_tmpfs_idx = None;
@@ -5577,6 +5596,7 @@ mod tests {
                 Path::new("/tmp/test-resolv"),
                 Path::new("/run/host/etc/resolv.conf"),
             )),
+            false,
         );
 
         let canonical = mounts.iter().any(|m| matches!(
@@ -5610,6 +5630,7 @@ mod tests {
                 Path::new("/etc/resolv.conf"),
             )),
             None,
+            false,
         );
 
         let resolv_binds: Vec<_> = mounts
@@ -5646,6 +5667,7 @@ mod tests {
             None,
             None,
             &nix,
+            false,
         );
 
         let nix_idx = mounts.iter().position(|m| {

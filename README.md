@@ -149,9 +149,15 @@ instead of your shell expanding it first.
 
 The private home is a fresh tmpfs per launch. Nothing persists between runs
 except state you explicitly mount (agent state, `--rw-map`, command tables).
-`/tmp` inside the sandbox is sandbox-local and discarded on exit; writes to
-dotfiles and caches vanish with the sandbox. Use a map or `--agent-state` for
-anything durable.
+On Linux `/tmp` inside the sandbox is sandbox-local and discarded on exit;
+writes to dotfiles and caches vanish with the sandbox. macOS has no mount
+namespace, so `/tmp` is the host's: `TMPDIR` instead points at a private
+per-launch session directory (mode `0700`), and that is the only temp path
+the profile grants. The one exception is `ai-jail claude` on macOS, which is
+also granted write access to `/private/tmp/claude-<your uid>` because Claude
+Code creates that directory unconditionally at startup and ignores `TMPDIR`;
+unlike the session directory, it persists between runs. Use a map or
+`--agent-state` for anything durable.
 
 ## Browsers
 

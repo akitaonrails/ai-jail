@@ -52,9 +52,14 @@ pub fn platform_notes(config: &Config) {
     }
 }
 
-pub fn build(config: &Config, project_dir: &Path, verbose: bool) -> Command {
+pub fn build(
+    config: &Config,
+    project_dir: &Path,
+    verbose: bool,
+    sandbox_tty: Option<&Path>,
+) -> Command {
     let lockdown = config.lockdown_enabled();
-    let profile = build_profile(config, project_dir, verbose);
+    let profile = build_profile(config, project_dir, verbose, sandbox_tty);
     let launch = super::build_launch_command(config);
 
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
@@ -109,7 +114,8 @@ fn apply_child_env(cmd: &mut Command, config: &Config) {
 }
 
 pub fn dry_run(config: &Config, project_dir: &Path, verbose: bool) -> String {
-    let profile = build_profile(config, project_dir, verbose);
+    // No PTY exists for a dry run, so no terminal ioctl rule is emitted.
+    let profile = build_profile(config, project_dir, verbose, None);
     let launch = super::build_launch_command(config);
 
     let mut command_line = String::from("sandbox-exec -p '<profile>' -- ");
@@ -122,8 +128,14 @@ pub fn dry_run(config: &Config, project_dir: &Path, verbose: bool) -> String {
     format_dry_run_macos(&command_line, &profile)
 }
 
-fn build_profile(config: &Config, project_dir: &Path, verbose: bool) -> String {
-    let profile = generate_sbpl_profile(config, project_dir);
+fn build_profile(
+    config: &Config,
+    project_dir: &Path,
+    verbose: bool,
+    sandbox_tty: Option<&Path>,
+) -> String {
+    let profile =
+        generate_sbpl_profile_for_tty(config, project_dir, sandbox_tty);
 
     if verbose {
         output::verbose("SBPL profile:");
@@ -184,7 +196,18 @@ fn sbpl_path(p: &Path) -> String {
     sbpl_escape(canonicalize_or_keep(p).to_string_lossy().as_ref())
 }
 
+/// Profile with no terminal ioctl grant, for tests that do not exercise a
+/// PTY; see [`generate_sbpl_profile_for_tty`].
+#[cfg(test)]
 fn generate_sbpl_profile(config: &Config, project_dir: &Path) -> String {
+    generate_sbpl_profile_for_tty(config, project_dir, None)
+}
+
+fn generate_sbpl_profile_for_tty(
+    config: &Config,
+    project_dir: &Path,
+    sandbox_tty: Option<&Path>,
+) -> String {
     let lockdown = config.lockdown_enabled();
     let exempt = super::dotdir_exemptions(config);
     let agent_state = agent_state_paths(config);
@@ -226,7 +249,11 @@ fn generate_sbpl_profile(config: &Config, project_dir: &Path) -> String {
     profile.push_str("(version 1)\n");
     profile.push_str("(deny default)\n\n");
 
-    push_static_sections(&mut profile, config.macos_host_ipc_enabled());
+    push_static_sections(
+        &mut profile,
+        config.macos_host_ipc_enabled(),
+        sandbox_tty,
+    );
     push_network_section(&mut profile, config);
     let is_claude =
         crate::command::effective_name(&config.command) == Some("claude");
@@ -267,7 +294,11 @@ fn push_path_rule(profile: &mut String, verb: &str, action: &str, path: &Path) {
 
 /// Sections that don't depend on filesystem policy. Always emitted first so
 /// the file structure is predictable across modes.
-fn push_static_sections(profile: &mut String, allow_host_ipc: bool) {
+fn push_static_sections(
+    profile: &mut String,
+    allow_host_ipc: bool,
+    sandbox_tty: Option<&Path>,
+) {
     profile.push_str("; Process operations\n");
     profile.push_str("(allow process-exec)\n");
     profile.push_str("(allow process-fork)\n");
@@ -323,17 +354,29 @@ fn push_static_sections(profile: &mut String, allow_host_ipc: bool) {
     profile.push_str(
         "(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+\"))\n",
     );
-    // Scoped to the PTY device nodes only (not the broad
-    // --macos-host-ipc file-ioctl grant below). Without this, any
-    // ioctl on the child's own controlling terminal -- including
-    // TIOCGETD/TIOCSETA, which Node's tty.setRawMode() and libc's
-    // stty/tcsetattr need -- is denied under (deny default). The
-    // child then can't switch its stdin into raw mode: canonical
-    // (cooked) line discipline still delivers plain Enter as a
-    // normal line, but special key encodings (e.g. Shift+Enter's
-    // xterm/kitty CSI sequences) are never intercepted and instead
-    // show up as literal bytes in whatever reads the line.
-    profile.push_str("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+\"))\n");
+    // Terminal ioctl, scoped to the one PTY ai-jail allocated for this
+    // child.
+    //
+    // Without any grant, every ioctl on the child's own controlling
+    // terminal -- including TIOCGETD/TIOCSETA, which Node's
+    // tty.setRawMode() and libc's stty/tcsetattr need -- is denied under
+    // (deny default), and the agent cannot put its stdin into raw mode.
+    //
+    // The obvious rule, a regex over ^/dev/ttys[0-9]+, would also cover
+    // every *other* terminal this user has open. SBPL cannot filter by
+    // ioctl request number, so that would hand the sandbox TIOCSTI on
+    // those devices -- injecting keystrokes into another of the user's
+    // shells, which is a straightforward escape. Linux denies TIOCSTI
+    // through seccomp; macOS has no equivalent, so the grant is narrowed
+    // by path instead. When ai-jail is not proxying a PTY the child is
+    // talking to the host's own terminal, and no grant is emitted at all.
+    if let Some(tty) = sandbox_tty {
+        profile.push_str(&format!(
+            "(allow file-ioctl (literal \"{}\"))\n",
+            sbpl_path(tty)
+        ));
+    }
+    // /dev/ptmx stays allowed so the sandbox can allocate its own PTYs.
     profile.push_str("(allow file-ioctl (literal \"/dev/ptmx\"))\n\n");
 
     profile.push_str("; Standard devices\n");
@@ -1416,14 +1459,41 @@ mod tests {
         // line, but special key encodings (Shift+Enter's xterm/kitty
         // CSI sequences) are never intercepted and show up as
         // literal bytes instead.
-        let profile = generate_sbpl_profile(
+        let tty = PathBuf::from("/dev/ttys003");
+        let profile = generate_sbpl_profile_for_tty(
             &Config::default(),
             &PathBuf::from("/tmp/test-project"),
+            Some(&tty),
         );
         assert!(
-            profile
+            profile.contains("(allow file-ioctl (literal \"/dev/ttys003\"))")
+        );
+        assert!(profile.contains("(allow file-ioctl (literal \"/dev/ptmx\"))"));
+        // A regex over every terminal would also hand the sandbox TIOCSTI
+        // on the user's other shells, which is an escape.
+        assert!(
+            !profile
+                .contains("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+\"))"),
+            "terminal ioctl must not be granted on every /dev/ttys*"
+        );
+    }
+
+    #[test]
+    fn no_terminal_ioctl_granted_without_a_sandbox_pty() {
+        // Without a proxied PTY the child talks to the host's own
+        // terminal, so granting ioctl there is exactly the case that
+        // would allow injecting input into the user's shell.
+        let profile = generate_sbpl_profile_for_tty(
+            &Config::default(),
+            &PathBuf::from("/tmp/test-project"),
+            None,
+        );
+        assert!(!profile.contains("(allow file-ioctl (literal \"/dev/ttys"));
+        assert!(
+            !profile
                 .contains("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+\"))")
         );
+        // Allocating a fresh PTY inside the sandbox stays possible.
         assert!(profile.contains("(allow file-ioctl (literal \"/dev/ptmx\"))"));
     }
 
@@ -1438,19 +1508,24 @@ mod tests {
         }
         let config = Config::default();
         let project = PathBuf::from("/tmp/test-project");
-        let profile = generate_sbpl_profile(&config, &project);
 
-        let pty = nix::pty::openpty(None, None).expect("openpty");
+        // Allocate through the same path main.rs uses, so the profile is
+        // scoped to this exact device rather than to every terminal.
+        let pty = crate::pty::open().expect("openpty");
+        let tty = pty.slave_path().expect("ptsname");
+        let profile =
+            generate_sbpl_profile_for_tty(&config, &project, Some(&tty));
+
         let output = Command::new("/usr/bin/sandbox-exec")
             .arg("-p")
             .arg(&profile)
             .arg("--")
             .arg("/bin/stty")
             .arg("-a")
-            .stdin(pty.slave)
+            .stdin(pty.slave_try_clone().expect("dup slave"))
             .output()
             .expect("failed to run sandbox-exec");
-        drop(pty.master);
+        drop(pty);
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -1838,7 +1913,7 @@ mod tests {
             no_mise: Some(true),
             ..Config::default()
         };
-        let cmd = build(&config, Path::new("/tmp/test-project"), false);
+        let cmd = build(&config, Path::new("/tmp/test-project"), false, None);
         let session = root.join(format!("ai-jail-{}", std::process::id()));
         let tmpdir = cmd
             .get_envs()
@@ -1864,7 +1939,7 @@ mod tests {
             ],
             ..Config::default()
         };
-        let cmd = build(&config, Path::new("/tmp/test-project"), false);
+        let cmd = build(&config, Path::new("/tmp/test-project"), false, None);
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
 
         let get = |name: &str| {
@@ -1904,7 +1979,7 @@ mod tests {
             inherit_env: Some(true),
             ..Config::default()
         };
-        let cmd = build(&config, Path::new("/tmp/test-project"), false);
+        let cmd = build(&config, Path::new("/tmp/test-project"), false, None);
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert_eq!(
             env.get(&std::ffi::OsStr::new("AI_JAIL_HOST_STATE"))
