@@ -226,11 +226,31 @@ fn run() -> Result<i32, String> {
     let baseline = config::merge(&cli, global);
     let invocation_cwd = std::env::current_dir()
         .map_err(|e| format!("Cannot determine current directory: {e}"))?;
-    let (mut config, security_warnings) = config::merge_with_global_report(
-        baseline,
-        project_config.clone(),
+    // A project `.ai-jail` is untrusted monotonic policy unless the trusted
+    // global config lists this directory under `trust_project_config`, in
+    // which case it is merged with the same semantics as a global
+    // `[commands.<name>]` table and may enable capabilities.
+    let project_trusted = config::project_config_is_trusted(
+        &baseline.trust_project_config,
         &invocation_cwd,
     );
+    let (mut config, security_warnings) = if project_trusted {
+        if cli.verbose {
+            output::verbose(
+                "Project .ai-jail: trusted (listed in global trust_project_config)",
+            );
+        }
+        (
+            config::merge_trusted_project(baseline, project_config.clone()),
+            Vec::<String>::new(),
+        )
+    } else {
+        config::merge_with_global_report(
+            baseline,
+            project_config.clone(),
+            &invocation_cwd,
+        )
+    };
     if cli.command.is_empty() && !project_config.command.is_empty() {
         config.command = project_config.command.clone();
     }

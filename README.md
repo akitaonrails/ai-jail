@@ -174,6 +174,9 @@ Two config files plus CLI flags, in increasing authority:
 1. `./.ai-jail` (project) — untrusted, monotonic policy: it may tighten the
    sandbox but can never enable capabilities, outside maps, ports,
    `claude_dir`, or exceptions. It is hidden from the sandbox by default.
+   To let specific checkouts ship their own capability opt-ins, list their
+   parent directory under `trust_project_config` in the global config (see
+   below).
 2. `~/.ai-jail` (global, trusted) — a base table plus optional
    `[commands.<name>]` tables keyed by the first word of the command.
 3. CLI flags — highest authority.
@@ -187,6 +190,19 @@ Common fields: `command`, `rw_maps`, `ro_maps`, `overlay_maps`, `mask`,
 `network`, `x11`, `host_shm`, `terminal_passthrough`, `macos_host_ipc`,
 `systemd_user`, `ssh`, `pictures`, `private_home`, `lockdown`,
 `browser_profile`, `claude_dir`, `allow_tcp_ports`, `status_bar_style`.
+
+Global config only: `trust_project_config` lists directories whose project
+`.ai-jail` may enable capabilities rather than only tighten, for teams that
+ship per-repository policy:
+
+```toml
+# ~/.ai-jail
+trust_project_config = ["~/work/repos"]
+```
+
+Everything at or beneath a listed directory is trusted, including repositories
+cloned there later, so keep the list narrow. A project file that sets this
+itself is ignored.
 
 Legacy polarity warning: older boolean fields keep their inverted `no_*`
 names (`no_gpu`, `no_docker`, `no_display`, `no_worktree`, `no_mise`,

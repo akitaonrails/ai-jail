@@ -243,6 +243,17 @@ pub struct Config {
     /// entries can carry secret values.
     #[serde(default, skip_serializing)]
     pub env_pass: Vec<String>,
+    /// Directories whose project `.ai-jail` is trusted to grant
+    /// capabilities, instead of being treated as untrusted monotonic
+    /// policy. A project matches when it is one of these directories or
+    /// sits beneath one, compared after resolving both paths.
+    ///
+    /// Trusted layers only: an entry in a project `.ai-jail` is ignored,
+    /// because a repository must never be able to declare itself trusted.
+    /// Listing a directory means every repository you ever place under it
+    /// may enable capabilities, so keep the list narrow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trust_project_config: Vec<PathBuf>,
     /// Trusted capability: let the status bar check GitHub for a
     /// newer ai-jail release. Opt-in (phones home); the project
     /// `.ai-jail` may only disable it, never enable it.
@@ -650,6 +661,8 @@ fn global_config_for_command(
 /// command table.
 fn merge_trusted(global: Config, local: Config) -> Config {
     let mut c = global;
+    // Trust is conferred by the global config, never claimed by the layer
+    // being merged in, so this field is deliberately not taken from `local`.
     if !local.command.is_empty() {
         c.command = local.command;
     }
@@ -870,6 +883,35 @@ fn append_project_maps(
 /// Merge untrusted project configuration into an already trusted baseline
 /// (global configuration plus CLI). Project configuration may add restrictions,
 /// but never grants a capability the baseline did not already grant.
+/// Whether `project_dir`'s own `.ai-jail` may grant capabilities.
+///
+/// Directory containment rather than glob matching: this is a trust
+/// decision, and "at or beneath one of these directories" is a rule with no
+/// edge cases to get wrong. Both sides are resolved first, so `..` segments
+/// and symlinks cannot smuggle an unlisted project past the check.
+pub fn project_config_is_trusted(
+    trusted_dirs: &[PathBuf],
+    project_dir: &Path,
+) -> bool {
+    if trusted_dirs.is_empty() {
+        return false;
+    }
+    let Ok(project) = std::fs::canonicalize(project_dir) else {
+        return false;
+    };
+    trusted_dirs.iter().any(|dir| {
+        std::fs::canonicalize(expand_tilde(dir.clone()))
+            .is_ok_and(|dir| project.starts_with(&dir))
+    })
+}
+
+/// Merge a project `.ai-jail` that the global config marked trusted via
+/// `trust_project_config`, using the same semantics as a global
+/// `[commands.<name>]` table: it may enable capabilities, not only tighten.
+pub fn merge_trusted_project(global: Config, local: Config) -> Config {
+    merge_trusted(global, local)
+}
+
 pub fn merge_with_global_report(
     baseline: Config,
     local: Config,
@@ -877,6 +919,14 @@ pub fn merge_with_global_report(
 ) -> (Config, Vec<String>) {
     let mut c = baseline;
     let mut warnings = Vec::new();
+    // A project cannot nominate itself, or anything else, as trusted.
+    if !local.trust_project_config.is_empty() {
+        warnings.push(
+            "project .ai-jail trust_project_config ignored: only the global \
+             config can mark a directory trusted"
+                .into(),
+        );
+    }
     if c.command.is_empty() && !local.command.is_empty() {
         c.command = local.command;
     }
@@ -1060,6 +1110,9 @@ fn save_project(config: &Config, write_when_empty: bool) {
     // the project config is untrusted at merge time anyway — never
     // persist them to the project .ai-jail.
     local.env_pass.clear();
+    // Only the global config can mark a directory trusted, so never write
+    // this into a project file where it would be silently ignored.
+    local.trust_project_config.clear();
 
     if !write_when_empty && config_body_is_empty(&local) {
         return;
@@ -1966,6 +2019,7 @@ lockdown = false
     fn project_env_pass_is_ignored() {
         let project = Config {
             env_pass: vec!["AWS_SESSION_TOKEN".into()],
+            trust_project_config: vec![],
             ..Config::default()
         };
         let (merged, warnings) = merge_with_global_report(
@@ -2006,6 +2060,7 @@ env_pass = ["ANTHROPIC_API_KEY"]
         let config = Config {
             command: vec!["claude".into()],
             env_pass: vec!["ANTHROPIC_API_KEY=sk-secret".into()],
+            trust_project_config: vec![],
             ..Config::default()
         };
         let serialized = serialize_config(&config).unwrap();
@@ -2761,6 +2816,7 @@ no_gpu = true
             agent_state: Some(true),
             inherit_env: None,
             env_pass: vec!["ANTHROPIC_API_KEY".into()],
+            trust_project_config: vec![],
             update_check: Some(false),
         };
         let serialized = serialize_config(&config).unwrap();
@@ -4315,6 +4371,103 @@ allow_tcp_ports = [32000, 8080]
     }
 
     #[test]
+    fn pre_trust_project_config_files_still_parse() {
+        // Backward compatibility: configs written before
+        // trust_project_config existed must keep loading, with the field
+        // defaulting to empty (nothing trusted).
+        let old = r#"
+command = ["claude"]
+rw_maps = ["/tmp/a"]
+network = true
+"#;
+        let cfg = parse_toml(old).unwrap();
+        assert_eq!(cfg.command, vec!["claude"]);
+        assert!(cfg.trust_project_config.is_empty());
+
+        // And a global config of the same vintage.
+        let global = parse_global_toml(old).unwrap();
+        assert!(global.base.trust_project_config.is_empty());
+    }
+
+    #[test]
+    fn trusted_project_dirs_match_by_containment_only() {
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-trust-dirs-{}", std::process::id()));
+        let allowed = root.join("work/repos");
+        let inside = allowed.join("team-app");
+        let outside = root.join("elsewhere/other-app");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let trusted = vec![allowed.clone()];
+        assert!(project_config_is_trusted(&trusted, &inside));
+        assert!(project_config_is_trusted(&trusted, &allowed));
+        assert!(!project_config_is_trusted(&trusted, &outside));
+        // An empty list is the default: nothing is trusted.
+        assert!(!project_config_is_trusted(&[], &inside));
+        // `..` cannot walk out of a listed directory, because both sides
+        // are resolved before comparison.
+        let escape = inside.join("../../../elsewhere/other-app");
+        assert!(!project_config_is_trusted(&trusted, &escape));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn trusted_project_config_may_enable_capabilities() {
+        // Issue #104: teams that ship per-repo policy need project config
+        // to grant, not only tighten — but only where the trusted global
+        // config says so.
+        let global = Config {
+            trust_project_config: vec![PathBuf::from("/anything")],
+            ..Config::default()
+        };
+        let project = Config {
+            network: Some(true),
+            ..Config::default()
+        };
+
+        // Untrusted path: enabling a capability is refused and reported.
+        let (untrusted, warnings) = merge_with_global_report(
+            global.clone(),
+            project.clone(),
+            Path::new("/tmp"),
+        );
+        assert!(!untrusted.network_enabled());
+        assert!(
+            warnings.iter().any(|w| w.contains("network")),
+            "{warnings:?}"
+        );
+
+        // Trusted path: the same file is honored.
+        let trusted = merge_trusted_project(global, project);
+        assert!(trusted.network_enabled());
+    }
+
+    #[test]
+    fn a_project_cannot_declare_itself_trusted() {
+        // The claim must come from the global config, never from the file
+        // being judged.
+        let project = Config {
+            trust_project_config: vec![PathBuf::from("/")],
+            network: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/tmp"),
+        );
+        assert!(merged.trust_project_config.is_empty());
+        assert!(!merged.network_enabled());
+        assert!(
+            warnings.iter().any(|w| w.contains("trust_project_config")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
     fn auto_save_skips_a_config_with_no_settings() {
         // Issue #103: a plain first run in a clean directory used to leave
         // behind a .ai-jail containing nothing but the header comment.
@@ -4519,6 +4672,7 @@ hide_dotdirs = [".my_secrets"]
             agent_state: None,
             inherit_env: None,
             env_pass: vec![],
+            trust_project_config: vec![],
             update_check: None,
         };
         save(&config);

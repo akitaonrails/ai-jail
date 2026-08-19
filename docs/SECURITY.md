@@ -43,6 +43,22 @@ Project `.ai-jail` is untrusted input. Its policy is monotonic: it can tighten
 the effective sandbox but cannot enable capabilities, outside-source or
 outside-destination maps, ports, `claude_dir`, or policy exceptions. Put
 capability opt-ins in `~/.ai-jail` command-specific tables or on the CLI.
+
+Teams that ship per-repository policy can opt specific directories out of that
+rule from the trusted global config:
+
+```toml
+# ~/.ai-jail
+trust_project_config = ["~/work/repos"]
+```
+
+A project at or beneath a listed directory is merged with the same semantics
+as a global `[commands.<name>]` table, so its `.ai-jail` may enable
+capabilities. Both paths are resolved before comparison, so `..` segments and
+symlinks cannot smuggle an unlisted project past the check, and a project that
+sets `trust_project_config` itself is ignored — trust is only ever conferred by
+the global config. Everything under a listed directory is trusted, including
+repositories cloned there later, so keep the list narrow.
 Existing unreadable or invalid config fails closed. Bootstrap output is mode
 `0600`; launch wrappers and overlay setup also fail closed.
 
