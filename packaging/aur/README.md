@@ -26,13 +26,23 @@ makepkg -si
 
 ## Maintainer Release Checklist
 
-For every new upstream release:
+For every new upstream release, once the GitHub release exists:
 
 1. Update `pkgver` in both `PKGBUILD` files and reset `pkgrel=1`.
-2. Update source checksums.
-3. Validate both package variants with `makepkg --verifysource` and `makepkg -Ccf`.
-4. Generate `.SRCINFO` in each AUR checkout with `makepkg --printsrcinfo > .SRCINFO`.
-5. Commit and push to the separate AUR repos: `ai-jail` and `ai-jail-bin`.
+2. Update source checksums (helpers below, or `makepkg -g`).
+3. Validate a real build of both variants with `makepkg -Ccf`. The source
+   package runs the unit test suite as part of its `check()`.
+4. Run `./publish.sh` to assemble both AUR repos, verify the sources against
+   what upstream actually published, and regenerate `.SRCINFO`. It prints the
+   diff and pushes nothing.
+5. Re-run as `./publish.sh --push` to publish.
+
+`publish.sh` refuses to continue if the `PKGBUILD` versions disagree with the
+version being published, if the upstream release tag does not exist, if a
+checksum does not match the published artifact, or if a generated `.SRCINFO`
+disagrees with its `PKGBUILD` — that last one would otherwise leave AUR
+advertising the wrong version. It is safe to re-run: a package that is already
+published reports "nothing to do".
 
 Checksum helpers for version `X.Y.Z`:
 
