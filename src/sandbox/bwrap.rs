@@ -1508,14 +1508,9 @@ fn discover_mounts_full(
             if (!display_mounts.is_empty() || !systemd_mounts.is_empty())
                 && let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR")
             {
-                let runtime = PathBuf::from(runtime);
-                for name in
-                    ["bus", "systemd", "podman", "docker", "docker.sock"]
-                {
-                    masks.push(Mount::Tmpfs {
-                        dest: runtime.join(name),
-                    });
-                }
+                let granted: Vec<&Path> =
+                    systemd_mounts.iter().map(Mount::dest).collect();
+                masks.extend(runtime_dir_masks(Path::new(&runtime), &granted));
             }
             masks
         },
@@ -2521,6 +2516,27 @@ fn safe_xauthority(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
+/// tmpfs masks over the sensitive sockets inside `XDG_RUNTIME_DIR`.
+///
+/// The runtime directory is only ever partially exposed (a validated Wayland
+/// socket, or the user bus under `--systemd-user`), so everything else in it
+/// is masked rather than left visible.
+///
+/// `granted` lists the destinations `--systemd-user` is binding. A mask at
+/// exactly one of those paths would make that destination a directory, and
+/// the socket bind would then fail with "Can't create file at <path>: Is a
+/// directory", so `--systemd-user` could never launch (issue #106). A mask on
+/// a *parent* is deliberately kept: the tmpfs over `systemd/` hides
+/// everything except the single socket bound inside it.
+fn runtime_dir_masks(runtime: &Path, granted: &[&Path]) -> Vec<Mount> {
+    ["bus", "systemd", "podman", "docker", "docker.sock"]
+        .into_iter()
+        .map(|name| runtime.join(name))
+        .filter(|dest| !granted.contains(&dest.as_path()))
+        .map(|dest| Mount::Tmpfs { dest })
+        .collect()
+}
+
 fn discover_systemd_user(
     config: &Config,
     lockdown: bool,
@@ -3376,6 +3392,37 @@ mod tests {
         }));
 
         let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn runtime_dir_masks_never_collide_with_granted_sockets() {
+        // Regression for #106: --systemd-user masked the very bus socket it
+        // then bound. The tmpfs made that path a directory, so bwrap failed
+        // with "Can't create file at <runtime>/bus: Is a directory" and the
+        // flag could never launch at all.
+        let runtime = Path::new("/run/user/1000");
+        let bus = runtime.join("bus");
+        let private = runtime.join("systemd/private");
+
+        let granted = [bus.as_path(), private.as_path()];
+        let masks = runtime_dir_masks(runtime, &granted);
+        let dests: Vec<&Path> = masks.iter().map(Mount::dest).collect();
+
+        assert!(
+            !dests.contains(&bus.as_path()),
+            "a granted socket must not also be masked"
+        );
+        // The parent mask is still wanted: it hides everything in systemd/
+        // except the one socket bound inside it.
+        assert!(dests.contains(&runtime.join("systemd").as_path()));
+        assert!(dests.contains(&runtime.join("podman").as_path()));
+        assert!(dests.contains(&runtime.join("docker.sock").as_path()));
+
+        // Without --systemd-user nothing is granted, so the bus stays masked.
+        let none = runtime_dir_masks(runtime, &[]);
+        let dests: Vec<&Path> = none.iter().map(Mount::dest).collect();
+        assert!(dests.contains(&bus.as_path()));
+        assert_eq!(none.len(), 5);
     }
 
     #[test]
