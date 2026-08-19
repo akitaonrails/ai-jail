@@ -46,6 +46,12 @@ capability opt-ins in `~/.ai-jail` command-specific tables or on the CLI.
 Existing unreadable or invalid config fails closed. Bootstrap output is mode
 `0600`; launch wrappers and overlay setup also fail closed.
 
+The project `.ai-jail` is never followed through a symlink. The global
+`~/.ai-jail` may be one, so dotfile managers such as GNU stow work, but only
+when the resolved target is a regular file this user owns, carries no group or
+other write bits, and lies outside the project directory — a target inside the
+project could be rewritten by the very agent the policy constrains.
+
 Private home is on by default. ai-jail exposes only state needed by the invoked
 agent, and agent credential state itself is opt-in (`--agent-state`, also
 settable per command in `~/.ai-jail`). Use

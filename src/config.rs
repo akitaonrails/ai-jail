@@ -482,16 +482,86 @@ fn parse_global_toml(contents: &str) -> Result<GlobalConfig, String> {
     toml::from_str(contents).map_err(|e| e.to_string())
 }
 
+/// Whether a symlinked config may be followed.
+///
+/// The project `.ai-jail` is untrusted input, so it is always read as a
+/// plain file. The global `~/.ai-jail` is trusted policy that can enable
+/// capabilities, but dotfile managers such as GNU stow legitimately install
+/// it as a symlink, so it may be followed under the conditions in
+/// [`trusted_symlink_target`].
+#[derive(Clone, Copy, PartialEq)]
+enum SymlinkPolicy {
+    Reject,
+    FollowIfTrusted,
+}
+
+/// Resolve a symlinked global config, or explain why it is not trustworthy.
+///
+/// Following a symlink hands whoever can write its target control of trusted
+/// policy, so the resolved file must be a regular file this user owns, with
+/// no group or other write bits, and must sit outside the project directory.
+/// That last condition is the important one: the project is mounted
+/// read-write by default, so a target inside it could be rewritten by the
+/// very agent the policy is meant to constrain, and the next launch would
+/// then honor whatever capabilities it granted itself.
+fn trusted_symlink_target(path: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let target = std::fs::canonicalize(path)
+        .map_err(|e| format!("cannot resolve symlink ({e})"))?;
+    let metadata = std::fs::metadata(&target)
+        .map_err(|e| format!("cannot stat {} ({e})", target.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", target.display()));
+    }
+    let uid = unsafe { nix::libc::geteuid() };
+    if metadata.uid() != uid {
+        return Err(format!("{} is not owned by uid {uid}", target.display()));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{} is group- or world-writable",
+            target.display()
+        ));
+    }
+    if let Ok(project) = std::env::current_dir()
+        && let Ok(project) = std::fs::canonicalize(project)
+        && target.starts_with(&project)
+    {
+        return Err(format!(
+            "{} is inside the project directory, which the sandbox can write",
+            target.display()
+        ));
+    }
+    Ok(target)
+}
+
 fn load_toml_from_path<T: Default>(
     path: &Path,
     parse: impl FnOnce(&str) -> Result<T, String>,
 ) -> Result<T, String> {
-    match std::fs::symlink_metadata(path) {
+    load_toml_with_policy(path, parse, SymlinkPolicy::Reject)
+}
+
+fn load_toml_with_policy<T: Default>(
+    path: &Path,
+    parse: impl FnOnce(&str) -> Result<T, String>,
+    policy: SymlinkPolicy,
+) -> Result<T, String> {
+    let mut path = path.to_path_buf();
+    match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(format!(
-                "Refusing to read {}: path is a symlink",
-                path.display()
-            ));
+            if policy == SymlinkPolicy::Reject {
+                return Err(format!(
+                    "Refusing to read {}: path is a symlink",
+                    path.display()
+                ));
+            }
+            // Read through the resolved path so the decision and the read
+            // cannot disagree if a hop is swapped in between.
+            path = trusted_symlink_target(&path).map_err(|e| {
+                format!("Refusing to read {}: {e}", path.display())
+            })?;
         }
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -499,6 +569,7 @@ fn load_toml_from_path<T: Default>(
             return Err(format!("Failed to stat {}: {e}", path.display()));
         }
     }
+    let path = path.as_path();
     match std::fs::read_to_string(path) {
         Ok(contents) => parse(&contents)
             .map_err(|e| format!("Failed to parse {}: {e}", path.display())),
@@ -512,7 +583,11 @@ fn load_from_path(path: &Path) -> Result<Config, String> {
 }
 
 fn load_global_from_path(path: &Path) -> Result<GlobalConfig, String> {
-    load_toml_from_path(path, parse_global_toml)
+    load_toml_with_policy(
+        path,
+        parse_global_toml,
+        SymlinkPolicy::FollowIfTrusted,
+    )
 }
 
 /// Load project-level config from `.ai-jail` in the current dir.
@@ -1033,6 +1108,27 @@ const CONFIG_FILE_HEADER: &str = "# ai-jail sandbox configuration\n\
 
 fn save_global_doc_to_path(path: &Path, global: &GlobalConfig) {
     let header = CONFIG_FILE_HEADER;
+    // A trusted symlink is followed for writes too, so a stow-managed
+    // global config stays writable instead of reading fine but failing to
+    // save. The target passes the same checks load applies.
+    let resolved;
+    let mut path = path;
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+    {
+        match trusted_symlink_target(path) {
+            Ok(target) => {
+                resolved = target;
+                path = resolved.as_path();
+            }
+            Err(e) => {
+                output::warn(&format!(
+                    "Refusing to write {}: {e}",
+                    path.display()
+                ));
+                return;
+            }
+        }
+    }
     if let Err(e) = ensure_regular_target_or_absent(path) {
         output::warn(&format!("Refusing to write {}: {e}", path.display()));
         return;
@@ -4146,6 +4242,75 @@ allow_tcp_ports = [32000, 8080]
         assert_eq!(global.status_bar_style.as_deref(), Some("dark"));
 
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_config_may_be_a_trusted_symlink() {
+        // Issue #102: dotfile managers such as GNU stow install
+        // ~/.ai-jail as a symlink, which used to be a fatal error.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir()
+            .join(format!("ai-jail-symlink-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("dotfiles-ai-jail");
+        std::fs::write(&target, "lockdown = true\n").unwrap();
+        let link = dir.join(".ai-jail");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let loaded = load_global_from_path(&link).unwrap();
+        assert_eq!(loaded.base.lockdown, Some(true));
+
+        // A group-writable target is not trustworthy: anyone in that group
+        // could grant themselves capabilities through it.
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(0o664),
+        )
+        .unwrap();
+        let err = load_global_from_path(&link).unwrap_err();
+        assert!(err.contains("group- or world-writable"), "{err}");
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        // The project config is untrusted input and stays strict.
+        let project_link = dir.join("project-link");
+        std::os::unix::fs::symlink(&target, &project_link).unwrap();
+        let err = load_from_path(&project_link).unwrap_err();
+        assert!(err.contains("path is a symlink"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_config_symlink_into_the_project_is_refused() {
+        // The project directory is mounted read-write, so a target inside
+        // it could be rewritten by the agent the policy constrains. Tests
+        // run with the crate root as the working directory, so a file
+        // created here is inside the "project" for this check.
+        let target = std::env::current_dir()
+            .unwrap()
+            .join(format!(".ai-jail-symlink-probe-{}", std::process::id()));
+        std::fs::write(&target, "lockdown = true\n").unwrap();
+        let dir = std::env::temp_dir()
+            .join(format!("ai-jail-symlink-proj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join(".ai-jail");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = load_global_from_path(&link).unwrap_err();
+        assert!(
+            err.contains("inside the project directory"),
+            "expected project-containment refusal, got: {err}"
+        );
+
+        let _ = std::fs::remove_file(&target);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
