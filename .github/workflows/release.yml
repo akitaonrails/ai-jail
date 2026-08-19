@@ -85,6 +85,7 @@ jobs:
   build-linux:
     needs: preflight
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -95,7 +96,27 @@ jobs:
         with:
           toolchain: 1.97.1
       - name: Install sandbox prerequisites (Linux)
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap build-essential
+        run: |
+          set -eu
+          # This step has hung for hours on the runner rather than failing,
+          # blocking merges and releases while every other step takes
+          # seconds. Bound each apt call so a hang becomes a retry instead
+          # of an unbounded wait, and retry a few times so a transient
+          # mirror problem heals itself.
+          install_prereqs() {
+            timeout 300 sudo apt-get update -o Acquire::Retries=3 || return 1
+            timeout 300 sudo apt-get install -y -o Acquire::Retries=3 \
+              bubblewrap build-essential || return 1
+          }
+          for attempt in 1 2 3; do
+            if install_prereqs; then
+              exit 0
+            fi
+            echo "::warning title=apt retry::attempt $attempt hung or failed; retrying"
+            sleep 10
+          done
+          echo "apt failed after 3 attempts" >&2
+          exit 1
       - name: Test and build unsigned Linux binary
         run: cargo test --locked && cargo build --locked --release --target x86_64-unknown-linux-gnu
       - name: Archive and checksum
