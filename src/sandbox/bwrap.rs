@@ -654,9 +654,42 @@ fn trusted_bwrap_path(path: &Path) -> Option<PathBuf> {
 /// that user could then drop in a fake bwrap and silently disable the
 /// sandbox.
 fn nix_store_is_protected(store: &Path) -> bool {
-    store.metadata().is_ok_and(|m| {
+    let protected_by_metadata = store.metadata().is_ok_and(|m| {
         m.is_dir() && nix_store_metadata_is_protected(m.uid(), m.mode())
-    })
+    });
+    protected_by_metadata && !path_is_writable_by_us(store)
+}
+
+/// Whether this process can actually write into `dir`, according to the
+/// kernel rather than to a uid/mode guess.
+///
+/// Owner and mode bits only approximate the question that matters here —
+/// "could whoever runs ai-jail drop a fake bwrap in this store?" — and the
+/// approximation has blind spots: an owner that is merely *unmapped* reads
+/// back as the overflow uid whether or not we can write it, and neither
+/// supplementary groups nor ACLs are visible in `st_mode` at all. Asking the
+/// kernel answers it directly, and also treats a read-only store mount as
+/// the protection it is.
+fn path_is_writable_by_us(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    // As root, W_OK succeeds almost everywhere and so tells us nothing; the
+    // ownership check is the guard in that case.
+    if unsafe { nix::libc::geteuid() } == 0 {
+        return false;
+    }
+    let Ok(c_dir) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        // A path we cannot even represent is not one to trust.
+        return true;
+    };
+    unsafe {
+        nix::libc::faccessat(
+            nix::libc::AT_FDCWD,
+            c_dir.as_ptr(),
+            nix::libc::W_OK,
+            nix::libc::AT_EACCESS,
+        ) == 0
+    }
 }
 
 fn nix_store_metadata_is_protected(uid: u32, mode: u32) -> bool {
@@ -5419,6 +5452,47 @@ mod tests {
         assert!(!trusted_binary_metadata(true, 1000, 0o555, false));
         assert!(!trusted_binary_metadata(true, 0, 0o775, false));
         assert!(!trusted_binary_metadata(true, 0, 0o644, false));
+    }
+
+    #[test]
+    fn writability_probe_matches_the_kernel_not_the_mode_bits() {
+        // The uid/mode heuristic cannot see supplementary groups, ACLs, or
+        // an unmapped (overflow-uid) owner we nonetheless have write access
+        // to, so nix_store_is_protected also asks the kernel directly. The
+        // fully adversarial layout (a store owned by the overflow uid whose
+        // group we are in) needs CAP_CHOWN to build, so this exercises the
+        // probe itself against real directories.
+        if unsafe { nix::libc::geteuid() } == 0 {
+            // As root every path reads as writable; the probe is disabled
+            // and the ownership check is the guard.
+            return;
+        }
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-writable-probe-{}", std::process::id()));
+        let writable = root.join("writable");
+        let readonly = root.join("readonly");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&writable).unwrap();
+        std::fs::create_dir_all(&readonly).unwrap();
+        std::fs::set_permissions(
+            &readonly,
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+
+        assert!(path_is_writable_by_us(&writable));
+        assert!(!path_is_writable_by_us(&readonly));
+        // A store we can write is never protected, whatever its mode bits
+        // suggest.
+        assert!(!nix_store_is_protected(&writable));
+        // Nonexistent paths are not stores at all.
+        assert!(!nix_store_is_protected(&root.join("missing")));
+
+        let _ = std::fs::set_permissions(
+            &readonly,
+            std::fs::Permissions::from_mode(0o700),
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
