@@ -69,7 +69,7 @@ OPTIONS:
     --browser[=PROFILE]            Use browser isolation profile (hard | soft; default hard)
     --no-browser                   Disable browser auto-detection/profile
     --save-config / --no-save-config
-                                   Enable/disable automatic .ai-jail writes
+                                   Enable/disable automatic .ai-jail writes (default: on)
     --hide-config / --no-hide-config
                                    Mask the project .ai-jail file from the agent (default: on)
     -s, --status-bar[=STYLE]       Set status line theme (pastel | dark | light; default pastel)

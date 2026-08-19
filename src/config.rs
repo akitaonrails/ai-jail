@@ -962,6 +962,20 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
 /// User-level fields (status bar + resize redraw key) are excluded —
 /// they belong in the global `$HOME/.ai-jail`.
 pub fn save(config: &Config) {
+    save_project(config, true);
+}
+
+/// Auto-save variant used by ordinary runs.
+///
+/// Writes nothing when the project config would carry no settings at all, so
+/// a plain first run in a clean directory no longer leaves a comment-only
+/// `.ai-jail` behind (issue #103). `--init` still writes that file, because
+/// there the user explicitly asked for one to edit.
+pub fn save_auto(config: &Config) {
+    save_project(config, false);
+}
+
+fn save_project(config: &Config, write_when_empty: bool) {
     let mut local = config.clone();
     // Strip user-level fields from project config
     local.no_status_bar = None;
@@ -972,7 +986,18 @@ pub fn save(config: &Config) {
     // persist them to the project .ai-jail.
     local.env_pass.clear();
 
+    if !write_when_empty && config_body_is_empty(&local) {
+        return;
+    }
     save_to_path(&config_path(), &local);
+}
+
+/// Whether a config serializes to no settings at all — only defaults, which
+/// are skipped on write, leaving a file of nothing but the header comment.
+fn config_body_is_empty(config: &Config) -> bool {
+    toml::to_string_pretty(config)
+        .map(|body| body.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// Persist user-level preferences (status bar) to `$HOME/.ai-jail`.
@@ -4122,6 +4147,23 @@ allow_tcp_ports = [32000, 8080]
 
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_save_skips_a_config_with_no_settings() {
+        // Issue #103: a plain first run in a clean directory used to leave
+        // behind a .ai-jail containing nothing but the header comment.
+        assert!(config_body_is_empty(&Config::default()));
+        assert!(!config_body_is_empty(&Config {
+            lockdown: Some(true),
+            ..Config::default()
+        }));
+        // A recorded command is a real setting, so ordinary runs that name
+        // one still save.
+        assert!(!config_body_is_empty(&Config {
+            command: vec!["claude".into()],
+            ..Config::default()
+        }));
     }
 
     #[test]

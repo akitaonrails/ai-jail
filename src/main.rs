@@ -292,7 +292,7 @@ fn run() -> Result<i32, String> {
             project_config,
             &invocation_cwd,
         );
-        config::save(&to_save);
+        config::save_auto(&to_save);
     }
 
     // Handle dry run
