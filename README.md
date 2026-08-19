@@ -82,20 +82,20 @@ worktree metadata, X11, host shared memory, terminal passthrough, update
 check, and macOS host IPC. Docker, SSH, Pictures, Tailscale, and the systemd
 user bus are also off by default.
 
-| Flag pair | Effect and security consequence |
-|---|---|
-| `--network` / `--no-network` | Enables/disables unrestricted network. `--network` permits full network exfiltration of any readable data. |
-| `--gpu` / `--no-gpu` | Enables/disables GPU device access. |
-| `--display` / `--no-display` | Enables/disables display access. Only the validated Wayland socket is mounted; ai-jail never mounts all of `XDG_RUNTIME_DIR`. X11 is separate (`--x11`). |
-| `--x11` / `--no-x11` | Enables/disables X11 separately. X11 access permits keylogging and screenshots. |
-| `--host-shm` / `--no-host-shm` | Enables/disables host `/dev/shm`; enabling it opens host cross-process IPC. |
-| `--terminal-passthrough` / `--no-terminal-passthrough` | Enables/disables raw terminal forwarding. Output is filtered through a VT parser by default; raw forwarding exposes terminal clipboard, query, and parser surface. |
-| `--agent-state` / `--no-agent-state` | Enables/disables mounting the invoked command's credential state (default off). Enables the agent to authenticate — and lets anything in the sandbox use those credentials. |
-| `--inherit-env` / `--no-inherit-env` | Default is a minimal environment allowlist. `--inherit-env` passes the full parent environment, secrets included. |
-| `--update-check` / `--no-update-check` | Enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active (default off; all other launches make no network requests). |
-| `--macos-host-ipc` / `--no-macos-host-ipc` | Enables/disables macOS Mach, IOKit, and host IPC exposure. |
-| `--worktree` / `--no-worktree` | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only. |
-| `--private-home` / `--no-private-home` | Enables/disables the default private home. Disabling it is broad host-home access. |
+| Flag pair                                              | Effect and security consequence                                                                                                                                                                |
+| ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--network` / `--no-network`                           | Enables/disables unrestricted network. `--network` permits full network exfiltration of any readable data.                                                                                     |
+| `--gpu` / `--no-gpu`                                   | Enables/disables GPU device access.                                                                                                                                                            |
+| `--display` / `--no-display`                           | Enables/disables display access. Only the validated Wayland socket is mounted; ai-jail never mounts all of `XDG_RUNTIME_DIR`. X11 is separate (`--x11`).                                       |
+| `--x11` / `--no-x11`                                   | Enables/disables X11 separately. X11 access permits keylogging and screenshots.                                                                                                                |
+| `--host-shm` / `--no-host-shm`                         | Enables/disables host `/dev/shm`; enabling it opens host cross-process IPC.                                                                                                                    |
+| `--terminal-passthrough` / `--no-terminal-passthrough` | Enables/disables raw terminal forwarding. Output is filtered through a VT parser by default; raw forwarding exposes terminal clipboard, query, and parser surface.                             |
+| `--agent-state` / `--no-agent-state`                   | Enables/disables mounting the invoked command's credential state (default off). Enables the agent to authenticate — and lets anything in the sandbox use those credentials.                    |
+| `--inherit-env` / `--no-inherit-env`                   | Default is a minimal environment allowlist. `--inherit-env` passes the full parent environment, secrets included.                                                                              |
+| `--update-check` / `--no-update-check`                 | Enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active (default off; all other launches make no network requests).      |
+| `--macos-host-ipc` / `--no-macos-host-ipc`             | Enables/disables macOS Mach, IOKit, and host IPC exposure.                                                                                                                                     |
+| `--worktree` / `--no-worktree`                         | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only. |
+| `--private-home` / `--no-private-home`                 | Enables/disables the default private home. Disabling it is broad host-home access.                                                                                                             |
 
 `--allow-tcp-port` remains accepted for backward compatibility, but launch
 fails closed because UDP cannot be securely constrained through this option.
