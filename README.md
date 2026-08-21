@@ -36,7 +36,9 @@ Linux requires `bwrap` (`bubblewrap`): `pacman -S bubblewrap`,
 `apt install bubblewrap`, or `dnf install bubblewrap`. `BWRAP_BIN` is accepted
 only when it canonically resolves to a root-owned executable that is not
 group- or world-writable, or to an executable with no write bits under a
-`/nix/store` that this user cannot write (a multi-user, root-owned store).
+`/nix/store` whose own owner is root (or an unmapped owner inside a user
+namespace) and which is not world-writable — the standard multi-user store
+layout. A single-user store owned by the invoking user does not qualify.
 macOS uses Apple's deprecated `/usr/bin/sandbox-exec` interface. Windows is not
 supported; use WSL2 and the Linux backend inside it.
 

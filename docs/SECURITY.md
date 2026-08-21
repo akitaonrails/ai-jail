@@ -78,10 +78,19 @@ settable per command in `~/.ai-jail`). Use
 Linux combines bubblewrap namespaces with Landlock, seccomp, and resource
 limits where available. `BWRAP_BIN` must resolve canonically either to a
 root-owned executable with no group- or world-write bits, or to an executable
-with no write bits at all under a `/nix/store` that the invoking user cannot
-write. A single-user Nix store owned by that user does not qualify: anything
-running as them could otherwise supply a fake bwrap and silently disable the
-sandbox.
+with no write bits at all under a `/nix/store` that is itself owned by root
+(or by an unmapped owner, which a user namespace reports as the overflow uid)
+and is not world-writable. A single-user store owned by the invoking user does
+not qualify: anything running as them could otherwise supply a fake bwrap and
+silently disable the sandbox.
+
+The store check deliberately stops at ownership and mode rather than asking
+the kernel whether this process can write the directory. The standard
+multi-user store is `root:nixbld` mode `1775`, and Nix builds run as a nixbld
+member, so a writability probe answers "yes" for exactly the legitimate case
+and rejects every such install. The sticky bit is what makes that group write
+safe — a member can add store paths but not replace someone else's — and the
+binary itself must still carry no write bits.
 
 macOS starts with no global reads, network, or host IPC, and supports the same
 opt-in `--agent-state` credential mounts as Linux. Temp access is limited to a
