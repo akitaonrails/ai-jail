@@ -124,6 +124,22 @@ ai-jail --env CI --env API_BASE=https://internal.example claude
 - `--inherit-env` passes the entire parent environment instead. This exports
   every secret currently in your shell into the sandbox; avoid it.
 
+The same thing is available from trusted config as `env_pass`, so you do not
+have to repeat `--env` on every launch:
+
+```toml
+# ~/.ai-jail
+env_pass = ["CI", "API_BASE=https://internal.example"]
+
+[commands.claude]
+env_pass = ["ANTHROPIC_BASE_URL"]
+```
+
+`env_pass` is a trusted-layer field: it is read from the global config and its
+`[commands.<name>]` tables, and ignored in a project `.ai-jail`, since a
+repository must not be able to pull variables out of your shell. It is also
+never written back to disk, because `NAME=VALUE` entries can carry secrets.
+
 ## Project secrets
 
 The project directory is writable by default, so secrets inside it are
@@ -193,7 +209,8 @@ Common fields: `command`, `rw_maps`, `ro_maps`, `overlay_maps`, `mask`,
 `systemd_user`, `ssh`, `pictures`, `private_home`, `lockdown`,
 `browser_profile`, `claude_dir`, `allow_tcp_ports`, `status_bar_style`.
 
-Global config only: `trust_project_config` lists directories whose project
+Global config only: `env_pass` (see Environment policy above) and
+`trust_project_config`, which lists directories whose project
 `.ai-jail` may enable capabilities rather than only tighten, for teams that
 ship per-repository policy:
 
