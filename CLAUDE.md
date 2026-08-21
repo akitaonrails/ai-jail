@@ -58,7 +58,7 @@ This is the single most important invariant of the project. Users generate `.ai-
 - Project `.ai-jail` is untrusted monotonic policy. It may tighten the effective
   sandbox but cannot enable capabilities, outside maps, ports, `claude_dir`, or
   exceptions. Capability opt-ins belong in global config or on the CLI.
-  The single exception is `trust_project_config` in the *global* config, which
+  The single exception is `trust_project_config` in the _global_ config, which
   names directories whose project files are merged with trusted semantics. The
   trust always originates in the trusted layer: a project file that sets
   `trust_project_config` itself is ignored and warned about.
