@@ -1531,6 +1531,23 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
 /// [`merge_with_global`]. Auto-save must not copy those inherited values into
 /// the project `.ai-jail`; it should persist only the existing project config
 /// plus CLI-persistable changes from this invocation.
+/// Project layer to persist for `--init`: the project file as it stands plus
+/// whatever this invocation asked for.
+///
+/// Deliberately not the fully merged config. Merging the global baseline in
+/// copied personal settings such as `claude_dir` and absolute home paths into
+/// a repository file, where they are also inert — a project `.ai-jail` cannot
+/// enable capabilities regardless (issue #110).
+pub fn project_config_for_init(
+    cli: &CliArgs,
+    project: Config,
+    invocation_cwd: &Path,
+) -> Config {
+    let mut to_save = merge(cli, project);
+    absolutize_user_paths(&mut to_save, invocation_cwd);
+    to_save
+}
+
 pub fn project_config_for_auto_save(
     cli: &CliArgs,
     project: Config,
@@ -4465,6 +4482,36 @@ network = true
             warnings.iter().any(|w| w.contains("trust_project_config")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn init_saves_only_the_project_layer_not_the_global_baseline() {
+        // Issue #110: --init wrote the fully merged config, so a global
+        // ~/.ai-jail full of personal settings was copied into the
+        // repository's .ai-jail — where it is also inert, since a project
+        // file cannot enable capabilities.
+        let global_ish = Config {
+            claude_dir: Some(PathBuf::from("/home/someone/.claude")),
+            rw_maps: vec![PathBuf::from("/home/someone/dir")],
+            network: Some(true),
+            tailscale: Some(true),
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            network: Some(false),
+            ..CliArgs::default()
+        };
+
+        let saved =
+            project_config_for_init(&cli, Config::default(), Path::new("/tmp"));
+
+        // Only what this invocation asked for.
+        assert_eq!(saved.network, Some(false));
+        assert!(saved.claude_dir.is_none(), "global claude_dir leaked");
+        assert!(saved.rw_maps.is_empty(), "global rw_maps leaked");
+        assert!(saved.tailscale.is_none(), "global tailscale leaked");
+        // Sanity: those really were set on the global-shaped config.
+        assert!(global_ish.claude_dir.is_some());
     }
 
     #[test]

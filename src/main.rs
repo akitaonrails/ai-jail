@@ -278,9 +278,20 @@ fn run() -> Result<i32, String> {
         config::save_global(&config)?;
     }
 
-    // Handle --init: save config and exit
+    // Handle --init: save config and exit.
+    //
+    // Save the project layer only — the existing project file plus whatever
+    // this invocation asked for — not the global baseline merged on top of
+    // it. Writing the merged result copied personal global settings such as
+    // claude_dir and absolute home paths into a repository file, where they
+    // are also inert: a project .ai-jail cannot enable capabilities anyway
+    // (issue #110).
     if cli.init {
-        config::save(&config);
+        config::save(&config::project_config_for_init(
+            &cli,
+            project_config.clone(),
+            &invocation_cwd,
+        ));
         output::info("Config saved to .ai-jail");
         return Ok(0);
     }
