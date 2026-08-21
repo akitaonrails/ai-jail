@@ -253,6 +253,24 @@ agents get the project's language versions. Disable with `--no-mise` or
 `no_mise = true`. It is skipped automatically in `--lockdown` and browser
 profile modes.
 
+Activation is best-effort: if mise cannot run, or has neither its config nor
+its installs inside the sandbox, it is skipped and your command still starts.
+
+**Under the default private home, mise has neither.** `$HOME` is a fresh
+tmpfs, so `~/.config/mise` and `~/.local/share/mise` are not mounted, and the
+inherited `PATH` still names the host's `~/.local/share/mise/installs/...`
+directories even though nothing is there. Activation is therefore skipped
+rather than left to fail slowly against the network. To give an agent a real
+mise toolchain, map it in explicitly from trusted global config:
+
+```toml
+# ~/.ai-jail
+[commands.claude]
+ro_maps = ["~/.config/mise", "~/.local/share/mise"]
+```
+
+or use `--no-private-home` when you deliberately want the whole host home.
+
 ## Herdr
 
 [Herdr](https://herdr.dev/) runs outside the sandbox, one `ai-jail` per pane,

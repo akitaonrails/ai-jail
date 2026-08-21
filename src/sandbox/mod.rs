@@ -853,8 +853,30 @@ fn mise_wrapper_command(
     mise_path: &Path,
     user_cmd: LaunchCommand,
 ) -> LaunchCommand {
-    // Command argv is passed via "$@" to avoid shell interpretation of user arguments.
-    let script = "MISE=\"$1\"; shift; \"$MISE\" trust -q && eval \"$($MISE activate bash)\" && eval \"$($MISE env)\" && exec \"$@\"";
+    // Command argv is passed via "$@" to avoid shell interpretation of user
+    // arguments.
+    //
+    // Activation is best-effort and `exec "$@"` is unconditional. Chaining
+    // the command onto the activation with `&&` meant a mise that is not
+    // reachable inside the sandbox — the binary lives under ~/.local/bin,
+    // which private home does not mount — aborted the whole launch, so the
+    // agent never started at all (issue #109).
+    //
+    // Activation is also skipped when mise has neither its config nor its
+    // installs inside the sandbox. Under private home it has neither, and
+    // running it anyway makes mise resolve every declared tool over the
+    // network, costing a multi-second timeout each before the agent starts,
+    // then failing on shims that cannot resolve (issue #113).
+    let script = concat!(
+        "MISE=\"$1\"; shift; ",
+        "if [ -x \"$MISE\" ] && { ",
+        "[ -d \"${MISE_DATA_DIR:-$HOME/.local/share/mise}\" ] || ",
+        "[ -d \"${MISE_CONFIG_DIR:-$HOME/.config/mise}\" ]; }; then ",
+        "\"$MISE\" trust -q && eval \"$(\"$MISE\" activate bash)\" && ",
+        "eval \"$(\"$MISE\" env)\"; ",
+        "fi; ",
+        "exec \"$@\"",
+    );
     let mut args = vec![
         "-lc".into(),
         script.into(),
@@ -1700,6 +1722,38 @@ mod tests {
             "mise wrapper should forward command argv via exec \"$@\""
         );
         assert_eq!(wrapped.args.last(), Some(&"a b".to_string()));
+    }
+
+    #[test]
+    fn mise_activation_never_blocks_the_launch() {
+        // Issue #109: the wrapper chained the user command onto activation
+        // with `&&`, so a mise that is not reachable inside the sandbox
+        // aborted the launch and the agent never started. Issue #113: with
+        // mise reachable but its config and installs absent, activation
+        // resolves every tool over the network and then fails on shims.
+        let wrapped = mise_wrapper_command(
+            Path::new("/usr/bin/mise"),
+            LaunchCommand {
+                program: "claude".into(),
+                args: vec![],
+            },
+        );
+        let script = wrapped
+            .args
+            .iter()
+            .find(|a| a.contains("exec \"$@\""))
+            .expect("wrapper script");
+
+        // exec must not hang off the activation chain.
+        assert!(
+            !script.contains("&& exec \"$@\""),
+            "activation must not gate the user command: {script}"
+        );
+        assert!(script.contains("fi; exec \"$@\""));
+        // Activation only when mise has something to activate against.
+        assert!(script.contains("MISE_DATA_DIR"));
+        assert!(script.contains("MISE_CONFIG_DIR"));
+        assert!(script.contains("[ -x \"$MISE\" ]"));
     }
 
     #[test]
