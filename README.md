@@ -37,8 +37,11 @@ Linux requires `bwrap` (`bubblewrap`): `pacman -S bubblewrap`,
 only when it canonically resolves to a root-owned executable that is not
 group- or world-writable, or to an executable with no write bits under a
 `/nix/store` whose own owner is root (or an unmapped owner inside a user
-namespace) and which is not world-writable — the standard multi-user store
-layout. A single-user store owned by the invoking user does not qualify.
+namespace), is not world-writable, and carries the sticky bit if it is
+group-writable — the standard multi-user store layout, mode `1775`. A
+group-writable store without the sticky bit is refused, because a group member
+could then replace the binary. A single-user store owned by the invoking user
+does not qualify either.
 macOS uses Apple's deprecated `/usr/bin/sandbox-exec` interface. Windows is not
 supported; use WSL2 and the Linux backend inside it.
 

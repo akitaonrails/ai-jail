@@ -97,8 +97,9 @@ the kernel whether this process can write the directory. The standard
 multi-user store is `root:nixbld` mode `1775`, and Nix builds run as a nixbld
 member, so a writability probe answers "yes" for exactly the legitimate case
 and rejects every such install. The sticky bit is what makes that group write
-safe — a member can add store paths but not replace someone else's — and the
-binary itself must still carry no write bits.
+safe — a member can add store paths but not replace someone else's — so it is
+required rather than assumed: a group-writable store without it is refused.
+The binary itself must still carry no write bits.
 
 macOS starts with no global reads, network, or host IPC, and supports the same
 opt-in `--agent-state` credential mounts as Linux. Temp access is limited to a
