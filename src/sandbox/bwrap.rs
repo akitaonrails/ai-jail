@@ -646,28 +646,28 @@ fn trusted_bwrap_path(path: &Path) -> Option<PathBuf> {
 /// Whether the Nix store itself is beyond the reach of whoever runs
 /// ai-jail.
 ///
-/// `trusted_binary_metadata` trusts a *non-root-owned* executable purely
-/// because it lives in the store, so that relaxation is only sound while the
-/// store cannot be written by this user. A multi-user Nix store is root-owned
-/// (typically `root:nixbld`, mode 1775) and qualifies; a single-user store
-/// owned by the invoking user does not, because anyone able to run code as
-/// that user could then drop in a fake bwrap and silently disable the
-/// sandbox.
+/// Deliberately ownership and mode only, with no "can I write here?" probe:
+/// inside a Nix build sandbox the build user is in group `nixbld` and the
+/// standard multi-user store (`root:nixbld` mode 1775) is legitimately
+/// group-writable by that user, so a kernel writability probe rejected every
+/// NixOS install (issue #114). The sticky bit is what makes group write
+/// safe — a member may create new store paths but cannot replace someone
+/// else's — so `nix_store_metadata_is_protected` explicitly requires it on
+/// group-writable stores. A store owned by a non-root user (e.g. a single-user
+/// install) must carry no write bits at all.
 fn nix_store_is_protected(store: &Path) -> bool {
-    // Deliberately ownership and mode only, with no "can I write here?"
-    // probe. A standard multi-user store is root:nixbld mode 1775, and Nix
-    // builds run as a nixbld member, so the kernel answers "writable" for
-    // the people this is meant to protect. The sticky bit is the reason
-    // that is safe: a group member may create new store paths but cannot
-    // replace someone else's, and the binary itself is separately required
-    // to carry no write bits. Probing the directory rejected every NixOS
-    // install (issue #114).
     store.metadata().is_ok_and(|m| {
         m.is_dir() && nix_store_metadata_is_protected(m.uid(), m.mode())
     })
 }
 
 fn nix_store_metadata_is_protected(uid: u32, mode: u32) -> bool {
+    // A group-writable store requires the sticky bit so a group member
+    // cannot replace someone else's files (0775 is refused, 1775 is trusted).
+    if (mode & 0o020 != 0) && (mode & 0o1000 == 0) {
+        return false;
+    }
+
     if uid == 0 || uid == 65534 {
         mode & 0o002 == 0
     } else {
@@ -5493,6 +5493,11 @@ mod tests {
         // ownership/mode matrix below is the enforceable part.
         assert!(nix_store_metadata_is_protected(0, 0o1775));
         assert!(nix_store_metadata_is_protected(65534, 0o1775));
+
+        // Group-writable without the sticky bit is refused (e.g. 0775).
+        assert!(!nix_store_metadata_is_protected(0, 0o0775));
+        assert!(!nix_store_metadata_is_protected(65534, 0o0775));
+
         // World-writable is still refused, sticky bit or not.
         assert!(!nix_store_metadata_is_protected(0, 0o1777));
         assert!(!nix_store_metadata_is_protected(65534, 0o1777));
