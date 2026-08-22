@@ -8,6 +8,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const WSL_DOCKER_DESKTOP_CLI_TOOLS: &str = "/mnt/wsl/docker-desktop/cli-tools";
+const NIXOS_SYSTEM_BIN: &str = "/run/current-system/sw/bin";
+const NIX_USER_PROFILE_BIN: &str = ".nix-profile/bin";
 /// Also granted read-write by Landlock (`collect_normal_paths`) —
 /// keep the two in sync via this shared constant.
 pub(crate) const TAILSCALE_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
@@ -165,8 +167,8 @@ struct MountSet {
     config_hide: Vec<Mount>,
     cache_hide: Vec<Mount>,
     local_overrides: Vec<Mount>,
-    /// Read-only binds keeping the invoked command startable in
-    /// private-home mode when it is installed under `$HOME` (#81).
+    /// Read-only binds keeping the invoked command startable when a private
+    /// tmpfs hides its host path (`$HOME` in private-home mode, or `/run`).
     command_binary: Vec<Mount>,
     git_worktree: Vec<Mount>,
     gpu: Vec<Mount>,
@@ -1505,11 +1507,14 @@ fn discover_mounts_full(
         } else {
             discover_local_overrides()
         },
-        // Only for user-requested private home: lockdown clears the
-        // environment (system PATH only), and browser mode runs
-        // system-installed browsers.
-        command_binary: if config.private_home_enabled() && !lockdown {
-            discover_command_binary(config, verbose)
+        // Lockdown clears the environment to paths already supplied by the
+        // sandbox, so it intentionally skips host command exemptions.
+        command_binary: if !lockdown {
+            discover_command_binary(
+                config,
+                config.private_home_enabled(),
+                verbose,
+            )
         } else {
             vec![]
         },
@@ -2198,13 +2203,42 @@ fn discover_subdir_hide(parent: &str, deny_list: &[&str]) -> Vec<Mount> {
         .collect()
 }
 
-/// Read-only binds for the invoked command's binary when it lives
-/// under `$HOME` (#81). Private home replaces `$HOME` with a tmpfs,
-/// which would otherwise hide agents installed the official way
-/// (e.g. `~/.local/bin/claude` → `~/.local/share/claude/versions/<v>`)
-/// and make the inner exec fail with ENOENT.
-fn discover_command_binary(config: &Config, verbose: bool) -> Vec<Mount> {
-    super::command_home_paths(config)
+/// Read-only binds for invoked command paths hidden by sandbox tmpfs mounts.
+/// Private-home mode hides `$HOME` (#81), including the Nix user profile,
+/// while `/run` is always private and contains the NixOS system profile
+/// (`/run/current-system/sw/bin`, #117).
+fn discover_command_binary(
+    config: &Config,
+    private_home: bool,
+    verbose: bool,
+) -> Vec<Mount> {
+    let mut paths = if private_home {
+        super::command_home_paths(config)
+    } else {
+        Vec::new()
+    };
+    if private_home {
+        let profile_bin = super::home_dir().join(NIX_USER_PROFILE_BIN);
+        let profile_is_on_path =
+            std::env::var_os("PATH").is_some_and(|path| {
+                std::env::split_paths(&path)
+                    .any(|entry| entry == profile_bin)
+            });
+        if profile_is_on_path && profile_bin.is_dir() {
+            // The private-home tmpfs hides ~/.nix-profile. Preserve its full
+            // bin directory so commands started later by a shell remain on
+            // PATH, not only the executable selected for ai-jail itself.
+            paths.retain(|path| !path.starts_with(&profile_bin));
+            paths.push(profile_bin);
+        }
+    }
+    for path in super::command_paths_under(config, Path::new("/run")) {
+        let path = command_mount_path(&path);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
         .into_iter()
         .map(|path| {
             if verbose {
@@ -2219,6 +2253,18 @@ fn discover_command_binary(config: &Config, verbose: bool) -> Vec<Mount> {
             }
         })
         .collect()
+}
+
+fn command_mount_path(path: &Path) -> PathBuf {
+    let system_bin = Path::new(NIXOS_SYSTEM_BIN);
+    if path.starts_with(system_bin) {
+        // Preserve the complete system-profile bin directory. Besides making
+        // `ai-jail bash` start, this keeps PATH useful inside that shell (for
+        // example, `wget` from the same NixOS profile).
+        system_bin.to_path_buf()
+    } else {
+        path.to_path_buf()
+    }
 }
 
 fn discover_local_overrides() -> Vec<Mount> {
@@ -4124,6 +4170,63 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn nixos_command_mount_keeps_system_profile_bin() {
+        assert_eq!(
+            command_mount_path(Path::new("/run/current-system/sw/bin/bash")),
+            PathBuf::from("/run/current-system/sw/bin")
+        );
+        assert_eq!(
+            command_mount_path(Path::new("/run/user/1000/custom-agent")),
+            PathBuf::from("/run/user/1000/custom-agent")
+        );
+    }
+
+    #[test]
+    fn private_home_binds_nix_user_profile_bin() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-bwrap-nix-profile-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let profile = root.join("profiles/profile");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(profile.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&profile, home.join(".nix-profile"))
+            .unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let path = std::env::join_paths([
+            home.join(NIX_USER_PROFILE_BIN),
+            PathBuf::from("/bin"),
+            PathBuf::from("/usr/bin"),
+        ])
+        .unwrap();
+        let _path = EnvVarGuard::set("PATH", path);
+
+        let config = Config {
+            command: vec!["bash".into()],
+            private_home: Some(true),
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &home.join("project"),
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        assert!(has_ro_bind(&args, &home.join(NIX_USER_PROFILE_BIN)));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

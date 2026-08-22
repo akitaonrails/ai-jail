@@ -515,11 +515,20 @@ fn home_dir() -> PathBuf {
 /// so version payloads and launcher siblings resolve. Tools with needs
 /// beyond their install directory stay on the `--map` escape hatch.
 pub(crate) fn command_home_paths(config: &Config) -> Vec<PathBuf> {
+    command_paths_under(config, &home_dir())
+}
+
+/// Paths needed to execute the configured command that live below `root`.
+///
+/// Linux uses this for volatile host paths such as NixOS's
+/// `/run/current-system/sw/bin`, which are hidden by the sandbox's private
+/// `/run`. Keeping the root explicit also lets the private-home handling use
+/// the same symlink-safe command resolution without broadening either mount.
+pub(crate) fn command_paths_under(config: &Config, root: &Path) -> Vec<PathBuf> {
     let path_env = std::env::var("PATH").unwrap_or_default();
-    let home = home_dir();
     let mut paths = Vec::new();
     for executable in crate::command::executable_candidates(&config.command) {
-        for path in command_home_paths_impl(executable, &home, &path_env) {
+        for path in command_paths_under_impl(executable, root, &path_env) {
             if !paths.contains(&path) {
                 paths.push(path);
             }
@@ -528,9 +537,9 @@ pub(crate) fn command_home_paths(config: &Config) -> Vec<PathBuf> {
     paths
 }
 
-fn command_home_paths_impl(
+fn command_paths_under_impl(
     cmd: &str,
-    home: &Path,
+    root: &Path,
     path_env: &str,
 ) -> Vec<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
@@ -573,9 +582,9 @@ fn command_home_paths_impl(
     for _ in 0..16 {
         match std::fs::read_link(&cur) {
             Ok(target) => {
-                // A symlink hop; the chain may leave and re-enter
-                // $HOME, so collect per hop rather than bailing early.
-                if cur.starts_with(home) {
+                // A symlink hop; the chain may leave and re-enter `root`, so
+                // collect per hop rather than bailing early.
+                if cur.starts_with(root) {
                     push_unique(&mut paths, cur.clone());
                 }
                 cur = if target.is_absolute() {
@@ -590,7 +599,7 @@ fn command_home_paths_impl(
             Err(_) => {
                 // Terminal: a regular file (or a broken link target —
                 // warn-and-skip philosophy, exec will report it).
-                if cur.starts_with(home)
+                if cur.starts_with(root)
                     && cur.is_file()
                     && let Some(parent) = cur.parent()
                 {
@@ -2025,7 +2034,7 @@ mod tests {
         let path_env =
             format!("/usr/bin:{}", home.join(".local/bin").display());
 
-        let paths = command_home_paths_impl("agent", &home, &path_env);
+        let paths = command_paths_under_impl("agent", &home, &path_env);
 
         assert_eq!(
             paths,
@@ -2035,6 +2044,46 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn command_paths_under_keeps_nixos_profile_entry() {
+        // Regression for #117: bwrap replaces /run with a tmpfs, so the
+        // selected entry from /run/current-system/sw/bin must be mounted back
+        // even though its final target lives in the already-mounted Nix store.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let fixture = std::env::temp_dir()
+            .join(format!("ai-jail-nixos-command-{}", std::process::id()));
+        let run = fixture.join("run");
+        let bin = run.join("current-system/sw/bin");
+        let store = fixture.join("nix/store/bash/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        let target = store.join("bash");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let entry = bin.join("bash");
+        std::os::unix::fs::symlink(&target, &entry).unwrap();
+        let _path = EnvVarGuard::set("PATH", bin.as_os_str());
+
+        let named = Config {
+            command: vec!["bash".into()],
+            ..Config::default()
+        };
+        assert_eq!(command_paths_under(&named, &run), vec![entry.clone()]);
+
+        let absolute = Config {
+            command: vec![entry.display().to_string()],
+            ..Config::default()
+        };
+        assert_eq!(command_paths_under(&absolute, &run), vec![entry]);
+
+        let _ = std::fs::remove_dir_all(fixture);
     }
 
     #[test]
@@ -2085,7 +2134,7 @@ mod tests {
         let cmd = home.join(".local/bin/agent");
 
         let paths =
-            command_home_paths_impl(cmd.to_str().unwrap(), &home, "/usr/bin");
+            command_paths_under_impl(cmd.to_str().unwrap(), &home, "/usr/bin");
 
         assert_eq!(
             paths,
@@ -2102,10 +2151,10 @@ mod tests {
         // A command outside $HOME needs no extra mounts.
         let home = PathBuf::from("/home/definitely-not-this-user");
         assert!(
-            command_home_paths_impl("sh", &home, "/usr/bin:/bin").is_empty()
+            command_paths_under_impl("sh", &home, "/usr/bin:/bin").is_empty()
         );
         assert!(
-            command_home_paths_impl("/bin/sh", &home, "/usr/bin").is_empty()
+            command_paths_under_impl("/bin/sh", &home, "/usr/bin").is_empty()
         );
     }
 
@@ -2116,13 +2165,13 @@ mod tests {
 
         // Not on PATH at all.
         assert!(
-            command_home_paths_impl("no-such-agent", &home, &path_env)
+            command_paths_under_impl("no-such-agent", &home, &path_env)
                 .is_empty()
         );
         // Relative-with-slash resolves against the project cwd, which
         // is always mounted.
         assert!(
-            command_home_paths_impl("./agent", &home, &path_env).is_empty()
+            command_paths_under_impl("./agent", &home, &path_env).is_empty()
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -2289,7 +2338,7 @@ mod tests {
         std::os::unix::fs::symlink(bin.join("a"), bin.join("b")).unwrap();
 
         let cmd = bin.join("a");
-        let paths = command_home_paths_impl(cmd.to_str().unwrap(), &home, "");
+        let paths = command_paths_under_impl(cmd.to_str().unwrap(), &home, "");
 
         // Only the symlink hops are collected; no final dir exists.
         assert!(paths.iter().all(|p| p.starts_with(&home)));
