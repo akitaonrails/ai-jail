@@ -182,6 +182,42 @@ static void test_init_module(void)
  * Either ENETUNREACH (no route) or EACCES/EPERM (Landlock)
  * indicates the network is properly isolated.
  */
+/*
+ * Open the netlink route socket getifaddrs() uses to enumerate interfaces.
+ * Permitted only when the sandbox already has unrestricted network and is
+ * not in lockdown; the seccomp filter denies every other SOCK_RAW domain
+ * and every other netlink protocol.
+ */
+static void test_netlink_route(void)
+{
+    errno = 0;
+    int fd = socket(AF_NETLINK, SOCK_RAW, 0 /* NETLINK_ROUTE */);
+    if (fd == -1) {
+        if (errno == EPERM || errno == EACCES)
+            BLOCKED();
+        ALLOWED("(socket errno=%d)", errno);
+    }
+    close(fd);
+    ALLOWED("(netlink route socket opened)");
+}
+
+/*
+ * A different netlink protocol must stay denied even when the route socket
+ * is permitted, so the carve-out cannot become "all of netlink".
+ */
+static void test_netlink_audit(void)
+{
+    errno = 0;
+    int fd = socket(AF_NETLINK, SOCK_RAW, 9 /* NETLINK_AUDIT */);
+    if (fd == -1) {
+        if (errno == EPERM || errno == EACCES)
+            BLOCKED();
+        ALLOWED("(socket errno=%d)", errno);
+    }
+    close(fd);
+    ALLOWED("(netlink audit socket opened)");
+}
+
 static void test_network(void)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -267,6 +303,8 @@ int main(int argc, char *argv[])
     if (strcmp(t, "mount") == 0)         test_mount();
     if (strcmp(t, "init_module") == 0)   test_init_module();
     if (strcmp(t, "network") == 0)       test_network();
+    if (strcmp(t, "netlink_route") == 0) test_netlink_route();
+    if (strcmp(t, "netlink_audit") == 0) test_netlink_audit();
     if (strcmp(t, "write_sys") == 0)     test_write_sys();
 
     fprintf(stderr, "Unknown test: %s\n", t);

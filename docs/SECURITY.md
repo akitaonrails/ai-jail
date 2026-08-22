@@ -76,7 +76,15 @@ settable per command in `~/.ai-jail`). Use
 ## Platform notes and residual risks
 
 Linux combines bubblewrap namespaces with Landlock, seccomp, and resource
-limits where available. `BWRAP_BIN` must resolve canonically either to a
+limits where available. Seccomp denies raw and packet sockets, with one
+narrow exception: `socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE)`, which
+`getifaddrs()` uses to enumerate local interfaces, is permitted when the
+sandbox already has unrestricted network and is not in lockdown. Blocking it
+there bought nothing — an agent with `--network` can learn the same addresses
+by connecting out — while breaking any tool that calls `getifaddrs()`. Every
+other netlink protocol and every other raw socket domain stays denied, and
+under `--lockdown` or without `--network` so does this one, so lockdown's
+`/sys/class/net` mask cannot be walked around. `BWRAP_BIN` must resolve canonically either to a
 root-owned executable with no group- or world-write bits, or to an executable
 with no write bits at all under a `/nix/store` that is itself owned by root
 (or by an unmapped owner, which a user namespace reports as the overflow uid)

@@ -223,6 +223,30 @@ fn assert_blocked_or_skipped(output: &Output, test_name: &str) {
     assert_blocked(output, test_name);
 }
 
+/// Run a command inside the sandbox with unrestricted network.
+fn network_run(args: &[&str]) -> Output {
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
+    Command::new(ai_jail())
+        .args([
+            "--clean",
+            "--network",
+            "--no-ssh",
+            "--no-gpu",
+            "--no-docker",
+            "--no-display",
+            "--no-status-bar",
+        ])
+        .args(args)
+        .output()
+        .expect("failed to spawn ai-jail")
+}
+
+/// Helper: run the compiled C helper inside a networked sandbox.
+fn helper_network(test_name: &str) -> Output {
+    let bin = helper_bin();
+    network_run(&[bin.to_str().unwrap(), test_name])
+}
+
 /// Helper: run the compiled C helper inside normal sandbox.
 fn helper_normal(test_name: &str) -> Output {
     let bin = helper_bin();
@@ -289,6 +313,59 @@ fn seccomp_blocks_init_module() {
 }
 
 // ── Filesystem tests (normal mode) ──────────────
+
+#[test]
+fn netlink_route_is_blocked_without_network() {
+    require_bwrap!();
+    require_helper!();
+    // getifaddrs() needs this socket, but describing the host's interfaces
+    // to a sandbox that has no network serves no purpose (#118).
+    let out = helper_normal("netlink_route");
+    assert_blocked(&out, "netlink route socket without --network");
+}
+
+#[test]
+fn netlink_route_is_allowed_with_network() {
+    require_bwrap_net!();
+    require_helper!();
+    // With unrestricted network the agent could learn the same addresses by
+    // connecting out, so blocking getifaddrs() only broke ordinary tools.
+    let out = helper_network("netlink_route");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ALLOWED"),
+        "netlink route socket should be permitted with --network, got \
+         stdout={stdout:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn other_netlink_protocols_stay_blocked_with_network() {
+    require_bwrap_net!();
+    require_helper!();
+    // The carve-out is one protocol, not all of netlink.
+    let out = helper_network("netlink_audit");
+    assert_blocked(&out, "netlink audit socket with --network");
+}
+
+#[test]
+fn netlink_route_is_blocked_in_lockdown() {
+    require_bwrap_net!();
+    require_helper!();
+    // Lockdown masks /sys/class/net precisely to stop host network
+    // topology being enumerated; the carve-out must not walk around it.
+    let bin = helper_bin();
+    let out = {
+        let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
+        Command::new(ai_jail())
+            .args(["--clean", "--lockdown", "--network", "--no-status-bar"])
+            .args([bin.to_str().unwrap(), "netlink_route"])
+            .output()
+            .expect("failed to spawn ai-jail")
+    };
+    assert_blocked(&out, "netlink route socket in lockdown");
+}
 
 #[test]
 fn sandbox_blocks_write_to_usr() {

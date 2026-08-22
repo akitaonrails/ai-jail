@@ -1113,6 +1113,15 @@ fn landlock_wrapper_args(
     if config.agent_state_enabled() {
         args.push("--agent-state".into());
     }
+    // Forward the network capability so the inner wrapper's seccomp filter
+    // can make the same decision the outer process did. Landlock's network
+    // rules key on lockdown and allowed ports, never on this, so forwarding
+    // it cannot loosen them.
+    args.push(if config.network_enabled() {
+        "--network".into()
+    } else {
+        "--no-network".into()
+    });
     args.push(if config.seccomp_enabled() {
         "--seccomp".into()
     } else {

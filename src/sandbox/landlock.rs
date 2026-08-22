@@ -201,7 +201,8 @@ fn do_apply(
 ///
 /// LIMITATION: Landlock V4 only covers TCP. When allowed ports
 /// are configured, --unshare-net is skipped and UDP/ICMP traffic
-/// is unrestricted. Seccomp blocks raw/packet sockets but
+/// is unrestricted. Seccomp blocks raw/packet sockets (the netlink route
+/// exception for getifaddrs() never applies in lockdown) but
 /// regular UDP datagrams can still be sent and received.
 fn apply_net_rules(config: &Config, verbose: bool) -> Result<(), String> {
     if !config.lockdown_enabled() {

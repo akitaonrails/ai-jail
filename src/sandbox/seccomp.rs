@@ -242,16 +242,10 @@ fn compile_filter(
 
     // SeccompCondition::new compares Dword syscall arguments. MaskedEq(0xF)
     // matches SOCK_RAW despite SOCK_CLOEXEC or SOCK_NONBLOCK type flags.
-    let socket_rules = [
+    let mut socket_rules = [
         SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 17),
         SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 31),
         SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 15),
-        SeccompCondition::new(
-            1,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::MaskedEq(0xF),
-            libc::SOCK_RAW as u64,
-        ),
     ]
     .into_iter()
     .map(|condition| {
@@ -259,6 +253,72 @@ fn compile_filter(
     })
     .collect::<Result<Vec<_>, _>>()
     .map_err(|e| format!("Seccomp: failed to build socket rules: {e}"))?;
+
+    let raw_type = || {
+        SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(0xF),
+            libc::SOCK_RAW as u64,
+        )
+    };
+
+    // `getifaddrs()` enumerates local interfaces through
+    // `socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE)`, so a blanket SOCK_RAW
+    // deny makes that ordinary libc call fail with EPERM and takes down
+    // anything that assumes it works (issue #118).
+    //
+    // The carve-out is deliberately narrow and conditional. Lockdown masks
+    // /sys/class/net precisely to stop an agent enumerating host network
+    // topology, so allowing NETLINK_ROUTE there would walk straight around
+    // that; and with no network there is no reason to describe the host's
+    // interfaces at all. It is permitted only when the sandbox already has
+    // unrestricted network, where the agent could learn the same addresses
+    // by connecting out.
+    let netlink_route_permitted = config.network_enabled() && !lockdown;
+    let raw_socket_rules = if netlink_route_permitted {
+        vec![
+            // Every SOCK_RAW domain except AF_NETLINK.
+            vec![
+                raw_type(),
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Ne,
+                    libc::AF_NETLINK as u64,
+                ),
+            ],
+            // AF_NETLINK SOCK_RAW for any protocol except NETLINK_ROUTE.
+            vec![
+                raw_type(),
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Eq,
+                    libc::AF_NETLINK as u64,
+                ),
+                SeccompCondition::new(
+                    2,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Ne,
+                    libc::NETLINK_ROUTE as u64,
+                ),
+            ],
+        ]
+    } else {
+        vec![vec![raw_type()]]
+    };
+    for conditions in raw_socket_rules {
+        let conditions = conditions
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                format!("Seccomp: failed to build socket rules: {e}")
+            })?;
+        socket_rules.push(SeccompRule::new(conditions).map_err(|e| {
+            format!("Seccomp: failed to build socket rules: {e}")
+        })?);
+    }
     rules.insert(libc::SYS_socket, socket_rules);
 
     let tiocsti = SeccompCondition::new(
