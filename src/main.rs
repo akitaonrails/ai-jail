@@ -135,12 +135,50 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     #[cfg(target_os = "linux")]
     sandbox::rlimits::apply_nproc(&config, cli.verbose);
 
+    // Drop PATH entries that do not exist in here.
+    //
+    // The sandbox inherits the host's PATH, which describes the host's
+    // layout: under private home it names ~/.local/share/mise/installs/...
+    // and similar directories that were never mounted. Tools then look
+    // installed as far as PATH is concerned and resolve to nothing, and mise
+    // in particular reports shims it cannot satisfy (issue #113). This runs
+    // inside the sandbox, which is the only place the answer is knowable.
+    if let Some(path) = std::env::var_os("PATH")
+        && let Some((pruned, kept, total)) = prune_missing_path_entries(&path)
+    {
+        if cli.verbose {
+            output::verbose(&format!(
+                "PATH: kept {kept} of {total} entries that exist here"
+            ));
+        }
+        // SAFETY: single-threaded, before exec.
+        unsafe { std::env::set_var("PATH", &pruned) };
+    }
+
     // Replace this process with the real command
     let err = std::process::Command::new(&cli.command[0])
         .args(&cli.command[1..])
         .exec();
 
     Err(format!("Failed to exec {}: {err}", cli.command[0]))
+}
+
+/// Drop `PATH` entries that are not directories here, returning the rewritten
+/// value with the kept and original counts. `None` when nothing changed.
+fn prune_missing_path_entries(
+    path: &std::ffi::OsStr,
+) -> Option<(std::ffi::OsString, usize, usize)> {
+    let total = std::env::split_paths(path).count();
+    let kept: Vec<std::path::PathBuf> = std::env::split_paths(path)
+        .filter(|entry| entry.is_dir())
+        .collect();
+    if kept.len() == total {
+        return None;
+    }
+    let count = kept.len();
+    std::env::join_paths(kept)
+        .ok()
+        .map(|pruned| (pruned, count, total))
 }
 
 fn validate_write_flags(cli: &cli::CliArgs) -> Result<(), String> {
@@ -531,9 +569,10 @@ mod tests {
     use super::{
         apply_browser_profile, command_is_browser, command_needs_direct_tty,
         default_resize_redraw_key, exec_requires_terminal_passthrough,
-        pty_proxy_active, resolve_browser_profile, running_inside_multiplexer,
-        should_auto_save_project_config, should_check_update,
-        should_save_global_preferences, validate_write_flags,
+        prune_missing_path_entries, pty_proxy_active, resolve_browser_profile,
+        running_inside_multiplexer, should_auto_save_project_config,
+        should_check_update, should_save_global_preferences,
+        validate_write_flags,
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
@@ -572,6 +611,31 @@ mod tests {
             ]),
             Some("ctrl-shift-l")
         );
+    }
+
+    #[test]
+    fn path_pruning_drops_only_missing_entries() {
+        // Issue #113: the sandbox inherits a PATH describing the host's
+        // layout, so entries that were never mounted dangle and tools look
+        // installed while resolving to nothing.
+        let real = std::env::temp_dir();
+        let missing =
+            real.join(format!("ai-jail-no-such-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+
+        let path =
+            std::env::join_paths([real.clone(), missing.clone()]).unwrap();
+        let (pruned, kept, total) =
+            prune_missing_path_entries(&path).expect("should prune");
+        assert_eq!((kept, total), (1, 2));
+        assert_eq!(
+            std::env::split_paths(&pruned).collect::<Vec<_>>(),
+            vec![real.clone()]
+        );
+
+        // Nothing to do when every entry exists: callers skip the rewrite.
+        let all_real = std::env::join_paths([real.clone(), real]).unwrap();
+        assert!(prune_missing_path_entries(&all_real).is_none());
     }
 
     #[test]
