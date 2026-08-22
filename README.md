@@ -191,7 +191,12 @@ Two config files plus CLI flags, in increasing authority:
 
 1. `./.ai-jail` (project) — untrusted, monotonic policy: it may tighten the
    sandbox but can never enable capabilities, outside maps, ports,
-   `claude_dir`, or exceptions. It is hidden from the sandbox by default.
+   `claude_dir`, or exceptions. It is masked from the sandbox by default, so
+   the agent sees an empty file rather than your policy. Add `.ai-jail` to
+   `.gitignore` and leave it uncommitted if you would rather the agent not
+   notice it at all: `git status` inside the sandbox is then completely
+   clean. A *committed* `.ai-jail` always shows as modified there, because
+   masking replaces its contents — git has to report something either way.
    To let specific checkouts ship their own capability opt-ins, list their
    parent directory under `trust_project_config` in the global config (see
    below).
