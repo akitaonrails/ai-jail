@@ -51,3 +51,23 @@ jobs:
       - run: cargo test --locked
       - name: Check macOS target
         run: cargo clippy --locked --target aarch64-apple-darwin --all-targets -- -D warnings
+
+  nix:
+    # The Nix build path had no CI coverage, so two NixOS regressions reached
+    # users: v1.19.0 refused its own bwrap (#114), and flake changes could
+    # only ever be validated by the reporter. `nix flake check` builds the
+    # package and runs its checkPhase, which is the same suite CI runs above.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: nix flake check
+        run: nix flake check --print-build-logs
