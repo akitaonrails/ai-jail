@@ -524,7 +524,10 @@ pub(crate) fn command_home_paths(config: &Config) -> Vec<PathBuf> {
 /// `/run/current-system/sw/bin`, which are hidden by the sandbox's private
 /// `/run`. Keeping the root explicit also lets the private-home handling use
 /// the same symlink-safe command resolution without broadening either mount.
-pub(crate) fn command_paths_under(config: &Config, root: &Path) -> Vec<PathBuf> {
+pub(crate) fn command_paths_under(
+    config: &Config,
+    root: &Path,
+) -> Vec<PathBuf> {
     let path_env = std::env::var("PATH").unwrap_or_default();
     let mut paths = Vec::new();
     for executable in crate::command::executable_candidates(&config.command) {

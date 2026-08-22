@@ -95,7 +95,7 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 10. Config hide (tmpfs over sensitive `~/.config/*` subdirs)
 11. Cache hide (tmpfs over sensitive `~/.cache/*` subdirs)
 12. Local overrides (`~/.local/state`, `~/.local/share/*` rw subdirs)
-13. Command binary exemption (private-home only)
+13. Command binary exemption (paths the sandbox would otherwise hide: under private home the command's own directory beneath `$HOME`, and always the NixOS system profile under the private `/run`)
 14. Linked Git worktree metadata (validated, opt-in; common dir mounted first, then the nested per-worktree git dir — both writable outside lockdown, both read-only under it)
 15. SSH agent socket and `~/.ssh` exemption mounts
 16. Pictures mount

@@ -9,7 +9,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const WSL_DOCKER_DESKTOP_CLI_TOOLS: &str = "/mnt/wsl/docker-desktop/cli-tools";
 const NIXOS_SYSTEM_BIN: &str = "/run/current-system/sw/bin";
-const NIX_USER_PROFILE_BIN: &str = ".nix-profile/bin";
 /// Also granted read-write by Landlock (`collect_normal_paths`) —
 /// keep the two in sync via this shared constant.
 pub(crate) const TAILSCALE_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
@@ -2217,21 +2216,6 @@ fn discover_command_binary(
     } else {
         Vec::new()
     };
-    if private_home {
-        let profile_bin = super::home_dir().join(NIX_USER_PROFILE_BIN);
-        let profile_is_on_path =
-            std::env::var_os("PATH").is_some_and(|path| {
-                std::env::split_paths(&path)
-                    .any(|entry| entry == profile_bin)
-            });
-        if profile_is_on_path && profile_bin.is_dir() {
-            // The private-home tmpfs hides ~/.nix-profile. Preserve its full
-            // bin directory so commands started later by a shell remain on
-            // PATH, not only the executable selected for ai-jail itself.
-            paths.retain(|path| !path.starts_with(&profile_bin));
-            paths.push(profile_bin);
-        }
-    }
     for path in super::command_paths_under(config, Path::new("/run")) {
         let path = command_mount_path(&path);
         if !paths.contains(&path) {
@@ -4185,46 +4169,74 @@ mod tests {
     }
 
     #[test]
-    fn private_home_binds_nix_user_profile_bin() {
+    fn private_home_binds_the_nix_profile_only_when_the_command_lives_there() {
+        // The generic resolution already mounts the parent directory of the
+        // invoked command, so a Nix profile command exposes its own bin dir
+        // exactly like ~/.local/bin does elsewhere — #117 confirms this half
+        // already worked ("ai-jail opencode runs fine"). What private home
+        // should not do is mount the profile merely because it is on PATH,
+        // when the command came from somewhere else entirely.
         let _lock = ENV_LOCK.lock().unwrap();
-        let root = std::env::temp_dir().join(format!(
-            "ai-jail-bwrap-nix-profile-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-bwrap-nix-profile-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("home");
-        let profile = root.join("profiles/profile");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(profile.join("bin")).unwrap();
-        std::os::unix::fs::symlink(&profile, home.join(".nix-profile"))
+        let profile_bin = root.join("profiles/profile/bin");
+        let local_bin = home.join(".local/bin");
+        std::fs::create_dir_all(&profile_bin).unwrap();
+        std::fs::create_dir_all(&local_bin).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("profiles/profile"),
+            home.join(".nix-profile"),
+        )
+        .unwrap();
+        for exe in [profile_bin.join("from-profile"), local_bin.join("agent")] {
+            std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(
+                &exe,
+                std::fs::Permissions::from_mode(0o755),
+            )
             .unwrap();
+        }
         let _home = EnvVarGuard::set("HOME", &home);
         let path = std::env::join_paths([
-            home.join(NIX_USER_PROFILE_BIN),
-            PathBuf::from("/bin"),
-            PathBuf::from("/usr/bin"),
+            home.join(".nix-profile/bin"),
+            local_bin.clone(),
         ])
         .unwrap();
         let _path = EnvVarGuard::set("PATH", path);
 
-        let config = Config {
-            command: vec!["bash".into()],
-            private_home: Some(true),
-            ..minimal_test_config()
+        let run = |command: &str| {
+            let config = Config {
+                command: vec![command.into()],
+                private_home: Some(true),
+                ..minimal_test_config()
+            };
+            let guard =
+                SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+            build_dry_run_args(
+                &config,
+                &home.join("project"),
+                guard.hosts_mount(),
+                guard.resolv_mount(),
+                guard.empty_path(),
+                false,
+            )
+            .unwrap()
         };
-        let guard =
-            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
-        let args = build_dry_run_args(
-            &config,
-            &home.join("project"),
-            guard.hosts_mount(),
-            guard.resolv_mount(),
-            guard.empty_path(),
-            false,
-        )
-        .unwrap();
 
-        assert!(has_ro_bind(&args, &home.join(NIX_USER_PROFILE_BIN)));
+        // Command from the profile: its bin directory comes along.
+        let args = run("from-profile");
+        assert!(has_ro_bind(&args, &home.join(".nix-profile/bin")));
+
+        // Command from elsewhere: the profile stays hidden even though it is
+        // on PATH, so private home exposes no more than the command needs.
+        let args = run("agent");
+        assert!(has_ro_bind(&args, &local_bin));
+        assert!(
+            !has_ro_bind(&args, &home.join(".nix-profile/bin")),
+            "profile must not be mounted when the command came from elsewhere"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
