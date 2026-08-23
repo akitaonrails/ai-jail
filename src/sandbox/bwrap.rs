@@ -1815,6 +1815,7 @@ fn command_state_paths(config: &Config) -> &'static [&'static str] {
         Some(name) if name.starts_with("kimi") => &[".kimi-code"],
         Some("gemini") => &[".gemini"],
         Some("grok") => &[".grok"],
+        Some("jcode") => &[".jcode", ".config/jcode"],
         Some("pi") => &[".pi", ".pi-lens"],
         Some("aider") => &[".aider"],
         Some("soulforge") => &[".soulforge"],
@@ -5381,6 +5382,10 @@ mod tests {
             ("kimi", &[".kimi-code"]),
             ("gemini", &[".gemini"]),
             ("grok", &[".grok"]),
+            // jcode keeps credentials in ~/.jcode/auth.json and reads
+            // provider env files from ~/.config/jcode on Linux, so both
+            // are needed for --agent-state to mean anything (#108).
+            ("jcode", &[".jcode", ".config/jcode"]),
             ("pi", &[".pi", ".pi-lens"]),
             ("aider", &[".aider"]),
             ("soulforge", &[".soulforge"]),

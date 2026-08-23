@@ -9,7 +9,8 @@ USAGE:
     ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 
 COMMANDS (positional):
-    gemini, claude, codex, opencode, crush, soulforge, grok, pi, kimi, bash
+    gemini, claude, codex, opencode, crush, soulforge, grok, pi, jcode,
+    kimi, bash
                                             Known AI tool presets
     status                                 Show current .ai-jail config
     Any other string                       Passed through as the command
@@ -557,7 +558,7 @@ mod tests {
 
     #[test]
     fn help_lists_pi_preset() {
-        assert!(HELP.contains("grok, pi, kimi, bash"));
+        assert!(HELP.contains("grok, pi, jcode,"));
     }
 
     #[test]

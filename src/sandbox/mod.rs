@@ -159,6 +159,7 @@ pub fn denied_dotdirs<'a>(
 const DOTDIR_RW: &[&str] = &[
     ".gemini",
     ".claude",
+    ".jcode",
     ".crush",
     ".codex",
     ".aider",
@@ -1793,6 +1794,7 @@ mod tests {
             ".omp",
             ".pi",
             ".pi-lens",
+            ".jcode",
         ] {
             assert!(DOTDIR_RW.contains(name), "{name} should be in rw list");
         }
