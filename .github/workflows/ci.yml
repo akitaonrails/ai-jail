@@ -97,3 +97,20 @@ jobs:
       # compiles the crate and runs the test suite in its checkPhase.
       - name: nix build
         run: nix build .#default --print-build-logs
+      # #116 removed the Rust toolchain from the runtime closure by building
+      # with a minimal rustc/cargo and remapping store paths out of the
+      # binary. Both halves are easy to undo by accident — switching the
+      # package back to the aggregated `rust` derivation is a one-line edit —
+      # and the result still builds and tests clean, so only the closure
+      # shows it. Bubblewrap is a genuine runtime dependency and stays.
+      - name: Runtime closure carries no toolchain
+        run: |
+          set -eu
+          closure="$(nix path-info -r .#default)"
+          if leaked="$(printf '%s\n' "$closure" |
+              grep -E -- '-(rustc|cargo|clippy-preview|rustfmt-preview|rust-analyzer-preview|rust-src|rust-docs|rust-std|rust-default|llvm-tools-preview)-')"; then
+            echo "::error::Rust toolchain leaked into the runtime closure" >&2
+            printf '%s\n' "$leaked" >&2
+            exit 1
+          fi
+          printf '%s\n' "$closure" | wc -l | xargs echo "runtime closure paths:"
