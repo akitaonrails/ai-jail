@@ -791,9 +791,19 @@ fn deepest_existing_ancestor(path: &Path) -> Option<(PathBuf, PathBuf)> {
 /// cannot be stat'd — fail closed). Symlinks above the project root
 /// are irrelevant: the canonicalized `stop` already resolved them.
 fn ancestor_chain_has_symlink(start: &Path, stop: &Path) -> bool {
+    // `stop` is canonical while `start` is not, so textual equality alone
+    // never fires when any component above the project root is a symlink —
+    // the walk then runs past the root and rejects on that symlink, which
+    // is exactly what this function documents as irrelevant. macOS makes it
+    // routine (`/var` -> `private/var`, `/tmp` -> `private/tmp`), but a
+    // Linux home behind a symlink hits it too.
+    let reached_stop = |path: &Path| {
+        path == stop
+            || std::fs::canonicalize(path).is_ok_and(|real| real == stop)
+    };
     let mut current = start;
     loop {
-        if current == stop {
+        if reached_stop(current) {
             return false;
         }
         match std::fs::symlink_metadata(current) {
@@ -2194,6 +2204,33 @@ env_pass = ["ANTHROPIC_API_KEY"]
 
         assert!(resolves_inside_project(
             &project.join("src/newdir/nested"),
+            &project
+        ));
+        assert!(resolves_inside_project(&project.join("newdir"), &project));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolves_inside_project_ignores_symlink_above_the_project_root() {
+        // The project root is reached through a symlink, so the
+        // canonicalized root and the caller's path spell it differently.
+        // The chain walk must still terminate at the root: a symlink
+        // *above* it was already resolved by canonicalizing, and treating
+        // it as an escape rejected every in-project map. This is the
+        // permanent state of affairs on macOS, where $TMPDIR lives under
+        // `/var` -> `private/var`.
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-resolve-above-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let real = root.join("real");
+        std::fs::create_dir_all(real.join("project/src")).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let project = link.join("project");
+        assert!(resolves_inside_project(
+            &project.join("src/newdir"),
             &project
         ));
         assert!(resolves_inside_project(&project.join("newdir"), &project));
