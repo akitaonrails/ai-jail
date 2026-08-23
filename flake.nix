@@ -36,9 +36,20 @@
 
         rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
+        # Only rustc + cargo + rust-std are needed to actually *build* the
+        # package. `rust` above also drags in rustfmt/clippy/rust-analyzer/
+        # rust-src/rust-docs/llvm-tools (whatever rust-toolchain.toml asks
+        # for), and since they're all part of the same aggregated
+        # derivation, their /nix/store paths get embedded as plain strings
+        # in the compiled binary (panic locations, debug info, etc.) and
+        # end up as spurious runtime dependencies of the final package.
+        rustBuild = pkgs.rust-bin.fromRustupToolchain {
+          channel = (builtins.fromTOML (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
+        };
+
         rustPlatform = pkgs.makeRustPlatform {
-          rustc = rust;
-          cargo = rust;
+          rustc = rustBuild;
+          cargo = rustBuild;
         };
 
         formatter =
@@ -93,6 +104,12 @@
           ];
 
           BWRAP_BIN = "${pkgs.bubblewrap}/bin/bwrap";
+
+          # Belt-and-suspenders: strip any /nix/store path that might still
+          # get baked into the binary (panic!()/file!() locations, debug
+          # info, ...) so Nix's reference scanner has nothing left to
+          # falsely latch onto, even for the now-much-smaller build toolchain.
+          RUSTFLAGS = "--remap-path-prefix=${builtins.storeDir}=/build";
 
           postFixup = ''
             wrapProgram "$out/bin/ai-jail" \
