@@ -2239,6 +2239,32 @@ env_pass = ["ANTHROPIC_API_KEY"]
     }
 
     #[test]
+    fn resolves_inside_project_rejects_parent_traversal_in_missing_tail() {
+        // The containment check ends in a lexical `starts_with`, so a `..`
+        // surviving into the non-existent tail would read as inside the
+        // project while resolving outside it. `to_absolute` normalizes the
+        // path before the ancestor walk, which is what prevents that —
+        // assert it here so the ordering cannot be refactored apart.
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-resolve-dotdot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+
+        assert!(!resolves_inside_project(
+            &project.join("missing/../../outside/loot"),
+            &project
+        ));
+        assert!(!resolves_inside_project(
+            &project.join("missing/../.."),
+            &project
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn resolves_inside_project_rejects_symlink_escape_via_missing_tail() {
         // Regression: a non-existent path whose deepest existing
         // ancestor is a symlink pointing outside the project used to

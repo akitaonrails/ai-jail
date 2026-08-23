@@ -144,8 +144,13 @@ jobs:
         with:
           toolchain: 1.97.1
           targets: aarch64-apple-darwin
-      - name: Build unsigned macOS binary
-        run: cargo build --locked --release --target aarch64-apple-darwin
+      # Symmetric with build-linux above. This leg tested until a09179b
+      # (v1.18.0) split the os matrix and kept `cargo test` on the Linux
+      # side only, which left the macOS-gated suite with no runner at all
+      # until ci.yml gained a macos job. CI covers every push to master, so
+      # this is the backstop for a tag placed on an untested commit.
+      - name: Test and build unsigned macOS binary
+        run: cargo test --locked && cargo build --locked --release --target aarch64-apple-darwin
       - name: Archive and checksum unsigned binary
         run: |
           tar czf ai-jail-macos-aarch64-unsigned.tar.gz -C target/aarch64-apple-darwin/release ai-jail
