@@ -159,6 +159,7 @@ fn mounted_map_args<'a>(
     args
 }
 
+#[cfg_attr(test, derive(Default))]
 struct MountSet {
     base: Vec<Mount>,
     sys_masks: Vec<Mount>,
@@ -307,6 +308,19 @@ impl MountSet {
                     "DBUS_SESSION_BUS_ADDRESS".into(),
                 ]);
             }
+            // Environment hardening: by default the sandbox inherits
+            // only the safe allowlist (plus explicit env_pass
+            // entries); --inherit-env keeps the full host
+            // environment. Landlock-wrapper inner args are argv, not
+            // environment, and are unaffected.
+            args.extend(env_args(inherit_env, env_pass));
+            // Capability env must follow env_args, because that is what
+            // carries --clearenv and bwrap drops every --setenv preceding
+            // it. Emitted earlier, these were silently discarded while
+            // their sockets stayed bound, so --display bound the Wayland
+            // socket to a client that could not be told where it was, and
+            // --systemd-user did the same with the session bus (#122).
+            // This is also where ssh/claude/PS1 already sit, below.
             for (key, val) in &self.display_env {
                 args.push("--setenv".into());
                 args.push(key.clone());
@@ -317,12 +331,6 @@ impl MountSet {
                 args.push(key.clone());
                 args.push(val.clone());
             }
-            // Environment hardening: by default the sandbox inherits
-            // only the safe allowlist (plus explicit env_pass
-            // entries); --inherit-env keeps the full host
-            // environment. Landlock-wrapper inner args are argv, not
-            // environment, and are unaffected.
-            args.extend(env_args(inherit_env, env_pass));
         }
 
         // SSH agent env (non-lockdown only — lockdown clears env)
@@ -360,9 +368,13 @@ impl MountSet {
 /// bwrap would by default, with env_pass entries forced verbatim via
 /// `--setenv` (winning over the `--unsetenv` hardening above). The
 /// default filters to the safe allowlist: `--clearenv` followed by a
-/// `--setenv` per kept variable. `--setenv` values survive
-/// `--clearenv` regardless of argv order (bwrap applies them after
-/// clearing), so the later ssh/claude/PS1 setenvs are unaffected.
+/// `--setenv` per kept variable.
+///
+/// Argv order is load-bearing: bwrap applies these operations in
+/// sequence, so `--clearenv` discards every `--setenv` before it and
+/// keeps every `--setenv` after it. Anything that must reach the child
+/// has to be emitted after this function's output — which is why the
+/// display, systemd, ssh, claude and PS1 setenvs all follow it (#122).
 fn env_args(inherit_env: bool, env_pass: &[String]) -> Vec<String> {
     let host_env: Vec<(String, String)> = std::env::vars().collect();
     let mut args = Vec::new();
@@ -5386,6 +5398,91 @@ mod tests {
     }
 
     // ── Sandbox environment filtering ───────────────────────────
+
+    #[test]
+    fn capability_env_survives_clearenv() {
+        // Regression for #122. bwrap applies argv in sequence, so
+        // --clearenv discards every --setenv before it. display_env and
+        // systemd_env were emitted ahead of env_args (which is what carries
+        // --clearenv), so --display bound the Wayland socket while
+        // WAYLAND_DISPLAY never arrived and the client fell back to
+        // wayland-0, and --systemd-user lost DBUS_SESSION_BUS_ADDRESS the
+        // same way. XDG_RUNTIME_DIR hid the breakage by being rescued
+        // independently through the XDG_ allowlist prefix.
+        let set = MountSet {
+            display_env: vec![
+                ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
+                ("WAYLAND_DISPLAY".into(), "wayland-1".into()),
+                ("DISPLAY".into(), ":0".into()),
+                ("XAUTHORITY".into(), "/home/u/.Xauthority".into()),
+            ],
+            systemd_env: vec![(
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/run/user/1000/bus".into(),
+            )],
+            ssh_env: vec![(
+                "SSH_AUTH_SOCK".into(),
+                "/run/user/1000/ssh".into(),
+            )],
+            claude_env: vec![("CLAUDE_CONFIG_DIR".into(), "/home/u/.c".into())],
+            ..MountSet::default()
+        };
+
+        let args = set.isolation_args(
+            Path::new("/home/u/project"),
+            false,
+            true,
+            false,
+            &[],
+        );
+        let clearenv = args
+            .iter()
+            .position(|a| a == "--clearenv")
+            .expect("non-inherit mode must clear the environment");
+
+        for name in [
+            "WAYLAND_DISPLAY",
+            "XDG_RUNTIME_DIR",
+            "DISPLAY",
+            "XAUTHORITY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "SSH_AUTH_SOCK",
+            "CLAUDE_CONFIG_DIR",
+            "PS1",
+        ] {
+            // Match the `--setenv NAME` pair, not the bare name: the
+            // hardening block above emits `--unsetenv SSH_AUTH_SOCK`
+            // first, and that earlier occurrence is not the one that
+            // has to survive.
+            let at = args
+                .iter()
+                .enumerate()
+                .position(|(i, a)| {
+                    a == name && i > 0 && args[i - 1] == "--setenv"
+                })
+                .unwrap_or_else(|| panic!("{name} must be set at all"));
+            assert!(
+                at > clearenv,
+                "{name} is emitted at {at}, before --clearenv at {clearenv}, \
+                 so bwrap discards it"
+            );
+        }
+
+        // The invariant rather than the enumeration: nothing this function
+        // emits may sit on the losing side of --clearenv, including groups
+        // added later.
+        let stranded: Vec<&String> = args[..clearenv]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i > &0 && args[i - 1] == "--setenv")
+            .map(|(_, name)| name)
+            .collect();
+        assert!(
+            stranded.is_empty(),
+            "these --setenv values precede --clearenv and are discarded: \
+             {stranded:?}"
+        );
+    }
 
     #[test]
     fn env_args_filters_credentials_by_default() {
