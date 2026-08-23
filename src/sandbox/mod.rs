@@ -502,28 +502,20 @@ fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
 }
 
-/// Paths under `$HOME` that must stay visible in private-home mode for
-/// the sandboxed command itself to start (issue #81). Private home
-/// replaces `$HOME` with a tmpfs and skips all dotdir binds, which
-/// also hides the agent binary when it was installed under the home
-/// directory — e.g. the official Claude installer symlinks
-/// `~/.local/bin/claude` to `~/.local/share/claude/versions/<v>`.
+/// Paths below `root` that must stay visible for the sandboxed command
+/// itself to start (issue #81).
 ///
-/// Resolves the command the way exec will (host `PATH` search), then
-/// walks the symlink chain: every hop under `$HOME` is collected, and
-/// for the final regular-file target its parent directory is collected
-/// so version payloads and launcher siblings resolve. Tools with needs
-/// beyond their install directory stay on the `--map` escape hatch.
-pub(crate) fn command_home_paths(config: &Config) -> Vec<PathBuf> {
-    command_paths_under(config, &home_dir())
-}
-
-/// Paths needed to execute the configured command that live below `root`.
+/// Resolves the command the way exec will (host `PATH` search), then walks
+/// the symlink chain: every hop below `root` is collected, and for the final
+/// regular-file target its parent directory is collected so version payloads
+/// and launcher siblings resolve. Tools with needs beyond their install
+/// directory stay on the `--map` escape hatch.
 ///
-/// Linux uses this for volatile host paths such as NixOS's
-/// `/run/current-system/sw/bin`, which are hidden by the sandbox's private
-/// `/run`. Keeping the root explicit also lets the private-home handling use
-/// the same symlink-safe command resolution without broadening either mount.
+/// `root` is what each backend hides. Linux passes `$HOME`, whose tmpfs
+/// takes the agent binary with it — the official Claude installer symlinks
+/// `~/.local/bin/claude` to `~/.local/share/claude/versions/<v>` — and
+/// `/run`, which is always private and holds the NixOS system profile
+/// (#117). macOS denies by default everywhere, so it passes `/` (#120).
 pub(crate) fn command_paths_under(
     config: &Config,
     root: &Path,
@@ -2030,7 +2022,7 @@ mod tests {
     }
 
     #[test]
-    fn command_home_paths_follows_installer_symlink_chain() {
+    fn command_paths_under_follows_installer_symlink_chain() {
         // Regression for #81: PATH entry + final target's parent dir
         // must both surface so private-home mode can exec the agent.
         let home = command_home_fixture("chain");
@@ -2090,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn command_home_paths_include_managed_outer_and_inner_executables() {
+    fn command_paths_under_include_managed_outer_and_inner_executables() {
         let _lock = ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir()
             .join(format!("ai-jail-managed-cmd-home-{}", std::process::id()));
@@ -2127,12 +2119,15 @@ mod tests {
             ..Config::default()
         };
 
-        assert_eq!(command_home_paths(&config), vec![outer_dir, inner_dir]);
+        assert_eq!(
+            command_paths_under(&config, &home_dir()),
+            vec![outer_dir, inner_dir]
+        );
         let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
-    fn command_home_paths_resolves_absolute_command() {
+    fn command_paths_under_resolves_absolute_command() {
         let home = command_home_fixture("abs");
         let cmd = home.join(".local/bin/agent");
 
@@ -2150,7 +2145,7 @@ mod tests {
     }
 
     #[test]
-    fn command_home_paths_ignores_system_binaries() {
+    fn command_paths_under_ignores_system_binaries() {
         // A command outside $HOME needs no extra mounts.
         let home = PathBuf::from("/home/definitely-not-this-user");
         assert!(
@@ -2162,7 +2157,7 @@ mod tests {
     }
 
     #[test]
-    fn command_home_paths_ignores_missing_and_relative_commands() {
+    fn command_paths_under_ignores_missing_and_relative_commands() {
         let home = command_home_fixture("miss");
         let path_env = home.join(".local/bin").display().to_string();
 
@@ -2330,7 +2325,7 @@ mod tests {
     }
 
     #[test]
-    fn command_home_paths_survives_symlink_loops() {
+    fn command_paths_under_survives_symlink_loops() {
         // The chain walk is capped; a loop must not hang or panic.
         let home = std::env::temp_dir()
             .join(format!("ai-jail-cmd-home-loop-{}", std::process::id()));

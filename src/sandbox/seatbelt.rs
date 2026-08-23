@@ -3,6 +3,24 @@ use crate::output;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Core runtime and toolchain locations granted read-only so the sandboxed
+/// command can exec and resolve its dynamic libraries. This is the macOS
+/// counterpart of the Linux base mounts in `bwrap.rs`, and it carries the
+/// same entries: `/opt` belongs here because Homebrew on Apple Silicon
+/// installs there, exactly as the Intel prefix `/usr/local` — already
+/// covered by `/usr` — does on the other architecture (issue #120).
+const SYSTEM_READ_PATHS: &[&str] = &[
+    "/System",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/etc",
+    "/private/etc",
+    "/Library",
+    "/opt",
+    "/dev",
+];
+
 pub struct SandboxGuard;
 
 pub fn check() -> Result<(), String> {
@@ -91,7 +109,12 @@ fn apply_child_env(cmd: &mut Command, config: &Config) {
 
     let host_env: Vec<(String, String)> = std::env::vars().collect();
     let env = if config.inherit_env_enabled() {
-        let mut env = Vec::new();
+        // The whole parent environment, secrets included — that is what
+        // the opt-in means. Starting from an empty vector here handed the
+        // child nothing at all (not even PATH), because `env_clear` above
+        // has already dropped what `Command` would otherwise inherit;
+        // bwrap reaches the same result by omitting `--clearenv`.
+        let mut env = host_env.clone();
         crate::config::apply_env_pass(&mut env, config.env_pass(), &host_env);
         env
     } else {
@@ -828,21 +851,14 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
         }
     }
 
-    // Core runtime and toolchain locations needed to execute binaries
-    // and resolve dynamic libraries on macOS.
-    for p in [
-        "/System",
-        "/usr",
-        "/bin",
-        "/sbin",
-        "/etc",
-        "/private/etc",
-        "/Library",
-        "/dev",
-    ] {
+    for p in SYSTEM_READ_PATHS {
         let pb = PathBuf::from(p);
         if super::path_exists(&pb) {
-            push_unique(pb);
+            // Canonicalize before deduplicating: `/etc` and `/private/etc`
+            // are the same directory on macOS and the rules are emitted
+            // canonically, so the raw forms would produce one duplicate
+            // allow in every profile.
+            push_unique(canonicalize_or_keep(&pb));
         }
     }
 
@@ -927,11 +943,14 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
                 push_unique(canonicalize_or_keep(p));
             }
         }
-        // The invoked command itself may live under $HOME (e.g. the
-        // official Claude installer targets ~/.local/bin); without a
-        // read allowance on its install paths the exec fails before
-        // the agent starts (#81).
-        for p in super::command_home_paths(config) {
+        // Without a read allowance on the command's install paths the
+        // exec fails before the agent starts (#81). Unlike Linux, where
+        // everything outside the private $HOME is already bind-mounted,
+        // a macOS profile denies by default everywhere, so the search
+        // covers the whole filesystem rather than just $HOME — an agent
+        // installed under /Applications or /nix/store needs the same
+        // grant that a ~/.local/bin one does (issue #120).
+        for p in super::command_paths_under(config, Path::new("/")) {
             push_unique(canonicalize_or_keep(&p));
         }
         if config.ssh_enabled() {
@@ -1412,6 +1431,66 @@ mod tests {
     }
 
     #[test]
+    fn system_reads_cover_both_homebrew_prefixes() {
+        // Regression for #120. The Intel prefix /usr/local is reachable
+        // through /usr, so only the Apple Silicon prefix can go missing —
+        // and it did, leaving Homebrew-installed agents unexecutable on
+        // exactly one architecture.
+        assert!(SYSTEM_READ_PATHS.contains(&"/opt"));
+        assert!(SYSTEM_READ_PATHS.contains(&"/usr"));
+    }
+
+    #[test]
+    fn reads_allow_command_installed_outside_home() {
+        // Regression for #120: the read grant for the invoked command
+        // used to stop at $HOME, so an agent installed anywhere else —
+        // a Homebrew prefix, /Applications, /nix/store — was denied and
+        // the exec failed before the agent started.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-seatbelt-cmd-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let prefix = root.join("prefix");
+        let libexec = prefix.join("libexec");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::create_dir_all(&libexec).unwrap();
+        let target = libexec.join("agent-1.0");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, prefix.join("bin/agent")).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path = EnvVarGuard::set("PATH", prefix.join("bin").as_os_str());
+
+        // The install prefix is deliberately outside $HOME; if the fixture
+        // ever landed inside it, the test would pass without proving
+        // anything.
+        assert!(!prefix.starts_with(&home));
+
+        let config = Config {
+            command: vec!["agent".into()],
+            private_home: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile(&config, &home.join("project"));
+
+        assert!(
+            profile.contains(&format!("(subpath \"{}\")", sbpl_path(&libexec)))
+        );
+        assert!(
+            profile.contains(&format!("(literal \"{}\")", sbpl_path(&target)))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn restricted_reads_allow_root_node() {
         // Regression: without a read rule on the root node itself, the
         // dyld loader on macOS 26 aborts every dynamically-linked process
@@ -1595,13 +1674,23 @@ mod tests {
         let target = format!("{parent}/ai-jail-probe-{}", std::process::id());
         let _ = std::fs::remove_dir(format!("/private{target}"));
 
+        // One non-recursive mkdir, which is the call Claude Code makes.
+        // `mkdir -p` would instead walk down from `/tmp` and try to create
+        // it: the sandbox answers a denied write with EPERM rather than
+        // the EEXIST that mkdir tolerates, so the probe would fail on a
+        // path the agent never touches. Create the uid-scoped dir itself
+        // when it is absent — the exact reported operation — and fall
+        // back to a throwaway child so a live Claude Code session's
+        // directory is left alone.
+        let parent_exists = Path::new(&format!("/private{parent}")).is_dir();
+        let probe = if parent_exists { &target } else { &parent };
+
         let output = Command::new("/usr/bin/sandbox-exec")
             .arg("-p")
             .arg(&profile)
             .arg("--")
             .arg("/bin/mkdir")
-            .arg("-p")
-            .arg(&target)
+            .arg(probe)
             .output()
             .expect("failed to run sandbox-exec");
 
@@ -1688,8 +1777,11 @@ mod tests {
     #[test]
     fn writable_paths_grant_worktree_git_dir_and_common_dir() {
         let fixture = create_linked_worktree_fixture();
+        // Worktree metadata is opt-in; without --worktree discovery
+        // returns nothing and the assertions below have no subject.
         let config = Config {
             no_mise: Some(true),
+            no_worktree: Some(false),
             ..Config::default()
         };
         let paths = macos_writable_paths(&fixture.project_dir, &config, false);
@@ -1717,6 +1809,7 @@ mod tests {
         let fixture = create_linked_worktree_fixture();
         let config = Config {
             lockdown: Some(true),
+            no_worktree: Some(false),
             ..Config::default()
         };
         let paths = macos_read_paths(&config, &fixture.project_dir);

@@ -2221,7 +2221,7 @@ fn discover_command_binary(
     verbose: bool,
 ) -> Vec<Mount> {
     let mut paths = if private_home {
-        super::command_home_paths(config)
+        super::command_paths_under(config, &super::home_dir())
     } else {
         Vec::new()
     };
