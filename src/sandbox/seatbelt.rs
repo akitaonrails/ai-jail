@@ -684,6 +684,10 @@ fn agent_state_paths(config: &Config) -> Vec<PathBuf> {
         Some(name) if name.starts_with("kimi") => push(".kimi-code"),
         Some("gemini") => push(".gemini"),
         Some("grok") => push(".grok"),
+        Some("jcode") => {
+            push(".jcode");
+            push(".config/jcode");
+        }
         Some("pi") => {
             push(".pi");
             push(".pi-lens");
@@ -906,6 +910,7 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
             ".kiro",
             ".soulforge",
             ".grok",
+            ".jcode",
             ".agents",
             ".omp",
             ".pi",
