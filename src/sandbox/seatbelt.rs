@@ -315,6 +315,99 @@ fn push_path_rule(profile: &mut String, verb: &str, action: &str, path: &Path) {
     profile.push_str(&format!("({verb} {action} ({pattern} \"{escaped}\"))\n"));
 }
 
+/// Grant read-metadata on every directory above an allowed path.
+///
+/// Seatbelt resolves a path one component at a time, so an allowed leaf stays
+/// unreachable unless each directory above it can be `stat`ed. The allow-list
+/// names leaves, never the chain to them, and nothing else supplies it. The
+/// clearest symptom is that no Node script can run inside the mounted project:
+///
+/// ```text
+/// $ node script.js
+/// Error: EPERM: operation not permitted, lstat '/Users'
+///     at Object.realpathSync (node:fs)
+/// ```
+///
+/// `node -e` works, because it never resolves an entry file. The same applies
+/// to any tool that calls `realpath(3)` on its own argv\[0\] or entry point.
+///
+/// `(literal ...)` on a directory grants `stat()` of that node alone — not
+/// listing it, and not reaching anything inside it. Verified against the
+/// shipped profile: `ls /Users`, `ls ~`, `stat ~/.ssh/config`,
+/// `stat ~/.aws/credentials` and `stat ~/.oci` all stay denied; the only new
+/// answer is the existence and mtime of directories the profile already
+/// grants access underneath.
+///
+/// Emitted before the deny-list so an explicit `--deny-path` on one of these
+/// directories still wins.
+fn push_ancestor_metadata_rules(profile: &mut String, read_paths: &[PathBuf]) {
+    let root = Path::new("/");
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for path in read_paths {
+        let mut cur = path.parent();
+        while let Some(dir) = cur {
+            if dir == root {
+                break;
+            }
+            if !seen.contains(&dir.to_path_buf()) {
+                seen.push(dir.to_path_buf());
+            }
+            cur = dir.parent();
+        }
+    }
+    seen.sort();
+    for dir in seen {
+        let escaped = sbpl_escape(dir.to_string_lossy().as_ref());
+        profile.push_str(&format!(
+            "(allow file-read-metadata (literal \"{escaped}\"))\n"
+        ));
+    }
+}
+
+/// Grant read-metadata on a path that *is* a symlink, using the path as
+/// given rather than its resolved target.
+///
+/// `push_path_rule` canonicalizes, so a symlink only ever reaches the profile
+/// as the thing it points at. Seatbelt checks read-metadata on the symlink
+/// node itself while resolving a path, so the allowed target stays
+/// unreachable through the path callers actually walk. For a PATH entry that
+/// is fatal in a quiet way: `command_paths_under` picks
+/// `~/.local/bin/<tool>`, the profile only names its target, `execvp` cannot
+/// see the entry, and exec falls through to whatever build of the same tool
+/// sits further down PATH inside an already-readable prefix such as
+/// `/opt/homebrew/bin` -- so the sandbox runs a binary it never vetted.
+///
+/// Metadata on the node grants stat() of the link itself, never its contents.
+fn push_symlink_node_rule(profile: &mut String, path: &Path) {
+    let is_symlink = path
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_symlink {
+        return;
+    }
+    // Resolve the ancestors but keep the final component as written: the
+    // kernel matches rules against the path it has already resolved, so a
+    // wholly raw literal misses whenever a directory above the link is
+    // itself a symlink (a PATH entry under /var, say), while a wholly
+    // canonical one collapses onto the target and misses the node.
+    let Some(node) = symlink_node_rule_path(path) else {
+        return;
+    };
+    let escaped = sbpl_escape(node.to_string_lossy().as_ref());
+    profile.push_str(&format!(
+        "(allow file-read-metadata (literal \"{escaped}\"))\n"
+    ));
+}
+
+/// The path a symlink node must be named by in the profile: its parent
+/// canonicalized, its own name left alone.
+fn symlink_node_rule_path(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let name = path.file_name()?;
+    Some(canonicalize_or_keep(parent).join(name))
+}
+
 /// Sections that don't depend on filesystem policy. Always emitted first so
 /// the file structure is predictable across modes.
 fn push_static_sections(
@@ -434,6 +527,20 @@ fn push_file_read_section(
     // dyld needs the root node to resolve absolute paths. This literal rule
     // does not grant any filesystem subtree.
     profile.push_str("(allow file-read* (literal \"/\"))\n");
+    // On macOS /etc, /var and /tmp are symlinks into /private. Seatbelt runs a
+    // read-metadata check on every component while resolving a path, and the
+    // allow-list below only ever names resolved targets (push_path_rule
+    // canonicalizes), so without these literals each allowed subtree stays
+    // unreachable through the path programs actually use. That breaks
+    // getaddrinfo (no DNS) and the TLS trust store at /etc/ssl/cert.pem, and
+    // Node refuses to boot from a cwd that resolves through /private.
+    // `(literal ...)` grants stat() on those exact nodes only -- never their
+    // contents -- so it does not widen the read allow-list or the deny-list.
+    profile.push_str(
+        "(allow file-read-metadata (literal \"/private\") (literal \"/etc\") \
+         (literal \"/var\") (literal \"/tmp\") (literal \"/private/tmp\") \
+         (literal \"/private/var\"))\n",
+    );
     if is_claude {
         // /tmp is a symlink into /private/tmp; push_path_rule
         // canonicalizes every path it emits, so the write grant for
@@ -444,10 +551,30 @@ fn push_file_read_section(
         // does via the literal "/tmp/..." path (not "/private/tmp/...")
         // still gets EPERM even with the write rule below in place.
         profile.push_str("(allow file-read* (literal \"/tmp\"))\n");
+        // The write grant in push_file_write_section is not enough: Claude Code
+        // reads its session and tool-output state back from this directory, and
+        // Node's recursive mkdir stat()s the path to confirm it is a directory,
+        // so a write-only grant fails at startup with
+        //   EEXIST: file already exists, mkdir '/tmp/claude-<uid>'
+        // once the directory exists.
+        let uid = unsafe { nix::libc::getuid() };
+        profile.push_str(&format!(
+            "(allow file-read* (subpath \"/private/tmp/claude-{uid}\"))\n"
+        ));
     }
-    for rd_path in macos_read_paths(config, project_dir) {
-        push_path_rule(profile, "allow", "file-read*", &rd_path);
+    let read_paths = macos_read_paths(config, project_dir);
+    for rd_path in &read_paths {
+        push_path_rule(profile, "allow", "file-read*", rd_path);
     }
+    // macos_read_paths canonicalizes, which is what dedupes the rules but
+    // also loses every symlink node on the way to the command. Re-walk the
+    // raw paths so the PATH entry itself stays resolvable.
+    if !config.lockdown_enabled() {
+        for p in super::command_paths_under(config, Path::new("/")) {
+            push_symlink_node_rule(profile, &p);
+        }
+    }
+    push_ancestor_metadata_rules(profile, &read_paths);
     profile.push('\n');
     for deny_path in deny_paths {
         push_path_rule(profile, "deny", "file-read*", deny_path);
@@ -1490,6 +1617,228 @@ mod tests {
         );
         assert!(
             profile.contains(&format!("(literal \"{}\")", sbpl_path(&target)))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_tmp_dir_is_readable_not_only_writable() {
+        // #100 granted this path but only for writing, and its probe only
+        // ever issued a mkdir. Claude Code reads its session and
+        // tool-output state back, and Node's recursive mkdir stat()s the
+        // path to confirm it is a directory — that denied stat is what
+        // surfaces to the user as
+        //   EEXIST: file already exists, mkdir '/tmp/claude-<uid>'
+        // on the second launch, once the directory exists.
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let _lock = ENV_LOCK.lock().unwrap();
+        let profile = generate_sbpl_profile(
+            &Config {
+                command: vec!["claude".into()],
+                ..Config::default()
+            },
+            &PathBuf::from("/tmp/test-project"),
+        );
+
+        // Probe a throwaway child so a live Claude Code session's own
+        // directory is left alone.
+        let parent = format!("/tmp/claude-{}", unsafe { nix::libc::getuid() });
+        let probe =
+            format!("{parent}/ai-jail-read-probe-{}", std::process::id());
+        let real = format!("/private{probe}");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(format!("{real}/x"), "hi\n").unwrap();
+
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("--")
+            .arg("/bin/cat")
+            .arg(format!("{probe}/x"))
+            .output()
+            .expect("sandbox-exec should run");
+
+        let _ = std::fs::remove_dir_all(&real);
+        assert!(
+            output.status.success(),
+            "reading back from {probe} was denied: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn reads_allow_the_command_path_entry_itself() {
+        // #121 grants "the symlink chain plus the final target's
+        // directory", but macos_read_paths canonicalizes every path it
+        // collects, so each chain element collapses onto its target and
+        // the PATH entry — the node execvp actually walks — is never
+        // named. The assertions above pass either way, which is why this
+        // stayed hidden.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-seatbelt-entry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let bin = root.join("prefix/bin");
+        let libexec = root.join("prefix/libexec");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&libexec).unwrap();
+        let target = libexec.join("agent-1.0");
+        std::fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let entry = bin.join("agent");
+        std::os::unix::fs::symlink(&target, &entry).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path = EnvVarGuard::set("PATH", bin.as_os_str());
+
+        let config = Config {
+            command: vec!["agent".into()],
+            private_home: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile(&config, &home.join("project"));
+
+        // The entry itself, not just what it points at.
+        let node = symlink_node_rule_path(&entry).unwrap();
+        assert!(
+            profile.contains(&format!(
+                "(allow file-read-metadata (literal \"{}\"))",
+                sbpl_escape(node.to_string_lossy().as_ref())
+            )),
+            "profile never names the PATH entry:\n{profile}"
+        );
+        // ... and it must not have been collapsed onto the target.
+        assert_ne!(node, canonicalize_or_keep(&entry));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn command_path_entry_is_reachable_under_generated_profile() {
+        // End-to-end counterpart: without the rule above, execvp cannot
+        // see the entry ai-jail resolved and vetted, and falls through to
+        // whatever build of the same tool sits further down PATH inside an
+        // already-readable prefix — /opt became one of those in #121. The
+        // sandbox then runs a binary it never inspected, with no warning.
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-seatbelt-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let bin = root.join("prefix/bin");
+        let libexec = root.join("prefix/libexec");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&libexec).unwrap();
+        let target = libexec.join("agent-1.0");
+        std::fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let entry = bin.join("agent");
+        std::os::unix::fs::symlink(&target, &entry).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path = EnvVarGuard::set("PATH", bin.as_os_str());
+
+        let config = Config {
+            command: vec!["agent".into()],
+            private_home: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile(&config, &home.join("project"));
+
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg("--")
+            .arg("/bin/test")
+            .arg("-x")
+            .arg(&entry)
+            .output()
+            .expect("sandbox-exec should run");
+        assert!(
+            output.status.success(),
+            "PATH entry {} unreachable under the profile: {}",
+            entry.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reads_allow_metadata_on_ancestors_but_not_their_contents() {
+        // Seatbelt resolves a path component by component, so an allowed
+        // leaf is unreachable unless every directory above it can be
+        // stat()ed. Nothing else supplies that: the allow-list names
+        // leaves, never the chain to them, which is why `node script.js`
+        // in the mounted project dies with EPERM lstat '/Users' while
+        // `node -e` is fine.
+        //
+        // The grant must stay metadata-only: stat() of the directory
+        // node, never a listing and never anything inside it.
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-seatbelt-anc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("nested/project");
+        std::fs::create_dir_all(&project).unwrap();
+        let sibling = root.join("nested/secret.txt");
+        std::fs::write(&sibling, "secret\n").unwrap();
+
+        let config = Config {
+            command: vec!["bash".into()],
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile(&config, &project);
+        let ancestor = canonicalize_or_keep(&root.join("nested"));
+
+        let run = |args: &[&std::ffi::OsStr]| {
+            Command::new("/usr/bin/sandbox-exec")
+                .arg("-p")
+                .arg(&profile)
+                .arg("--")
+                .args(args)
+                .output()
+                .expect("sandbox-exec should run")
+                .status
+                .success()
+        };
+
+        assert!(
+            run(&["/usr/bin/stat".as_ref(), ancestor.as_os_str()]),
+            "ancestor {} should be stat-able",
+            ancestor.display()
+        );
+        assert!(
+            !run(&["/bin/ls".as_ref(), ancestor.as_os_str()]),
+            "ancestor {} must not be listable",
+            ancestor.display()
+        );
+        assert!(
+            !run(&[
+                "/bin/cat".as_ref(),
+                canonicalize_or_keep(&sibling).as_os_str()
+            ]),
+            "a sibling of the project must stay unreadable"
         );
 
         let _ = std::fs::remove_dir_all(&root);
