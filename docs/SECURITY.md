@@ -118,9 +118,27 @@ compromised agent use `TIOCSTI` to inject input into another of your shells.
 When ai-jail is not proxying a PTY, no terminal ioctl is granted at all.
 `/dev/ptmx` stays available so the sandbox can allocate its own PTYs; a PTY
 created inside the sandbox is not covered by the path-scoped rule. Linux
-denies `TIOCSTI` outright through seccomp. On both platforms,
-kernel and driver bugs, terminal emulator bugs (especially after terminal
-passthrough), and sandbox backend defects remain residual risk.
+denies `TIOCSTI` outright through seccomp.
+
+The macOS profile also grants `file-read-metadata` on each directory above an
+allowed path, and on the symlink nodes leading to the command. Seatbelt
+resolves a path one component at a time, so without this an allowed leaf stays
+unreachable through the path callers actually walk. The grant is `stat()` of
+those directory nodes only: it does not make them listable and does not reach
+anything inside them, so it exposes the existence, mode and mtime of
+directories the profile already grants access underneath — for a default run,
+the chain down to the project and to the agent's own install. It is deliberately
+narrower than a blanket `(allow file-read-metadata (subpath "/"))`, which would
+also override the profile's own deny-list and let `stat` answer for `~/.ssh`
+and `~/.aws`.
+
+Naming the command's PATH entry matters for containment, not only for startup:
+when that node is invisible, `execvp` does not fail, it continues down `PATH`
+and runs the first match inside an already-readable prefix such as the Homebrew
+one — a different build of the same tool than the one ai-jail resolved and
+granted access to. On both platforms, kernel and driver bugs, terminal emulator
+bugs (especially after terminal passthrough), and sandbox backend defects remain
+residual risk.
 
 ## Reporting vulnerabilities
 
