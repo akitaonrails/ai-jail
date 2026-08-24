@@ -1577,7 +1577,9 @@ mod tests {
         // Regression for #120: the read grant for the invoked command
         // used to stop at $HOME, so an agent installed anywhere else —
         // a Homebrew prefix, /Applications, /nix/store — was denied and
-        // the exec failed before the agent started.
+        // the exec failed before the agent started. Covers every path the
+        // exec needs: the PATH entry, what it resolves to, and the
+        // directory that target lives in.
         let _lock = ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir()
             .join(format!("ai-jail-seatbelt-cmd-out-{}", std::process::id()));
@@ -1596,7 +1598,8 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        std::os::unix::fs::symlink(&target, prefix.join("bin/agent")).unwrap();
+        let entry = prefix.join("bin/agent");
+        std::os::unix::fs::symlink(&target, &entry).unwrap();
         let _home = EnvVarGuard::set("HOME", &home);
         let _path = EnvVarGuard::set("PATH", prefix.join("bin").as_os_str());
 
@@ -1617,6 +1620,20 @@ mod tests {
         );
         assert!(
             profile.contains(&format!("(literal \"{}\")", sbpl_path(&target)))
+        );
+        // The install directory and the target are not sufficient on their
+        // own: exec walks the PATH entry, and naming only what that entry
+        // resolves to leaves the node itself unreachable, which sends
+        // execvp on to the next readable match instead of failing (#124).
+        // Assert the whole set the exec actually needs, so this test
+        // cannot go green again while the agent is unreachable.
+        let node = symlink_node_rule_path(&entry).unwrap();
+        assert!(
+            profile.contains(&format!(
+                "(allow file-read-metadata (literal \"{}\"))",
+                sbpl_escape(node.to_string_lossy().as_ref())
+            )),
+            "the PATH entry itself must be named:\n{profile}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
