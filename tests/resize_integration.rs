@@ -156,11 +156,7 @@ fn resize_pty_delivers_sigwinch_and_new_size() {
     unsafe {
         cmd.pre_exec(move || {
             nix::libc::setsid();
-            nix::libc::ioctl(
-                slave_fd,
-                nix::libc::TIOCSCTTY as nix::libc::c_ulong,
-                0,
-            );
+            nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY as _, 0);
             Ok(())
         });
     }
@@ -221,11 +217,7 @@ fn resize_sequence_scroll_region_before_pty_resize() {
     unsafe {
         cmd.pre_exec(move || {
             nix::libc::setsid();
-            nix::libc::ioctl(
-                slave_fd,
-                nix::libc::TIOCSCTTY as nix::libc::c_ulong,
-                0,
-            );
+            nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY as _, 0);
             Ok(())
         });
     }
@@ -310,11 +302,7 @@ fn resize_grow_and_shrink() {
     unsafe {
         cmd.pre_exec(move || {
             nix::libc::setsid();
-            nix::libc::ioctl(
-                slave_fd,
-                nix::libc::TIOCSCTTY as nix::libc::c_ulong,
-                0,
-            );
+            nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY as _, 0);
             Ok(())
         });
     }

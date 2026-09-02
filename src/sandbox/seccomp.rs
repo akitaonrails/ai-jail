@@ -321,11 +321,13 @@ fn compile_filter(
     }
     rules.insert(libc::SYS_socket, socket_rules);
 
+    // `TIOCSTI` is a `c_ulong` const on glibc but `c_int` on musl;
+    // `as _` coerces either to the `u64` the condition expects.
     let tiocsti = SeccompCondition::new(
         1,
         SeccompCmpArgLen::Qword,
         SeccompCmpOp::Eq,
-        libc::TIOCSTI,
+        libc::TIOCSTI as _,
     )
     .and_then(|condition| SeccompRule::new(vec![condition]))
     .map_err(|e| format!("Seccomp: failed to build ioctl rules: {e}"))?;
