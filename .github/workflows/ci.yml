@@ -22,7 +22,7 @@ jobs:
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
-          targets: aarch64-apple-darwin
+          targets: aarch64-apple-darwin, x86_64-unknown-linux-musl
       - name: Install sandbox prerequisites (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -51,6 +51,12 @@ jobs:
       - run: cargo test --locked
       - name: Check macOS target
         run: cargo clippy --locked --target aarch64-apple-darwin --all-targets -- -D warnings
+      # musl types some libc constants differently from glibc — TIOCSCTTY and
+      # TIOCSTI are c_int there and c_ulong here — so ai-jail stopped building
+      # on Alpine without anything on the glibc runner noticing (#127). This
+      # is a type check, not a link: no musl toolchain is needed.
+      - name: Check musl target
+        run: cargo check --locked --target x86_64-unknown-linux-musl --all-targets
 
   macos:
     # `src/sandbox/seatbelt.rs` is `#[cfg(target_os = "macos")]`, so the Linux
