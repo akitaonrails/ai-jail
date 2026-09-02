@@ -32,31 +32,38 @@
           inherit system;
           overlays = [
             (import rust-overlay)
-            # crates.io answers 403 to generic HTTP client User-Agents. That
-            # is deliberate bot policy rather than an outage, and
-            # importCargoLock fetches every crate through plain fetchurl,
-            # which sends curl's default UA — so `nix build` cannot vendor
-            # anything. Identify ourselves, which is what crates.io's policy
-            # asks for. Same resolution as rust-lang/crates.io#13482, which
-            # was fixed on the client side for fetchCargoVendor; this is the
-            # fetchurl path that fix does not cover.
+            # crates.io rejects any User-Agent containing the `curl/` token,
+            # and nixpkgs' fetchurl builder identifies itself as
+            # "curl/$curlVersion Nixpkgs/$nixpkgsVersion" — so every crate
+            # fetch is refused with a 403 and `nix build` cannot vendor
+            # anything. Verified directly against the download endpoint:
+            # "curl/8.16.0 Nixpkgs/25.11" -> 403, "Nixpkgs/25.11" -> 200.
             #
-            # Only the request header changes. These are fixed-output
-            # derivations, so the sha256 still pins exactly what is fetched
-            # and substitution from cache.nixos.org is unaffected. Drop this
-            # once the pinned nixpkgs sets a User-Agent itself.
+            # builder.sh appends curlOptsList after its own --user-agent, and
+            # curl honours the last one given, so this replaces the UA without
+            # patching nixpkgs. fetchurl is an overridable functor rather than
+            # a bare lambda, so keep its attributes (`override` and friends)
+            # and swap only __functor — replacing the whole value with a
+            # lambda breaks every caller that reaches for fetchurl.override.
+            #
+            # Only the request header changes: these are fixed-output
+            # derivations, so sha256 still pins exactly what is fetched and
+            # substitution from cache.nixos.org is unaffected. Remove once
+            # nixpkgs stops sending a UA that crates.io blocks.
             (final: prev: {
-              fetchurl =
-                args:
-                prev.fetchurl (
-                  args
-                  // {
-                    curlOptsList = (args.curlOptsList or [ ]) ++ [
-                      "--user-agent"
-                      "ai-jail-flake (+https://github.com/akitaonrails/ai-jail)"
-                    ];
-                  }
-                );
+              fetchurl = prev.fetchurl // {
+                __functor =
+                  _: args:
+                  prev.fetchurl (
+                    args
+                    // {
+                      curlOptsList = (args.curlOptsList or [ ]) ++ [
+                        "--user-agent"
+                        "Nixpkgs-ai-jail"
+                      ];
+                    }
+                  );
+              };
             })
           ];
         };
