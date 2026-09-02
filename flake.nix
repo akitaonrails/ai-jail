@@ -30,7 +30,35 @@
       let
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ (import rust-overlay) ];
+          overlays = [
+            (import rust-overlay)
+            # crates.io answers 403 to generic HTTP client User-Agents. That
+            # is deliberate bot policy rather than an outage, and
+            # importCargoLock fetches every crate through plain fetchurl,
+            # which sends curl's default UA — so `nix build` cannot vendor
+            # anything. Identify ourselves, which is what crates.io's policy
+            # asks for. Same resolution as rust-lang/crates.io#13482, which
+            # was fixed on the client side for fetchCargoVendor; this is the
+            # fetchurl path that fix does not cover.
+            #
+            # Only the request header changes. These are fixed-output
+            # derivations, so the sha256 still pins exactly what is fetched
+            # and substitution from cache.nixos.org is unaffected. Drop this
+            # once the pinned nixpkgs sets a User-Agent itself.
+            (final: prev: {
+              fetchurl =
+                args:
+                prev.fetchurl (
+                  args
+                  // {
+                    curlOptsList = (args.curlOptsList or [ ]) ++ [
+                      "--user-agent"
+                      "ai-jail-flake (+https://github.com/akitaonrails/ai-jail)"
+                    ];
+                  }
+                );
+            })
+          ];
         };
         inherit (pkgs) mkShell;
 
