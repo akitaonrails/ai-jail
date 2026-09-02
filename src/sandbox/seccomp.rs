@@ -425,6 +425,31 @@ mod tests {
     }
 
     #[test]
+    fn filter_denies_tiocsti_by_its_real_request_number() {
+        // docs/SECURITY.md states that Linux denies TIOCSTI outright through
+        // seccomp, and nothing checked it. The condition is built by widening
+        // libc::TIOCSTI to the u64 the comparison takes, and that constant is
+        // c_ulong on glibc but c_int on musl (#127) — a widening that went
+        // wrong, or a rule quietly dropped, would leave terminal injection
+        // open with every other test still green.
+        //
+        // Asserting on the compiled program rather than on the constant is
+        // what makes this meaningful: it proves the value the kernel will
+        // compare against, on whatever libc and architecture built it.
+        // Widen exactly the way the production condition does, so the test
+        // follows whatever type this target's libc gives the constant.
+        let (bpf, _, _) = compile_filter(&Config::default()).unwrap();
+        let request: u64 = libc::TIOCSTI as _;
+        assert!(
+            bpf.iter().any(|insn| u64::from(insn.k) == request),
+            "no instruction compares against TIOCSTI ({request:#x}); \
+             the ioctl deny is not in the filter. A constant that widened \
+             wrong lands here too: BPF compares 32-bit words, so a \
+             sign-extended value could never match one"
+        );
+    }
+
+    #[test]
     fn filter_includes_new_deny_rules() {
         assert!(DENY_ALWAYS.contains(&libc::SYS_personality));
         assert!(DENY_ALWAYS.contains(&libc::SYS_pidfd_getfd));
