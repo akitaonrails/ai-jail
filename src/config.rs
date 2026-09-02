@@ -918,7 +918,13 @@ pub fn project_config_is_trusted(
 /// Merge a project `.ai-jail` that the global config marked trusted via
 /// `trust_project_config`, using the same semantics as a global
 /// `[commands.<name>]` table: it may enable capabilities, not only tighten.
-pub fn merge_trusted_project(global: Config, local: Config) -> Config {
+pub fn merge_trusted_project(global: Config, mut local: Config) -> Config {
+    // The project layer is merged after `merge` has already expanded global
+    // and CLI paths, so its own `~/...` entries have to be expanded here.
+    // Without this they stay relative and `absolutize_user_paths` prepends
+    // the project directory, turning `~/.npmrc` into `<project>/~/.npmrc`
+    // (#126). The untrusted path already expands, in `append_project_maps`.
+    expand_user_paths(&mut local);
     merge_trusted(global, local)
 }
 
@@ -1517,10 +1523,22 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
         config.claude_dir = Some(p);
     }
 
-    // Expand ~ / ~/ in every user-provided path field in one pass.
-    // Config files are TOML (no shell expansion); CLI args are
-    // shell-expanded already but harmless to re-run. Only leading
-    // tilde is recognized; `~user` is left alone.
+    expand_user_paths(&mut config);
+
+    config
+}
+
+/// Expand a leading `~` / `~/` in every user-provided path field.
+///
+/// Config files are TOML, which does no shell expansion; CLI arguments are
+/// shell-expanded already but re-running is harmless because `expand_tilde`
+/// is idempotent. Only a leading tilde is recognized; `~user` is left alone.
+///
+/// Every layer that reaches the sandbox has to pass through here. `merge`
+/// covers global + CLI, and a trusted project layer is merged in after that,
+/// so it expands separately (#126) — the field list lives in one place so the
+/// two cannot drift apart.
+fn expand_user_paths(config: &mut Config) {
     transform_map_specs(&mut config.rw_maps, expand_tilde);
     transform_map_specs(&mut config.ro_maps, expand_tilde);
     expand_tilde_vec(&mut config.overlay_maps);
@@ -1531,8 +1549,6 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     if let Some(p) = config.claude_dir.take() {
         config.claude_dir = Some(expand_tilde(p));
     }
-
-    config
 }
 
 /// Build the project-local config to write during automatic saves.
@@ -4492,6 +4508,58 @@ network = true
         assert!(!project_config_is_trusted(&trusted, &escape));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn trusted_project_expands_tilde_in_its_own_paths() {
+        // Issue #126: a trusted project layer is merged after `merge` has
+        // already expanded global and CLI paths, so it needs its own pass.
+        // Without one the entries stay relative and `absolutize_user_paths`
+        // prepends the project directory — `~/.npmrc` became
+        // `<project>/~/.npmrc`, a path that cannot exist.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = "/home/tildeuser";
+        let _home = EnvVarGuard::set("HOME", home);
+
+        let global = Config {
+            trust_project_config: vec![PathBuf::from("/srv/test")],
+            ..Config::default()
+        };
+        let project = Config {
+            ro_maps: vec![PathBuf::from("~/.npmrc")],
+            rw_maps: vec![PathBuf::from("~/.cache/build")],
+            mask: vec![PathBuf::from("~/secret")],
+            claude_dir: Some(PathBuf::from("~/.claude-jail")),
+            ..Config::default()
+        };
+
+        let mut merged = merge_trusted_project(global, project);
+        // Absolutizing is what used to corrupt the path, so run it too:
+        // the bug only became visible on the far side of this call.
+        absolutize_user_paths(&mut merged, Path::new("/srv/test"));
+
+        assert_eq!(
+            merged.ro_maps,
+            vec![PathBuf::from("/home/tildeuser/.npmrc")]
+        );
+        assert_eq!(
+            merged.rw_maps,
+            vec![PathBuf::from("/home/tildeuser/.cache/build")]
+        );
+        // Fields beyond the maps go through the same helper, so they are
+        // covered here rather than left to drift.
+        assert_eq!(merged.mask, vec![PathBuf::from("/home/tildeuser/secret")]);
+        assert_eq!(
+            merged.claude_dir,
+            Some(PathBuf::from("/home/tildeuser/.claude-jail"))
+        );
+        for path in merged.ro_maps.iter().chain(merged.rw_maps.iter()) {
+            assert!(
+                !path.to_string_lossy().contains('~'),
+                "an unexpanded tilde survived into {}",
+                path.display()
+            );
+        }
     }
 
     #[test]
