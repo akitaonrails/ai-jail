@@ -1092,12 +1092,10 @@ fn run_with_passthrough(
             if nix::libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
-            if nix::libc::ioctl(
-                slave_raw,
-                nix::libc::TIOCSCTTY as nix::libc::c_ulong,
-                0,
-            ) == -1
-            {
+            // `ioctl`'s request argument is `c_ulong` on glibc and
+            // macOS but `c_int` on musl; `as _` lets the cast follow
+            // whichever the target libc declares.
+            if nix::libc::ioctl(slave_raw, nix::libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             nix::libc::dup2(slave_raw, 0);
