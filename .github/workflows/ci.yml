@@ -92,8 +92,26 @@ jobs:
           persist-credentials: false
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
+          # crates.io rejects any User-Agent containing the `curl/` token, and
+          # nixpkgs' fetchurl identifies itself as
+          # "curl/$curlVersion Nixpkgs/$nixpkgsVersion", so every crate fetch
+          # is refused with a 403 and the build cannot vendor anything.
+          # Measured against the download endpoint:
+          #   curl/8.16.0 Nixpkgs/25.11 -> 403
+          #   Nixpkgs/25.11             -> 200
+          #
+          # fetchurl's builder appends $NIX_CURL_FLAGS last and curl honours
+          # the final --user-agent, so this replaces the blocked UA without
+          # patching nixpkgs. NIX_CURL_FLAGS is already in fetchurl's
+          # impureEnvVars; impure-env is how a client passes it to the daemon.
+          # The value must be one shell word — the builder expands it unquoted.
+          #
+          # Only the request header changes: these are fixed-output
+          # derivations, so sha256 still pins exactly what is fetched. Remove
+          # once nixpkgs stops sending a UA that crates.io blocks.
           extra_nix_config: |
-            experimental-features = nix-command flakes
+            experimental-features = nix-command flakes configurable-impure-env
+            impure-env = NIX_CURL_FLAGS=--user-agent=Nixpkgs-ai-jail
       # `flake check` realizes `checks.*` only. It reports the package as
       # "derivation evaluated to ...ai-jail.drv" and stops there, so on its
       # own this job proves the formatting hooks pass and nothing else.
