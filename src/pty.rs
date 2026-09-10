@@ -685,9 +685,20 @@ enum FilterState {
 
 /// Streaming primary-screen filter. It retains normal text and CSI display
 /// controls while dropping OSC, DCS, APC, PM and terminal capability queries.
+///
+/// The child's output is UTF-8. A byte in `0x80..=0x9f` is only an 8-bit C1
+/// control when it stands on its own; inside a multi-byte character it is a
+/// continuation byte and must pass through untouched. The block characters
+/// U+2590..U+259F (`▐▛▜▝…`, the Claude Code logo) encode as `E2 96 90..9F`,
+/// so without that distinction the filter mistook them for DCS/CSI/OSC
+/// introducers and a C1 ST, swallowing rows of the banner and leaking the
+/// tail of the window-title OSC as text.
 struct TerminalFilter {
     state: FilterState,
     pending: Vec<u8>,
+    /// Continuation bytes still expected for the UTF-8 character in
+    /// progress; while non-zero, `0x80..=0xbf` is character data.
+    utf8_remaining: u8,
 }
 
 impl TerminalFilter {
@@ -695,12 +706,58 @@ impl TerminalFilter {
         Self {
             state: FilterState::Ground,
             pending: Vec::new(),
+            utf8_remaining: 0,
         }
+    }
+
+    /// Track UTF-8 sequence boundaries. Returns `true` when `b` is part
+    /// of a multi-byte character (lead or continuation byte) and must be
+    /// treated as plain data rather than a C1 control.
+    fn utf8_char_byte(&mut self, b: u8) -> bool {
+        if self.utf8_remaining > 0 {
+            if (0x80..=0xbf).contains(&b) {
+                self.utf8_remaining -= 1;
+                return true;
+            }
+            // Truncated sequence: `b` stands on its own.
+            self.utf8_remaining = 0;
+        }
+        self.utf8_remaining = match b {
+            0xc2..=0xdf => 1,
+            0xe0..=0xef => 2,
+            0xf0..=0xf4 => 3,
+            _ => 0,
+        };
+        self.utf8_remaining > 0
     }
 
     fn feed(&mut self, data: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(data.len());
         for &b in data {
+            if self.utf8_char_byte(b) {
+                // Character data: never an introducer or terminator.
+                match self.state {
+                    FilterState::Ground => out.push(b),
+                    FilterState::Esc => {
+                        self.pending.push(b);
+                        out.extend_from_slice(&self.pending);
+                        self.pending.clear();
+                        self.state = FilterState::Ground;
+                    }
+                    FilterState::Csi => {
+                        self.pending.push(b);
+                        if self.pending.len() > OSC_MAX_LEN {
+                            self.pending.clear();
+                            self.state = FilterState::Ground;
+                        }
+                    }
+                    FilterState::String => {}
+                    FilterState::StringEsc => {
+                        self.state = FilterState::String;
+                    }
+                }
+                continue;
+            }
             match self.state {
                 FilterState::Ground => {
                     if b == 0x1b {
@@ -1578,6 +1635,49 @@ mod tests {
         let mut filter = super::TerminalFilter::new();
         let out = filter.feed(b"\x9d0;t\x1b\x9cok");
         assert_eq!(out, b"ok");
+    }
+
+    #[test]
+    fn primary_filter_passes_utf8_block_characters_through() {
+        // U+2590..U+259F encode as E2 96 90..9F: the continuation bytes
+        // coincide with the C1 DCS (0x90), CSI (0x9b), ST (0x9c), OSC
+        // (0x9d) codes. The Claude Code logo is drawn with them and
+        // used to lose whole rows (issue seen on macOS startup).
+        let mut filter = super::TerminalFilter::new();
+        let logo = " ▐\x1b[48;2;0;0;0m▛████▜█\x1b[12G\x1b[1mClaude\x1b[19GCode"
+            .as_bytes();
+        assert_eq!(filter.feed(logo), logo);
+        let row2 = "▝▜\x1b[48;2;0;0;0m█████\x1b[49m█▀\x1b[12GFable".as_bytes();
+        assert_eq!(filter.feed(row2), row2);
+        // Four-byte characters carry 0x9f-style bytes as well.
+        assert_eq!(filter.feed("😀 ok".as_bytes()), "😀 ok".as_bytes());
+    }
+
+    #[test]
+    fn primary_filter_utf8_character_split_across_reads() {
+        let mut filter = super::TerminalFilter::new();
+        assert_eq!(filter.feed(b"\xe2\x96"), b"\xe2\x96");
+        // 0x9c here is the last byte of U+259C, not a C1 ST.
+        assert_eq!(filter.feed(b"\x9c rest"), b"\x9c rest");
+    }
+
+    #[test]
+    fn primary_filter_drops_osc_title_with_utf8_payload_whole() {
+        // OSC 0 with "✳" (E2 9C B3) in the title: the 0x9c continuation
+        // byte used to terminate the string early and leak
+        // "\xb3 Claude Code\x07" to the terminal.
+        let mut filter = super::TerminalFilter::new();
+        let out = filter.feed("\x1b]0;✳ Claude Code\x07after".as_bytes());
+        assert_eq!(out, b"after");
+    }
+
+    #[test]
+    fn primary_filter_c1_after_complete_utf8_char_still_recognized() {
+        // A standalone 0x9d following a finished character is still an
+        // 8-bit OSC introducer and gets stripped up to its terminator.
+        let mut filter = super::TerminalFilter::new();
+        let out = filter.feed(b"\xc3\xa9\x9d0;evil\x07ok");
+        assert_eq!(out, b"\xc3\xa9ok");
     }
 
     #[test]
