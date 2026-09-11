@@ -681,6 +681,8 @@ enum FilterState {
     Csi,
     String,
     StringEsc,
+    /// Inside `ESC %` — a character-set designation, dropped whole.
+    Charset,
 }
 
 /// Streaming primary-screen filter. It retains normal text and CSI display
@@ -755,6 +757,9 @@ impl TerminalFilter {
                     FilterState::StringEsc => {
                         self.state = FilterState::String;
                     }
+                    // Payload bytes here are ASCII in practice; drop any
+                    // stray byte with the rest of the sequence.
+                    FilterState::Charset => self.state = FilterState::Ground,
                 }
                 continue;
             }
@@ -777,6 +782,17 @@ impl TerminalFilter {
                         self.pending.push(b);
                         self.state = FilterState::Csi;
                     }
+                    // `ESC % @` returns the terminal to ISO 8859-1, where
+                    // 0x80..=0x9f are C1 controls again. Everything below
+                    // assumes the terminal stays in UTF-8 mode — that is what
+                    // makes it safe to pass a continuation byte through as
+                    // character data — so the sequence that revokes the
+                    // assumption has to go. Dropped rather than forwarded:
+                    // ai-jail always speaks UTF-8 to the terminal.
+                    b'%' => {
+                        self.pending.clear();
+                        self.state = FilterState::Charset;
+                    }
                     b']' | b'P' | b'X' | b'^' | b'_' => {
                         self.pending.clear();
                         self.state = FilterState::String;
@@ -788,6 +804,13 @@ impl TerminalFilter {
                         self.state = FilterState::Ground;
                     }
                 },
+                // `ESC % / F` designates a multi-byte set; `/` means one
+                // more byte follows. Anything else ends the sequence.
+                FilterState::Charset => {
+                    if b != b'/' {
+                        self.state = FilterState::Ground;
+                    }
+                }
                 FilterState::Csi => {
                     self.pending.push(b);
                     if (0x40..=0x7e).contains(&b) {
@@ -1635,6 +1658,37 @@ mod tests {
         let mut filter = super::TerminalFilter::new();
         let out = filter.feed(b"\x9d0;t\x1b\x9cok");
         assert_eq!(out, b"ok");
+    }
+
+    #[test]
+    fn primary_filter_drops_charset_designation() {
+        // Treating a UTF-8 continuation byte as character data is only safe
+        // while the terminal is in UTF-8 mode. `ESC % @` returns it to
+        // ISO 8859-1, where 0x80..=0x9f are C1 controls again — so an agent
+        // could send that, then smuggle a C1 CSI through as the third byte
+        // of a UTF-8 sequence and have the terminal act on it. Dropping the
+        // designation keeps the assumption the filter relies on true.
+        let mut filter = super::TerminalFilter::new();
+        assert_eq!(
+            filter.feed(b"\x1b%@"),
+            b"",
+            "ESC % @ must not reach the terminal"
+        );
+        assert_eq!(
+            filter.feed(b"\x1b%G"),
+            b"",
+            "ESC % G must not reach the terminal"
+        );
+        // `ESC % / F` designates a multi-byte set: three bytes after ESC.
+        assert_eq!(
+            filter.feed(b"\x1b%/4"),
+            b"",
+            "ESC % / F must not reach the terminal"
+        );
+        // Text on either side is untouched.
+        assert_eq!(filter.feed(b"ok\x1b%@done"), b"okdone");
+        // And a lone ESC % mid-stream does not swallow what follows.
+        assert_eq!(filter.feed(b"\x1b%@\xe2\x96\x9c"), b"\xe2\x96\x9c");
     }
 
     #[test]
