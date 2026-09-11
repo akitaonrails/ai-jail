@@ -854,9 +854,20 @@ fn default_launch_command(config: &Config) -> LaunchCommand {
     LaunchCommand { program, args }
 }
 
+/// Whether the mise wrapper shell should be a login shell. A login bash
+/// sources `~/.bash_profile`; under private home on macOS the seatbelt
+/// profile denies that read instead of hiding the file (Linux mounts an
+/// empty tmpfs home), so bash prints
+/// `ai-jail-mise: ~/.bash_profile: Operation not permitted` at every
+/// launch. There is nothing to source there anyway.
+fn mise_wrapper_login_shell(config: &Config) -> bool {
+    !(cfg!(target_os = "macos") && config.private_home_enabled())
+}
+
 fn mise_wrapper_command(
     mise_path: &Path,
     user_cmd: LaunchCommand,
+    login_shell: bool,
 ) -> LaunchCommand {
     // Command argv is passed via "$@" to avoid shell interpretation of user
     // arguments.
@@ -883,7 +894,7 @@ fn mise_wrapper_command(
         "exec \"$@\"",
     );
     let mut args = vec![
-        "-lc".into(),
+        if login_shell { "-lc" } else { "-c" }.into(),
         script.into(),
         "ai-jail-mise".into(),
         mise_path.display().to_string(),
@@ -1005,7 +1016,11 @@ pub fn build_launch_command(config: &Config) -> LaunchCommand {
     }
 
     if let Some(mise) = mise_bin() {
-        return mise_wrapper_command(&mise, user_cmd);
+        return mise_wrapper_command(
+            &mise,
+            user_cmd,
+            mise_wrapper_login_shell(config),
+        );
     }
 
     user_cmd
@@ -1720,13 +1735,44 @@ mod tests {
             args: vec!["$(id)".into(), "a b".into()],
         };
         let wrapped =
-            mise_wrapper_command(Path::new("/usr/bin/mise"), user_cmd);
+            mise_wrapper_command(Path::new("/usr/bin/mise"), user_cmd, true);
         assert_eq!(wrapped.program, "bash");
         assert!(
             wrapped.args.iter().any(|a| a.contains("exec \"$@\"")),
             "mise wrapper should forward command argv via exec \"$@\""
         );
         assert_eq!(wrapped.args.last(), Some(&"a b".to_string()));
+    }
+
+    #[test]
+    fn mise_wrapper_skips_login_shell_when_profile_is_unreadable() {
+        // macOS private home: seatbelt denies ~/.bash_profile, so a login
+        // shell prints "Operation not permitted" at every launch.
+        let cmd = || LaunchCommand {
+            program: "claude".into(),
+            args: vec![],
+        };
+        let login =
+            mise_wrapper_command(Path::new("/usr/bin/mise"), cmd(), true);
+        assert_eq!(login.args[0], "-lc");
+        let plain =
+            mise_wrapper_command(Path::new("/usr/bin/mise"), cmd(), false);
+        assert_eq!(plain.args[0], "-c");
+        assert_eq!(plain.args[1..], login.args[1..]);
+
+        let private = Config {
+            private_home: Some(true),
+            ..Config::default()
+        };
+        let shared = Config {
+            private_home: Some(false),
+            ..Config::default()
+        };
+        assert!(mise_wrapper_login_shell(&shared));
+        assert_eq!(
+            mise_wrapper_login_shell(&private),
+            !cfg!(target_os = "macos")
+        );
     }
 
     #[test]
@@ -1742,6 +1788,7 @@ mod tests {
                 program: "claude".into(),
                 args: vec![],
             },
+            true,
         );
         let script = wrapped
             .args
