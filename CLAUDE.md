@@ -90,24 +90,25 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 5. Tailscale socket
 6. Shared memory (`/dev/shm`)
 7. Display mounts (validated Wayland socket and optional X11; never the whole runtime directory)
-8. systemd user bus mounts (`--systemd-user`, narrow explicit runtime sockets)
-9. Home directory (tmpfs `$HOME` first, then command-specific state/dotfiles)
-10. Config hide (tmpfs over sensitive `~/.config/*` subdirs)
-11. Cache hide (tmpfs over sensitive `~/.cache/*` subdirs)
-12. Local overrides (`~/.local/state`, `~/.local/share/*` rw subdirs)
-13. Command binary exemption (paths the sandbox would otherwise hide: under private home the command's own directory beneath `$HOME`, and always the NixOS system profile under the private `/run`)
-14. Linked Git worktree metadata (validated, opt-in; common dir mounted first, then the nested per-worktree git dir — both writable outside lockdown, both read-only under it)
-15. SSH agent socket and `~/.ssh` exemption mounts
-16. Pictures mount
-17. Browser profile state mount
-18. Extra user mounts (`--map`, `--rw-map`)
-19. Overlay maps (`--overlay-map` — copy-on-write `--overlay-src`/`--overlay`)
-20. Project directory (pwd, rw or ro depending on mode)
-21. In-project user mounts (after the project bind)
-22. In-project overlay maps (after the project bind)
-23. Mask overlays (`--mask` and hidden project `.ai-jail`)
-24. Deny overlays (`--deny-path`, mode-000 file/dir placeholders)
-25. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last)
+8. Audio mounts (`--audio`: validated PipeWire/PulseAudio sockets in the runtime dir, plus `/dev/snd`)
+9. systemd user bus mounts (`--systemd-user`, narrow explicit runtime sockets)
+10. Home directory (tmpfs `$HOME` first, then command-specific state/dotfiles)
+11. Config hide (tmpfs over sensitive `~/.config/*` subdirs)
+12. Cache hide (tmpfs over sensitive `~/.cache/*` subdirs)
+13. Local overrides (`~/.local/state`, `~/.local/share/*` rw subdirs)
+14. Command binary exemption (paths the sandbox would otherwise hide: under private home the command's own directory beneath `$HOME`, and always the NixOS system profile under the private `/run`)
+15. Linked Git worktree metadata (validated, opt-in; common dir mounted first, then the nested per-worktree git dir — both writable outside lockdown, both read-only under it)
+16. SSH agent socket and `~/.ssh` exemption mounts
+17. Pictures mount
+18. Browser profile state mount
+19. Extra user mounts (`--map`, `--rw-map`)
+20. Overlay maps (`--overlay-map` — copy-on-write `--overlay-src`/`--overlay`)
+21. Project directory (pwd, rw or ro depending on mode)
+22. In-project user mounts (after the project bind)
+23. In-project overlay maps (after the project bind)
+24. Mask overlays (`--mask` and hidden project `.ai-jail`)
+25. Deny overlays (`--deny-path`, mode-000 file/dir placeholders)
+26. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last)
 
 Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts. Overlay maps come after the home/dotfile mounts (so an overlay on a home path sits on top). User mounts and overlay maps whose destination sits **inside** the project directory are emitted after the project mount — bwrap gives the later mount precedence, so emitting them earlier lets the project bind silently shadow them (issue #83: `--map .git` stayed writable and in-project overlay writes hit the real files). Mask and deny overlays come after those so they still win. Overlay storage hide comes last, after the project mount, so it masks the upper/work layers the project mount would otherwise expose.
 

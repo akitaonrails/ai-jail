@@ -43,6 +43,9 @@ OPTIONS:
     --no-docker / --docker         Disable/enable Docker socket passthrough (grants host root; default: off)
     --tailscale / --no-tailscale   Enable/disable Tailscale socket passthrough (default: off)
     --no-display / --display       Disable/enable X11/Wayland passthrough (Linux only)
+    --audio / --no-audio           Enable/disable host audio passthrough
+                                   (PulseAudio/PipeWire sockets + /dev/snd;
+                                   Linux only; default: off)
     --network / --no-network       Enable/disable unrestricted network access (default: off)
     --macos-host-ipc / --no-macos-host-ipc
                                     Enable/disable broad macOS host IPC compatibility (default: off)
@@ -109,6 +112,7 @@ pub struct CliArgs {
     pub docker: Option<bool>,
     pub tailscale: Option<bool>,
     pub display: Option<bool>,
+    pub audio: Option<bool>,
     pub network: Option<bool>,
     pub macos_host_ipc: Option<bool>,
     pub x11: Option<bool>,
@@ -268,6 +272,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("display" | "no-display")) => {
                 args.display = Some(s == "display");
+            }
+            Long(s @ ("audio" | "no-audio")) => {
+                args.audio = Some(s == "audio");
             }
             Long(s @ ("network" | "no-network")) => {
                 args.network = Some(s == "network");
@@ -442,6 +449,8 @@ fn is_sandbox_long_flag(arg: &str) -> bool {
             | "--no-lockdown"
             | "--no-display"
             | "--display"
+            | "--audio"
+            | "--no-audio"
             | "--network"
             | "--no-network"
             | "--macos-host-ipc"
@@ -710,6 +719,26 @@ mod tests {
     fn parse_display() {
         let args = parse_test(&["--display", "bash"]).unwrap();
         assert_eq!(args.display, Some(true));
+    }
+
+    #[test]
+    fn parse_audio() {
+        let args = parse_test(&["--audio", "bash"]).unwrap();
+        assert_eq!(args.audio, Some(true));
+    }
+
+    #[test]
+    fn parse_no_audio() {
+        let args = parse_test(&["--no-audio", "bash"]).unwrap();
+        assert_eq!(args.audio, Some(false));
+    }
+
+    #[test]
+    fn parse_audio_last_wins() {
+        let args = parse_test(&["--audio", "--no-audio", "bash"]).unwrap();
+        assert_eq!(args.audio, Some(false));
+        let args = parse_test(&["--no-audio", "--audio", "bash"]).unwrap();
+        assert_eq!(args.audio, Some(true));
     }
 
     #[test]

@@ -175,6 +175,13 @@ pub struct Config {
     pub tailscale: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_display: Option<bool>,
+    /// Trusted capability: expose the host audio stack — the
+    /// PipeWire/PulseAudio sockets in the validated
+    /// `XDG_RUNTIME_DIR`, plus `/dev/snd` for pure-ALSA clients.
+    /// Opt-in (Linux only); the untrusted project `.ai-jail` may
+    /// only disable it, never enable it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<bool>,
     /// Permit macOS Seatbelt's broad host IPC compatibility rules. This is
@@ -284,6 +291,9 @@ impl Config {
     }
     pub fn display_enabled(&self) -> bool {
         self.no_display == Some(false)
+    }
+    pub fn audio_enabled(&self) -> bool {
+        self.audio == Some(true)
     }
     pub fn x11_enabled(&self) -> bool {
         self.x11 == Some(true)
@@ -696,6 +706,7 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(no_docker);
     take!(tailscale);
     take!(no_display);
+    take!(audio);
     take!(network);
     take!(macos_host_ipc);
     take!(x11);
@@ -1028,6 +1039,7 @@ pub fn merge_with_global_report(
     monotonic!(no_docker, |config: &Config| config.docker_enabled());
     monotonic!(tailscale, |config: &Config| config.tailscale_enabled());
     monotonic!(no_display, |config: &Config| config.display_enabled());
+    monotonic!(audio, |config: &Config| config.audio_enabled());
     monotonic!(network, |config: &Config| config.network_enabled());
     monotonic!(macos_host_ipc, |config: &Config| config
         .macos_host_ipc_enabled());
@@ -1486,6 +1498,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     invert!(docker, no_docker);
     direct!(tailscale);
     invert!(display, no_display);
+    direct!(audio);
     direct!(network);
     direct!(macos_host_ipc);
     direct!(x11);
@@ -1615,6 +1628,7 @@ pub fn display_status(config: &Config) {
     print_opt_in_tristate("  Docker", config.no_docker);
     print_shared_or_hidden("  Tailscale", config.tailscale);
     print_opt_in_tristate("  Display", config.no_display);
+    print_opt_in_enabled("  Audio", config.audio);
     print_opt_in_enabled("  Network", config.network);
     print_opt_in_enabled("  macOS host IPC", config.macos_host_ipc);
     print_opt_in_enabled("  X11", config.x11);
@@ -1917,6 +1931,26 @@ mod tests {
                 .unwrap()
                 .contains("macos_host_ipc = true")
         );
+    }
+
+    #[test]
+    fn audio_is_opt_in_and_project_cannot_enable_it() {
+        let baseline = Config::default();
+        let project = Config {
+            audio: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert!(!merged.audio_enabled());
+        assert!(warnings.iter().any(|warning| warning.contains("audio")));
+
+        let enabled = Config {
+            audio: Some(true),
+            ..Config::default()
+        };
+        assert!(enabled.audio_enabled());
+        assert!(serialize_config(&enabled).unwrap().contains("audio = true"));
     }
 
     // ── Trusted capabilities: agent_state / env / update_check ──
@@ -2886,6 +2920,7 @@ no_gpu = true
             no_docker: None,
             tailscale: Some(true),
             no_display: Some(false),
+            audio: Some(true),
             network: None,
             macos_host_ipc: None,
             x11: Some(true),
@@ -4043,6 +4078,25 @@ allow_tcp_ports = [32000, 8080]
     }
 
     #[test]
+    fn audio_enabled_accessor() {
+        assert!(!Config::default().audio_enabled());
+        assert!(
+            !Config {
+                audio: Some(false),
+                ..Config::default()
+            }
+            .audio_enabled()
+        );
+        assert!(
+            Config {
+                audio: Some(true),
+                ..Config::default()
+            }
+            .audio_enabled()
+        );
+    }
+
+    #[test]
     fn worktree_enabled_accessor() {
         assert!(!Config::default().worktree_enabled());
         assert!(
@@ -4824,6 +4878,7 @@ hide_dotdirs = [".my_secrets"]
             no_docker: None,
             tailscale: Some(true),
             no_display: None,
+            audio: None,
             network: None,
             macos_host_ipc: None,
             x11: None,

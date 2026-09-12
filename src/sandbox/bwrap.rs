@@ -19,6 +19,13 @@ const SYSTEMD_USER_BUS_SUBPATH: &str = "bus";
 /// — keep the two in sync via this shared constant.
 pub(crate) const SYSTEMD_USER_SUBPATHS: &[&str] =
     &[SYSTEMD_USER_BUS_SUBPATH, "systemd/private"];
+/// Audio server sockets (relative to `XDG_RUNTIME_DIR`) that `--audio`
+/// exposes: PipeWire's client and manager sockets and the PulseAudio
+/// compat socket. Also granted read-write by Landlock
+/// (`collect_normal_paths_with_mounted_paths`) — keep the two in sync
+/// via the shared `audio_socket_paths` helper.
+pub(crate) const AUDIO_SOCKET_SUBPATHS: &[&str] =
+    &["pipewire-0", "pipewire-0-manager", "pulse/native"];
 
 #[derive(Debug, Clone)]
 enum Mount {
@@ -177,6 +184,8 @@ struct MountSet {
     shm: Vec<Mount>,
     display: Vec<Mount>,
     display_env: Vec<(String, String)>,
+    audio: Vec<Mount>,
+    audio_env: Vec<(String, String)>,
     systemd_user: Vec<Mount>,
     systemd_env: Vec<(String, String)>,
     ssh_agent: Vec<Mount>,
@@ -205,7 +214,7 @@ struct MountSet {
 }
 
 impl MountSet {
-    fn ordered_mounts(&self) -> [&[Mount]; 25] {
+    fn ordered_mounts(&self) -> [&[Mount]; 26] {
         [
             &self.base,
             &self.sys_masks,
@@ -214,6 +223,7 @@ impl MountSet {
             &self.tailscale,
             &self.shm,
             &self.display,
+            &self.audio,
             &self.systemd_user,
             &self.home_dotfiles,
             &self.config_hide,
@@ -320,8 +330,13 @@ impl MountSet {
             // their sockets stayed bound, so --display bound the Wayland
             // socket to a client that could not be told where it was, and
             // --systemd-user did the same with the session bus (#122).
-            // This is also where ssh/claude/PS1 already sit, below.
+            // This is also where audio/ssh/claude/PS1 already sit, below.
             for (key, val) in &self.display_env {
+                args.push("--setenv".into());
+                args.push(key.clone());
+                args.push(val.clone());
+            }
+            for (key, val) in &self.audio_env {
                 args.push("--setenv".into());
                 args.push(key.clone());
                 args.push(val.clone());
@@ -1438,6 +1453,11 @@ fn discover_mounts_full(
     } else {
         (vec![], vec![])
     };
+    let (audio_mounts, audio_env) = if !lockdown && config.audio_enabled() {
+        discover_audio(verbose)
+    } else {
+        (vec![], vec![])
+    };
     let (systemd_mounts, systemd_env) = discover_systemd_user(
         config,
         lockdown,
@@ -1561,6 +1581,8 @@ fn discover_mounts_full(
         },
         display: display_mounts,
         display_env,
+        audio: audio_mounts,
+        audio_env,
         systemd_user: systemd_mounts,
         systemd_env,
         ssh_agent: ssh_agent_mount,
@@ -2499,6 +2521,49 @@ fn discover_display(
     (mounts, env)
 }
 
+/// Host audio passthrough (`--audio`): bind the validated PipeWire /
+/// PulseAudio sockets inside `XDG_RUNTIME_DIR`, plus `/dev/snd` for
+/// pure-ALSA setups. Separate opt-in from `--display`: a headless audio
+/// workload should not need the display socket, and a displayed app
+/// should not get audio unless asked. Disabled under `--lockdown`.
+///
+/// `XDG_RUNTIME_DIR` is pushed into the child env only when at least
+/// one audio socket was actually bound; the value is the same one
+/// `audio_socket_paths` already validated.
+fn discover_audio(verbose: bool) -> (Vec<Mount>, Vec<(String, String)>) {
+    let mut mounts = Vec::new();
+    let mut env = Vec::new();
+
+    let sockets = audio_socket_paths();
+    if !sockets.is_empty()
+        && let Ok(xdg_dir) = std::env::var("XDG_RUNTIME_DIR")
+    {
+        env.push(("XDG_RUNTIME_DIR".into(), xdg_dir));
+    }
+    for socket in sockets {
+        if verbose {
+            output::verbose(&format!("audio: {}", socket.display()));
+        }
+        mounts.push(Mount::Bind {
+            src: socket.clone(),
+            dest: socket,
+        });
+    }
+
+    let snd = PathBuf::from("/dev/snd");
+    if snd.is_dir() {
+        if verbose {
+            output::verbose(&format!("audio: {}", snd.display()));
+        }
+        mounts.push(Mount::DevBind {
+            src: snd.clone(),
+            dest: snd,
+        });
+    }
+
+    (mounts, env)
+}
+
 pub(crate) fn is_safe_xdg_runtime(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
 
@@ -2519,6 +2584,45 @@ pub(crate) fn is_safe_xdg_runtime(path: &Path) -> bool {
         && metadata.is_dir()
         && metadata.uid() == uid
         && metadata.mode() & 0o077 <= 0o055
+}
+
+/// Validated audio server sockets (PipeWire/PulseAudio) inside the
+/// invoking user's runtime directory.
+///
+/// Shared by the bwrap `--audio` binds and the Landlock read-write
+/// grants so the two can never disagree about which sockets are
+/// exposed. Returns nothing unless `XDG_RUNTIME_DIR` passes the same
+/// validation the Wayland socket requires, and each entry must be a
+/// real socket owned by that tree — a symlink is skipped rather than
+/// followed out of the validated directory.
+pub(crate) fn audio_socket_paths() -> Vec<PathBuf> {
+    let Ok(xdg_dir) = std::env::var("XDG_RUNTIME_DIR") else {
+        return vec![];
+    };
+    let xdg_path = PathBuf::from(&xdg_dir);
+    if !is_safe_xdg_runtime(&xdg_path) {
+        return vec![];
+    }
+    let Ok(runtime) = xdg_path.canonicalize() else {
+        return vec![];
+    };
+    audio_sockets_in(&runtime)
+}
+
+/// The subset of [`AUDIO_SOCKET_SUBPATHS`] that exists as a real socket
+/// directly inside `runtime` (no symlinks — bwrap would follow those out
+/// of the validated tree).
+fn audio_sockets_in(runtime: &Path) -> Vec<PathBuf> {
+    AUDIO_SOCKET_SUBPATHS
+        .iter()
+        .map(|sub| runtime.join(sub))
+        .filter(|socket| {
+            socket
+                .symlink_metadata()
+                .map(|metadata| metadata.file_type().is_socket())
+                .unwrap_or(false)
+        })
+        .collect()
 }
 
 fn safe_xauthority(path: &Path) -> bool {
@@ -3540,6 +3644,105 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == &private_str));
 
         let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    #[test]
+    fn audio_sockets_in_binds_only_real_sockets() {
+        use std::os::unix::net::UnixListener;
+
+        let runtime = std::env::temp_dir()
+            .join(format!("ai-jail-audio-sockets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&runtime);
+        std::fs::create_dir_all(runtime.join("pulse")).unwrap();
+        // A real socket is picked up.
+        let pipewire = runtime.join("pipewire-0");
+        let _listener = UnixListener::bind(&pipewire).unwrap();
+        // A regular file with a socket's name is not.
+        std::fs::write(runtime.join("pipewire-0-manager"), "").unwrap();
+        // A symlink to the real socket is skipped rather than followed
+        // out of the validated tree.
+        std::os::unix::fs::symlink(&pipewire, runtime.join("pulse/native"))
+            .unwrap();
+
+        let sockets = audio_sockets_in(&runtime);
+        assert_eq!(sockets, vec![pipewire]);
+
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    #[test]
+    fn audio_socket_paths_rejects_unvalidated_runtime_dir() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let runtime = std::env::temp_dir()
+            .join(format!("ai-jail-audio-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&runtime);
+        std::fs::create_dir_all(&runtime).unwrap();
+        let _xdg = EnvVarGuard::set("XDG_RUNTIME_DIR", runtime.as_os_str());
+
+        // A temp dir is never the invoking user's validated runtime
+        // dir, so no socket may be exposed through it.
+        assert!(audio_socket_paths().is_empty());
+
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    #[test]
+    fn audio_dry_run_binds_nothing_without_validated_runtime_dir() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let runtime = std::env::temp_dir()
+            .join(format!("ai-jail-audio-dry-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&runtime);
+        std::fs::create_dir_all(runtime.join("pulse")).unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(runtime.join("pipewire-0"))
+                .unwrap();
+        let _xdg = EnvVarGuard::set("XDG_RUNTIME_DIR", runtime.as_os_str());
+
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            audio: Some(true),
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let args = build_dry_run_args_full(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+        )
+        .unwrap();
+
+        let socket = runtime.join("pipewire-0").display().to_string();
+        assert!(!args.windows(3).any(|w| w[0] == "--bind" && w[1] == socket));
+
+        let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    #[test]
+    fn audio_dry_run_skips_in_lockdown() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _xdg = EnvVarGuard::remove("XDG_RUNTIME_DIR");
+
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            audio: Some(true),
+            lockdown: Some(true),
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let args = build_dry_run_args_full(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+        )
+        .unwrap();
+
+        for sub in AUDIO_SOCKET_SUBPATHS {
+            assert!(!args.iter().any(|arg| arg.contains(sub)));
+        }
     }
 
     #[test]

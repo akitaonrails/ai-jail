@@ -18,6 +18,7 @@ fn project_config_dangerous_opt_ins(
         (config.ssh_enabled(), "SSH keys/agent"),
         (config.pictures_enabled(), "Pictures directory"),
         (config.systemd_user_enabled(), "systemd user bus"),
+        (config.audio_enabled(), "Host audio"),
     ] {
         if enabled {
             items.push(name.into());

@@ -712,6 +712,32 @@ fn collect_normal_paths_with_mounted_paths(
         }
     }
 
+    // Audio: read-write — Landlock runs INSIDE the bwrap sandbox, which
+    // bind-mounts the PipeWire/PulseAudio sockets when --audio is set;
+    // without matching rules here every access to the (visible) sockets
+    // is denied and audio silently breaks. Mirrors the Wayland socket
+    // rule above; /dev/snd covers pure-ALSA setups. Parent directories
+    // need no explicit grant: the root read-only rule already permits
+    // traversal down to these paths.
+    if config.audio_enabled() {
+        for socket in super::bwrap::audio_socket_paths() {
+            if verbose {
+                output::verbose(&format!(
+                    "Landlock: audio socket {} rw",
+                    socket.display()
+                ));
+            }
+            rw.push(socket);
+        }
+        let snd = PathBuf::from("/dev/snd");
+        if super::path_exists(&snd) {
+            if verbose {
+                output::verbose("Landlock: audio /dev/snd rw");
+            }
+            rw.push(snd);
+        }
+    }
+
     // systemd --user bus: dangerous opt-in. When display passthrough is off,
     // bwrap only exposes the narrow user-bus sockets; Landlock must allow the
     // sockets and their parents so `systemd-run --user` can connect. Display
@@ -1307,6 +1333,32 @@ mod tests {
         };
         let (_, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
         assert!(!rw.contains(&tmp_root));
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn normal_paths_audio_grants_nothing_without_validated_runtime_dir() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let tmp_root = std::env::temp_dir()
+            .join(format!("ai-jail-landlock-audio-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_root);
+        std::fs::create_dir_all(tmp_root.join("pulse")).unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(tmp_root.join("pipewire-0"))
+                .unwrap();
+        let _xdg = EnvVarGuard::set("XDG_RUNTIME_DIR", tmp_root.as_os_str());
+
+        let config = Config {
+            audio: Some(true),
+            ..Config::default()
+        };
+        let (_, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
+        // The bwrap side rejects this runtime dir, so Landlock must not
+        // grant anything under it either — the two stay in lockstep.
+        for sub in crate::sandbox::bwrap::AUDIO_SOCKET_SUBPATHS {
+            assert!(!rw.contains(&tmp_root.join(sub)));
+        }
 
         let _ = std::fs::remove_dir_all(&tmp_root);
     }

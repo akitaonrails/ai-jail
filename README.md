@@ -93,6 +93,7 @@ user bus are also off by default.
 | `--gpu` / `--no-gpu`                                   | Enables/disables GPU device access.                                                                                                                                                            |
 | `--display` / `--no-display`                           | Enables/disables display access. Only the validated Wayland socket is mounted; ai-jail never mounts all of `XDG_RUNTIME_DIR`. X11 is separate (`--x11`).                                       |
 | `--x11` / `--no-x11`                                   | Enables/disables X11 separately. X11 access permits keylogging and screenshots.                                                                                                                |
+| `--audio` / `--no-audio`                               | Enables/disables host audio (Linux only). Binds the validated PipeWire/PulseAudio sockets in `XDG_RUNTIME_DIR` plus `/dev/snd`; anything in the sandbox can record and play audio while enabled. |
 | `--host-shm` / `--no-host-shm`                         | Enables/disables host `/dev/shm`; enabling it opens host cross-process IPC.                                                                                                                    |
 | `--terminal-passthrough` / `--no-terminal-passthrough` | Enables/disables raw terminal forwarding. Output is filtered through a VT parser by default; raw forwarding exposes terminal clipboard, query, and parser surface.                             |
 | `--agent-state` / `--no-agent-state`                   | Enables/disables mounting the invoked command's credential state (default off). Enables the agent to authenticate — and lets anything in the sandbox use those credentials.                    |
@@ -186,7 +187,10 @@ unlike the session directory, it persists between runs. Use a map or
 need `--network` and `--display` passed explicitly on Linux (on macOS the
 display is system-level, so only `--network` applies there); `--browser` alone
 produces a browser that cannot load pages — and on Linux cannot open a window.
-X11-based browsers need `--x11` instead of `--display`.
+X11-based browsers need `--x11` instead of `--display`. Audio (e.g. video
+playback) additionally needs `--audio`, which binds the validated
+PipeWire/PulseAudio sockets — `ai-jail --browser=soft --network --display
+--audio chromium`.
 
 ## Configuration
 
