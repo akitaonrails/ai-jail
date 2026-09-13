@@ -137,3 +137,17 @@ cargo build --release    # 881K stripped binary
 ```
 
 Install by copying `target/release/ai-jail` to `~/.local/bin/` or `/usr/local/bin/`.
+
+## Releasing
+
+Bump `version` in `Cargo.toml`, run `cargo update -p ai-jail`, add
+`releases/vX.Y.Z.md`, commit as `chore(release): vX.Y.Z`, then tag and push:
+
+```
+git tag -m vX.Y.Z vX.Y.Z    # tag.gpgSign=true is set repo-local: -m is required
+git push origin master vX.Y.Z
+```
+
+The repo sets `tag.gpgSign = true` and a local `user.signingkey`, so release
+tags are annotated and GPG-signed. Always pass `-m`: without it git opens an
+editor for the tag message, which hangs non-interactive shells.
