@@ -160,6 +160,9 @@ fn is_known_api_agent(name: &str) -> bool {
 /// config denies a capability it needs (issue #131): `network` to reach
 /// the model API and `agent_state` for its login/session data. Warning
 /// only -- the launch is never blocked, and unknown commands are silent.
+/// Under `--lockdown` the network warning is suppressed: lockdown blocks
+/// network regardless of config, and it is an explicit hardening choice,
+/// so pointing at `network = true` would mislead.
 pub(crate) fn capability_gap_warnings(
     config: &crate::config::Config,
 ) -> Vec<String> {
@@ -170,7 +173,7 @@ pub(crate) fn capability_gap_warnings(
         return Vec::new();
     }
     let mut warnings = Vec::new();
-    if !config.network_enabled() {
+    if !config.lockdown_enabled() && !config.network_enabled() {
         warnings.push(format!(
             "ai-jail: `{name}` is a network API client but network is off \
              (default since v1.18.0) — set `network = true` or pass \
@@ -367,5 +370,18 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("`codex`"));
         assert!(warnings[0].contains("agent_state is off"));
+    }
+
+    #[test]
+    fn capability_gap_suppresses_network_warning_under_lockdown() {
+        // Lockdown blocks network regardless of config, and it is an
+        // explicit hardening choice -- pointing at `network = true`
+        // would mislead. The agent_state warning still applies.
+        let mut config = gap_config("claude", None, None);
+        config.lockdown = Some(true);
+        let warnings = capability_gap_warnings(&config);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("agent_state is off"));
+        assert!(!warnings.iter().any(|warning| warning.contains("network")));
     }
 }
