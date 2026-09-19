@@ -419,6 +419,13 @@ fn push_static_sections(
     profile.push_str("(allow process-exec)\n");
     profile.push_str("(allow process-fork)\n");
     profile.push_str("(allow process-info* (target same-sandbox))\n");
+    // Signalling stays inside the sandbox. A fork-pool test runner (vitest,
+    // jest, pytest-xdist) kills its own workers to shut down, and with no
+    // signal rule at all that kill(2) is EPERM: the suite finishes and then
+    // hangs, or reports a teardown error. `same-sandbox` cannot reach a host
+    // process, so this is not the broad `(allow signal)` the host-IPC opt-in
+    // below grants — same split already applied to `process-info*` above.
+    profile.push_str("(allow signal (target same-sandbox))\n");
     profile.push_str("(allow sysctl-read)\n\n");
 
     profile.push_str("; IPC and Mach\n");
@@ -1210,6 +1217,9 @@ mod tests {
             // Broad host IPC is opt-in only: signaling host processes,
             // POSIX shm, and POSIX semaphores stay denied by default.
             assert!(!profile.contains("(allow signal)"));
+            // ...while signalling inside the sandbox is always allowed, or a
+            // fork-pool test runner cannot kill the workers it spawned.
+            assert!(profile.contains("(allow signal (target same-sandbox))"));
             assert!(!profile.contains("ipc-posix-shm"));
             assert!(!profile.contains("(allow ipc-posix-sem)"));
             // The only mach-lookup allowances are the two literal
