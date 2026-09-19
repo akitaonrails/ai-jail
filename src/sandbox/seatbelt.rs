@@ -576,6 +576,15 @@ fn push_file_read_section(
         profile.push_str(&format!(
             "(allow file-read* (subpath \"/private/tmp/claude-{uid}\"))\n"
         ));
+        // Claude Code also drops a /tmp/claude-<random-4-hex>-cwd marker
+        // file loose in /tmp on every Bash tool call
+        // (anthropics/claude-code#8856). The per-uid grants here can
+        // never match it -- it has no uid component -- so it needs its
+        // own hex-scoped regex.
+        profile.push_str(
+            "(allow file-read* file-write* \
+             (regex #\"^/private/tmp/claude-[0-9a-f]+-cwd$\"))\n",
+        );
     }
     let read_paths = macos_read_paths(config, project_dir);
     for rd_path in &read_paths {
@@ -634,6 +643,14 @@ fn push_file_write_section(
         profile.push_str(&format!(
             "(allow file-write* (regex #\"^/private/tmp/claude-{uid}(/.*)?$\"))\n"
         ));
+        // The /tmp/claude-<random-4-hex>-cwd marker file from
+        // anthropics/claude-code#8856 (see the read section) is written,
+        // not just read, so the write side needs the same hex-scoped
+        // regex -- the per-uid regex above cannot match it.
+        profile.push_str(
+            "(allow file-read* file-write* \
+             (regex #\"^/private/tmp/claude-[0-9a-f]+-cwd$\"))\n",
+        );
     }
     if !atomic_paths.is_empty() {
         profile.push('\n');
@@ -1328,6 +1345,38 @@ mod tests {
         assert!(profile.contains(
             "(allow file-read* (literal \"/private/var/select/sh\"))"
         ));
+    }
+
+    #[test]
+    fn sbpl_profile_claude_grants_tmp_cwd_marker() {
+        // anthropics/claude-code#8856: Claude Code writes
+        // /tmp/claude-<random-4-hex>-cwd loose in /tmp on every Bash
+        // call; the per-uid grant can never match it.
+        let config = Config {
+            command: vec!["claude".into()],
+            ..Config::default()
+        };
+        let profile =
+            generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
+        let rule = "claude-[0-9a-f]+-cwd$";
+        assert!(profile.contains(rule));
+        // The marker grant is independent of the per-uid grant: it must
+        // not embed the invoking user's uid.
+        let uid = unsafe { nix::libc::getuid() };
+        for line in profile.lines().filter(|line| line.contains(rule)) {
+            assert!(!line.contains(&uid.to_string()));
+        }
+    }
+
+    #[test]
+    fn sbpl_profile_non_claude_has_no_tmp_cwd_marker() {
+        let config = Config {
+            command: vec!["bash".into()],
+            ..Config::default()
+        };
+        let profile =
+            generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
+        assert!(!profile.contains("claude-[0-9a-f]+-cwd"));
     }
 
     #[test]
