@@ -580,9 +580,11 @@ fn push_file_read_section(
         // file loose in /tmp on every Bash tool call
         // (anthropics/claude-code#8856). The per-uid grants here can
         // never match it -- it has no uid component -- so it needs its
-        // own hex-scoped regex.
+        // own hex-scoped regex. This section grants only the read: the
+        // write half lives in push_file_write_section, which is the one
+        // place lockdown gates host file-write allowances.
         profile.push_str(
-            "(allow file-read* file-write* \
+            "(allow file-read* \
              (regex #\"^/private/tmp/claude-[0-9a-f]+-cwd$\"))\n",
         );
     }
@@ -644,9 +646,12 @@ fn push_file_write_section(
             "(allow file-write* (regex #\"^/private/tmp/claude-{uid}(/.*)?$\"))\n"
         ));
         // The /tmp/claude-<random-4-hex>-cwd marker file from
-        // anthropics/claude-code#8856 (see the read section) is written,
-        // not just read, so the write side needs the same hex-scoped
-        // regex -- the per-uid regex above cannot match it.
+        // anthropics/claude-code#8856 (see the read section, which
+        // grants the read half) is written, not just read, so the write
+        // side needs the same hex-scoped regex -- the per-uid regex
+        // above cannot match it. Keeping the write grant here, not in
+        // the read section, is what keeps it under lockdown's
+        // early-return above.
         profile.push_str(
             "(allow file-read* file-write* \
              (regex #\"^/private/tmp/claude-[0-9a-f]+-cwd$\"))\n",
@@ -1360,12 +1365,40 @@ mod tests {
             generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
         let rule = "claude-[0-9a-f]+-cwd$";
         assert!(profile.contains(rule));
+        // The non-lockdown profile grants both read and write on the
+        // marker (read in the read section, the combined rule in the
+        // write section).
+        assert!(profile.contains(&format!(
+            "(allow file-read* file-write* (regex #\"^/private/tmp/{rule}\")"
+        )));
         // The marker grant is independent of the per-uid grant: it must
         // not embed the invoking user's uid.
         let uid = unsafe { nix::libc::getuid() };
         for line in profile.lines().filter(|line| line.contains(rule)) {
             assert!(!line.contains(&uid.to_string()));
         }
+    }
+
+    #[test]
+    fn sbpl_profile_lockdown_keeps_tmp_cwd_marker_read_only() {
+        // The read section has no lockdown gating, so the marker's write
+        // grant must come only from the write section, which
+        // early-returns under lockdown -- otherwise lockdown's "no host
+        // file-write allowances" invariant leaks.
+        let config = Config {
+            command: vec!["claude".into()],
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        let profile =
+            generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
+        let rule = "claude-[0-9a-f]+-cwd$";
+        assert!(profile.contains(&format!(
+            "(allow file-read* (regex #\"^/private/tmp/{rule}\")"
+        )));
+        assert!(!profile.contains(&format!(
+            "file-write* (regex #\"^/private/tmp/{rule}\")"
+        )));
     }
 
     #[test]
