@@ -103,12 +103,21 @@ required rather than assumed: a group-writable store without it is refused.
 The binary itself must still carry no write bits.
 
 macOS starts with no global reads, network, or host IPC, and supports the same
-opt-in `--agent-state` credential mounts as Linux. Temp access is limited to a
-private per-launch session directory pointed to by `TMPDIR`, with one
-command-specific exception: `claude` is also granted write access to
-`/private/tmp/claude-<uid>`, scoped to the invoking uid, because Claude Code
-creates that path unconditionally at startup and ignores `TMPDIR`. It is
-outside the project and persists between runs; `--overlay-map` is honored
+opt-in `--agent-state` credential mounts as Linux. Signalling between processes
+inside the same sandbox is always allowed (`signal` targeting `same-sandbox`),
+so an agent can manage the workers it spawns; signalling host processes stays
+denied without `--macos-host-ipc`. The default profile also grants
+file-read-metadata on `/private/var/select` and file-read on
+`/private/var/select/sh`: since Catalina `/bin/sh` consults that file to pick
+bash vs zsh, and without it every hook shell exits `EPERM` before it can exec.
+Temp access is limited to a
+private per-launch session directory pointed to by `TMPDIR`, with two
+command-specific exceptions for `claude`, both matched under `/private/tmp`:
+the per-uid directory `/private/tmp/claude-<uid>`, which Claude Code creates
+unconditionally at startup and ignores `TMPDIR`, and the
+`/private/tmp/claude-<hex>-cwd` marker file it writes loose in `/tmp` on every
+Bash tool call, matched by a hex-scoped regex. They are
+outside the project and persist between runs; `--overlay-map` is honored
 as a read-only map because copy-on-write overlays are Linux-only.
 `sandbox-exec` is deprecated by Apple and is not equivalent to Linux
 isolation; use a disposable VM for hostile workloads. Agents need `file-ioctl`
