@@ -548,6 +548,14 @@ fn push_file_read_section(
          (literal \"/var\") (literal \"/tmp\") (literal \"/private/tmp\") \
          (literal \"/private/var\"))\n",
     );
+    // Since Catalina, /bin/sh consults /var/select/sh (resolved through
+    // /private) to pick its real shell, bash vs zsh. Without these two
+    // literals every hook shell exits EPERM before it can exec.
+    profile.push_str(
+        "(allow file-read-metadata (literal \"/private/var/select\"))\n",
+    );
+    profile
+        .push_str("(allow file-read* (literal \"/private/var/select/sh\"))\n");
     if is_claude {
         // /tmp is a symlink into /private/tmp; push_path_rule
         // canonicalizes every path it emits, so the write grant for
@@ -1302,6 +1310,24 @@ mod tests {
                 .contains(&format!("{}/.ai-jail", project.display()))
         );
         let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn sbpl_profile_grants_var_select_shell_resolution() {
+        // Since Catalina /bin/sh reads /var/select/sh to pick bash vs
+        // zsh; without these literals every hook shell exits EPERM.
+        let config = Config {
+            command: vec!["bash".into()],
+            ..Config::default()
+        };
+        let profile =
+            generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
+        assert!(profile.contains(
+            "(allow file-read-metadata (literal \"/private/var/select\"))"
+        ));
+        assert!(profile.contains(
+            "(allow file-read* (literal \"/private/var/select/sh\"))"
+        ));
     }
 
     #[test]
