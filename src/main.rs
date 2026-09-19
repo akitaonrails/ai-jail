@@ -295,6 +295,13 @@ fn run() -> Result<i32, String> {
     for warning in security_warnings {
         output::security_warn(&warning);
     }
+    // Capability gaps for known API-client agents (issue #131): warn at
+    // launch so an upgrade that flips a default does not fail silently.
+    // `output::warn` respects --exec quiet mode like other non-security
+    // warnings; the launch itself is never blocked.
+    for warning in command::capability_gap_warnings(&config) {
+        output::warn(&warning);
+    }
     // Resolve any relative paths in rw_maps/ro_maps against the user's
     // invocation cwd before they reach bwrap/landlock/seatbelt (issue
     // #54). Done here so display_status and the --init save path see
