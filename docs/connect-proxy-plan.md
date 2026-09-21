@@ -1,7 +1,7 @@
 # Filtered egress plan: CONNECT proxy + `--allow-host`
 
 **Date**: September 2026
-**Status**: plan, not yet implemented
+**Status**: implemented in v2.0.0
 **Context**: `docs/openshell-comparison.md` identified fine-grained egress as
 the one OpenShell capability worth borrowing. This is the design and
 implementation plan. It also covers the two small companion features from the
