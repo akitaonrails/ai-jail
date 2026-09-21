@@ -7,6 +7,7 @@ mod command;
 mod config;
 mod fsutil;
 mod output;
+mod proxy;
 mod pty;
 mod sandbox;
 mod signals;
