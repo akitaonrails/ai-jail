@@ -257,6 +257,13 @@ pub struct Config {
     /// entries can carry secret values.
     #[serde(default, skip_serializing)]
     pub env_pass: Vec<String>,
+    /// Credential files read like `--env` entries (`KEY=VALUE` lines).
+    /// Each file must exist, be a user-owned regular file (not a
+    /// symlink), mode 0600 or stricter, and live outside the project
+    /// directory. Trusted layers only — the project `.ai-jail` is
+    /// ignored. Never serialized: the paths point at secret material.
+    #[serde(default, skip_serializing)]
+    pub env_from_file: Vec<PathBuf>,
     /// Directories whose project `.ai-jail` is trusted to grant
     /// capabilities, instead of being treated as untrusted monotonic
     /// policy. A project matches when it is one of these directories or
@@ -520,6 +527,107 @@ pub fn apply_env_pass(
     }
 }
 
+/// Load `--env-from-file` credential files into `NAME=VALUE` env_pass
+/// entries. Every refusal here is a launch error, not a warning: this
+/// is credential material, so it fails closed.
+pub fn load_env_files(
+    paths: &[PathBuf],
+    project_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let mut entries = Vec::new();
+    for path in paths {
+        let absolute = to_absolute(path.clone(), project_dir);
+        validate_env_file(&absolute, project_dir)?;
+        let content = std::fs::read_to_string(&absolute).map_err(|e| {
+            format!("--env-from-file {}: {e}", absolute.display())
+        })?;
+        parse_env_file(&content, &absolute, &mut entries)?;
+    }
+    Ok(entries)
+}
+
+/// A credential file must be an existing, user-owned regular file,
+/// mode 0600 or stricter, reached without symlinks, living outside the
+/// project directory.
+fn validate_env_file(path: &Path, project_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let label = || format!("--env-from-file {}", path.display());
+    // lstat, not stat: a symlink is refused, never followed.
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("{}: {e}", label()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{}: is a symlink; credential files are never followed through links",
+            label()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!("{}: not a regular file", label()));
+    }
+    let euid = unsafe { nix::libc::geteuid() };
+    if metadata.uid() != euid {
+        return Err(format!("{}: must be owned by the current user", label()));
+    }
+    let mode = metadata.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "{}: must be mode 0600 or stricter (is {:04o})",
+            label(),
+            mode
+        ));
+    }
+    if resolves_inside_project(path, project_dir) {
+        return Err(format!(
+            "{}: credential files must live outside the project directory",
+            label()
+        ));
+    }
+    Ok(())
+}
+
+/// Strict `KEY=VALUE` lines: `#` comments and blank lines are skipped,
+/// keys must match `[A-Za-z_][A-Za-z0-9_]*` (no `export` prefix), and
+/// values are used verbatim after the first `=` -- no quote stripping.
+fn parse_env_file(
+    content: &str,
+    path: &Path,
+    entries: &mut Vec<String>,
+) -> Result<(), String> {
+    for (lineno, line) in content.lines().enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!(
+                "--env-from-file {}:{}: not a KEY=VALUE line",
+                path.display(),
+                lineno + 1
+            ));
+        };
+        if !valid_env_key(key) {
+            return Err(format!(
+                "--env-from-file {}:{}: invalid variable name {key:?}",
+                path.display(),
+                lineno + 1
+            ));
+        }
+        entries.push(format!("{key}={value}"));
+    }
+    Ok(())
+}
+
+fn valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// The sandbox environment for normal mode when full inheritance is
 /// off: the default allowlist (plus prefix families) present in
 /// `host_env`, plus explicit `env_pass` entries applied verbatim.
@@ -776,6 +884,8 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(audit_log);
     c.env_pass.extend(local.env_pass);
     dedup_strings(&mut c.env_pass);
+    c.env_from_file.extend(local.env_from_file);
+    dedup_paths(&mut c.env_from_file);
     c.allow_tcp_ports.extend(local.allow_tcp_ports);
     c.allow_tcp_ports.sort_unstable();
     c.allow_tcp_ports.dedup();
@@ -1119,6 +1229,12 @@ pub fn merge_with_global_report(
     if !local.env_pass.is_empty() {
         warnings.push(
             "project .ai-jail env_pass ignored (use --env or global config)"
+                .into(),
+        );
+    }
+    if !local.env_from_file.is_empty() {
+        warnings.push(
+            "project .ai-jail env_from_file ignored (use --env-from-file or global config)"
                 .into(),
         );
     }
@@ -1600,6 +1716,11 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     config.env_pass.extend(cli.env.iter().cloned());
     dedup_strings(&mut config.env_pass);
 
+    config
+        .env_from_file
+        .extend(cli.env_from_file.iter().cloned());
+    dedup_paths(&mut config.env_from_file);
+
     if let Some(p) = cli.claude_dir.clone() {
         config.claude_dir = Some(p);
     }
@@ -1627,6 +1748,7 @@ fn expand_user_paths(config: &mut Config) {
     expand_tilde_vec(&mut config.deny_paths);
     expand_tilde_vec(&mut config.mask_exceptions);
     expand_tilde_vec(&mut config.deny_path_exceptions);
+    expand_tilde_vec(&mut config.env_from_file);
     if let Some(p) = config.claude_dir.take() {
         config.claude_dir = Some(expand_tilde(p));
     }
@@ -1705,6 +1827,7 @@ pub fn display_status(config: &Config) {
     print_opt_in_enabled("  Agent state", config.agent_state);
     print_opt_in_enabled("  Full env inherit", config.inherit_env);
     print_string_list("  Env passthrough", &config.env_pass);
+    print_path_list("  Env from file", &config.env_from_file);
     print_opt_in_enabled("  Update check", config.update_check);
     print_opt_in_enabled("  Audit log", config.audit_log);
     print_opt_in_tristate("  Git worktree", config.no_worktree);
@@ -3031,6 +3154,7 @@ no_gpu = true
             agent_state: Some(true),
             inherit_env: None,
             env_pass: vec!["ANTHROPIC_API_KEY".into()],
+            env_from_file: vec![PathBuf::from("/run/secrets/anthropic")],
             trust_project_config: vec![],
             update_check: Some(false),
             audit_log: Some(true),
@@ -3073,6 +3197,9 @@ no_gpu = true
         // Deserialization of hand-written `env_pass` is covered by
         // parse tests.
         assert!(deserialized.env_pass.is_empty());
+        // env_from_file is likewise never serialized: the paths point
+        // at credential material and must not land in a config file.
+        assert!(deserialized.env_from_file.is_empty());
         assert_eq!(deserialized.update_check, config.update_check);
         assert_eq!(deserialized.audit_log, config.audit_log);
     }
@@ -4148,6 +4275,204 @@ update_check = false
     }
 
     #[test]
+    fn regression_v1_22_0_config_without_env_from_file() {
+        // Configs written before env_from_file existed must still
+        // parse, defaulting to no credential files.
+        let toml = r#"
+command = ["claude"]
+env_pass = ["ANTHROPIC_API_KEY"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert!(cfg.env_from_file.is_empty());
+    }
+
+    #[test]
+    fn parse_config_with_env_from_file() {
+        let toml = r#"
+command = ["claude"]
+env_from_file = ["/run/secrets/anthropic"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(
+            cfg.env_from_file,
+            vec![PathBuf::from("/run/secrets/anthropic")]
+        );
+    }
+
+    #[test]
+    fn project_env_from_file_is_ignored_with_warning() {
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            Config {
+                env_from_file: vec![PathBuf::from("keys")],
+                ..Config::default()
+            },
+            Path::new("/project"),
+        );
+        assert!(merged.env_from_file.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("env_from_file")));
+    }
+
+    #[test]
+    fn merge_env_from_file_trusted_union_and_cli() {
+        let global = Config {
+            env_from_file: vec![PathBuf::from("/run/secrets/anthropic")],
+            ..Config::default()
+        };
+        let command_table = Config {
+            env_from_file: vec![PathBuf::from("/run/secrets/openai")],
+            ..Config::default()
+        };
+        let merged = merge_with_global(global, command_table);
+        assert_eq!(
+            merged.env_from_file,
+            vec![
+                PathBuf::from("/run/secrets/anthropic"),
+                PathBuf::from("/run/secrets/openai"),
+            ]
+        );
+
+        let cli = CliArgs {
+            env_from_file: vec![PathBuf::from("/run/secrets/grok")],
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, merged);
+        assert_eq!(merged.env_from_file.len(), 3);
+    }
+
+    fn env_file_fixture(name: &str, content: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-env-file-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let file = root.join(name);
+        std::fs::write(&file, content).unwrap();
+        std::fs::set_permissions(
+            &file,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        (root, file)
+    }
+
+    #[test]
+    fn env_from_file_parses_strict_key_value_lines() {
+        let (root, file) = env_file_fixture(
+            "parse",
+            "# comment\n\nAPI_KEY=sk-123\nEMPTY=\nURL=https://x?a=b&c=d\nQUOTED=\"keep me\"\n",
+        );
+        let entries = load_env_files(&[file], &root.join("project")).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                "API_KEY=sk-123".to_string(),
+                "EMPTY=".to_string(),
+                // Verbatim after the first '=': no quote stripping.
+                "URL=https://x?a=b&c=d".to_string(),
+                "QUOTED=\"keep me\"".to_string(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn env_from_file_rejects_bad_lines_and_keys() {
+        for (name, content) in [
+            ("no-eq", "JUST_A_NAME\n"),
+            ("bad-key", "1KEY=value\n"),
+            ("export", "export KEY=value\n"),
+            ("spaced-key", "KEY WITH SPACE=value\n"),
+            ("empty-key", "=value\n"),
+        ] {
+            let (root, file) = env_file_fixture(name, content);
+            assert!(
+                load_env_files(&[file], &root.join("project")).is_err(),
+                "{name} must fail closed"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn env_from_file_refuses_unsafe_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Missing file.
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-env-file-missing-{}", std::process::id()));
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(load_env_files(&[root.join("nope")], &project).is_err());
+
+        // Loose permissions.
+        let (root, file) = env_file_fixture("loose", "A=1\n");
+        std::fs::set_permissions(&file, PermissionsExt::from_mode(0o644))
+            .unwrap();
+        assert!(load_env_files(&[file], &root.join("project")).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Symlink.
+        let (root, file) = env_file_fixture("linked", "A=1\n");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(load_env_files(&[link], &root.join("project")).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Inside the project directory.
+        let (root, file) = env_file_fixture("outside", "A=1\n");
+        let inside = root.join("project").join("keys");
+        std::fs::write(&inside, "A=1\n").unwrap();
+        std::fs::set_permissions(&inside, PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let result = load_env_files(&[inside], &root.join("project"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("outside the project"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = file;
+
+        // Not a regular file.
+        let (root, _file) = env_file_fixture("regular", "A=1\n");
+        let dir = root.join("a-directory");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(load_env_files(&[dir], &root.join("project")).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Not owned by the current user (root-owned system file; skip
+        // when absent or when running as root).
+        let system = PathBuf::from("/etc/shadow");
+        let euid = unsafe { nix::libc::geteuid() };
+        if euid != 0
+            && let Ok(metadata) = std::fs::symlink_metadata(&system)
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != euid {
+                let (root, _file) = env_file_fixture("owned", "A=1\n");
+                let result = load_env_files(&[system], &root.join("project"));
+                assert!(result.is_err());
+                assert!(
+                    result.unwrap_err().contains("owned by the current user")
+                );
+                let _ = std::fs::remove_dir_all(&root);
+            }
+        }
+    }
+
+    #[test]
+    fn env_from_file_entries_yield_to_env_flag() {
+        // apply_env_pass replaces earlier values with later ones, so
+        // file entries first + --env entries after = --env wins.
+        let (root, file) = env_file_fixture("precedence", "TOKEN=file-value\n");
+        let file_entries =
+            load_env_files(&[file], &root.join("project")).unwrap();
+        let mut env: Vec<(String, String)> = Vec::new();
+        apply_env_pass(&mut env, &file_entries, &[]);
+        apply_env_pass(&mut env, &["TOKEN=cli-value".to_string()], &[]);
+        assert_eq!(env, vec![("TOKEN".to_string(), "cli-value".to_string())]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn merge_lockdown_flag_overrides() {
         let existing = Config {
             lockdown: Some(true),
@@ -5181,6 +5506,7 @@ hide_dotdirs = [".my_secrets"]
             agent_state: None,
             inherit_env: None,
             env_pass: vec![],
+            env_from_file: vec![],
             trust_project_config: vec![],
             update_check: None,
             audit_log: None,

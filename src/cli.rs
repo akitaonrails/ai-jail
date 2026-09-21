@@ -60,6 +60,9 @@ OPTIONS:
     --env <NAME[=VALUE]>            Pass environment variable NAME (value copied from
                                     the host) or NAME=VALUE into the sandbox
                                     (repeatable; not persisted to .ai-jail)
+    --env-from-file <PATH>          Read KEY=VALUE lines from PATH (repeatable; file
+                                    must be user-owned, mode 0600, outside the project;
+                                    applies like --env, which wins on conflicts)
     --inherit-env / --no-inherit-env
                                     Inherit the full host environment (default: off —
                                     only a safe allowlist is passed)
@@ -140,6 +143,7 @@ pub struct CliArgs {
     pub inherit_env: Option<bool>,
     pub update_check: Option<bool>,
     pub audit_log: Option<bool>,
+    pub env_from_file: Vec<PathBuf>,
     pub env: Vec<String>,
     pub exec: bool,
     pub clean: bool,
@@ -336,6 +340,16 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     );
                 }
                 args.env.push(s.into_owned());
+            }
+            Long("env-from-file") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let path = val.to_string_lossy();
+                if path.is_empty() {
+                    return Err(
+                        "--env-from-file requires a non-empty path".into()
+                    );
+                }
+                args.env_from_file.push(PathBuf::from(path.into_owned()));
             }
             Long(s @ ("worktree" | "no-worktree")) => {
                 args.worktree = Some(s == "worktree");
@@ -557,6 +571,7 @@ fn is_sandbox_long_flag(arg: &str) -> bool {
             | "--audit-log"
             | "--no-audit-log"
             | "--env"
+            | "--env-from-file"
             | "--mise"
             | "--no-mise"
             | "--save-config"
@@ -1504,6 +1519,36 @@ mod tests {
         let args = parse_test(&["--no-audit-log", "bash"]).unwrap();
         assert_eq!(args.audit_log, Some(false));
         let error = parse_test(&["claude", "--audit-log"]).unwrap_err();
+        assert!(error.contains("after command"));
+    }
+
+    #[test]
+    fn parse_env_from_file_repeatable() {
+        let args = parse_test(&[
+            "--env-from-file",
+            "/run/secrets/anthropic",
+            "--env-from-file=/run/secrets/openai",
+            "claude",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.env_from_file,
+            vec![
+                PathBuf::from("/run/secrets/anthropic"),
+                PathBuf::from("/run/secrets/openai"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_env_from_file_missing_value() {
+        assert!(parse_test(&["--env-from-file"]).is_err());
+    }
+
+    #[test]
+    fn parse_env_from_file_after_command_rejected() {
+        let error =
+            parse_test(&["claude", "--env-from-file=/tmp/keys"]).unwrap_err();
         assert!(error.contains("after command"));
     }
 

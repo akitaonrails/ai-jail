@@ -405,6 +405,22 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
 
+    // --env-from-file (phase 6 of docs/connect-proxy-plan.md): validated
+    // credential files. Entries apply exactly like --env, and on a
+    // conflict the --env entry wins (closest to the user), so the file
+    // entries come first; apply_env_pass replaces earlier values with
+    // later ones. Forced setenvs (the filtered-egress proxy vars) are
+    // applied after all of this and still win. This runs after the
+    // status/init/bootstrap early returns so secret values never reach
+    // `ai-jail status` output.
+    if !config.env_from_file.is_empty() {
+        let file_entries =
+            config::load_env_files(&config.env_from_file, &invocation_cwd)?;
+        let mut env_pass = file_entries;
+        env_pass.extend(config.env_pass.iter().cloned());
+        config.env_pass = env_pass;
+    }
+
     // Check sandbox tool is available
     sandbox::check()?;
 

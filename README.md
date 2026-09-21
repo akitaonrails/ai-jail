@@ -158,6 +158,19 @@ env_pass = ["ANTHROPIC_BASE_URL"]
 repository must not be able to pull variables out of your shell. It is also
 never written back to disk, because `NAME=VALUE` entries can carry secrets.
 
+### Credential hygiene: `--env-from-file`
+
+For API keys and similar secrets, keep them out of every `.ai-jail` file:
+pass them from the host environment via `--env NAME`, or from a 0600 file
+via `--env-from-file PATH` (repeatable; also `env_from_file` in the global
+config). Each file must be user-owned, a regular file (never a symlink),
+mode 0600 or stricter, and live outside the project directory — any
+violation fails the launch. The format is strict `KEY=VALUE` lines (`#`
+comments and blank lines are skipped; no `export` prefix, no quote
+stripping). Entries apply like `--env`, and `--env` wins on conflicts.
+Auto-save strips them, but don't rely on it: write secrets into files or
+your shell, never into config.
+
 ## Project secrets
 
 The project directory is writable by default, so secrets inside it are
