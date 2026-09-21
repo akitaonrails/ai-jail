@@ -15,7 +15,10 @@
 //! the threads, the same lifecycle the supervisor already has for
 //! reaping. `Proxy`'s Drop only unlinks the Unix socket file.
 
-#![allow(dead_code)] // consumed by phases 2-3 of docs/connect-proxy-plan.md
+// The Unix-socket listener, in-sandbox bridge, and related constants are
+// only consumed on Linux; on macOS they are unused, so the module keeps a
+// dead_code allowance for that target.
+#![allow(dead_code)]
 
 use std::io::{self, Read, Write};
 use std::net::{
@@ -440,10 +443,16 @@ fn denied_class(ip: &IpAddr) -> Option<&'static str> {
                 Some("unspecified address")
             } else if v6.is_loopback() {
                 Some("loopback address")
+            } else if v6.is_multicast() {
+                Some("multicast address")
             } else if v6.is_unicast_link_local() {
                 Some("link-local address")
             } else if v6.is_unique_local() {
                 Some("private address range")
+            } else if v6.to_ipv4().is_some() {
+                // Deprecated v4-compatible ::/96 (e.g. ::10.0.0.1);
+                // :: and ::1 are already handled above.
+                Some("v4-compatible address")
             } else {
                 None
             }
@@ -464,6 +473,8 @@ fn denied_class_v4(ip: &Ipv4Addr) -> Option<&'static str> {
         Some("link-local address")
     } else if ip.is_private() {
         Some("private address range")
+    } else if ip.is_multicast() {
+        Some("multicast address")
     } else if ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64 {
         Some("carrier-grade NAT address range")
     } else {
@@ -672,8 +683,12 @@ mod tests {
             ("100.127.255.255", "carrier-grade NAT address range"),
             ("169.254.169.254", "cloud metadata address"),
             ("169.254.0.1", "link-local address"),
+            ("224.0.0.1", "multicast address"),
+            ("239.255.255.255", "multicast address"),
             ("::", "unspecified address"),
             ("::1", "loopback address"),
+            ("ff00::1", "multicast address"),
+            ("ff02::1", "multicast address"),
             ("fe80::1", "link-local address"),
             ("febf::ffff", "link-local address"),
             ("fc00::1", "private address range"),
@@ -683,6 +698,10 @@ mod tests {
             ("::ffff:127.0.0.1", "loopback address"),
             ("::ffff:10.1.2.3", "private address range"),
             ("::ffff:169.254.169.254", "cloud metadata address"),
+            ("::ffff:224.0.0.1", "multicast address"),
+            // Deprecated v4-compatible ::/96 is refused outright.
+            ("::10.0.0.1", "v4-compatible address"),
+            ("::8.8.8.8", "v4-compatible address"),
         ] {
             let ip: IpAddr = addr.parse().unwrap();
             assert_eq!(denied_class(&ip), Some(class), "{addr}");
@@ -699,6 +718,8 @@ mod tests {
             "100.63.255.255",
             "100.128.0.0",
             "192.0.2.1",
+            "223.255.255.255",
+            "240.0.0.1",
             "2606:4700:4700::1111",
             "::ffff:8.8.8.8",
         ] {

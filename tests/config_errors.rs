@@ -186,6 +186,20 @@ fn project_symlink_map_to_nonexistent_outside_path_is_denied() {
 }
 
 #[test]
+fn proxy_bridge_is_internal_only() {
+    // The in-sandbox bridge mode must refuse top-level invocation; only
+    // the landlock wrapper spawns it (with the marker env var set).
+    let tree = TestTree::new("proxy-bridge-internal");
+    let output = tree.run(&["--proxy-bridge", "15919", "/tmp/x.sock"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr.contains("internal mode"),
+        "missing refusal: {stderr:?}"
+    );
+}
+
+#[test]
 fn sandbox_flag_after_command_hard_errors() {
     // Sandbox flags placed after the command would be passed to the
     // child instead of ai-jail — both the space-separated and the

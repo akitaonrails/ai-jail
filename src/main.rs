@@ -212,6 +212,10 @@ fn spawn_proxy_bridge(port: u16) -> Result<(), String> {
             port.to_string().as_str(),
             proxy::IN_SANDBOX_SOCK_PATH,
         ])
+        // The internal-mode marker --proxy-bridge refuses to run
+        // without; an agent that can already reach the proxy socket
+        // gains nothing by setting it itself.
+        .env("AI_JAIL_PROXY_BRIDGE", "1")
         .spawn()
         .map_err(|e| format!("Failed to spawn the proxy bridge: {e}"))?;
     Ok(())
@@ -309,7 +313,16 @@ fn run() -> Result<i32, String> {
     }
 
     // Internal: the in-sandbox filtered-egress bridge (spawned by the
-    // landlock wrapper). Prints nothing; quiet mode needs no handling.
+    // landlock wrapper, which sets the marker env var; top-level
+    // invocation is refused). Prints nothing; quiet mode needs no
+    // handling.
+    if cli.proxy_bridge.is_some()
+        && std::env::var_os("AI_JAIL_PROXY_BRIDGE").is_none()
+    {
+        return Err(
+            "--proxy-bridge is an internal mode, not a launch option".into()
+        );
+    }
     if let Some((port, socket)) = &cli.proxy_bridge {
         return proxy::run_bridge(*port, socket).map(|()| 0);
     }
