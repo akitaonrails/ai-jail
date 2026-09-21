@@ -1231,8 +1231,14 @@ fn landlock_wrapper_args(
         args.push(port.to_string());
     }
 
-    // Filtered egress: the wrapper spawns the in-sandbox bridge on the
-    // fixed loopback port before it restricts itself.
+    // Filtered egress: the wrapper's inner config must see the
+    // allowlist so its network_mode() resolves Filtered -- the inner
+    // Landlock V4 net ruleset keys the bridge-port ConnectTcp rule off
+    // it, and the wrapper spawns the bridge on that port.
+    for host in &config.allow_hosts {
+        args.push("--allow-host".into());
+        args.push(host.clone());
+    }
     if config.network_mode() == crate::config::NetworkMode::Filtered {
         args.push("--proxy-bridge-port".into());
         args.push(crate::proxy::BRIDGE_PORT.to_string());
@@ -3876,6 +3882,13 @@ mod tests {
             .position(|arg| arg == "--proxy-bridge-port")
             .expect("expected --proxy-bridge-port in wrapper args");
         assert_eq!(args[port_pos + 1], crate::proxy::BRIDGE_PORT.to_string());
+        // The wrapper also sees the allowlist: its inner Landlock net
+        // ruleset keys the bridge-port rule off network_mode().
+        let host_pos = args
+            .windows(2)
+            .position(|w| w[0] == "--allow-host")
+            .expect("expected --allow-host in wrapper args");
+        assert_eq!(args[host_pos + 1], "api.anthropic.com");
         // The forced proxy env names the in-sandbox bridge port, and
         // no_proxy is emptied.
         let url = format!("http://127.0.0.1:{}", crate::proxy::BRIDGE_PORT);

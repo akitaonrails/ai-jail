@@ -89,9 +89,23 @@ fn filtered_run(
     extra_env: &[(&str, &str)],
     script: &str,
 ) -> Output {
+    filtered_run_locked(allow_hosts, extra_env, script, false)
+}
+
+/// Lockdown variant: same filtered sandbox plus --lockdown, which on
+/// kernels ≥ 6.7 also stacks the Landlock V4 net ruleset.
+fn filtered_run_locked(
+    allow_hosts: &[&str],
+    extra_env: &[(&str, &str)],
+    script: &str,
+    lockdown: bool,
+) -> Output {
     let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
     let mut command = Command::new(ai_jail());
     command.args(["--clean", "--no-status-bar", "--exec"]);
+    if lockdown {
+        command.arg("--lockdown");
+    }
     for host in allow_hosts {
         command.args(["--allow-host", host]);
     }
@@ -258,6 +272,35 @@ fn filtered_egress_forced_env_wins_over_user_env() {
         stdout.contains("SEEN=http://127.0.0.1:15919/"),
         "user --env overrode the forced proxy env: stdout={stdout:?} \
          stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn filtered_egress_lockdown_still_tunnels() {
+    require_bwrap_net!();
+    // Lockdown stacks the Landlock V4 net ruleset on kernels ≥ 6.7;
+    // without the bridge-port ConnectTcp rule the child gets EACCES
+    // reaching its own proxy. On older kernels Landlock net is
+    // unavailable and this passes through the netns path instead.
+    let fixture = http_fixture();
+    let script = format!(
+        "echo \"PROXY=$http_proxy\"; \
+         curl -p -sS {CURL_RETRY} http://127.0.0.1:{fixture}/"
+    );
+    let output = filtered_run_locked(&["127.0.0.1"], &[], &script, true);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "lockdown run failed: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("PROXY=http://127.0.0.1:15919"),
+        "forced proxy env missing under lockdown: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("ok"),
+        "fixture body missing under lockdown: {stdout:?}"
     );
 }
 

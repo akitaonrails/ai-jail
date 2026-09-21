@@ -181,7 +181,11 @@ fn do_apply(
 ///
 /// In lockdown mode with no allowed ports: handle BindTcp +
 /// ConnectTcp but add NO port rules → all TCP is denied. This
-/// is defense-in-depth alongside bwrap's --unshare-net.
+/// is defense-in-depth alongside bwrap's --unshare-net. The one
+/// exception is filtered egress (`--allow-host`): the ruleset then
+/// allows ConnectTcp to the in-sandbox proxy bridge's fixed port, or
+/// the child could not reach its only endpoint (the port is safe to
+/// name -- inside the private netns it exists only on loopback).
 ///
 /// In lockdown mode with allowed ports: handle BindTcp +
 /// ConnectTcp and add NetPort rules for each allowed port
@@ -191,8 +195,10 @@ fn do_apply(
 ///
 /// In normal mode: no network restrictions via Landlock.
 ///
-/// Best-effort when no allowed ports: silently skipped if kernel
-/// lacks V4 support (--unshare-net provides the isolation).
+/// Best-effort when no user ports are configured: silently skipped if
+/// the kernel lacks V4 support (--unshare-net provides the isolation).
+/// The filtered-mode bridge port does not change this: its rule is
+/// best-effort too, because the private netns stays up as the fence.
 ///
 /// Hard-fail when allowed ports are configured but V4 is
 /// unavailable: --unshare-net was already skipped so there
@@ -214,14 +220,20 @@ fn apply_net_rules(config: &Config, verbose: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let allowed = config.allow_tcp_ports();
+    let user_ports = config.allow_tcp_ports();
+    // Filtered egress adds the in-sandbox proxy bridge's fixed port to
+    // the ConnectTcp allow set, or lockdown would deny the child its
+    // only reachable endpoint. Port-scoped and safe: inside the private
+    // netns that port exists only on loopback, where the bridge
+    // listens, and every other TCP operation stays denied.
+    let allowed = allowed_connect_ports(config);
 
     let result = Ruleset::default()
         .handle_access(net_access)
         .and_then(landlock::Ruleset::create)
         .and_then(|r| {
             let mut created = r;
-            for &port in allowed {
+            for &port in &allowed {
                 created = created
                     .add_rule(NetPort::new(port, AccessNet::ConnectTcp))?;
             }
@@ -236,7 +248,12 @@ fn apply_net_rules(config: &Config, verbose: bool) -> Result<(), String> {
                 RulesetStatus::NotEnforced => "not enforced",
             };
 
-            if !allowed.is_empty() {
+            // Only the user's own --allow-tcp-port entries make V4
+            // mandatory: those skip --unshare-net, so without V4 there
+            // would be no network restriction at all. The filtered-mode
+            // bridge port does not -- the private netns stays up and is
+            // the real fence, so its rule rides along best-effort.
+            if !user_ports.is_empty() {
                 match status.ruleset {
                     RulesetStatus::FullyEnforced => {}
                     _ => {
@@ -267,7 +284,15 @@ fn apply_net_rules(config: &Config, verbose: bool) -> Result<(), String> {
             Ok(())
         }
         Err(e) => {
-            if allowed.is_empty() {
+            if !user_ports.is_empty() {
+                Err(format!(
+                    "Landlock V4 required for \
+                     --allow-tcp-port but unavailable \
+                     ({e}). Cannot enforce port \
+                     allowlist without network \
+                     namespace — refusing to start"
+                ))
+            } else {
                 if verbose {
                     output::verbose(
                         "Landlock V4 net: unavailable \
@@ -276,17 +301,20 @@ fn apply_net_rules(config: &Config, verbose: bool) -> Result<(), String> {
                     );
                 }
                 Ok(())
-            } else {
-                Err(format!(
-                    "Landlock V4 required for \
-                     --allow-tcp-port but unavailable \
-                     ({e}). Cannot enforce port \
-                     allowlist without network \
-                     namespace — refusing to start"
-                ))
             }
         }
     }
+}
+
+/// TCP ports the lockdown net ruleset allows ConnectTcp to: the user's
+/// `--allow-tcp-port` entries plus, in filtered-egress mode, the
+/// in-sandbox proxy bridge port (see apply_net_rules).
+fn allowed_connect_ports(config: &Config) -> Vec<u16> {
+    let mut ports = config.allow_tcp_ports().to_vec();
+    if config.network_mode() == crate::config::NetworkMode::Filtered {
+        ports.push(crate::proxy::BRIDGE_PORT);
+    }
+    ports
 }
 
 /// Lockdown paths: minimal set for a read-only sandbox.
@@ -1517,6 +1545,49 @@ mod tests {
         // Empty ports → same as no ports → best-effort V4 or
         // fallback to --unshare-net only.
         let _ = apply_net_rules(&config, true);
+    }
+
+    #[test]
+    fn filtered_lockdown_allows_the_bridge_port() {
+        // Ruleset construction, kernel-independent: filtered egress
+        // under lockdown must allow ConnectTcp to the bridge port or
+        // the child cannot reach its only endpoint.
+        let config = Config {
+            lockdown: Some(true),
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        assert_eq!(
+            allowed_connect_ports(&config),
+            vec![crate::proxy::BRIDGE_PORT]
+        );
+        // User ports compose with it.
+        let config = Config {
+            allow_tcp_ports: vec![32000],
+            ..config
+        };
+        assert_eq!(
+            allowed_connect_ports(&config),
+            vec![32000, crate::proxy::BRIDGE_PORT]
+        );
+        // Without lockdown the net ruleset never applies, and the port
+        // list only matters there; non-filtered lockdown stays
+        // deny-all.
+        let plain = Config {
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        assert!(allowed_connect_ports(&plain).is_empty());
+        // Filtered + lockdown must not hard-fail on kernels without V4:
+        // the bridge rule is best-effort (the netns is the fence), only
+        // user ports make V4 mandatory. On this kernel (≥ 6.7) the call
+        // succeeds; on older ones it returns Ok after skipping.
+        let filtered_only = Config {
+            lockdown: Some(true),
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        assert!(apply_net_rules(&filtered_only, false).is_ok());
     }
 
     #[test]
