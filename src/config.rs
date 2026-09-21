@@ -273,6 +273,12 @@ pub struct Config {
     /// `.ai-jail` may only disable it, never enable it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_check: Option<bool>,
+    /// Opt-in launch audit log at `~/.local/share/ai-jail/history.jsonl`
+    /// (phase 5 of docs/connect-proxy-plan.md). Enabling writes a host
+    /// file, so the untrusted project `.ai-jail` may only disable it,
+    /// never enable it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_log: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -430,6 +436,10 @@ impl Config {
     /// disabled unless explicitly enabled via CLI or global config.
     pub fn update_check_enabled(&self) -> bool {
         self.update_check == Some(true)
+    }
+    /// Opt-in launch audit log: off unless explicitly enabled.
+    pub fn audit_log_enabled(&self) -> bool {
+        self.audit_log == Some(true)
     }
 }
 
@@ -763,6 +773,7 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(agent_state);
     take!(inherit_env);
     take!(update_check);
+    take!(audit_log);
     c.env_pass.extend(local.env_pass);
     dedup_strings(&mut c.env_pass);
     c.allow_tcp_ports.extend(local.allow_tcp_ports);
@@ -1104,6 +1115,7 @@ pub fn merge_with_global_report(
     monotonic!(inherit_env, |config: &Config| config.inherit_env_enabled());
     monotonic!(update_check, |config: &Config| config
         .update_check_enabled());
+    monotonic!(audit_log, |config: &Config| config.audit_log_enabled());
     if !local.env_pass.is_empty() {
         warnings.push(
             "project .ai-jail env_pass ignored (use --env or global config)"
@@ -1559,6 +1571,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     direct!(agent_state);
     direct!(inherit_env);
     direct!(update_check);
+    direct!(audit_log);
     invert!(mise, no_mise);
     invert!(save_config, no_save_config);
     invert!(hide_config, no_hide_config);
@@ -1693,6 +1706,7 @@ pub fn display_status(config: &Config) {
     print_opt_in_enabled("  Full env inherit", config.inherit_env);
     print_string_list("  Env passthrough", &config.env_pass);
     print_opt_in_enabled("  Update check", config.update_check);
+    print_opt_in_enabled("  Audit log", config.audit_log);
     print_opt_in_tristate("  Git worktree", config.no_worktree);
     print_auto_tristate("  Mise", config.no_mise);
     print_default_on_tristate("  Save config", config.no_save_config);
@@ -3019,6 +3033,7 @@ no_gpu = true
             env_pass: vec!["ANTHROPIC_API_KEY".into()],
             trust_project_config: vec![],
             update_check: Some(false),
+            audit_log: Some(true),
         };
         let serialized = serialize_config(&config).unwrap();
         let deserialized = parse_toml(&serialized).unwrap();
@@ -3059,6 +3074,7 @@ no_gpu = true
         // parse tests.
         assert!(deserialized.env_pass.is_empty());
         assert_eq!(deserialized.update_check, config.update_check);
+        assert_eq!(deserialized.audit_log, config.audit_log);
     }
 
     #[test]
@@ -4085,6 +4101,50 @@ allow_tcp_ports = []
                 .iter()
                 .any(|w| w.contains("allow_hosts") && w.contains("evil.com"))
         );
+    }
+
+    #[test]
+    fn regression_v1_22_0_config_without_audit_log() {
+        // Configs written before audit_log existed must still parse,
+        // defaulting the audit log to off.
+        let toml = r#"
+command = ["claude"]
+lockdown = false
+update_check = false
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.audit_log, None);
+        assert!(!cfg.audit_log_enabled());
+    }
+
+    #[test]
+    fn project_cannot_enable_audit_log_but_may_disable() {
+        // Enabling writes a host file: a capability the untrusted
+        // project layer never gets.
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            Config {
+                audit_log: Some(true),
+                ..Config::default()
+            },
+            Path::new("/project"),
+        );
+        assert!(!merged.audit_log_enabled());
+        assert!(warnings.iter().any(|w| w.contains("audit_log")));
+
+        let (merged, warnings) = merge_with_global_report(
+            Config {
+                audit_log: Some(true),
+                ..Config::default()
+            },
+            Config {
+                audit_log: Some(false),
+                ..Config::default()
+            },
+            Path::new("/project"),
+        );
+        assert!(!merged.audit_log_enabled());
+        assert!(!warnings.iter().any(|w| w.contains("audit_log")));
     }
 
     #[test]
@@ -5123,6 +5183,7 @@ hide_dotdirs = [".my_secrets"]
             env_pass: vec![],
             trust_project_config: vec![],
             update_check: None,
+            audit_log: None,
         };
         save(&config);
 

@@ -1,6 +1,7 @@
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("ai-jail only supports Linux and macOS");
 
+mod audit;
 mod bootstrap;
 mod cli;
 mod command;
@@ -410,6 +411,20 @@ fn run() -> Result<i32, String> {
     // Platform-specific info messages (e.g. no-op flags on macOS)
     sandbox::platform_notes(&config);
 
+    // Opt-in launch audit log (phase 5 of docs/connect-proxy-plan.md):
+    // a supervisor-side JSONL file the sandbox never sees. Opened here
+    // so the filtered-egress proxy below can share the handle; the
+    // launch record itself is appended when the child exits.
+    let audit_log = if config.audit_log_enabled() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        audit::AuditLog::open(&home)
+    } else {
+        None
+    };
+    let launch_start = std::time::Instant::now();
+
     // Prepare sandbox resources (temp hosts file on Linux, no-op on macOS)
     let guard = sandbox::prepare()?;
 
@@ -430,6 +445,9 @@ fn run() -> Result<i32, String> {
         // normal operation.
         proxy_config.danger_allow_private =
             std::env::var_os("AI_JAIL_TEST_PROXY_ALLOW_PRIVATE").is_some();
+        // The audit handle is supervisor-side; the sandbox never sees
+        // the file it appends to.
+        proxy_config.audit = audit_log.clone();
         let socket = proxy::default_socket_path();
         let proxy = proxy::Proxy::start(proxy_config, Some(&socket))
             .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
@@ -440,8 +458,9 @@ fn run() -> Result<i32, String> {
     #[cfg(target_os = "macos")]
     let egress_proxy = if config.network_mode() == config::NetworkMode::Filtered
     {
-        let proxy_config =
+        let mut proxy_config =
             proxy::ProxyConfig::new(config.allow_hosts().to_vec());
+        proxy_config.audit = audit_log.clone();
         let proxy = proxy::Proxy::start(proxy_config, None)
             .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
         Some(proxy)
@@ -649,6 +668,36 @@ fn run() -> Result<i32, String> {
         output::terminal_reset();
         code
     };
+
+    // Append the launch record only now: exit code and duration are
+    // what make it an audit trail rather than a log of intentions.
+    if let Some(log) = &audit_log {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        let network = match config.network_mode() {
+            config::NetworkMode::Off => "off",
+            config::NetworkMode::Filtered => "filtered",
+            config::NetworkMode::Full => "full",
+        };
+        log.record(audit::launch_record(&audit::LaunchRecord {
+            command: &config.command,
+            network_mode: network,
+            allow_hosts: config.allow_hosts(),
+            lockdown: config.lockdown_enabled(),
+            agent_state: config.agent_state_enabled(),
+            gpu: config.gpu_enabled(),
+            display: config.display_enabled(),
+            audio: config.audio_enabled(),
+            browser_profile: config.browser_profile.as_deref(),
+            project_config: !cli.clean
+                && invocation_cwd.join(".ai-jail").is_file(),
+            project_trusted,
+            global_config: home.join(".ai-jail").exists(),
+            exit_code,
+            duration: launch_start.elapsed(),
+        }));
+    }
 
     // Guard is dropped here, cleaning up any temp files. On macOS the
     // guard is a unit struct (no temp files to clean), so the explicit

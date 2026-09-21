@@ -52,6 +52,10 @@ pub(crate) struct ProxyConfig {
     /// tests can CONNECT to loopback fixture servers. Must never become
     /// settable from config or CLI in later phases.
     pub danger_allow_private: bool,
+    /// Shared audit-log handle (phase 5): when the launch audit log is
+    /// on, each CONNECT appends a verdict record. The file is
+    /// supervisor-side; the sandbox never sees it.
+    pub audit: Option<Arc<crate::audit::AuditLog>>,
 }
 
 impl ProxyConfig {
@@ -62,6 +66,7 @@ impl ProxyConfig {
             connect_timeout: Duration::from_secs(10),
             read_timeout: Duration::from_secs(10),
             danger_allow_private: false,
+            audit: None,
         }
     }
 }
@@ -250,7 +255,7 @@ fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
     };
 
     if !allowlist_matches(&shared.config.allowlist, &host) {
-        // phase 5: audit record { host, port, deny, "not in allowlist" }
+        audit_verdict(&shared, &host, port, "deny", "not-in-allowlist");
         reject(&mut client, &Reject::ForbiddenHost);
         return;
     }
@@ -258,17 +263,40 @@ fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
     let upstream = match connect_upstream(&host, port, &shared.config) {
         Ok(stream) => stream,
         Err(why) => {
-            // phase 5: audit record { host, port, deny, reason-class }
+            // Only policy refusals are verdicts; a failed resolution or
+            // dial is an upstream error, not a deny.
+            if matches!(why, Reject::ForbiddenRange) {
+                audit_verdict(
+                    &shared,
+                    &host,
+                    port,
+                    "deny",
+                    "forbidden-address-range",
+                );
+            }
             reject(&mut client, &why);
             return;
         }
     };
-    // phase 5: audit record { host, port, allow }
+    audit_verdict(&shared, &host, port, "allow", "in-allowlist");
 
     if client.write_all(REPLY_OK.as_bytes()).is_err() {
         return;
     }
     relay(client, upstream);
+}
+
+/// Append a CONNECT verdict record when the launch audit log is on.
+fn audit_verdict(
+    shared: &Shared,
+    host: &str,
+    port: u16,
+    verdict: &str,
+    reason: &str,
+) {
+    if let Some(log) = &shared.config.audit {
+        log.record(crate::audit::connect_record(host, port, verdict, reason));
+    }
 }
 
 fn reject<S: ClientStream>(stream: &mut S, why: &Reject) {
@@ -399,7 +427,7 @@ pub(crate) fn allowlist_matches(allowlist: &[String], host: &str) -> bool {
 
 /// SSRF guard: the refused class of an address, or None if dialable.
 /// The class names a range, never the specific address, so it is safe
-/// to surface (and to log in phase 5).
+/// to surface and to log.
 fn denied_class(ip: &IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(v4) => denied_class_v4(v4),
@@ -462,7 +490,8 @@ fn connect_upstream(
         if !config.danger_allow_private
             && let Some(class) = denied_class(&addr.ip())
         {
-            // phase 5: audit record { host, port, deny, class }
+            // The caller records one deny verdict for the request; the
+            // per-answer class detail stays internal to this filter.
             let _ = class;
             continue;
         }
@@ -928,6 +957,53 @@ mod tests {
             read_reply_head(&stream),
             "HTTP/1.1 400 Bad Request\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn e2e_audit_records_connect_verdicts() {
+        // Phase 5: with an audit handle attached, each CONNECT appends
+        // a verdict record -- deny for a non-allowlisted host, allow
+        // for a tunneled one.
+        let echo = echo_server();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-proxy-audit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let log = crate::audit::AuditLog::open(&home).unwrap();
+
+        let mut config = test_config(&["127.0.0.1"]);
+        config.audit = Some(log);
+        let proxy = Proxy::start(config, None).unwrap();
+
+        let denied =
+            connect_and_send(proxy.port(), &connect_request("example.com:443"));
+        assert_eq!(read_reply_head(&denied), "HTTP/1.1 403 Forbidden\r\n\r\n");
+
+        let allowed = connect_and_send(
+            proxy.port(),
+            &connect_request(&format!("127.0.0.1:{echo}")),
+        );
+        assert_eq!(read_reply_head(&allowed), REPLY_OK);
+        drop(allowed);
+        drop(proxy);
+
+        let content = std::fs::read_to_string(
+            home.join(".local/share/ai-jail/history.jsonl"),
+        )
+        .unwrap();
+        let records: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["type"], "connect");
+        assert_eq!(records[0]["host"], "example.com");
+        assert_eq!(records[0]["verdict"], "deny");
+        assert_eq!(records[0]["reason"], "not-in-allowlist");
+        assert_eq!(records[1]["host"], "127.0.0.1");
+        assert_eq!(records[1]["verdict"], "allow");
+        assert_eq!(records[1]["reason"], "in-allowlist");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

@@ -66,6 +66,9 @@ OPTIONS:
     --update-check / --no-update-check
                                     Enable/disable the status bar's GitHub update
                                     check (default: off)
+    --audit-log / --no-audit-log    Enable/disable the launch audit log at
+                                    ~/.local/share/ai-jail/history.jsonl
+                                    (default: off; project .ai-jail cannot enable)
     --worktree / --no-worktree     Enable/disable linked Git worktree metadata passthrough
     --no-mise / --mise             Disable/enable mise integration
     --ssh / --no-ssh               Share ~/.ssh read-only + forward SSH_AUTH_SOCK (default: off)
@@ -136,6 +139,7 @@ pub struct CliArgs {
     pub agent_state: Option<bool>,
     pub inherit_env: Option<bool>,
     pub update_check: Option<bool>,
+    pub audit_log: Option<bool>,
     pub env: Vec<String>,
     pub exec: bool,
     pub clean: bool,
@@ -318,6 +322,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("update-check" | "no-update-check")) => {
                 args.update_check = Some(s == "update-check");
+            }
+            Long(s @ ("audit-log" | "no-audit-log")) => {
+                args.audit_log = Some(s == "audit-log");
             }
             Long("env") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -547,6 +554,8 @@ fn is_sandbox_long_flag(arg: &str) -> bool {
             | "--no-inherit-env"
             | "--update-check"
             | "--no-update-check"
+            | "--audit-log"
+            | "--no-audit-log"
             | "--env"
             | "--mise"
             | "--no-mise"
@@ -1486,6 +1495,16 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.proxy_bridge_port, Some(15919));
+    }
+
+    #[test]
+    fn parse_audit_log_flag_pair() {
+        let args = parse_test(&["--audit-log", "bash"]).unwrap();
+        assert_eq!(args.audit_log, Some(true));
+        let args = parse_test(&["--no-audit-log", "bash"]).unwrap();
+        assert_eq!(args.audit_log, Some(false));
+        let error = parse_test(&["claude", "--audit-log"]).unwrap_err();
+        assert!(error.contains("after command"));
     }
 
     #[test]
