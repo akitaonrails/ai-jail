@@ -105,8 +105,17 @@ user bus are also off by default.
 | `--worktree` / `--no-worktree`                         | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only.   |
 | `--private-home` / `--no-private-home`                 | Enables/disables the default private home. Disabling it is broad host-home access.                                                                                                               |
 
+`--allow-host HOST` (repeatable, or `allow_hosts = [...]` in `.ai-jail`)
+enables filtered egress instead: the sandbox keeps no route off the host
+except a built-in CONNECT proxy that dials exactly the listed hosts — an
+entry matches the host itself and its subdomains. It is TCP/CONNECT-only:
+no UDP, and no working DNS inside the sandbox on Linux (on macOS the system
+resolver is not fenced). It cannot combine with `--network` or `--browser`,
+and a project `.ai-jail` may only shrink the list, never grow it.
+
 `--allow-tcp-port` remains accepted for backward compatibility, but launch
-fails closed because UDP cannot be securely constrained through this option.
+fails closed because UDP cannot be securely constrained through this option —
+use `--allow-host` for filtered egress instead.
 Use `--network` only when unrestricted network access is explicitly desired.
 
 `--docker` mounts an actual Unix Docker socket and is effectively host-root:

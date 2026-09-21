@@ -156,13 +156,28 @@ fn is_known_api_agent(name: &str) -> bool {
     KNOWN_API_AGENTS.contains(&name) || name.starts_with("kimi")
 }
 
+/// The hosted-API hostname an agent needs in filtered-egress mode, for
+/// the precise "your allowlist doesn't cover it" warning. Agents not
+/// listed have no canonical host we can name.
+fn api_host(name: &str) -> Option<&'static str> {
+    match name {
+        "claude" => Some("api.anthropic.com"),
+        "codex" => Some("api.openai.com"),
+        "gemini" => Some("generativelanguage.googleapis.com"),
+        "grok" => Some("api.x.ai"),
+        _ => None,
+    }
+}
+
 /// Launch-time warnings for a known API-client agent whose effective
 /// config denies a capability it needs (issue #131): `network` to reach
 /// the model API and `agent_state` for its login/session data. Warning
 /// only -- the launch is never blocked, and unknown commands are silent.
 /// Under `--lockdown` the network warning is suppressed: lockdown blocks
 /// network regardless of config, and it is an explicit hardening choice,
-/// so pointing at `network = true` would mislead.
+/// so pointing at `network = true` would mislead. Filtered egress
+/// (`allow_hosts`) counts as network-satisfied, with a precise warning
+/// when the agent's known API host is not covered by the allowlist.
 pub(crate) fn capability_gap_warnings(
     config: &crate::config::Config,
 ) -> Vec<String> {
@@ -173,11 +188,23 @@ pub(crate) fn capability_gap_warnings(
         return Vec::new();
     }
     let mut warnings = Vec::new();
-    if !config.lockdown_enabled() && !config.network_enabled() {
+    let filtered =
+        matches!(config.network_mode(), crate::config::NetworkMode::Filtered);
+    if !config.lockdown_enabled() && !config.network_enabled() && !filtered {
         warnings.push(format!(
             "ai-jail: `{name}` is a network API client but network is off \
              (default since v1.18.0) — set `network = true` or pass \
              --network; see `ai-jail status`"
+        ));
+    }
+    if filtered
+        && let Some(host) = api_host(name)
+        && !crate::proxy::allowlist_matches(config.allow_hosts(), host)
+    {
+        warnings.push(format!(
+            "ai-jail: filtered egress is on but `{name}`'s API host \
+             {host} is not in allow_hosts — add it there or pass \
+             --allow-host {host}; see `ai-jail status`"
         ));
     }
     if !config.agent_state_enabled() {
@@ -383,5 +410,36 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("agent_state is off"));
         assert!(!warnings.iter().any(|warning| warning.contains("network")));
+    }
+
+    #[test]
+    fn capability_gap_filtered_mode_satisfies_network() {
+        let mut config = gap_config("claude", None, Some(true));
+        config.allow_hosts = vec!["api.anthropic.com".into()];
+        assert!(capability_gap_warnings(&config).is_empty());
+        // Subdomain entries cover the bare host's subdomains too.
+        let mut config = gap_config("claude", None, Some(true));
+        config.allow_hosts = vec!["anthropic.com".into()];
+        assert!(capability_gap_warnings(&config).is_empty());
+    }
+
+    #[test]
+    fn capability_gap_filtered_mode_names_missing_api_host() {
+        let mut config = gap_config("claude", None, Some(true));
+        config.allow_hosts = vec!["github.com".into()];
+        let warnings = capability_gap_warnings(&config);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("api.anthropic.com"));
+        assert!(warnings[0].contains("--allow-host"));
+        assert!(!warnings[0].contains("network is off"));
+    }
+
+    #[test]
+    fn capability_gap_filtered_mode_silent_without_known_api_host() {
+        // Agents with no canonical API host in the table get no
+        // host-coverage warning in filtered mode.
+        let mut config = gap_config("kimi", None, Some(true));
+        config.allow_hosts = vec!["example.com".into()];
+        assert!(capability_gap_warnings(&config).is_empty());
     }
 }

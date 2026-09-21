@@ -74,6 +74,23 @@ fn apply_browser_profile(config: &mut config::Config) {
     config.no_status_bar = Some(true);
 }
 
+/// Network-mode contradiction checks, all fail-closed at launch.
+/// `--allow-tcp-port` stays dead (the filtered-egress proxy is the
+/// strictly better answer, docs/connect-proxy-plan.md), and filtered
+/// egress combines with neither unrestricted network nor browser mode.
+fn validate_network_flags(config: &config::Config) -> Result<(), String> {
+    if !config.allow_tcp_ports().is_empty() {
+        return Err("--allow-tcp-port is disabled (UDP cannot be isolated); use --allow-host for filtered egress instead".into());
+    }
+    if config.network_enabled() && !config.allow_hosts().is_empty() {
+        return Err("--network and --allow-host are mutually exclusive: filtered egress and unrestricted network cannot be combined".into());
+    }
+    if config.browser_profile().is_some() && !config.allow_hosts().is_empty() {
+        return Err("--browser and --allow-host cannot be combined: browsers need real DNS and many domains".into());
+    }
+    Ok(())
+}
+
 /// Detect a terminal multiplexer around the current process. Nested
 /// PTYs (tmux/zellij PTY → ai-jail vt100 PTY → child) conflict over
 /// resize, keyboard protocol, and status-bar drawing, so we auto-skip
@@ -309,9 +326,7 @@ fn run() -> Result<i32, String> {
     // the same canonical paths the sandbox will use.
     config::absolutize_user_paths(&mut config, &invocation_cwd);
     apply_browser_profile(&mut config);
-    if !config.allow_tcp_ports().is_empty() {
-        return Err("--allow-tcp-port is disabled because UDP cannot be isolated; use explicit --network for unrestricted network access".into());
-    }
+    validate_network_flags(&config)?;
 
     // Handle status command
     if cli.status {
@@ -580,7 +595,7 @@ mod tests {
         prune_missing_path_entries, pty_proxy_active, resolve_browser_profile,
         running_inside_multiplexer, should_auto_save_project_config,
         should_check_update, should_save_global_preferences,
-        validate_write_flags,
+        validate_network_flags, validate_write_flags,
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
@@ -590,6 +605,55 @@ mod tests {
     fn crush_requires_direct_tty() {
         assert!(command_needs_direct_tty(&["crush".into()]));
         assert!(command_needs_direct_tty(&["/usr/bin/crush".into()]));
+    }
+
+    #[test]
+    fn allow_tcp_port_error_points_at_allow_host() {
+        let config = Config {
+            allow_tcp_ports: vec![443],
+            ..Config::default()
+        };
+        let error = validate_network_flags(&config).unwrap_err();
+        assert!(error.contains("--allow-tcp-port is disabled"));
+        assert!(error.contains("--allow-host"));
+    }
+
+    #[test]
+    fn network_and_allow_host_contradiction_hard_errors() {
+        let config = Config {
+            network: Some(true),
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let error = validate_network_flags(&config).unwrap_err();
+        assert!(error.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn browser_and_allow_host_contradiction_hard_errors() {
+        let config = Config {
+            browser_profile: Some("hard".into()),
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let error = validate_network_flags(&config).unwrap_err();
+        assert!(error.contains("--browser"));
+        assert!(error.contains("--allow-host"));
+    }
+
+    #[test]
+    fn allow_host_alone_and_with_lockdown_is_valid() {
+        let filtered = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        assert!(validate_network_flags(&filtered).is_ok());
+        let locked = Config {
+            lockdown: Some(true),
+            ..filtered.clone()
+        };
+        assert!(validate_network_flags(&locked).is_ok());
+        assert!(validate_network_flags(&Config::default()).is_ok());
     }
 
     #[test]

@@ -81,6 +81,9 @@ OPTIONS:
     --no-status-bar                Disable persistent status line
     --exec                         Direct execution mode (no PTY proxy, no status bar)
     --allow-tcp-port <PORT>        Allow outbound TCP to PORT in lockdown (repeatable)
+    --allow-host <HOST>            Allow CONNECT egress to HOST and its subdomains via the
+                                   built-in filtered proxy (repeatable; implies filtered
+                                   network mode; cannot combine with --network)
     --claude-dir <PATH>            Use PATH as Claude config dir (sets CLAUDE_CONFIG_DIR)
     --clean                        Ignore project .ai-jail config, start fresh
     --dry-run                      Print the sandbox command without executing
@@ -128,6 +131,7 @@ pub struct CliArgs {
     pub status_bar: Option<bool>,
     pub status_bar_style: Option<String>,
     pub allow_tcp_ports: Vec<u16>,
+    pub allow_hosts: Vec<String>,
     pub claude_dir: Option<PathBuf>,
     pub agent_state: Option<bool>,
     pub inherit_env: Option<bool>,
@@ -255,6 +259,14 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     .parse()
                     .map_err(|_| format!("invalid port number: {val}"))?;
                 args.allow_tcp_ports.push(port);
+            }
+            Long("allow-host") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let host = val.to_string_lossy();
+                if host.is_empty() {
+                    return Err("--allow-host requires a non-empty host".into());
+                }
+                args.allow_hosts.push(host.into_owned());
             }
             Long("claude-dir") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -484,6 +496,7 @@ fn is_sandbox_long_flag(arg: &str) -> bool {
             | "--deny-path-except"
             | "--hide-dotdir"
             | "--allow-tcp-port"
+            | "--allow-host"
             | "--systemd-user"
             | "--no-systemd-user"
             | "--worktree"
@@ -1378,6 +1391,40 @@ mod tests {
     #[test]
     fn parse_allow_tcp_port_missing_value() {
         assert!(parse_test(&["--allow-tcp-port"]).is_err());
+    }
+
+    #[test]
+    fn parse_allow_host_single() {
+        let args = parse_test(&["--allow-host", "api.anthropic.com", "claude"])
+            .unwrap();
+        assert_eq!(args.allow_hosts, vec!["api.anthropic.com".to_string()]);
+    }
+
+    #[test]
+    fn parse_allow_host_repeatable() {
+        let args = parse_test(&[
+            "--allow-host",
+            "api.anthropic.com",
+            "--allow-host=github.com",
+            "claude",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.allow_hosts,
+            vec!["api.anthropic.com".to_string(), "github.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_allow_host_missing_value() {
+        assert!(parse_test(&["--allow-host"]).is_err());
+    }
+
+    #[test]
+    fn parse_allow_host_after_command_rejected() {
+        let error =
+            parse_test(&["claude", "--allow-host=example.com"]).unwrap_err();
+        assert!(error.contains("after command"));
     }
 
     #[test]

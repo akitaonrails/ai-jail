@@ -381,7 +381,7 @@ fn normalize_host(host: &str) -> String {
 /// literals match only that exact IP -- no suffix rule for addresses.
 /// Matching is case-insensitive and trailing-dot normalized on both
 /// sides.
-fn allowlist_matches(allowlist: &[String], host: &str) -> bool {
+pub(crate) fn allowlist_matches(allowlist: &[String], host: &str) -> bool {
     let host = normalize_host(host);
     allowlist.iter().any(|entry| {
         let entry = normalize_host(entry);

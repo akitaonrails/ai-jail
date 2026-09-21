@@ -228,6 +228,13 @@ pub struct Config {
     pub systemd_user: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_tcp_ports: Vec<u16>,
+    /// Hosts reachable through the filtered-egress CONNECT proxy
+    /// (docs/connect-proxy-plan.md). A non-empty list selects filtered
+    /// network mode; an entry matches the host itself and its
+    /// subdomains. The untrusted project `.ai-jail` may only shrink
+    /// this list, never grow it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_dir: Option<PathBuf>,
     /// Trusted capability: mount the invoked agent's own state
@@ -274,6 +281,17 @@ struct GlobalConfig {
     base: Config,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     commands: BTreeMap<String, Config>,
+}
+
+/// Effective network posture of a launch (docs/connect-proxy-plan.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkMode {
+    /// No network (default).
+    Off,
+    /// CONNECT-only egress to `allow_hosts` via the built-in proxy.
+    Filtered,
+    /// Unrestricted network (`network = true` / `--network`).
+    Full,
 }
 
 impl Config {
@@ -375,6 +393,23 @@ impl Config {
     }
     pub fn allow_tcp_ports(&self) -> &[u16] {
         &self.allow_tcp_ports
+    }
+    pub fn allow_hosts(&self) -> &[String] {
+        &self.allow_hosts
+    }
+    /// Effective network posture: `network = true` wins as unrestricted,
+    /// a non-empty `allow_hosts` selects filtered egress through the
+    /// CONNECT proxy, otherwise networking stays off. The
+    /// Full-plus-allow_hosts contradiction is a launch error, checked in
+    /// main (`validate_network_flags`).
+    pub fn network_mode(&self) -> NetworkMode {
+        if self.network_enabled() {
+            NetworkMode::Full
+        } else if !self.allow_hosts.is_empty() {
+            NetworkMode::Filtered
+        } else {
+            NetworkMode::Off
+        }
     }
     /// Command-specific agent state mounts (`~/.claude`, `~/.codex`,
     /// `~/.claude.json`, ...) are a trusted capability: disabled
@@ -733,6 +768,9 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     c.allow_tcp_ports.extend(local.allow_tcp_ports);
     c.allow_tcp_ports.sort_unstable();
     c.allow_tcp_ports.dedup();
+    // Trusted layers union the filtered-egress allowlist.
+    c.allow_hosts.extend(local.allow_hosts);
+    dedup_strings(&mut c.allow_hosts);
     take!(claude_dir);
     // Status bar + resize redraw key stay from global — local should
     // not override user-level preferences.
@@ -1096,6 +1134,20 @@ pub fn merge_with_global_report(
                 .map(u16::to_string)
                 .collect::<Vec<_>>()
                 .join(", ")
+        ));
+    }
+    // Filtered egress is shrink-only from an untrusted project: entries
+    // already in the baseline survive (the project may narrow by
+    // omission), anything new is dropped with a warning.
+    let dropped_hosts: Vec<_> = local
+        .allow_hosts
+        .into_iter()
+        .filter(|host| !c.allow_hosts.contains(host))
+        .collect();
+    if !dropped_hosts.is_empty() {
+        warnings.push(format!(
+            "project .ai-jail allow_hosts ignored: {}",
+            dropped_hosts.join(", ")
         ));
     }
     if local.claude_dir.is_some() {
@@ -1529,6 +1581,9 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     config.allow_tcp_ports.sort_unstable();
     config.allow_tcp_ports.dedup();
 
+    config.allow_hosts.extend(cli.allow_hosts.iter().cloned());
+    dedup_strings(&mut config.allow_hosts);
+
     config.env_pass.extend(cli.env.iter().cloned());
     dedup_strings(&mut config.env_pass);
 
@@ -1629,7 +1684,7 @@ pub fn display_status(config: &Config) {
     print_shared_or_hidden("  Tailscale", config.tailscale);
     print_opt_in_tristate("  Display", config.no_display);
     print_opt_in_enabled("  Audio", config.audio);
-    print_opt_in_enabled("  Network", config.network);
+    print_network_mode(config);
     print_opt_in_enabled("  macOS host IPC", config.macos_host_ipc);
     print_opt_in_enabled("  X11", config.x11);
     print_opt_in_enabled("  Host shared memory", config.host_shm);
@@ -1776,6 +1831,20 @@ fn print_allow_tcp_ports(ports: &[u16], lockdown: bool) {
         " (only effective in lockdown mode)"
     };
     output::status_header("  Allow TCP ports", &format!("{joined}{note}"));
+}
+
+fn print_network_mode(config: &Config) {
+    let v = match config.network_mode() {
+        NetworkMode::Full => "enabled".to_string(),
+        NetworkMode::Filtered => {
+            format!("filtered ({} hosts)", config.allow_hosts.len())
+        }
+        NetworkMode::Off => "disabled".to_string(),
+    };
+    output::status_header("  Network", &v);
+    if config.network_mode() == NetworkMode::Filtered {
+        print_string_list("  Allow hosts", &config.allow_hosts);
+    }
 }
 
 #[cfg(test)]
@@ -2943,6 +3012,7 @@ no_gpu = true
             no_rlimits: None,
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000, 8080],
+            allow_hosts: vec!["api.anthropic.com".into()],
             claude_dir: None,
             agent_state: Some(true),
             inherit_env: None,
@@ -2978,6 +3048,7 @@ no_gpu = true
         assert_eq!(deserialized.no_rlimits, config.no_rlimits);
         assert_eq!(deserialized.systemd_user, config.systemd_user);
         assert_eq!(deserialized.allow_tcp_ports, config.allow_tcp_ports);
+        assert_eq!(deserialized.allow_hosts, config.allow_hosts);
         assert_eq!(deserialized.claude_dir, config.claude_dir);
         assert_eq!(deserialized.agent_state, config.agent_state);
         assert_eq!(deserialized.inherit_env, config.inherit_env);
@@ -3870,6 +3941,150 @@ allow_tcp_ports = [32000, 8080]
 "#;
         let cfg = parse_toml(toml).unwrap();
         assert_eq!(cfg.allow_tcp_ports, vec![32000, 8080]);
+    }
+
+    #[test]
+    fn parse_config_with_allow_hosts() {
+        let toml = r#"
+command = ["claude"]
+allow_hosts = ["api.anthropic.com", "github.com"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(
+            cfg.allow_hosts,
+            vec!["api.anthropic.com".to_string(), "github.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn regression_v1_22_0_config_without_allow_hosts() {
+        // Configs written before allow_hosts existed must still parse,
+        // defaulting to an empty list (network mode unchanged).
+        let toml = r#"
+command = ["claude"]
+rw_maps = []
+ro_maps = []
+hide_dotdirs = []
+mask = []
+deny_paths = []
+no_gpu = false
+no_docker = false
+no_display = false
+lockdown = false
+no_landlock = false
+no_seccomp = false
+no_rlimits = false
+allow_tcp_ports = []
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert!(cfg.allow_hosts.is_empty());
+        assert_eq!(cfg.network_mode(), NetworkMode::Off);
+    }
+
+    #[test]
+    fn network_mode_resolution() {
+        assert_eq!(Config::default().network_mode(), NetworkMode::Off);
+        assert_eq!(
+            Config {
+                allow_hosts: vec!["api.anthropic.com".into()],
+                ..Config::default()
+            }
+            .network_mode(),
+            NetworkMode::Filtered
+        );
+        assert_eq!(
+            Config {
+                network: Some(true),
+                ..Config::default()
+            }
+            .network_mode(),
+            NetworkMode::Full
+        );
+        // The contradictory combination resolves Full here; it is a
+        // hard launch error via validate_network_flags in main.
+        assert_eq!(
+            Config {
+                network: Some(true),
+                allow_hosts: vec!["api.anthropic.com".into()],
+                ..Config::default()
+            }
+            .network_mode(),
+            NetworkMode::Full
+        );
+    }
+
+    #[test]
+    fn merge_allow_hosts_from_cli() {
+        let existing = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            allow_hosts: vec!["github.com".into(), "api.anthropic.com".into()],
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(
+            merged.allow_hosts,
+            vec!["api.anthropic.com".to_string(), "github.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_allow_hosts_trusted_union() {
+        let global = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let local = Config {
+            allow_hosts: vec!["github.com".into(), "api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let merged = merge_with_global(global, local);
+        assert_eq!(
+            merged.allow_hosts,
+            vec!["api.anthropic.com".to_string(), "github.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn project_allow_hosts_shrinks_silently() {
+        // A project may narrow the baseline by omission or subset.
+        let baseline = Config {
+            allow_hosts: vec!["api.anthropic.com".into(), "github.com".into()],
+            ..Config::default()
+        };
+        let project = Config {
+            allow_hosts: vec!["github.com".into()],
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert_eq!(
+            merged.allow_hosts,
+            vec!["api.anthropic.com".to_string(), "github.com".to_string()]
+        );
+        assert!(!warnings.iter().any(|w| w.contains("allow_hosts")));
+    }
+
+    #[test]
+    fn project_allow_hosts_cannot_extend_baseline() {
+        let baseline = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let project = Config {
+            allow_hosts: vec!["api.anthropic.com".into(), "evil.com".into()],
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert_eq!(merged.allow_hosts, vec!["api.anthropic.com".to_string()]);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("allow_hosts") && w.contains("evil.com"))
+        );
     }
 
     #[test]
@@ -4901,6 +5116,7 @@ hide_dotdirs = [".my_secrets"]
             no_rlimits: None,
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000],
+            allow_hosts: vec![],
             claude_dir: None,
             agent_state: None,
             inherit_env: None,
