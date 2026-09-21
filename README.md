@@ -108,7 +108,10 @@ user bus are also off by default.
 `--allow-host HOST` (repeatable, or `allow_hosts = [...]` in `.ai-jail`)
 enables filtered egress instead: the sandbox keeps no route off the host
 except a built-in CONNECT proxy that dials exactly the listed hosts — an
-entry matches the host itself and its subdomains. It is TCP/CONNECT-only:
+entry matches the host itself and its subdomains. On Linux the fence is a
+private network namespace whose only reachable endpoint is an in-sandbox
+bridge; on macOS it is a seatbelt endpoint rule allowing outbound only to
+the proxy's loopback port. It is TCP/CONNECT-only:
 no UDP, and no working DNS inside the sandbox on Linux (on macOS the system
 resolver is not fenced). It cannot combine with `--network` or `--browser`,
 and a project `.ai-jail` may only shrink the list, never grow it.

@@ -413,12 +413,12 @@ fn run() -> Result<i32, String> {
     // Prepare sandbox resources (temp hosts file on Linux, no-op on macOS)
     let guard = sandbox::prepare()?;
 
-    // Filtered egress (Linux): the CONNECT proxy runs as threads in
-    // this supervisor process; the sandbox reaches it through the
-    // bind-mounted Unix socket and the in-sandbox bridge. The handle
-    // must outlive the child, so it stays bound for the rest of run()
-    // (dropping it unlinks the socket file). macOS wires its direct
-    // loopback endpoint in phase 4 of the plan.
+    // Filtered egress: the CONNECT proxy runs as threads in this
+    // supervisor process. On Linux the sandbox reaches it through the
+    // bind-mounted Unix socket and the in-sandbox bridge; on macOS the
+    // child talks to its loopback TCP port directly (no netns there).
+    // The handle must outlive the child, so it stays bound for the rest
+    // of run() (dropping it unlinks the socket file).
     #[cfg(target_os = "linux")]
     let egress_proxy = if config.network_mode() == config::NetworkMode::Filtered
     {
@@ -437,9 +437,17 @@ fn run() -> Result<i32, String> {
     } else {
         None
     };
-    #[cfg(not(target_os = "linux"))]
-    let egress_proxy: Option<proxy::Proxy> = None;
-    let proxy_socket = egress_proxy.as_ref().and_then(proxy::Proxy::unix_path);
+    #[cfg(target_os = "macos")]
+    let egress_proxy = if config.network_mode() == config::NetworkMode::Filtered
+    {
+        let proxy_config =
+            proxy::ProxyConfig::new(config.allow_hosts().to_vec());
+        let proxy = proxy::Proxy::start(proxy_config, None)
+            .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
+        Some(proxy)
+    } else {
+        None
+    };
 
     let project_dir = std::env::current_dir()
         .map_err(|e| format!("Cannot determine current directory: {e}"))?;
@@ -463,7 +471,7 @@ fn run() -> Result<i32, String> {
             &config,
             &project_dir,
             cli.verbose,
-            proxy_socket,
+            egress_proxy.as_ref(),
         )?;
         output::dry_run_line(&formatted);
         return Ok(0);
@@ -558,7 +566,7 @@ fn run() -> Result<i32, String> {
         &project_dir,
         cli.verbose,
         sandbox_tty.as_deref(),
-        proxy_socket,
+        egress_proxy.as_ref(),
     )?;
 
     // Apply NOFILE and CORE limits on the parent (inherited by child

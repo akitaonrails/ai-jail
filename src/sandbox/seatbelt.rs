@@ -55,6 +55,12 @@ pub fn platform_notes(config: &Config) {
              tailscaled is reachable only if seatbelt network rules \
              already allow it)",
         );
+        if config.network_mode() == crate::config::NetworkMode::Filtered {
+            output::warn(
+                "--tailscale is unreachable in filtered egress mode: \
+                 the only allowed endpoint is the egress proxy",
+            );
+        }
     }
     if !config.allow_tcp_ports().is_empty() && config.lockdown_enabled() {
         output::warn(
@@ -75,9 +81,11 @@ pub fn build(
     project_dir: &Path,
     verbose: bool,
     sandbox_tty: Option<&Path>,
+    proxy_port: Option<u16>,
 ) -> Command {
     let lockdown = config.lockdown_enabled();
-    let profile = build_profile(config, project_dir, verbose, sandbox_tty);
+    let profile =
+        build_profile(config, project_dir, verbose, sandbox_tty, proxy_port);
     let launch = super::build_launch_command(config);
 
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
@@ -87,7 +95,7 @@ pub fn build(
     cmd.args(&launch.args);
     cmd.current_dir(project_dir);
 
-    apply_child_env(&mut cmd, config);
+    apply_child_env(&mut cmd, config, proxy_port);
 
     // The profile only grants RW inside the dedicated session scratch
     // dir; TMPDIR must point there or every temp operation in the
@@ -104,7 +112,13 @@ pub fn build(
 /// often carries tokens and machine-specific state). `env_pass`
 /// entries (`NAME` or `NAME=VALUE`) are always applied verbatim on
 /// top. Mirrors `bwrap::env_args` so both backends filter identically.
-fn apply_child_env(cmd: &mut Command, config: &Config) {
+/// `proxy_port` is the filtered-egress proxy's loopback port, when the
+/// launch is in filtered mode.
+fn apply_child_env(
+    cmd: &mut Command,
+    config: &Config,
+    proxy_port: Option<u16>,
+) {
     cmd.env_clear();
 
     let host_env: Vec<(String, String)> = std::env::vars().collect();
@@ -134,11 +148,29 @@ fn apply_child_env(cmd: &mut Command, config: &Config) {
     if let Some(dir) = &config.claude_dir {
         cmd.env("CLAUDE_CONFIG_DIR", dir);
     }
+
+    // Filtered egress: force the proxy env onto the child, pointing at
+    // the outer proxy's loopback TCP port. Emitted after the env_pass
+    // application above: Command::env replaces earlier values, so a
+    // user `--env http_proxy=...` cannot redirect the child to a
+    // different proxy -- the same guarantee the Linux bwrap env gives.
+    if config.network_mode() == crate::config::NetworkMode::Filtered
+        && let Some(port) = proxy_port
+    {
+        for (key, value) in crate::proxy::env_vars(port) {
+            cmd.env(key, value);
+        }
+    }
 }
 
-pub fn dry_run(config: &Config, project_dir: &Path, verbose: bool) -> String {
+pub fn dry_run(
+    config: &Config,
+    project_dir: &Path,
+    verbose: bool,
+    proxy_port: Option<u16>,
+) -> String {
     // No PTY exists for a dry run, so no terminal ioctl rule is emitted.
-    let profile = build_profile(config, project_dir, verbose, None);
+    let profile = build_profile(config, project_dir, verbose, None, proxy_port);
     let launch = super::build_launch_command(config);
 
     let mut command_line = String::from("sandbox-exec -p '<profile>' -- ");
@@ -156,9 +188,14 @@ fn build_profile(
     project_dir: &Path,
     verbose: bool,
     sandbox_tty: Option<&Path>,
+    proxy_port: Option<u16>,
 ) -> String {
-    let profile =
-        generate_sbpl_profile_for_tty(config, project_dir, sandbox_tty);
+    let profile = generate_sbpl_profile_for_tty(
+        config,
+        project_dir,
+        sandbox_tty,
+        proxy_port,
+    );
 
     if verbose {
         output::verbose("SBPL profile:");
@@ -223,13 +260,25 @@ fn sbpl_path(p: &Path) -> String {
 /// PTY; see [`generate_sbpl_profile_for_tty`].
 #[cfg(test)]
 fn generate_sbpl_profile(config: &Config, project_dir: &Path) -> String {
-    generate_sbpl_profile_for_tty(config, project_dir, None)
+    generate_sbpl_profile_for_tty(config, project_dir, None, None)
+}
+
+/// Profile for a filtered-egress launch whose outer proxy listens on
+/// the given loopback port; see [`generate_sbpl_profile_for_tty`].
+#[cfg(test)]
+fn generate_sbpl_profile_filtered(
+    config: &Config,
+    project_dir: &Path,
+    proxy_port: u16,
+) -> String {
+    generate_sbpl_profile_for_tty(config, project_dir, None, Some(proxy_port))
 }
 
 fn generate_sbpl_profile_for_tty(
     config: &Config,
     project_dir: &Path,
     sandbox_tty: Option<&Path>,
+    proxy_port: Option<u16>,
 ) -> String {
     let lockdown = config.lockdown_enabled();
     let exempt = super::dotdir_exemptions(config);
@@ -277,7 +326,7 @@ fn generate_sbpl_profile_for_tty(
         config.macos_host_ipc_enabled(),
         sandbox_tty,
     );
-    push_network_section(&mut profile, config);
+    push_network_section(&mut profile, config, proxy_port);
     let is_claude =
         crate::command::effective_name(&config.command) == Some("claude");
     push_file_read_section(
@@ -511,16 +560,38 @@ fn push_static_sections(
     profile.push('\n');
 }
 
-fn push_network_section(profile: &mut String, config: &Config) {
-    if !config.network_enabled() || config.lockdown_enabled() {
-        return;
+fn push_network_section(
+    profile: &mut String,
+    config: &Config,
+    proxy_port: Option<u16>,
+) {
+    match config.network_mode() {
+        crate::config::NetworkMode::Full if !config.lockdown_enabled() => {
+            // Full network can exfiltrate every file this profile
+            // permits reading.
+            profile.push_str("; Network\n");
+            profile.push_str("(allow network-outbound)\n");
+            profile.push_str("(allow network-inbound)\n");
+            profile.push_str("(allow network-bind)\n");
+            profile.push_str("(allow system-socket)\n\n");
+        }
+        crate::config::NetworkMode::Filtered => {
+            // Filtered egress: no blanket network rules, no inbound or
+            // bind -- the only reachable endpoint is the outer proxy's
+            // loopback port, and the proxy decides which CONNECT
+            // targets are allowed (the same rule shape Anthropic's
+            // sandbox-runtime ships). Without a started proxy there is
+            // nothing to name, and deny-default keeps every network
+            // operation refused.
+            if let Some(port) = proxy_port {
+                profile.push_str("; Filtered egress: CONNECT proxy only\n");
+                profile.push_str(&format!(
+                    "(allow network-outbound (remote ip \"localhost:{port}\"))\n\n"
+                ));
+            }
+        }
+        _ => {}
     }
-    // Full network can exfiltrate every file this profile permits reading.
-    profile.push_str("; Network\n");
-    profile.push_str("(allow network-outbound)\n");
-    profile.push_str("(allow network-inbound)\n");
-    profile.push_str("(allow network-bind)\n");
-    profile.push_str("(allow system-socket)\n\n");
 }
 
 fn push_file_read_section(
@@ -1290,6 +1361,138 @@ mod tests {
     }
 
     #[test]
+    fn sbpl_profile_filtered_egress_allows_only_the_proxy_endpoint() {
+        let config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile_filtered(
+            &config,
+            Path::new("/tmp/test-project"),
+            15919,
+        );
+        // The only allowed endpoint is the outer proxy's loopback port;
+        // deny-default covers everything else.
+        assert!(profile.contains(
+            "(allow network-outbound (remote ip \"localhost:15919\"))"
+        ));
+        assert!(!profile.contains("(allow network-outbound)\n"));
+        assert!(!profile.contains("(allow network-inbound)"));
+        assert!(!profile.contains("(allow network-bind)"));
+        assert!(!profile.contains("(allow system-socket)"));
+
+        // Lockdown narrows, never widens: filtered + lockdown still
+        // gets exactly the proxy endpoint, nothing more.
+        let locked = Config {
+            lockdown: Some(true),
+            ..config
+        };
+        let locked_profile = generate_sbpl_profile_filtered(
+            &locked,
+            Path::new("/tmp/test-project"),
+            15919,
+        );
+        assert!(locked_profile.contains(
+            "(allow network-outbound (remote ip \"localhost:15919\"))"
+        ));
+        assert!(!locked_profile.contains("(allow network-inbound)"));
+    }
+
+    #[test]
+    fn sbpl_profile_filtered_egress_without_proxy_fails_closed() {
+        // No started proxy -> no port to name -> no network rule at all.
+        let config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let profile =
+            generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
+        assert!(!profile.contains("network-outbound"));
+        assert!(!profile.contains("network-inbound"));
+        assert!(!profile.contains("network-bind"));
+    }
+
+    #[test]
+    fn sbpl_profile_non_filtered_network_unchanged() {
+        // Network on keeps the blanket rules; off keeps nothing. The
+        // endpoint-scoped rule must not appear outside filtered mode.
+        let on = Config {
+            network: Some(true),
+            ..Config::default()
+        };
+        let profile =
+            generate_sbpl_profile(&on, Path::new("/tmp/test-project"));
+        assert!(profile.contains("(allow network-outbound)\n"));
+        assert!(!profile.contains("remote ip"));
+
+        let off_profile = generate_sbpl_profile(
+            &Config::default(),
+            Path::new("/tmp/test-project"),
+        );
+        assert!(!off_profile.contains("network-outbound"));
+        assert!(!off_profile.contains("remote ip"));
+    }
+
+    #[test]
+    fn build_child_env_filtered_forces_proxy_env() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _passed = EnvVarGuard::set("AI_JAIL_TEST_SECRET", "hunter2");
+
+        // A hostile env_pass tries to redirect the child to another
+        // proxy; the forced values are applied after it and win.
+        let config = Config {
+            command: vec!["bash".into()],
+            no_mise: Some(true),
+            allow_hosts: vec!["api.anthropic.com".into()],
+            env_pass: vec![
+                "http_proxy=http://127.0.0.1:1".into(),
+                "no_proxy=*".into(),
+            ],
+            ..Config::default()
+        };
+        let cmd = build(
+            &config,
+            Path::new("/tmp/test-project"),
+            false,
+            None,
+            Some(15919),
+        );
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        let get = |name: &str| {
+            env.get(&std::ffi::OsStr::new(name)).copied().flatten()
+        };
+
+        let url = std::ffi::OsStr::new("http://127.0.0.1:15919");
+        for key in [
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+        ] {
+            assert_eq!(get(key), Some(url), "{key}");
+        }
+        assert_eq!(get("no_proxy"), Some(std::ffi::OsStr::new("")));
+        assert_eq!(get("NO_PROXY"), Some(std::ffi::OsStr::new("")));
+    }
+
+    #[test]
+    fn build_child_env_non_filtered_has_no_proxy_env() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let config = Config {
+            command: vec!["bash".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let cmd =
+            build(&config, Path::new("/tmp/test-project"), false, None, None);
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert!(!env.contains_key(std::ffi::OsStr::new("http_proxy")));
+        assert!(!env.contains_key(std::ffi::OsStr::new("ALL_PROXY")));
+    }
+
+    #[test]
     fn sbpl_profile_denies_deny_paths_for_read_and_write() {
         let config = Config {
             deny_paths: vec![PathBuf::from(".env")],
@@ -1520,7 +1723,7 @@ mod tests {
             ..Config::default()
         };
         let project = PathBuf::from("/tmp/test-project");
-        let output = dry_run(&config, &project, false);
+        let output = dry_run(&config, &project, false, None);
         assert!(output.contains("sandbox-exec"));
         assert!(output.contains("SBPL profile"));
     }
@@ -2032,6 +2235,7 @@ mod tests {
             &Config::default(),
             &PathBuf::from("/tmp/test-project"),
             Some(&tty),
+            None,
         );
         assert!(
             profile.contains("(allow file-ioctl (literal \"/dev/ttys003\"))")
@@ -2054,6 +2258,7 @@ mod tests {
         let profile = generate_sbpl_profile_for_tty(
             &Config::default(),
             &PathBuf::from("/tmp/test-project"),
+            None,
             None,
         );
         assert!(!profile.contains("(allow file-ioctl (literal \"/dev/ttys"));
@@ -2082,7 +2287,7 @@ mod tests {
         let pty = crate::pty::open().expect("openpty");
         let tty = pty.slave_path().expect("ptsname");
         let profile =
-            generate_sbpl_profile_for_tty(&config, &project, Some(&tty));
+            generate_sbpl_profile_for_tty(&config, &project, Some(&tty), None);
 
         let output = Command::new("/usr/bin/sandbox-exec")
             .arg("-p")
@@ -2495,7 +2700,8 @@ mod tests {
             no_mise: Some(true),
             ..Config::default()
         };
-        let cmd = build(&config, Path::new("/tmp/test-project"), false, None);
+        let cmd =
+            build(&config, Path::new("/tmp/test-project"), false, None, None);
         let session = root.join(format!("ai-jail-{}", std::process::id()));
         let tmpdir = cmd
             .get_envs()
@@ -2521,7 +2727,8 @@ mod tests {
             ],
             ..Config::default()
         };
-        let cmd = build(&config, Path::new("/tmp/test-project"), false, None);
+        let cmd =
+            build(&config, Path::new("/tmp/test-project"), false, None, None);
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
 
         let get = |name: &str| {
@@ -2561,7 +2768,8 @@ mod tests {
             inherit_env: Some(true),
             ..Config::default()
         };
-        let cmd = build(&config, Path::new("/tmp/test-project"), false, None);
+        let cmd =
+            build(&config, Path::new("/tmp/test-project"), false, None, None);
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert_eq!(
             env.get(&std::ffi::OsStr::new("AI_JAIL_HOST_STATE"))

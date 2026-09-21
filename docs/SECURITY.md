@@ -103,7 +103,13 @@ required rather than assumed: a group-writable store without it is refused.
 The binary itself must still carry no write bits.
 
 macOS starts with no global reads, network, or host IPC, and supports the same
-opt-in `--agent-state` credential mounts as Linux. Signalling between processes
+opt-in `--agent-state` credential mounts as Linux. Filtered egress
+(`--allow-host`) replaces the blanket network denial with one endpoint-scoped
+rule — outbound to `localhost:<proxy-port>` only, no inbound or bind — so the
+child reaches nothing but the CONNECT proxy, which decides which targets are
+allowed. The system resolver is not fenced: `getaddrinfo()` still works via
+mDNSResponder even when `connect()` is denied, so a low-bandwidth DNS channel
+remains (the same gap Anthropic's sandbox-runtime documents). Signalling between processes
 inside the same sandbox is always allowed (`signal` targeting `same-sandbox`),
 so an agent can manage the workers it spawns; signalling host processes stays
 denied without `--macos-host-ipc`. The default profile also grants
