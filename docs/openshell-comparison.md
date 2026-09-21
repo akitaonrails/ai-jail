@@ -159,6 +159,9 @@ build anything from this research, it's the loopback CONNECT proxy with
 `--allow-host`; everything else is validation that the minimal model was
 right.
 
+**Follow-up**: the design and implementation plan for that proxy now lives
+in [connect-proxy-plan.md](connect-proxy-plan.md).
+
 ## Sources
 
 - [NVIDIA/OpenShell repo](https://github.com/NVIDIA/OpenShell) and

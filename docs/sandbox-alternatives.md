@@ -24,12 +24,12 @@ For this use case, nothing else fits as well.
 
 ### Rust libraries
 
-**Landlock** (`landlock` crate v0.4) -- Linux Security Module, kernel 5.13+. Restricts filesystem access per-path and (since kernel 6.2) network bind/connect per-port. Works unprivileged. But it can't create namespaces, can't do bind mounts, can't set a custom hostname. It restricts what syscalls can do, not the environment the process sees.
+**Landlock** (`landlock` crate v0.4) -- Linux Security Module, kernel 5.13+. Restricts filesystem access per-path and (since kernel 6.7, ABI V4) network TCP bind/connect per-port. Works unprivileged. But it can't create namespaces, can't do bind mounts, can't set a custom hostname. It restricts what syscalls can do, not the environment the process sees.
 
 | Capability                        | Support            |
 | --------------------------------- | ------------------ |
 | Filesystem restriction (per-path) | Yes (kernel 5.13+) |
-| Network restriction (per-port)    | Yes (kernel 6.2+)  |
+| Network restriction (per-port)    | Yes (kernel 6.7+)  |
 | Unprivileged                      | Yes                |
 | PID/UTS/IPC namespaces            | No                 |
 | Bind mounts                       | No                 |

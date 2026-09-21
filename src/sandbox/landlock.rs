@@ -18,7 +18,7 @@
 //  2. Enforces read-only where bwrap uses ro-bind — Landlock's
 //     VFS-level checks catch writes even through /proc/self/fd
 //     or mmap(PROT_WRITE) on a read-only bind mount.
-//  3. Restricts network (V4, kernel ≥ 6.5) — in lockdown mode,
+//  3. Restricts network (V4, kernel ≥ 6.7) — in lockdown mode,
 //     denies all TCP bind/connect as defense-in-depth alongside
 //     bwrap's --unshare-net.
 //
@@ -177,7 +177,7 @@ fn do_apply(
     Ok(status.ruleset)
 }
 
-/// Apply Landlock V4 (kernel ≥ 6.5) network restrictions.
+/// Apply Landlock V4 (kernel ≥ 6.7) network restrictions.
 ///
 /// In lockdown mode with no allowed ports: handle BindTcp +
 /// ConnectTcp but add NO port rules → all TCP is denied. This
@@ -271,7 +271,7 @@ fn apply_net_rules(config: &Config, verbose: bool) -> Result<(), String> {
                 if verbose {
                     output::verbose(
                         "Landlock V4 net: unavailable \
-                         (kernel < 6.5, using \
+                         (kernel < 6.7, using \
                          --unshare-net only)",
                     );
                 }
