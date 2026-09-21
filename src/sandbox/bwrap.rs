@@ -191,6 +191,10 @@ struct MountSet {
     ssh_agent: Vec<Mount>,
     ssh_env: Vec<(String, String)>,
     claude_env: Vec<(String, String)>,
+    /// Forced proxy environment in filtered-egress mode
+    /// (http_proxy/https_proxy/all_proxy + an emptied no_proxy), empty
+    /// otherwise.
+    proxy_env: Vec<(String, String)>,
     pictures: Vec<Mount>,
     browser_state: Vec<Mount>,
     extra: Vec<Mount>,
@@ -359,6 +363,18 @@ impl MountSet {
 
         // Claude config dir env (always, even in lockdown)
         for (key, val) in &self.claude_env {
+            args.push("--setenv".into());
+            args.push(key.clone());
+            args.push(val.clone());
+        }
+
+        // Filtered egress proxy env (always, even in lockdown). Must
+        // follow env_args like the other capability env (#122): bwrap
+        // applies --setenv in order, so these forced values also win
+        // over a user-supplied `--env http_proxy=...` -- in filtered
+        // mode the child must not be told to use a different proxy,
+        // and the emptied no_proxy must not exempt anything.
+        for (key, val) in &self.proxy_env {
             args.push("--setenv".into());
             args.push(key.clone());
             args.push(val.clone());
@@ -1101,6 +1117,10 @@ fn resolve_landlock_wrapper(
     if !config.landlock_enabled()
         && !config.seccomp_enabled()
         && !config.rlimits_enabled()
+        // Filtered egress has new work for the wrapper even with every
+        // restriction control off: spawning the in-sandbox proxy bridge
+        // before the agent execs.
+        && config.network_mode() != crate::config::NetworkMode::Filtered
     {
         return Ok(None);
     }
@@ -1143,7 +1163,9 @@ fn landlock_wrapper_args(
     // Forward the network capability so the inner wrapper's seccomp filter
     // can make the same decision the outer process did. Landlock's network
     // rules key on lockdown and allowed ports, never on this, so forwarding
-    // it cannot loosen them.
+    // it cannot loosen them. Filtered egress forwards --no-network: the
+    // child only needs loopback TCP to the bridge, so the seccomp netlink
+    // carve-out stays off exactly as in network-off mode.
     args.push(if config.network_enabled() {
         "--network".into()
     } else {
@@ -1209,6 +1231,13 @@ fn landlock_wrapper_args(
         args.push(port.to_string());
     }
 
+    // Filtered egress: the wrapper spawns the in-sandbox bridge on the
+    // fixed loopback port before it restricts itself.
+    if config.network_mode() == crate::config::NetworkMode::Filtered {
+        args.push("--proxy-bridge-port".into());
+        args.push(crate::proxy::BRIDGE_PORT.to_string());
+    }
+
     if config.browser_profile().is_none() {
         args.extend_from_slice(map_args);
     }
@@ -1238,6 +1267,7 @@ pub fn build(
     config: &Config,
     project_dir: &Path,
     verbose: bool,
+    proxy_socket: Option<&Path>,
 ) -> Result<Command, String> {
     let sources = MountSources::from_guard(guard);
     let mount_set =
@@ -1269,6 +1299,10 @@ pub fn build(
         for arg in m.to_args() {
             cmd.arg(arg);
         }
+    }
+
+    for arg in proxy_socket_mount_args(config, proxy_socket)? {
+        cmd.arg(arg);
     }
 
     for arg in mount_set.isolation_args(
@@ -1303,14 +1337,48 @@ pub fn build(
     Ok(cmd)
 }
 
+/// Filtered egress: bind the outer proxy's Unix socket into the sandbox
+/// at the fixed internal path. Only the socket file is mounted -- the
+/// temp dir it lives in stays hidden. Emitted after all other mounts so
+/// the /tmp tmpfs already exists (the same constraint as the Landlock
+/// wrapper binary mount above). Writable bind: the bridge connect()s to
+/// it, and Unix socket connect does not cross network namespaces.
+fn proxy_socket_mount_args(
+    config: &Config,
+    proxy_socket: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    let filtered =
+        config.network_mode() == crate::config::NetworkMode::Filtered;
+    match (filtered, proxy_socket) {
+        (true, Some(sock)) => Ok(Mount::Bind {
+            src: sock.to_path_buf(),
+            dest: PathBuf::from(crate::proxy::IN_SANDBOX_SOCK_PATH),
+        }
+        .to_args()),
+        // Filtered egress without the outer proxy would silently mean
+        // "no egress at all" -- refuse to build the sandbox instead.
+        (true, None) => {
+            Err("filtered egress requires the outer proxy's Unix socket".into())
+        }
+        (false, _) => Ok(vec![]),
+    }
+}
+
 pub fn dry_run(
     guard: &SandboxGuard,
     config: &Config,
     project_dir: &Path,
     verbose: bool,
+    proxy_socket: Option<&Path>,
 ) -> Result<String, String> {
     let sources = MountSources::from_guard(guard);
-    let args = build_dry_run_args_full(config, project_dir, &sources, verbose)?;
+    let args = build_dry_run_args_full(
+        config,
+        project_dir,
+        &sources,
+        verbose,
+        proxy_socket,
+    )?;
     Ok(format_dry_run_args(&args))
 }
 
@@ -1324,7 +1392,7 @@ fn build_dry_run_args(
     verbose: bool,
 ) -> Result<Vec<String>, String> {
     let sources = MountSources::legacy(hosts_mount, resolv_mount, empty_path);
-    build_dry_run_args_full(config, project_dir, &sources, verbose)
+    build_dry_run_args_full(config, project_dir, &sources, verbose, None)
 }
 
 fn build_dry_run_args_full(
@@ -1332,6 +1400,7 @@ fn build_dry_run_args_full(
     project_dir: &Path,
     sources: &MountSources<'_>,
     verbose: bool,
+    proxy_socket: Option<&Path>,
 ) -> Result<Vec<String>, String> {
     let mount_set =
         discover_mounts_full(config, project_dir, sources, verbose)?;
@@ -1354,6 +1423,8 @@ fn build_dry_run_args_full(
         };
         args.extend(m.to_args());
     }
+
+    args.extend(proxy_socket_mount_args(config, proxy_socket)?);
 
     args.extend(mount_set.isolation_args(
         project_dir,
@@ -1469,6 +1540,15 @@ fn discover_mounts_full(
     let (ssh_agent_mount, ssh_env) =
         discover_ssh(config, lockdown, browser_mode, private_home, verbose);
     let claude_env = discover_claude_env(config);
+    // Filtered egress forces the proxy env onto the child. The values
+    // name the in-sandbox bridge's fixed loopback port; the proxy's own
+    // outer TCP port is unreachable from inside the netns.
+    let proxy_env =
+        if config.network_mode() == crate::config::NetworkMode::Filtered {
+            crate::proxy::env_vars(crate::proxy::BRIDGE_PORT)
+        } else {
+            vec![]
+        };
     let mask_mounts =
         discover_mask_mounts(config, project_dir, sources.empty_path, verbose);
     let deny_mounts = discover_deny_mounts(
@@ -1588,6 +1668,7 @@ fn discover_mounts_full(
         ssh_agent: ssh_agent_mount,
         ssh_env,
         claude_env,
+        proxy_env,
         pictures: pictures_mount,
         browser_state: browser_state_mount,
         extra: extra_outside,
@@ -3508,8 +3589,9 @@ mod tests {
             ..minimal_test_config()
         };
         let sources = MountSources::from_guard(&guard);
-        let args = build_dry_run_args_full(&config, &project, &sources, false)
-            .unwrap();
+        let args =
+            build_dry_run_args_full(&config, &project, &sources, false, None)
+                .unwrap();
 
         assert!(args.windows(3).any(|w| {
             w[0] == "--ro-bind"
@@ -3583,6 +3665,7 @@ mod tests {
             &std::env::temp_dir(),
             &sources,
             false,
+            None,
         )
         .unwrap();
 
@@ -3619,6 +3702,7 @@ mod tests {
             &std::env::temp_dir(),
             &sources,
             false,
+            None,
         )
         .unwrap();
         let bus_str = bus.display().to_string();
@@ -3638,6 +3722,7 @@ mod tests {
             &std::env::temp_dir(),
             &sources,
             false,
+            None,
         )
         .unwrap();
         assert!(!args.iter().any(|arg| arg == &bus_str));
@@ -3710,6 +3795,7 @@ mod tests {
             &std::env::temp_dir(),
             &sources,
             false,
+            None,
         )
         .unwrap();
 
@@ -3737,12 +3823,124 @@ mod tests {
             &std::env::temp_dir(),
             &sources,
             false,
+            None,
         )
         .unwrap();
 
         for sub in AUDIO_SOCKET_SUBPATHS {
             assert!(!args.iter().any(|arg| arg.contains(sub)));
         }
+    }
+
+    #[test]
+    fn filtered_egress_dry_run_wires_socket_bridge_and_env() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let sock = PathBuf::from("/tmp/ai-jail-proxy-test.sock");
+        let args = build_dry_run_args_full(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            Some(&sock),
+        )
+        .unwrap();
+
+        // The private netns stays: filtered is not unrestricted network.
+        assert!(args.iter().any(|arg| arg == "--unshare-net"));
+        // The proxy socket is bind-mounted at the fixed internal path,
+        // after the /tmp tmpfs mount that backs its parent.
+        let sock_src = sock.display().to_string();
+        let sock_dest = crate::proxy::IN_SANDBOX_SOCK_PATH.to_string();
+        let tmpfs_tmp = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/tmp")
+            .expect("expected /tmp tmpfs mount");
+        let socket_mount = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--bind" && w[1] == sock_src && w[2] == sock_dest
+            })
+            .expect("expected proxy socket bind mount");
+        assert!(socket_mount > tmpfs_tmp);
+        // The wrapper is forced even with every restriction control
+        // off, and gets the bridge port forwarded.
+        assert!(args.iter().any(|arg| arg == "--landlock-exec"));
+        let port_pos = args
+            .iter()
+            .position(|arg| arg == "--proxy-bridge-port")
+            .expect("expected --proxy-bridge-port in wrapper args");
+        assert_eq!(args[port_pos + 1], crate::proxy::BRIDGE_PORT.to_string());
+        // The forced proxy env names the in-sandbox bridge port, and
+        // no_proxy is emptied.
+        let url = format!("http://127.0.0.1:{}", crate::proxy::BRIDGE_PORT);
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--setenv" && w[1] == "http_proxy" && w[2] == url
+        }));
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--setenv" && w[1] == "HTTPS_PROXY" && w[2] == url
+        }));
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--setenv" && w[1] == "no_proxy" && w[2].is_empty()
+        }));
+        // The outer proxy's own TCP port never appears.
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("ai-jail-proxy-test")
+                    && arg != &sock_src)
+        );
+    }
+
+    #[test]
+    fn filtered_egress_without_proxy_socket_fails_closed() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let result = build_dry_run_args_full(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn non_filtered_dry_run_has_no_proxy_wiring() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = minimal_test_config();
+        let sources = MountSources::from_guard(&guard);
+        let args = build_dry_run_args_full(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(!args.iter().any(|arg| arg == "--proxy-bridge-port"));
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| { w[0] == "--setenv" && w[1] == "http_proxy" })
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == crate::proxy::IN_SANDBOX_SOCK_PATH)
+        );
     }
 
     #[test]

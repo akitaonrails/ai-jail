@@ -108,9 +108,10 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 23. In-project overlay maps (after the project bind)
 24. Mask overlays (`--mask` and hidden project `.ai-jail`)
 25. Deny overlays (`--deny-path`, mode-000 file/dir placeholders)
-26. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last)
+26. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last of the discovered groups)
+27. Landlock wrapper self-mount and filtered-egress proxy socket (emitted after all discovered groups so the `/tmp` tmpfs already exists: ai-jail itself read-only at `/tmp/.ai-jail-landlock`, and in filtered mode a writable bind of the outer proxy's Unix socket to `/tmp/.ai-jail-proxy.sock` — only the socket file, never its temp dir)
 
-Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts. Overlay maps come after the home/dotfile mounts (so an overlay on a home path sits on top). User mounts and overlay maps whose destination sits **inside** the project directory are emitted after the project mount — bwrap gives the later mount precedence, so emitting them earlier lets the project bind silently shadow them (issue #83: `--map .git` stayed writable and in-project overlay writes hit the real files). Mask and deny overlays come after those so they still win. Overlay storage hide comes last, after the project mount, so it masks the upper/work layers the project mount would otherwise expose.
+Changing this order can break the sandbox. The tmpfs for `$HOME` must come before the individual dotfile bind mounts. Overlay maps come after the home/dotfile mounts (so an overlay on a home path sits on top). User mounts and overlay maps whose destination sits **inside** the project directory are emitted after the project mount — bwrap gives the later mount precedence, so emitting them earlier lets the project bind silently shadow them (issue #83: `--map .git` stayed writable and in-project overlay writes hit the real files). Mask and deny overlays come after those so they still win. Overlay storage hide comes last among the discovered groups, after the project mount, so it masks the upper/work layers the project mount would otherwise expose. Group 27 is emitted programmatically at the end of `build`/`dry_run`, not discovered with the rest: both its members must sit on top of the `/tmp` tmpfs from group 1.
 
 ## Before Committing
 
