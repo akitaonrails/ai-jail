@@ -152,10 +152,10 @@ impl Drop for ActiveGuard {
     }
 }
 
-/// The client side of a CONNECT session. `TcpStream` from the loopback
-/// listener, `UnixStream` from the Unix listener; the upstream side is
-/// always a `TcpStream`.
-trait ClientStream: Read + Write + Send + 'static {
+/// A duplex byte stream the proxy or bridge can relay: `TcpStream` from
+/// the loopback listeners, `UnixStream` from the Unix listener and the
+/// bridge's upstream side.
+pub(crate) trait ClientStream: Read + Write + Send + 'static {
     fn try_clone_stream(&self) -> io::Result<Self>
     where
         Self: Sized;
@@ -488,9 +488,12 @@ fn connect_upstream(
 /// joined -- joining only the first would leak the other thread.
 /// Established tunnels have no idle timeout: agent SSE streams are
 /// long-lived.
-fn relay<S: ClientStream>(client: S, upstream: TcpStream) {
+///
+/// Shared with the in-sandbox bridge (phase 3): the proxy relays
+/// client<->TCP-target, the bridge relays client<->Unix-socket.
+pub(crate) fn relay<C: ClientStream, U: ClientStream>(client: C, upstream: U) {
     let (mut client_reader, mut upstream_reader) =
-        match (client.try_clone_stream(), upstream.try_clone()) {
+        match (client.try_clone_stream(), upstream.try_clone_stream()) {
             (Ok(reader), Ok(upstream)) => (reader, upstream),
             _ => return,
         };
@@ -499,7 +502,7 @@ fn relay<S: ClientStream>(client: S, upstream: TcpStream) {
 
     let up = thread::spawn(move || {
         let _ = io::copy(&mut client_reader, &mut upstream_writer);
-        let _ = upstream_writer.shutdown(Shutdown::Write);
+        let _ = upstream_writer.shutdown_write();
     });
     let down = thread::spawn(move || {
         let _ = io::copy(&mut upstream_reader, &mut client_writer);
@@ -507,6 +510,77 @@ fn relay<S: ClientStream>(client: S, upstream: TcpStream) {
     });
     let _ = up.join();
     let _ = down.join();
+}
+
+/// Fixed loopback port the in-sandbox bridge listens on (Linux,
+/// filtered egress). The port lives inside the private netns, so it
+/// cannot collide with anything on the host, and the proxy's own TCP
+/// port is irrelevant in there -- the bridge is the only endpoint the
+/// child can reach.
+pub(crate) const BRIDGE_PORT: u16 = 15919;
+
+/// Fixed path inside the sandbox where the outer proxy's Unix socket is
+/// bind-mounted (Linux, filtered egress). Lives under /tmp, which is
+/// always a fresh tmpfs in the sandbox.
+pub(crate) const IN_SANDBOX_SOCK_PATH: &str = "/tmp/.ai-jail-proxy.sock";
+
+/// Host-side nonce path for the proxy's Unix socket of this launch.
+pub(crate) fn default_socket_path() -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    std::env::temp_dir().join(format!(
+        "ai-jail-proxy.{}.{}.sock",
+        std::process::id(),
+        nonce
+    ))
+}
+
+/// The forced proxy environment for a filtered-egress sandbox
+/// (post-`--clearenv`, so nothing else can precede it). `no_proxy` is
+/// emptied explicitly: an inherited exclusion would route around the
+/// proxy straight into the netns wall.
+pub(crate) fn env_vars(port: u16) -> Vec<(String, String)> {
+    let url = format!("http://127.0.0.1:{port}");
+    let mut vars: Vec<(String, String)> = [
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ]
+    .iter()
+    .map(|key| ((*key).to_string(), url.clone()))
+    .collect();
+    vars.push(("no_proxy".to_string(), String::new()));
+    vars.push(("NO_PROXY".to_string(), String::new()));
+    vars
+}
+
+/// The in-sandbox bridge end of filtered egress (Linux, phase 3 of
+/// docs/connect-proxy-plan.md): listen on 127.0.0.1:<port> inside the
+/// private netns and pump each accepted connection to the outer proxy's
+/// bind-mounted Unix socket. Connecting to a Unix socket is a
+/// filesystem operation, so it does not cross network namespaces.
+///
+/// Runs unrestricted by design: the landlock wrapper spawns this mode
+/// before apply_landlock/apply_seccomp, and those only restrict the
+/// caller and its future children.
+pub(crate) fn run_bridge(port: u16, socket: &Path) -> Result<(), String> {
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(|e| {
+            format!("proxy bridge cannot bind 127.0.0.1:{port}: {e}")
+        })?;
+    for client in listener.incoming().map_while(Result::ok) {
+        let socket = socket.to_path_buf();
+        thread::spawn(move || {
+            if let Ok(upstream) = UnixStream::connect(&socket) {
+                relay(client, upstream);
+            }
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -923,5 +997,59 @@ mod tests {
         // Dropping the handle unlinks the socket file.
         drop(proxy);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn e2e_bridge_pumps_between_loopback_and_unix_socket() {
+        // The phase-3 data path, without the sandbox: bridge on
+        // loopback <-> proxy's Unix socket <-> allowlisted fixture.
+        let echo = echo_server();
+        let path = std::env::temp_dir()
+            .join(format!("ai-jail-bridge-test-{}.sock", std::process::id()));
+        let proxy =
+            Proxy::start(test_config(&["127.0.0.1"]), Some(&path)).unwrap();
+
+        let bridge_listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let bridge_port = bridge_listener.local_addr().unwrap().port();
+        let bridge_socket = path.clone();
+        let bridge = thread::spawn(move || {
+            for client in bridge_listener.incoming().map_while(Result::ok) {
+                let socket = bridge_socket.clone();
+                thread::spawn(move || {
+                    if let Ok(upstream) = UnixStream::connect(&socket) {
+                        relay(client, upstream);
+                    }
+                });
+            }
+        });
+
+        let stream =
+            TcpStream::connect((Ipv4Addr::LOCALHOST, bridge_port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = connect_request(&format!("127.0.0.1:{echo}"));
+        (&stream).write_all(&request).unwrap();
+        assert_eq!(read_reply_head(&stream), REPLY_OK);
+        (&stream).write_all(b"through").unwrap();
+        let mut buf = [0_u8; 7];
+        (&mut &stream).read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"through");
+
+        // A non-allowlisted target through the same bridge is refused
+        // by the proxy's own allowlist.
+        let refused =
+            TcpStream::connect((Ipv4Addr::LOCALHOST, bridge_port)).unwrap();
+        refused
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        (&refused)
+            .write_all(&connect_request("10.0.0.1:443"))
+            .unwrap();
+        assert_eq!(read_reply_head(&refused), "HTTP/1.1 403 Forbidden\r\n\r\n");
+
+        drop(bridge);
+        drop(proxy);
     }
 }

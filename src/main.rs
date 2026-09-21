@@ -130,6 +130,20 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     // but re-running guarantees no relative path reaches landlock.
     config::absolutize_user_paths(&mut config, &project_dir);
 
+    // Filtered egress (Linux): spawn the in-sandbox bridge BEFORE
+    // apply_landlock/apply_seccomp below. Both restrict the caller and
+    // its future children only, so an already-spawned bridge process
+    // stays unrestricted -- it needs loopback listen plus Unix connect,
+    // neither of which the sandbox policy would grant. The bridge dies
+    // with the sandbox: it sits in the private pid namespace bwrap
+    // created (--unshare-pid), and the kernel kills every namespace
+    // member when the namespace init -- this process, after the exec
+    // below -- exits.
+    #[cfg(target_os = "linux")]
+    if let Some(port) = cli.proxy_bridge_port {
+        spawn_proxy_bridge(port)?;
+    }
+
     // Apply Landlock inside the sandbox (after bwrap namespace setup).
     // Hidden path flags preserve destinations atomically, including ':'.
     sandbox::apply_landlock(
@@ -179,6 +193,27 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
         .exec();
 
     Err(format!("Failed to exec {}: {err}", cli.command[0]))
+}
+
+/// Spawn the in-sandbox proxy bridge as a child of the landlock
+/// wrapper. Fatal on spawn failure: without the bridge, filtered egress
+/// silently means "no egress at all", which is not what the launch
+/// asked for. The child is never reaped or waited on -- it lives
+/// exactly as long as the sandbox's pid namespace (see the call site).
+#[cfg(target_os = "linux")]
+fn spawn_proxy_bridge(port: u16) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| {
+        format!("Cannot resolve ai-jail binary for the proxy bridge: {e}")
+    })?;
+    std::process::Command::new(exe)
+        .args([
+            "--proxy-bridge",
+            port.to_string().as_str(),
+            proxy::IN_SANDBOX_SOCK_PATH,
+        ])
+        .spawn()
+        .map_err(|e| format!("Failed to spawn the proxy bridge: {e}"))?;
+    Ok(())
 }
 
 /// Drop `PATH` entries that are not directories here, returning the rewritten
@@ -270,6 +305,12 @@ fn run() -> Result<i32, String> {
             output::set_quiet(true);
         }
         return run_landlock_exec(&cli);
+    }
+
+    // Internal: the in-sandbox filtered-egress bridge (spawned by the
+    // landlock wrapper). Prints nothing; quiet mode needs no handling.
+    if let Some((port, socket)) = &cli.proxy_bridge {
+        return proxy::run_bridge(*port, socket).map(|()| 0);
     }
 
     // Load local (./.ai-jail), then command-aware global ($HOME/.ai-jail), merge

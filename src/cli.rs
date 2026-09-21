@@ -147,6 +147,13 @@ pub struct CliArgs {
     /// Internal: apply Landlock and exec remaining command.
     /// Used as a wrapper inside the bwrap sandbox.
     pub landlock_exec: bool,
+    /// Internal: run the in-sandbox proxy bridge (filtered egress),
+    /// as (loopback port, outer proxy's Unix socket path). Spawned by
+    /// the --landlock-exec wrapper before it restricts itself.
+    pub proxy_bridge: Option<(u16, PathBuf)>,
+    /// Internal: loopback port the wrapper's proxy bridge should listen
+    /// on; only valid with --landlock-exec.
+    pub proxy_bridge_port: Option<u16>,
     /// Internal: opaque read-write mount destinations for Landlock.
     pub landlock_rw_paths: Vec<PathBuf>,
     /// Internal: opaque read-only mount destinations for Landlock.
@@ -383,6 +390,30 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 args.status_bar = Some(false);
             }
             Long("landlock-exec") => args.landlock_exec = true,
+            Long("proxy-bridge") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let port_text = val.to_string_lossy();
+                let port: u16 = port_text.parse().map_err(|_| {
+                    format!("invalid proxy bridge port: {port_text}")
+                })?;
+                let sock: PathBuf =
+                    parser.value().map_err(|e| e.to_string())?.into();
+                args.proxy_bridge = Some((port, sock));
+            }
+            Long("proxy-bridge-port") => {
+                if !args.landlock_exec {
+                    return Err(
+                        "--proxy-bridge-port is internal and only valid with --landlock-exec"
+                            .into(),
+                    );
+                }
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let port_text = val.to_string_lossy();
+                let port: u16 = port_text.parse().map_err(|_| {
+                    format!("invalid proxy bridge port: {port_text}")
+                })?;
+                args.proxy_bridge_port = Some(port);
+            }
             Long("landlock-rw-path") => {
                 if !args.landlock_exec {
                     return Err(
@@ -1425,6 +1456,36 @@ mod tests {
         let error =
             parse_test(&["claude", "--allow-host=example.com"]).unwrap_err();
         assert!(error.contains("after command"));
+    }
+
+    #[test]
+    fn parse_proxy_bridge_internal_mode() {
+        let args = parse_test(&[
+            "--proxy-bridge",
+            "15919",
+            "/tmp/.ai-jail-proxy.sock",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.proxy_bridge,
+            Some((15919, PathBuf::from("/tmp/.ai-jail-proxy.sock")))
+        );
+        assert!(parse_test(&["--proxy-bridge", "nope", "/tmp/s"]).is_err());
+        assert!(parse_test(&["--proxy-bridge", "15919"]).is_err());
+    }
+
+    #[test]
+    fn parse_proxy_bridge_port_requires_landlock_exec() {
+        assert!(parse_test(&["--proxy-bridge-port", "15919"]).is_err());
+        let args = parse_test(&[
+            "--landlock-exec",
+            "--proxy-bridge-port",
+            "15919",
+            "--",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.proxy_bridge_port, Some(15919));
     }
 
     #[test]
