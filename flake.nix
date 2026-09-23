@@ -102,7 +102,10 @@
             pkgs.makeWrapper
             pkgs.bubblewrap
           ];
-          nativeCheckInputs = [ pkgs.curl ];
+          nativeCheckInputs = [
+            pkgs.curl
+            pkgs.bash
+          ];
 
           BWRAP_BIN = "${pkgs.bubblewrap}/bin/bwrap";
 
@@ -130,6 +133,7 @@
             formatter
             pkgs.bubblewrap
             pkgs.curl
+            pkgs.bash
           ];
 
           shellHook = ''
