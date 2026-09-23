@@ -102,6 +102,7 @@
             pkgs.makeWrapper
             pkgs.bubblewrap
           ];
+          nativeCheckInputs = [ pkgs.curl ];
 
           BWRAP_BIN = "${pkgs.bubblewrap}/bin/bwrap";
 
@@ -128,6 +129,7 @@
             rust
             formatter
             pkgs.bubblewrap
+            pkgs.curl
           ];
 
           shellHook = ''
