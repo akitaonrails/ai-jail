@@ -103,6 +103,10 @@
             pkgs.bubblewrap
           ];
 
+          # curl is required by tests/filtered_egress.rs to drive fixture
+          # traffic through the proxy bridge during checkPhase.
+          nativeCheckInputs = [ pkgs.curl ];
+
           BWRAP_BIN = "${pkgs.bubblewrap}/bin/bwrap";
 
           # Belt-and-suspenders: strip any /nix/store path that might still
@@ -128,6 +132,7 @@
             rust
             formatter
             pkgs.bubblewrap
+            pkgs.curl
           ];
 
           shellHook = ''

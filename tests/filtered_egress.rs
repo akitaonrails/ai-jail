@@ -47,6 +47,54 @@ fn bwrap_net_available() -> bool {
     })
 }
 
+/// The fixture requests need a host curl binary to drive HTTP traffic
+/// through the proxy bridge; detect availability and skip when absent.
+fn curl_available() -> bool {
+    static RESULT: OnceLock<bool> = OnceLock::new();
+    *RESULT.get_or_init(|| {
+        Command::new("curl")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+macro_rules! require_curl {
+    () => {
+        if !curl_available() {
+            eprintln!("SKIPPED: curl not found in PATH");
+            return;
+        }
+    };
+}
+
+/// Lockdown mode clears the environment and sets PATH to standard FHS
+/// directories (/usr/bin, /bin); on non-FHS systems (NixOS, etc.) guest
+/// binaries like bash or curl are not present in those locations.
+fn lockdown_cmd_available(cmd: &str) -> bool {
+    const LOCKDOWN_PATH: &str =
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    LOCKDOWN_PATH
+        .split(':')
+        .any(|dir| std::path::Path::new(dir).join(cmd).is_file())
+}
+
+macro_rules! require_lockdown_tools {
+    ($($cmd:expr),+ $(,)?) => {
+        $(
+            if !lockdown_cmd_available($cmd) {
+                eprintln!(
+                    "SKIPPED: {} not found in lockdown PATH \
+                     (non-FHS system / NixOS)",
+                    $cmd
+                );
+                return;
+            }
+        )+
+    };
+}
+
 macro_rules! require_bwrap_net {
     () => {
         if !bwrap_net_available() {
@@ -134,6 +182,7 @@ const CURL_RETRY: &str =
 #[test]
 fn filtered_egress_allowlisted_host_tunnels() {
     require_bwrap_net!();
+    require_curl!();
     let fixture = http_fixture();
     let script = format!(
         "echo \"PROXY=$http_proxy\"; \
@@ -178,6 +227,7 @@ fn filtered_egress_allowlisted_host_tunnels() {
 #[test]
 fn filtered_egress_disallowed_host_gets_403() {
     require_bwrap_net!();
+    require_curl!();
     let fixture = http_fixture();
     // The fixture is reachable but NOT allowlisted; the allowlist
     // covers only 127.0.0.2 (nothing listens there).
@@ -204,6 +254,7 @@ fn filtered_egress_disallowed_host_gets_403() {
 #[test]
 fn filtered_egress_direct_tcp_and_udp_are_dead() {
     require_bwrap_net!();
+    require_curl!();
     let fixture = http_fixture();
     let script = format!(
         // Direct connect to the fixture port on 127.0.0.1: nothing
@@ -278,6 +329,8 @@ fn filtered_egress_forced_env_wins_over_user_env() {
 #[test]
 fn filtered_egress_lockdown_still_tunnels() {
     require_bwrap_net!();
+    require_curl!();
+    require_lockdown_tools!("bash", "curl");
     // Lockdown stacks the Landlock V4 net ruleset on kernels ≥ 6.7;
     // without the bridge-port ConnectTcp rule the child gets EACCES
     // reaching its own proxy. On older kernels Landlock net is
