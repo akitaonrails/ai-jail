@@ -59,6 +59,15 @@ pub(crate) struct ProxyConfig {
     /// on, each CONNECT appends a verdict record. The file is
     /// supervisor-side; the sandbox never sees it.
     pub audit: Option<Arc<crate::audit::AuditLog>>,
+    /// Phantom credential bindings (issue #135): absolute-form
+    /// plain-HTTP requests to a binding's host are terminated, their
+    /// placeholders rewritten to the real values, and re-originated
+    /// over TLS.
+    pub secrets: Vec<crate::secret::SecretBinding>,
+    /// Test-only escape hatch: extra TLS trust roots for the
+    /// self-signed fixture in tests/. Same rule as
+    /// `danger_allow_private`: never config- or CLI-exposable.
+    pub danger_extra_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
 }
 
 impl ProxyConfig {
@@ -70,6 +79,8 @@ impl ProxyConfig {
             read_timeout: Duration::from_secs(10),
             danger_allow_private: false,
             audit: None,
+            secrets: Vec::new(),
+            danger_extra_roots: Vec::new(),
         }
     }
 }
@@ -213,6 +224,7 @@ enum Reject {
     ForbiddenRange,
     BadGateway,
     Unavailable,
+    NotImplemented,
 }
 
 impl Reject {
@@ -225,6 +237,7 @@ impl Reject {
             Reject::ForbiddenRange => (403, "Forbidden address range"),
             Reject::BadGateway => (502, "Bad Gateway"),
             Reject::Unavailable => (503, "Service Unavailable"),
+            Reject::NotImplemented => (501, "Not Implemented"),
         }
     }
 }
@@ -251,6 +264,24 @@ fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
 
     let (host, port) = match parse_request(&request) {
         Ok(target) => target,
+        Err(Reject::MethodNotAllowed) => {
+            // Phantom credentials (issue #135): a non-CONNECT method is
+            // still a 405 unless it is an absolute-form plain-HTTP
+            // request to a secret-bound allowlisted host, which the
+            // proxy terminates, rewrites, and re-originates over TLS.
+            // Anything else keeps today's 405 -- this proxy does not
+            // become a general HTTP relay.
+            match parse_absolute_form(&request) {
+                Some(target) => {
+                    handle_http_termination(client, target, request, &shared);
+                    return;
+                }
+                None => {
+                    reject(&mut client, &Reject::MethodNotAllowed);
+                    return;
+                }
+            }
+        }
         Err(why) => {
             reject(&mut client, &why);
             return;
@@ -520,6 +551,231 @@ fn connect_upstream(
     } else {
         Reject::ForbiddenRange
     })
+}
+
+/// Parse an absolute-form request line (`METHOD http://host[:port]/...
+/// HTTP/1.x`), returning (host, port). The port defaults to 443: the
+/// proxy re-originates over TLS, so the scheme's port 80 never applies.
+/// Origin-form requests and non-HTTP/1.x versions are not this path.
+fn parse_absolute_form(buf: &[u8]) -> Option<(String, u16)> {
+    let end = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = &buf[..end];
+    let line_end = head
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(head.len());
+    let line = std::str::from_utf8(&head[..line_end]).ok()?;
+    let mut parts = line.split(' ');
+    let _method = parts.next()?;
+    let uri = parts.next()?;
+    let version = parts.next()?;
+    if parts.next().is_some()
+        || (version != "HTTP/1.0" && version != "HTTP/1.1")
+    {
+        return None;
+    }
+    let rest = uri.strip_prefix("http://")?;
+    let authority = rest.split('/').next()?;
+    if let Some(v6) = authority.strip_prefix('[') {
+        let close = v6.find(']')?;
+        let host = &v6[..close];
+        host.parse::<Ipv6Addr>().ok()?;
+        let port = match v6[close + 1..].strip_prefix(':') {
+            Some(port) => port.parse().ok().filter(|p| *p > 0)?,
+            None => 443,
+        };
+        return Some((host.to_string(), port));
+    }
+    match authority.split_once(':') {
+        Some((host, port)) => {
+            if host.is_empty() {
+                return None;
+            }
+            let port: u16 = port.parse().ok().filter(|p| *p > 0)?;
+            Some((host.to_string(), port))
+        }
+        None if !authority.is_empty() => Some((authority.to_string(), 443)),
+        None => None,
+    }
+}
+
+/// One header field parsed from a request head: whether the request
+/// body is chunked, and the Content-Length when present.
+fn head_body_framing(head: &[u8]) -> (bool, Option<u64>) {
+    let mut chunked = false;
+    let mut content_length = None;
+    let Ok(text) = std::str::from_utf8(head) else {
+        return (chunked, content_length);
+    };
+    for line in text.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            chunked = true;
+        } else if name.trim().eq_ignore_ascii_case("content-length") {
+            content_length = value.trim().parse().ok();
+        }
+    }
+    (chunked, content_length)
+}
+
+/// Strip any client `Connection:` header and pin `Connection: close`:
+/// no keep-alive in the termination path (v1), so upstream EOF marks
+/// the end of the response.
+fn force_connection_close(head: &[u8]) -> Vec<u8> {
+    let terminator = b"\r\n\r\n";
+    let Some(end) =
+        head.windows(terminator.len()).position(|w| w == terminator)
+    else {
+        return head.to_vec();
+    };
+    let mut out = Vec::with_capacity(head.len() + 19);
+    let mut rest = &head[..end];
+    loop {
+        let line_end = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .unwrap_or(rest.len());
+        let line = &rest[..line_end];
+        let is_connection = line
+            .iter()
+            .position(|b| *b == b':')
+            .is_some_and(|at| line[..at].eq_ignore_ascii_case(b"connection"));
+        if !is_connection {
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+        }
+        if line_end == rest.len() {
+            break;
+        }
+        rest = &rest[line_end + 2..];
+    }
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out
+}
+
+/// Terminate an absolute-form plain-HTTP request: only a host that is
+/// both allowlisted and secret-bound takes this path (everything else
+/// keeps today's 405). The head is placeholder-rewritten, pinned to
+/// `Connection: close`, and re-originated over TLS; exactly
+/// Content-Length body bytes are forwarded and the response streams
+/// back until upstream EOF. No keep-alive in v1.
+fn handle_http_termination<S: ClientStream>(
+    mut client: S,
+    target: (String, u16),
+    request: Vec<u8>,
+    shared: &Shared,
+) {
+    let (host, port) = target;
+    // Secret-bound allowlisted hosts only: the allowlist check is the
+    // same one CONNECT targets get, and the binding is what makes this
+    // a termination request rather than a 405.
+    let binding = shared
+        .config
+        .secrets
+        .iter()
+        .find(|b| b.host.eq_ignore_ascii_case(&host));
+    if !allowlist_matches(&shared.config.allowlist, &host) || binding.is_none()
+    {
+        reject(&mut client, &Reject::MethodNotAllowed);
+        return;
+    }
+    let binding = binding.expect("binding checked above");
+
+    let (chunked, content_length) = head_body_framing(&request);
+    if chunked {
+        // API clients send Content-Length; chunked bodies are out of
+        // scope for v1 rather than silently mishandled.
+        reject(&mut client, &Reject::NotImplemented);
+        return;
+    }
+
+    // Split head from any body bytes already read (read_request reads
+    // in 1 KiB chunks and can overshoot into the body).
+    let head_end = request
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(request.len());
+    let (head, body_so_far) = request.split_at(head_end);
+
+    // Only the binding for THIS host may substitute: the host check
+    // above decides whether this is a termination request; which
+    // credentials may appear in it is scoped the same way, or a
+    // sandboxed process could exfiltrate KEY_A's real value by sending
+    // its placeholder to secret-bound host B.
+    let (rewritten, substitutions) =
+        crate::secret::rewrite_head(head, std::slice::from_ref(binding));
+    let rewritten = force_connection_close(&rewritten);
+    if let Some(log) = &shared.config.audit {
+        log.record(crate::audit::secret_inject_record(
+            &host,
+            &binding.key,
+            substitutions,
+        ));
+    }
+
+    let mut upstream = match tls_connect(&binding.host, port, &shared.config) {
+        Ok(stream) => stream,
+        Err(why) => {
+            reject(&mut client, &why);
+            return;
+        }
+    };
+
+    let body_len = content_length.unwrap_or(0) as usize;
+    let write_result = (|| -> io::Result<()> {
+        upstream.write_all(&rewritten)?;
+        upstream.write_all(body_so_far)?;
+        if body_len > body_so_far.len() {
+            let mut remaining = client
+                .try_clone_stream()?
+                .take((body_len - body_so_far.len()) as u64);
+            io::copy(&mut remaining, &mut upstream)?;
+        }
+        upstream.flush()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        return;
+    }
+
+    // Upstream closes at the end of the response (Connection: close),
+    // which ends this copy and the connection.
+    let mut client_writer = client;
+    let _ = io::copy(&mut upstream, &mut client_writer);
+    let _ = client_writer.shutdown_both();
+}
+
+/// TLS to the checked upstream: DNS pinning and the SSRF guard are
+/// inherited from connect_upstream (resolve once, dial the checked
+/// address); the original host name is the TLS SNI/ServerName. Roots
+/// are webpki-roots plus the test-only danger_extra_roots knob.
+fn tls_connect(
+    host: &str,
+    port: u16,
+    config: &ProxyConfig,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, Reject> {
+    let tcp = connect_upstream(host, port, config)?;
+    let mut roots = rustls::RootCertStore::from_iter(
+        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+    );
+    for der in &config.danger_extra_roots {
+        roots.add(der.clone()).map_err(|_| Reject::BadGateway)?;
+    }
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|_| Reject::BadGateway)?;
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name)
+        .map_err(|_| Reject::BadGateway)?;
+    let mut stream = rustls::StreamOwned::new(conn, tcp);
+    // Force the handshake now so a TLS failure is a 502, not a half-
+    // written request.
+    stream.flush().map_err(|_| Reject::BadGateway)?;
+    Ok(stream)
 }
 
 /// Relay bytes both ways until both directions end. On read-EOF the
@@ -1094,6 +1350,281 @@ mod tests {
         // Dropping the handle unlinks the socket file.
         drop(proxy);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn parse_absolute_form_table() {
+        assert_eq!(
+            parse_absolute_form(b"GET http://example.com/x HTTP/1.1\r\n\r\n"),
+            Some(("example.com".to_string(), 443))
+        );
+        assert_eq!(
+            parse_absolute_form(
+                b"POST http://127.0.0.1:8080/v1 HTTP/1.1\r\n\r\n"
+            ),
+            Some(("127.0.0.1".to_string(), 8080))
+        );
+        assert_eq!(
+            parse_absolute_form(b"GET http://[::1]:8443/ HTTP/1.0\r\n\r\n"),
+            Some(("::1".to_string(), 8443))
+        );
+        for buf in [
+            &b"GET /origin-form HTTP/1.1\r\n\r\n"[..],
+            b"GET https://example.com/ HTTP/1.1\r\n\r\n",
+            b"GET http://example.com HTTP/2\r\n\r\n",
+            b"GET http://:8080/ HTTP/1.1\r\n\r\n",
+            b"GET http://example.com:0/ HTTP/1.1\r\n\r\n",
+        ] {
+            assert!(parse_absolute_form(buf).is_none(), "{buf:?}");
+        }
+    }
+
+    #[test]
+    fn head_body_framing_parses_content_length_and_chunked() {
+        let (chunked, len) =
+            head_body_framing(b"POST / HTTP/1.1\r\nContent-Length: 42\r\n\r\n");
+        assert!(!chunked);
+        assert_eq!(len, Some(42));
+        let (chunked, len) = head_body_framing(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        assert!(chunked);
+        assert_eq!(len, None);
+        let (chunked, len) = head_body_framing(b"GET / HTTP/1.1\r\n\r\n");
+        assert!(!chunked);
+        assert_eq!(len, None);
+    }
+
+    #[test]
+    fn force_connection_close_rewrites_and_appends() {
+        let head = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let out = force_connection_close(head);
+        assert_eq!(
+            out,
+            b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        );
+        let head = b"GET / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n";
+        let out = force_connection_close(head);
+        assert_eq!(out, b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+        assert_eq!(out.windows(4).filter(|w| *w == b"\r\n\r\n").count(), 1);
+    }
+
+    /// TLS fixture: the test-only self-signed cert from
+    /// tests/fixtures, serving the received x-test-key header back in
+    /// the response body.
+    fn tls_fixture() -> u16 {
+        use rustls::pki_types::pem::PemObject;
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+        let cert = rustls::pki_types::CertificateDer::from_pem_slice(
+            &std::fs::read(format!("{dir}/test-only-cert.pem")).unwrap(),
+        )
+        .unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(
+            &std::fs::read(format!("{dir}/test-only-key.pem")).unwrap(),
+        )
+        .unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let config = Arc::new(config);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for conn in listener.incoming().map_while(Result::ok) {
+                let config = Arc::clone(&config);
+                thread::spawn(move || {
+                    let Ok(server_conn) = rustls::ServerConnection::new(config)
+                    else {
+                        return;
+                    };
+                    let mut tls = rustls::StreamOwned::new(server_conn, conn);
+                    let mut buf = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    loop {
+                        match tls.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf);
+                    let value = head
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':').and_then(|(name, v)| {
+                                name.trim()
+                                    .eq_ignore_ascii_case("x-test-key")
+                                    .then(|| v.trim().to_string())
+                            })
+                        })
+                        .unwrap_or_default();
+                    let body = format!("key={value}");
+                    let _ = tls.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+                             Connection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                });
+            }
+        });
+        port
+    }
+
+    fn fixture_root() -> rustls::pki_types::CertificateDer<'static> {
+        use rustls::pki_types::pem::PemObject;
+        rustls::pki_types::CertificateDer::from_pem_slice(
+            &std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/test-only-cert.pem"
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn e2e_http_termination_substitutes_secret_over_tls() {
+        let fixture = tls_fixture();
+        let binding = crate::secret::SecretBinding::new(
+            "X_KEY",
+            "real-secret",
+            "127.0.0.1",
+        );
+        let placeholder = binding.placeholder.clone();
+        let mut config = test_config(&["127.0.0.1"]);
+        config.secrets = vec![binding];
+        config.danger_extra_roots = vec![fixture_root()];
+        let proxy = Proxy::start(config, None).unwrap();
+
+        let request = format!(
+            "GET http://127.0.0.1:{fixture}/v1/test HTTP/1.1\r\n\
+             Host: 127.0.0.1:{fixture}\r\n\
+             x-test-key: {placeholder}\r\n\
+             \r\n"
+        );
+        let stream = connect_and_send(proxy.port(), request.as_bytes());
+        let mut response = Vec::new();
+        (&mut &stream).read_to_end(&mut response).unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        // The real value reached the fixture; the placeholder did not.
+        assert!(response.contains("key=real-secret"), "{response}");
+        assert!(!response.contains(&placeholder), "{response}");
+    }
+
+    #[test]
+    fn e2e_http_termination_substitutes_only_the_matched_host_binding() {
+        // Two bindings, KEY_A -> host A (the fixture) and KEY_B ->
+        // host B. A request to host A carrying KEY_B's placeholder must
+        // pass it through untouched: substitution is host-scoped, or a
+        // sandboxed process could exfiltrate A's credential by sending
+        // its placeholder to secret-bound host B.
+        let fixture = tls_fixture();
+        let binding_a =
+            crate::secret::SecretBinding::new("KEY_A", "real-a", "127.0.0.1");
+        let placeholder_a = binding_a.placeholder.clone();
+        let binding_b =
+            crate::secret::SecretBinding::new("KEY_B", "real-b", "127.0.0.2");
+        let placeholder_b = binding_b.placeholder.clone();
+
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-proxy-scope-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let log = crate::audit::AuditLog::open(&home).unwrap();
+
+        let mut config = test_config(&["127.0.0.1"]);
+        config.secrets = vec![binding_a, binding_b];
+        config.danger_extra_roots = vec![fixture_root()];
+        config.audit = Some(log);
+        let proxy = Proxy::start(config, None).unwrap();
+
+        let request = format!(
+            "GET http://127.0.0.1:{fixture}/ HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             x-test-key: {placeholder_b}\r\n\
+             x-test-key-a: {placeholder_a}\r\n\
+             \r\n"
+        );
+        let stream = connect_and_send(proxy.port(), request.as_bytes());
+        let mut response = Vec::new();
+        (&mut &stream).read_to_end(&mut response).unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        // KEY_B's placeholder reached host A untouched; its real value
+        // is nowhere in the exchange.
+        assert!(
+            response.contains(&format!("key={placeholder_b}")),
+            "{response}"
+        );
+        assert!(!response.contains("real-b"), "{response}");
+        drop(proxy);
+
+        // The audit record shows exactly one substitution -- KEY_A's
+        // placeholder in x-test-key-a -- not two.
+        let content = std::fs::read_to_string(
+            home.join(".local/share/ai-jail/history.jsonl"),
+        )
+        .unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(record["type"], "secret_inject");
+        assert_eq!(record["key"], "KEY_A");
+        assert_eq!(record["substitutions"], 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn e2e_http_absolute_form_non_secret_host_is_405() {
+        // Allowlisted but not secret-bound: no termination, today's 405.
+        let proxy = Proxy::start(test_config(&["127.0.0.1"]), None).unwrap();
+        let stream = connect_and_send(
+            proxy.port(),
+            b"GET http://127.0.0.1:1/ HTTP/1.1\r\n\r\n",
+        );
+        assert_eq!(
+            read_reply_head(&stream),
+            "HTTP/1.1 405 Method Not Allowed\r\n\r\n"
+        );
+        // Origin-form stays 405 even for a secret-bound host.
+        let binding =
+            crate::secret::SecretBinding::new("X_KEY", "real", "127.0.0.1");
+        let mut config = test_config(&["127.0.0.1"]);
+        config.secrets = vec![binding];
+        let proxy = Proxy::start(config, None).unwrap();
+        let stream = connect_and_send(proxy.port(), b"GET / HTTP/1.1\r\n\r\n");
+        assert_eq!(
+            read_reply_head(&stream),
+            "HTTP/1.1 405 Method Not Allowed\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn e2e_http_termination_rejects_chunked_with_501() {
+        let fixture = tls_fixture();
+        let binding =
+            crate::secret::SecretBinding::new("X_KEY", "real", "127.0.0.1");
+        let mut config = test_config(&["127.0.0.1"]);
+        config.secrets = vec![binding];
+        config.danger_extra_roots = vec![fixture_root()];
+        let proxy = Proxy::start(config, None).unwrap();
+        let request = format!(
+            "POST http://127.0.0.1:{fixture}/ HTTP/1.1\r\n\
+             Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+        );
+        let stream = connect_and_send(proxy.port(), request.as_bytes());
+        assert_eq!(
+            read_reply_head(&stream),
+            "HTTP/1.1 501 Not Implemented\r\n\r\n"
+        );
     }
 
     #[test]

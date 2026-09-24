@@ -116,6 +116,20 @@ no UDP, and no working DNS inside the sandbox on Linux (on macOS the system
 resolver is not fenced). It cannot combine with `--network` or `--browser`,
 and a project `.ai-jail` may only shrink the list, never grow it.
 
+### Phantom credentials: `--secret KEY=host`
+
+With filtered egress on, `--secret ANTHROPIC_API_KEY=api.anthropic.com`
+(repeatable, or `secret_hosts = { ... }` in the global config) keeps the real
+value out of the sandbox: the child env carries an `AIJAIL-PHANTOM-…`
+placeholder, and the egress proxy swaps in the real value only for requests
+terminating at the bound host. The key must already be passed via `--env` or
+`--env-from-file`. One honest caveat: CONNECT tunnels stay opaque — this only
+covers clients that can speak plain HTTP to the proxy (e.g. an
+`ANTHROPIC_BASE_URL=http://…` override); those requests are terminated and
+re-originated over TLS by the supervisor, which therefore sees that plaintext
+for secret-bound hosts. HTTPS clients that only CONNECT keep working exactly
+as before, with no substitution.
+
 `--allow-tcp-port` remains accepted for backward compatibility, but launch
 fails closed because UDP cannot be securely constrained through this option —
 use `--allow-host` for filtered egress instead.

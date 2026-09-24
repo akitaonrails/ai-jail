@@ -268,3 +268,16 @@ CLAUDE.md mount order + testing conventions, releases note per release flow.
 
 Additive, backward-compatible, default-off: **minor** (v1.23.0 when phases
 1–4 land; companions can ride the same minor or a following patch).
+
+## Implementation status (September 2026)
+
+Phases 1–6 landed in v2.0.0: the CONNECT proxy core, the
+`allow_hosts`/`--allow-host` surface, the Linux netns+bridge fence, the macOS
+endpoint rule, the opt-in launch audit log, and `--env-from-file`. On top of
+that, the audit log is hash-chained (issue #136; `seq`/`prev` per line over
+raw bytes, `--audit-verify` to check) and phantom credential injection is in
+(issue #135; `--secret KEY=host`, placeholder env in the sandbox, TLS
+re-origination of plain-HTTP proxy requests at the bound host). One plan
+note changed in review: the lockdown Landlock V4 ruleset must allow the
+in-sandbox bridge port in filtered mode, or the child cannot reach its own
+proxy on kernels ≥ 6.7.

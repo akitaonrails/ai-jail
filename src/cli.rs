@@ -63,6 +63,10 @@ OPTIONS:
     --env-from-file <PATH>          Read KEY=VALUE lines from PATH (repeatable; file
                                     must be user-owned, mode 0600, outside the project;
                                     applies like --env, which wins on conflicts)
+    --secret <KEY=host>             Keep KEY's real value out of the sandbox: the child
+                                    sees a placeholder; the egress proxy substitutes the
+                                    real value only for requests to host (repeatable;
+                                    requires filtered egress via --allow-host)
     --inherit-env / --no-inherit-env
                                     Inherit the full host environment (default: off —
                                     only a safe allowlist is passed)
@@ -72,6 +76,7 @@ OPTIONS:
     --audit-log / --no-audit-log    Enable/disable the launch audit log at
                                     ~/.local/share/ai-jail/history.jsonl
                                     (default: off; project .ai-jail cannot enable)
+    --audit-verify                 Verify the audit log's hash chain and exit
     --worktree / --no-worktree     Enable/disable linked Git worktree metadata passthrough
     --no-mise / --mise             Disable/enable mise integration
     --ssh / --no-ssh               Share ~/.ssh read-only + forward SSH_AUTH_SOCK (default: off)
@@ -143,7 +148,12 @@ pub struct CliArgs {
     pub inherit_env: Option<bool>,
     pub update_check: Option<bool>,
     pub audit_log: Option<bool>,
+    pub audit_verify: bool,
     pub env_from_file: Vec<PathBuf>,
+    /// Phantom credential bindings (`--secret KEY=host`, repeatable):
+    /// the sandbox sees a placeholder; the proxy substitutes the real
+    /// value only for requests terminating at `host`.
+    pub secrets: Vec<(String, String)>,
     pub env: Vec<String>,
     pub exec: bool,
     pub clean: bool,
@@ -330,6 +340,7 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long(s @ ("audit-log" | "no-audit-log")) => {
                 args.audit_log = Some(s == "audit-log");
             }
+            Long("audit-verify") => args.audit_verify = true,
             Long("env") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
                 let s = val.to_string_lossy();
@@ -350,6 +361,19 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     );
                 }
                 args.env_from_file.push(PathBuf::from(path.into_owned()));
+            }
+            Long("secret") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let s = val.to_string_lossy();
+                let Some((key, host)) = s.split_once('=') else {
+                    return Err("--secret requires KEY=host".into());
+                };
+                if key.is_empty() || host.is_empty() {
+                    return Err(
+                        "--secret requires non-empty KEY and host".into()
+                    );
+                }
+                args.secrets.push((key.to_string(), host.to_string()));
             }
             Long(s @ ("worktree" | "no-worktree")) => {
                 args.worktree = Some(s == "worktree");
@@ -570,8 +594,10 @@ fn is_sandbox_long_flag(arg: &str) -> bool {
             | "--no-update-check"
             | "--audit-log"
             | "--no-audit-log"
+            | "--audit-verify"
             | "--env"
             | "--env-from-file"
+            | "--secret"
             | "--mise"
             | "--no-mise"
             | "--save-config"
@@ -1523,6 +1549,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_audit_verify() {
+        let args = parse_test(&["--audit-verify"]).unwrap();
+        assert!(args.audit_verify);
+        let error = parse_test(&["claude", "--audit-verify"]).unwrap_err();
+        assert!(error.contains("after command"));
+    }
+
+    #[test]
     fn parse_env_from_file_repeatable() {
         let args = parse_test(&[
             "--env-from-file",
@@ -1549,6 +1583,34 @@ mod tests {
     fn parse_env_from_file_after_command_rejected() {
         let error =
             parse_test(&["claude", "--env-from-file=/tmp/keys"]).unwrap_err();
+        assert!(error.contains("after command"));
+    }
+
+    #[test]
+    fn parse_secret_repeatable_and_strict() {
+        let args = parse_test(&[
+            "--secret",
+            "ANTHROPIC_API_KEY=api.anthropic.com",
+            "--secret=OPENAI_API_KEY=api.openai.com",
+            "claude",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.secrets,
+            vec![
+                (
+                    "ANTHROPIC_API_KEY".to_string(),
+                    "api.anthropic.com".to_string()
+                ),
+                ("OPENAI_API_KEY".to_string(), "api.openai.com".to_string()),
+            ]
+        );
+        for bad in ["KEY", "=example.com", "KEY="] {
+            assert!(parse_test(&["--secret", bad]).is_err(), "{bad}");
+        }
+        assert!(parse_test(&["--secret"]).is_err());
+        let error =
+            parse_test(&["claude", "--secret", "K=example.com"]).unwrap_err();
         assert!(error.contains("after command"));
     }
 

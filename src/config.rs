@@ -264,6 +264,13 @@ pub struct Config {
     /// ignored. Never serialized: the paths point at secret material.
     #[serde(default, skip_serializing)]
     pub env_from_file: Vec<PathBuf>,
+    /// Phantom credential bindings (issue #135): `KEY = "host"` — the
+    /// sandbox env holds a placeholder for KEY and the egress proxy
+    /// substitutes the real value only for requests terminating at
+    /// host. Trusted layers only — the project `.ai-jail` is ignored.
+    /// Never serialized: it names which variables are secrets.
+    #[serde(default, skip_serializing)]
+    pub secret_hosts: std::collections::BTreeMap<String, String>,
     /// Directories whose project `.ai-jail` is trusted to grant
     /// capabilities, instead of being treated as untrusted monotonic
     /// policy. A project matches when it is one of these directories or
@@ -886,6 +893,7 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     dedup_strings(&mut c.env_pass);
     c.env_from_file.extend(local.env_from_file);
     dedup_paths(&mut c.env_from_file);
+    c.secret_hosts.extend(local.secret_hosts);
     c.allow_tcp_ports.extend(local.allow_tcp_ports);
     c.allow_tcp_ports.sort_unstable();
     c.allow_tcp_ports.dedup();
@@ -1235,6 +1243,12 @@ pub fn merge_with_global_report(
     if !local.env_from_file.is_empty() {
         warnings.push(
             "project .ai-jail env_from_file ignored (use --env-from-file or global config)"
+                .into(),
+        );
+    }
+    if !local.secret_hosts.is_empty() {
+        warnings.push(
+            "project .ai-jail secret_hosts ignored (use --secret or global config)"
                 .into(),
         );
     }
@@ -1720,6 +1734,10 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
         .env_from_file
         .extend(cli.env_from_file.iter().cloned());
     dedup_paths(&mut config.env_from_file);
+
+    for (key, host) in &cli.secrets {
+        config.secret_hosts.insert(key.clone(), host.clone());
+    }
 
     if let Some(p) = cli.claude_dir.clone() {
         config.claude_dir = Some(p);
@@ -3155,6 +3173,12 @@ no_gpu = true
             inherit_env: None,
             env_pass: vec!["ANTHROPIC_API_KEY".into()],
             env_from_file: vec![PathBuf::from("/run/secrets/anthropic")],
+            secret_hosts: [(
+                "ANTHROPIC_API_KEY".to_string(),
+                "api.anthropic.com".to_string(),
+            )]
+            .into_iter()
+            .collect(),
             trust_project_config: vec![],
             update_check: Some(false),
             audit_log: Some(true),
@@ -3200,6 +3224,9 @@ no_gpu = true
         // env_from_file is likewise never serialized: the paths point
         // at credential material and must not land in a config file.
         assert!(deserialized.env_from_file.is_empty());
+        // secret_hosts names which variables are secrets; it is never
+        // serialized either.
+        assert!(deserialized.secret_hosts.is_empty());
         assert_eq!(deserialized.update_check, config.update_check);
         assert_eq!(deserialized.audit_log, config.audit_log);
     }
@@ -4473,6 +4500,77 @@ env_from_file = ["/run/secrets/anthropic"]
     }
 
     #[test]
+    fn regression_v2_1_0_config_without_secret_hosts() {
+        // Configs written before secret_hosts existed must still parse,
+        // defaulting to no phantom bindings.
+        let toml = r#"
+command = ["claude"]
+env_pass = ["ANTHROPIC_API_KEY"]
+env_from_file = ["/run/secrets/anthropic"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert!(cfg.secret_hosts.is_empty());
+    }
+
+    #[test]
+    fn parse_config_with_secret_hosts_table() {
+        let toml = r#"
+command = ["claude"]
+allow_hosts = ["api.anthropic.com"]
+
+[secret_hosts]
+ANTHROPIC_API_KEY = "api.anthropic.com"
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(
+            cfg.secret_hosts
+                .get("ANTHROPIC_API_KEY")
+                .map(String::as_str),
+            Some("api.anthropic.com")
+        );
+    }
+
+    #[test]
+    fn project_secret_hosts_is_ignored_with_warning() {
+        let mut project = Config::default();
+        project
+            .secret_hosts
+            .insert("KEY".into(), "example.com".into());
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(merged.secret_hosts.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("secret_hosts")));
+    }
+
+    #[test]
+    fn merge_secret_hosts_trusted_union_and_cli() {
+        let mut global = Config::default();
+        global
+            .secret_hosts
+            .insert("A_KEY".into(), "a.example.com".into());
+        let mut table = Config::default();
+        table
+            .secret_hosts
+            .insert("B_KEY".into(), "b.example.com".into());
+        let merged = merge_with_global(global, table);
+        assert_eq!(merged.secret_hosts.len(), 2);
+
+        let cli = CliArgs {
+            secrets: vec![("C_KEY".into(), "c.example.com".into())],
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, merged);
+        assert_eq!(merged.secret_hosts.len(), 3);
+        assert_eq!(
+            merged.secret_hosts.get("C_KEY").map(String::as_str),
+            Some("c.example.com")
+        );
+    }
+
+    #[test]
     fn merge_lockdown_flag_overrides() {
         let existing = Config {
             lockdown: Some(true),
@@ -5507,6 +5605,7 @@ hide_dotdirs = [".my_secrets"]
             inherit_env: None,
             env_pass: vec![],
             env_from_file: vec![],
+            secret_hosts: Default::default(),
             trust_project_config: vec![],
             update_check: None,
             audit_log: None,

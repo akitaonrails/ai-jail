@@ -11,6 +11,7 @@ mod output;
 mod proxy;
 mod pty;
 mod sandbox;
+mod secret;
 mod signals;
 mod statusbar;
 
@@ -75,6 +76,85 @@ fn apply_browser_profile(config: &mut config::Config) {
     config.no_status_bar = Some(true);
 }
 
+/// Phantom credentials (issue #135): validate every `secret_hosts`
+/// binding and rewrite the bound `env_pass` entries to placeholders,
+/// moving the real values into supervisor-side `SecretBinding`s for the
+/// egress proxy. All violations hard-error; the caller runs this before
+/// any sandbox starts.
+///
+/// A binding requires: filtered egress (CONNECT tunnels are opaque, so
+/// there is nothing to substitute into), a bare hostname that the
+/// allowlist covers, and the key already present in `env_pass` (via
+/// `--env` or `--env-from-file`). Bare `NAME` entries resolve against
+/// the host environment here and are rewritten to the explicit
+/// `NAME=placeholder` form so the sandbox deterministically sees the
+/// placeholder.
+fn prepare_secrets(
+    config: &mut config::Config,
+) -> Result<Vec<secret::SecretBinding>, String> {
+    if config.secret_hosts.is_empty() {
+        return Ok(Vec::new());
+    }
+    if config.network_mode() != config::NetworkMode::Filtered {
+        return Err("--secret requires filtered egress (--allow-host); CONNECT tunnels stay opaque".into());
+    }
+    let bindings_spec: Vec<(String, String)> =
+        config.secret_hosts.clone().into_iter().collect();
+    let mut bindings = Vec::new();
+    for (key, host) in bindings_spec {
+        if host.contains("://") || host.contains('/') {
+            return Err(format!(
+                "--secret {key}: host must be a bare hostname, not {host:?}"
+            ));
+        }
+        if !proxy::allowlist_matches(config.allow_hosts(), &host) {
+            return Err(format!(
+                "--secret {key}: {host} is not in allow_hosts (pass --allow-host {host})"
+            ));
+        }
+        let Some(at) = config
+            .env_pass
+            .iter()
+            .position(|entry| entry.split('=').next() == Some(key.as_str()))
+        else {
+            return Err(format!(
+                "--secret {key}: {key} is not in the sandbox env; pass it via --env or --env-from-file"
+            ));
+        };
+        let real = match config.env_pass[at].split_once('=') {
+            Some((_, value)) => value.to_string(),
+            None => std::env::var(&key).map_err(|_| {
+                format!(
+                    "--secret {key}: {key} is named in --env but not set in the host environment"
+                )
+            })?,
+        };
+        let binding = secret::SecretBinding::new(&key, &real, &host);
+        config.env_pass[at] = format!("{key}={}", binding.placeholder);
+        bindings.push(binding);
+    }
+    Ok(bindings)
+}
+
+/// Test-only TLS trust roots for the phantom-secret integration fixture
+/// (tests/phantom_secrets.rs): a PEM file of extra roots. Same rule as
+/// AI_JAIL_TEST_PROXY_ALLOW_PRIVATE -- never documented, never set in
+/// normal operation.
+#[cfg(target_os = "linux")]
+fn test_extra_roots() -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    use rustls::pki_types::pem::PemObject;
+    let Some(path) = std::env::var_os("AI_JAIL_TEST_PROXY_EXTRA_ROOTS") else {
+        return Vec::new();
+    };
+    let Ok(pem) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    match rustls::pki_types::CertificateDer::from_pem_slice(&pem) {
+        Ok(der) => vec![der],
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Network-mode contradiction checks, all fail-closed at launch.
 /// `--allow-tcp-port` stays dead (the filtered-egress proxy is the
 /// strictly better answer, docs/connect-proxy-plan.md), and filtered
@@ -112,6 +192,36 @@ fn default_resize_redraw_key(command: &[String]) -> Option<&'static str> {
         Some("codex") => Some("ctrl-shift-l"),
         _ => None,
     }
+}
+
+/// `--audit-verify`: walk the audit log and check its hash chain.
+/// Exit 0 intact, 1 broken, 2 when no log exists.
+fn run_audit_verify(cli: &cli::CliArgs) -> Result<i32, String> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let path = home.join(".local/share/ai-jail/history.jsonl");
+    if !path.exists() {
+        output::info(&format!("No audit log at {}", path.display()));
+        return Ok(2);
+    }
+    let report = audit::verify(&path)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    if cli.verbose {
+        output::verbose(&format!(
+            "Audit log: {} chained records",
+            report.chained
+        ));
+    }
+    if let Some(line) = report.first_break {
+        output::error(&format!("BROKEN at line {line}"));
+        return Ok(1);
+    }
+    output::ok(&format!(
+        "OK {} records ({} legacy), chain intact",
+        report.total, report.legacy
+    ));
+    Ok(0)
 }
 
 fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
@@ -327,6 +437,12 @@ fn run() -> Result<i32, String> {
         return proxy::run_bridge(*port, socket).map(|()| 0);
     }
 
+    // --audit-verify: offline hash-chain check of the audit log. No
+    // config, no sandbox, no proxy.
+    if cli.audit_verify {
+        return run_audit_verify(&cli);
+    }
+
     // Load local (./.ai-jail), then command-aware global ($HOME/.ai-jail), merge
     let project_config = if cli.clean {
         config::Config::default()
@@ -434,6 +550,12 @@ fn run() -> Result<i32, String> {
         config.env_pass = env_pass;
     }
 
+    // Phantom credentials (issue #135): each bound key's env_pass entry
+    // is rewritten to a placeholder the sandbox sees; the real value
+    // moves into a supervisor-side SecretBinding for the egress proxy.
+    // All violations hard-error here, before any sandbox starts.
+    let secrets = prepare_secrets(&mut config)?;
+
     // Check sandbox tool is available
     sandbox::check()?;
 
@@ -474,9 +596,11 @@ fn run() -> Result<i32, String> {
         // normal operation.
         proxy_config.danger_allow_private =
             std::env::var_os("AI_JAIL_TEST_PROXY_ALLOW_PRIVATE").is_some();
+        proxy_config.danger_extra_roots = test_extra_roots();
         // The audit handle is supervisor-side; the sandbox never sees
         // the file it appends to.
         proxy_config.audit = audit_log.clone();
+        proxy_config.secrets = secrets;
         let socket = proxy::default_socket_path();
         let proxy = proxy::Proxy::start(proxy_config, Some(&socket))
             .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
@@ -490,6 +614,7 @@ fn run() -> Result<i32, String> {
         let mut proxy_config =
             proxy::ProxyConfig::new(config.allow_hosts().to_vec());
         proxy_config.audit = audit_log.clone();
+        proxy_config.secrets = secrets;
         let proxy = proxy::Proxy::start(proxy_config, None)
             .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
         Some(proxy)
@@ -815,6 +940,100 @@ mod tests {
         };
         assert!(validate_network_flags(&locked).is_ok());
         assert!(validate_network_flags(&Config::default()).is_ok());
+    }
+
+    #[test]
+    fn secrets_require_filtered_mode_allowlist_and_env_key() {
+        // Not filtered.
+        let mut config = Config {
+            env_pass: vec!["KEY=real".into()],
+            secret_hosts: [("KEY".into(), "example.com".into())]
+                .into_iter()
+                .collect(),
+            ..Config::default()
+        };
+        let error = super::prepare_secrets(&mut config).unwrap_err();
+        assert!(error.contains("--allow-host"));
+
+        // Key not in env_pass: the error names --env-from-file.
+        let mut config = Config {
+            allow_hosts: vec!["example.com".into()],
+            secret_hosts: [("MISSING".into(), "example.com".into())]
+                .into_iter()
+                .collect(),
+            ..Config::default()
+        };
+        let error = super::prepare_secrets(&mut config).unwrap_err();
+        assert!(error.contains("--env-from-file"));
+
+        // Host not allowlisted.
+        let mut config = Config {
+            allow_hosts: vec!["example.com".into()],
+            env_pass: vec!["KEY=real".into()],
+            secret_hosts: [("KEY".into(), "evil.com".into())]
+                .into_iter()
+                .collect(),
+            ..Config::default()
+        };
+        let error = super::prepare_secrets(&mut config).unwrap_err();
+        assert!(error.contains("not in allow_hosts"));
+
+        // Scheme/path in the host is rejected.
+        let mut config = Config {
+            allow_hosts: vec!["example.com".into()],
+            env_pass: vec!["KEY=real".into()],
+            secret_hosts: [("KEY".into(), "https://example.com".into())]
+                .into_iter()
+                .collect(),
+            ..Config::default()
+        };
+        assert!(super::prepare_secrets(&mut config).is_err());
+    }
+
+    #[test]
+    fn secrets_swap_env_pass_for_placeholders() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _bare = EnvVarGuard::set("AI_JAIL_TEST_BARE_KEY", "bare-real");
+
+        let mut config = Config {
+            allow_hosts: vec!["example.com".into()],
+            env_pass: vec![
+                "KEY=real-value".into(),
+                "AI_JAIL_TEST_BARE_KEY".into(),
+            ],
+            secret_hosts: [
+                ("KEY".into(), "example.com".into()),
+                ("AI_JAIL_TEST_BARE_KEY".into(), "example.com".into()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Config::default()
+        };
+        let bindings = super::prepare_secrets(&mut config).unwrap();
+        assert_eq!(bindings.len(), 2);
+        for binding in &bindings {
+            let entry = config
+                .env_pass
+                .iter()
+                .find(|e| e.starts_with(&format!("{}=", binding.key)))
+                .unwrap();
+            // The sandbox sees the placeholder, never the real value.
+            assert!(entry.ends_with(&binding.placeholder));
+            assert!(binding.placeholder.starts_with("AIJAIL-PHANTOM-"));
+            assert!(!entry.contains(&binding.real));
+        }
+        assert_eq!(
+            bindings.iter().find(|b| b.key == "KEY").unwrap().real,
+            "real-value"
+        );
+        assert_eq!(
+            bindings
+                .iter()
+                .find(|b| b.key == "AI_JAIL_TEST_BARE_KEY")
+                .unwrap()
+                .real,
+            "bare-real"
+        );
     }
 
     #[test]

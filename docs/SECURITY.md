@@ -136,6 +136,17 @@ When ai-jail is not proxying a PTY, no terminal ioctl is granted at all.
 created inside the sandbox is not covered by the path-scoped rule. Linux
 denies `TIOCSTI` outright through seccomp.
 
+Phantom credentials (`--secret KEY=host`, filtered egress only) shift part of
+the trust boundary to the supervisor: the sandbox env holds an
+`AIJAIL-PHANTOM-…` placeholder, and the egress proxy substitutes the real
+value only in the request head of plain-HTTP proxy requests terminating at the
+bound host, re-originating them over TLS. Placeholders are not credentials —
+knowing one authorizes nothing — and real values live only in supervisor
+memory, never in any config file, the audit log, or the sandbox. The cost:
+for secret-bound hosts the supervisor (and the proxy's TLS endpoint) sees the
+request plaintext, by construction. CONNECT tunnels to any host stay opaque
+and carry no substitution.
+
 The macOS profile also grants `file-read-metadata` on each directory above an
 allowed path, and on the symlink nodes leading to the command. Seatbelt
 resolves a path one component at a time, so without this an allowed leaf stays

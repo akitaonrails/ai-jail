@@ -1548,13 +1548,31 @@ fn discover_mounts_full(
     let claude_env = discover_claude_env(config);
     // Filtered egress forces the proxy env onto the child. The values
     // name the in-sandbox bridge's fixed loopback port; the proxy's own
-    // outer TCP port is unreachable from inside the netns.
-    let proxy_env =
-        if config.network_mode() == crate::config::NetworkMode::Filtered {
-            crate::proxy::env_vars(crate::proxy::BRIDGE_PORT)
-        } else {
-            vec![]
-        };
+    // outer TCP port is unreachable from inside the netns. Under
+    // lockdown the env_pass path never runs, so phantom-secret
+    // placeholders would not reach the child at all -- force the bound
+    // KEY=placeholder entries here too (harmless: placeholders are not
+    // credentials).
+    let proxy_env = if config.network_mode()
+        == crate::config::NetworkMode::Filtered
+    {
+        let mut vars = crate::proxy::env_vars(crate::proxy::BRIDGE_PORT);
+        if lockdown {
+            for key in config.secret_hosts.keys() {
+                if let Some(value) = config.env_pass.iter().find_map(|entry| {
+                    entry
+                        .split_once('=')
+                        .filter(|(name, _)| *name == key)
+                        .map(|(_, value)| value.to_string())
+                }) {
+                    vars.push((key.clone(), value));
+                }
+            }
+        }
+        vars
+    } else {
+        vec![]
+    };
     let mask_mounts =
         discover_mask_mounts(config, project_dir, sources.empty_path, verbose);
     let deny_mounts = discover_deny_mounts(
@@ -3927,6 +3945,46 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn filtered_lockdown_forces_placeholder_env() {
+        // Under lockdown the env_pass path never runs, so phantom
+        // secrets would otherwise never reach the child: the bound
+        // KEY=placeholder entries are forced alongside the proxy env.
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let mut config = Config {
+            lockdown: Some(true),
+            allow_hosts: vec!["api.anthropic.com".into()],
+            env_pass: vec!["KEY=AIJAIL-PHANTOM-0123456789abcdef".into()],
+            ..minimal_test_config()
+        };
+        config
+            .secret_hosts
+            .insert("KEY".into(), "api.anthropic.com".into());
+        let sources = MountSources::from_guard(&guard);
+        let sock = PathBuf::from("/tmp/ai-jail-proxy-test.sock");
+        let args = build_dry_run_args_full(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            Some(&sock),
+        )
+        .unwrap();
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--setenv"
+                && w[1] == "KEY"
+                && w[2] == "AIJAIL-PHANTOM-0123456789abcdef"
+        }));
+        // And never a real value: the only KEY setenv is the
+        // placeholder.
+        assert!(!args.windows(3).any(|w| {
+            w[0] == "--setenv"
+                && w[1] == "KEY"
+                && !w[2].starts_with("AIJAIL-PHANTOM-")
+        }));
     }
 
     #[test]
