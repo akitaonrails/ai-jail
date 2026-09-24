@@ -27,9 +27,9 @@ serde_json = "1"
 vt100 = "0.16"
 sha2 = "0.10"
 rustls = { version = "0.23", default-features = false, features = [
-    "ring",
-    "std",
-    "tls12",
+  "ring",
+  "std",
+  "tls12",
 ] }
 webpki-roots = "0.26"
 
