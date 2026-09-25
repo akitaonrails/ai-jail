@@ -712,6 +712,20 @@ fn collect_normal_paths_with_mounted_paths(
         collect_gpu_paths(&mut rw, verbose);
     }
 
+    // KVM: read-write — bwrap binds /dev/kvm when --kvm is set, and
+    // landlock_wrapper_args forwards the flag here. The /dev rule above
+    // already covers the node; this one keeps KVM usable if that rule is
+    // ever narrowed.
+    if config.kvm_enabled() {
+        let kvm = PathBuf::from("/dev/kvm");
+        if super::path_exists(&kvm) {
+            if verbose {
+                output::verbose("Landlock: kvm /dev/kvm rw");
+            }
+            rw.push(kvm);
+        }
+    }
+
     // Display runtime: only the selected Wayland socket is exposed.
     if config.display_enabled()
         && let Ok(xdg_dir) = std::env::var("XDG_RUNTIME_DIR")
@@ -1148,6 +1162,26 @@ mod tests {
         assert!(!rw.iter().any(|p| {
             p == Path::new(crate::sandbox::bwrap::TAILSCALE_SOCKET)
         }));
+    }
+
+    #[test]
+    fn normal_paths_grant_dev_kvm_only_when_enabled() {
+        let dev_kvm = Path::new("/dev/kvm");
+        let config = Config {
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            private_home: Some(false),
+            ..Config::default()
+        };
+        let (_ro, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
+        assert!(!rw.iter().any(|p| p == dev_kvm));
+
+        let config = Config {
+            kvm: Some(true),
+            ..config
+        };
+        let (_ro, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
+        assert_eq!(rw.iter().any(|p| p == dev_kvm), dev_kvm.exists());
     }
 
     #[test]

@@ -182,6 +182,12 @@ pub struct Config {
     /// only disable it, never enable it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<bool>,
+    /// Trusted capability: expose `/dev/kvm` for hardware
+    /// virtualization (QEMU/Firecracker/Android emulator). Opt-in
+    /// (Linux only); the untrusted project `.ai-jail` may only
+    /// disable it, never enable it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kvm: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<bool>,
     /// Permit macOS Seatbelt's broad host IPC compatibility rules. This is
@@ -332,6 +338,9 @@ impl Config {
     }
     pub fn audio_enabled(&self) -> bool {
         self.audio == Some(true)
+    }
+    pub fn kvm_enabled(&self) -> bool {
+        self.kvm == Some(true)
     }
     pub fn x11_enabled(&self) -> bool {
         self.x11 == Some(true)
@@ -867,6 +876,7 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(tailscale);
     take!(no_display);
     take!(audio);
+    take!(kvm);
     take!(network);
     take!(macos_host_ipc);
     take!(x11);
@@ -1207,6 +1217,7 @@ pub fn merge_with_global_report(
     monotonic!(tailscale, |config: &Config| config.tailscale_enabled());
     monotonic!(no_display, |config: &Config| config.display_enabled());
     monotonic!(audio, |config: &Config| config.audio_enabled());
+    monotonic!(kvm, |config: &Config| config.kvm_enabled());
     monotonic!(network, |config: &Config| config.network_enabled());
     monotonic!(macos_host_ipc, |config: &Config| config
         .macos_host_ipc_enabled());
@@ -1693,6 +1704,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     direct!(tailscale);
     invert!(display, no_display);
     direct!(audio);
+    direct!(kvm);
     direct!(network);
     direct!(macos_host_ipc);
     direct!(x11);
@@ -1837,6 +1849,7 @@ pub fn display_status(config: &Config) {
     print_shared_or_hidden("  Tailscale", config.tailscale);
     print_opt_in_tristate("  Display", config.no_display);
     print_opt_in_enabled("  Audio", config.audio);
+    print_opt_in_enabled("  KVM", config.kvm);
     print_network_mode(config);
     print_opt_in_enabled("  macOS host IPC", config.macos_host_ipc);
     print_opt_in_enabled("  X11", config.x11);
@@ -2175,6 +2188,48 @@ mod tests {
         };
         assert!(enabled.audio_enabled());
         assert!(serialize_config(&enabled).unwrap().contains("audio = true"));
+    }
+
+    #[test]
+    fn kvm_is_opt_in_and_project_cannot_enable_it() {
+        assert!(!Config::default().kvm_enabled());
+        let project = Config {
+            kvm: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(!merged.kvm_enabled());
+        assert!(warnings.iter().any(|warning| warning.contains("kvm")));
+
+        let enabled = Config {
+            kvm: Some(true),
+            ..Config::default()
+        };
+        assert!(enabled.kvm_enabled());
+        assert!(serialize_config(&enabled).unwrap().contains("kvm = true"));
+
+        // A project may still turn off a globally enabled KVM.
+        let project = Config {
+            kvm: Some(false),
+            ..Config::default()
+        };
+        let (merged, _) =
+            merge_with_global_report(enabled, project, Path::new("/project"));
+        assert!(!merged.kvm_enabled());
+    }
+
+    #[test]
+    fn merge_kvm_flag_overrides() {
+        let cli = CliArgs {
+            kvm: Some(true),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, Config::default());
+        assert!(merged.kvm_enabled());
     }
 
     // ── Trusted capabilities: agent_state / env / update_check ──
@@ -3055,6 +3110,22 @@ rw_maps = ["/tmp/rw"]
     }
 
     #[test]
+    fn regression_v2_2_1_config_without_kvm() {
+        // Configs written before kvm existed must still parse, with KVM
+        // left off.
+        let toml = r#"
+command = ["claude"]
+rw_maps = ["/tmp/rw"]
+no_gpu = false
+audio = true
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.kvm, None);
+        assert!(!cfg.kvm_enabled());
+        assert!(cfg.audio_enabled());
+    }
+
+    #[test]
     fn parse_config_with_overlay_maps() {
         let toml = r#"
 command = ["claude"]
@@ -3145,6 +3216,7 @@ no_gpu = true
             tailscale: Some(true),
             no_display: Some(false),
             audio: Some(true),
+            kvm: Some(true),
             network: None,
             macos_host_ipc: None,
             x11: Some(true),
@@ -3196,6 +3268,7 @@ no_gpu = true
             config.deny_path_exceptions
         );
         assert_eq!(deserialized.no_gpu, config.no_gpu);
+        assert_eq!(deserialized.kvm, config.kvm);
         assert_eq!(deserialized.no_docker, config.no_docker);
         assert_eq!(deserialized.tailscale, config.tailscale);
         assert_eq!(deserialized.no_display, config.no_display);
@@ -5577,6 +5650,7 @@ hide_dotdirs = [".my_secrets"]
             tailscale: Some(true),
             no_display: None,
             audio: None,
+            kvm: None,
             network: None,
             macos_host_ipc: None,
             x11: None,

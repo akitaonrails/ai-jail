@@ -46,6 +46,9 @@ OPTIONS:
     --audio / --no-audio           Enable/disable host audio passthrough
                                    (PulseAudio/PipeWire sockets + /dev/snd;
                                    Linux only; default: off)
+    --kvm / --no-kvm               Enable/disable /dev/kvm passthrough for
+                                   hardware virtualization (Linux only;
+                                   default: off)
     --network / --no-network       Enable/disable unrestricted network access (default: off)
     --macos-host-ipc / --no-macos-host-ipc
                                     Enable/disable broad macOS host IPC compatibility (default: off)
@@ -128,6 +131,7 @@ pub struct CliArgs {
     pub tailscale: Option<bool>,
     pub display: Option<bool>,
     pub audio: Option<bool>,
+    pub kvm: Option<bool>,
     pub network: Option<bool>,
     pub macos_host_ipc: Option<bool>,
     pub x11: Option<bool>,
@@ -314,6 +318,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("audio" | "no-audio")) => {
                 args.audio = Some(s == "audio");
+            }
+            Long(s @ ("kvm" | "no-kvm")) => {
+                args.kvm = Some(s == "kvm");
             }
             Long(s @ ("network" | "no-network")) => {
                 args.network = Some(s == "network");
@@ -558,6 +565,8 @@ fn is_sandbox_long_flag(arg: &str) -> bool {
             | "--display"
             | "--audio"
             | "--no-audio"
+            | "--kvm"
+            | "--no-kvm"
             | "--network"
             | "--no-network"
             | "--macos-host-ipc"
@@ -845,6 +854,16 @@ mod tests {
     fn parse_no_audio() {
         let args = parse_test(&["--no-audio", "bash"]).unwrap();
         assert_eq!(args.audio, Some(false));
+    }
+
+    #[test]
+    fn parse_kvm() {
+        let args = parse_test(&["--kvm", "bash"]).unwrap();
+        assert_eq!(args.kvm, Some(true));
+        let args = parse_test(&["--no-kvm", "bash"]).unwrap();
+        assert_eq!(args.kvm, Some(false));
+        let args = parse_test(&["--kvm", "--no-kvm", "bash"]).unwrap();
+        assert_eq!(args.kvm, Some(false));
     }
 
     #[test]

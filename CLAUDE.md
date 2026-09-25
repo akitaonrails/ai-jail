@@ -85,7 +85,7 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 
 1. Base mounts (`/usr`, `/etc`, `/opt`, `/sys`, `/dev`, `/proc`, `/tmp`, `/run`)
 2. Sensitive /sys masks (tmpfs over `/sys/firmware`, `/sys/kernel/security`, etc.)
-3. GPU devices
+3. GPU devices, then KVM device (`--kvm`, `/dev/kvm`)
 4. Docker socket
 5. Tailscale socket
 6. Shared memory (`/dev/shm`)

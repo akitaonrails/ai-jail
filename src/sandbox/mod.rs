@@ -19,6 +19,7 @@ fn project_config_dangerous_opt_ins(
         (config.pictures_enabled(), "Pictures directory"),
         (config.systemd_user_enabled(), "systemd user bus"),
         (config.audio_enabled(), "Host audio"),
+        (config.kvm_enabled(), "KVM device"),
     ] {
         if enabled {
             items.push(name.into());

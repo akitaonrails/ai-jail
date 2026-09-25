@@ -198,6 +198,7 @@ pub(crate) struct LaunchRecord<'a> {
     pub gpu: bool,
     pub display: bool,
     pub audio: bool,
+    pub kvm: bool,
     pub browser_profile: Option<&'a str>,
     pub project_config: bool,
     pub project_trusted: bool,
@@ -403,6 +404,7 @@ pub(crate) fn launch_record(record: &LaunchRecord<'_>) -> serde_json::Value {
         "gpu": record.gpu,
         "display": record.display,
         "audio": record.audio,
+        "kvm": record.kvm,
         "browser_profile": record.browser_profile,
         "config": {
             "project": record.project_config,
@@ -629,6 +631,7 @@ mod tests {
             gpu: false,
             display: false,
             audio: false,
+            kvm: false,
             browser_profile: None,
             project_config: true,
             project_trusted: false,
