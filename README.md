@@ -207,6 +207,24 @@ re-originated over TLS by the supervisor, which therefore sees that plaintext
 for secret-bound hosts. HTTPS clients that only CONNECT keep working exactly
 as before, with no substitution.
 
+### Host loopback services: `--forward-port PORT`
+
+Without `--network` the sandbox has its own loopback, so services listening
+on the host's `127.0.0.1` — a local MCP server, an editor's IDE socket, a
+dev database — are unreachable. `--forward-port 49374` (repeatable, or
+`forward_ports = [...]` in the global config) relays exactly that port: the
+supervisor connects a per-launch Unix socket to the host's
+`127.0.0.1:49374`, and an in-sandbox bridge listens on the sandbox's own
+`127.0.0.1:49374` and pumps into it. The private network namespace stays
+up; every other host port stays unreachable. It combines with filtered
+egress and `--lockdown` (the port joins the Landlock V4 connect allow set),
+cannot combine with `--network` (the host loopback is already reachable
+there), and is Linux-only.
+
+A forwarded port is trusted in full: there is no allowlist or inspection on
+it, so the agent can do whatever the service behind it accepts. A project
+`.ai-jail` may only shrink the list, never grow it.
+
 `--allow-tcp-port` remains accepted for backward compatibility, but launch
 fails closed because UDP cannot be securely constrained through this option —
 use `--allow-host` for filtered egress instead.
@@ -512,6 +530,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --deny-path PATH|GLOB           deny project paths
 --agent-state / --no-agent-state  mount the command's credential state (default off)
 --env NAME[=VALUE]              forward or set an environment variable (repeatable)
+--forward-port PORT             relay host 127.0.0.1:PORT into the sandbox (Linux, repeatable)
 --inherit-env / --no-inherit-env  pass the full parent environment (default: allowlist)
 --update-check / --no-update-check  host-side version check (default off)
 --lockdown / --no-lockdown      strict read-only mode, no network by default

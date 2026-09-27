@@ -227,6 +227,32 @@ fn validate_network_flags(config: &config::Config) -> Result<(), String> {
     if config.browser_profile().is_some() && !config.allow_hosts().is_empty() {
         return Err("--browser and --allow-host cannot be combined: browsers need real DNS and many domains".into());
     }
+    validate_forward_ports(config)
+}
+
+/// `--forward-port` contradiction checks, fail-closed at launch. A
+/// forward only means something across a private netns; the in-sandbox
+/// bridge port is taken; port 0 names no service.
+fn validate_forward_ports(config: &config::Config) -> Result<(), String> {
+    if config.forward_ports().is_empty() {
+        return Ok(());
+    }
+    if cfg!(not(target_os = "linux")) {
+        return Err("--forward-port is Linux-only: it relays across the sandbox's private network namespace".into());
+    }
+    if config.network_enabled() {
+        return Err("--network and --forward-port are mutually exclusive: with unrestricted network the host's loopback is already reachable".into());
+    }
+    for &port in config.forward_ports() {
+        if port == 0 {
+            return Err("--forward-port 0 is not a port".into());
+        }
+        if port == proxy::BRIDGE_PORT {
+            return Err(format!(
+                "--forward-port {port} collides with the in-sandbox proxy bridge port"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -389,7 +415,13 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     // below -- exits.
     #[cfg(target_os = "linux")]
     if let Some(port) = cli.proxy_bridge_port {
-        spawn_proxy_bridge(port)?;
+        spawn_bridge(port, std::path::Path::new(proxy::IN_SANDBOX_SOCK_PATH))?;
+    }
+    // Port forwards: the same bridge, one per port, pumping into the
+    // host-side forward socket bwrap mounted at the per-port path.
+    #[cfg(target_os = "linux")]
+    for &port in config.forward_ports() {
+        spawn_bridge(port, &proxy::forward_in_sandbox_path(port))?;
     }
 
     // Apply Landlock inside the sandbox (after bwrap namespace setup).
@@ -443,28 +475,27 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     Err(format!("Failed to exec {}: {err}", cli.command[0]))
 }
 
-/// Spawn the in-sandbox proxy bridge as a child of the landlock
-/// wrapper. Fatal on spawn failure: without the bridge, filtered egress
-/// silently means "no egress at all", which is not what the launch
-/// asked for. The child is never reaped or waited on -- it lives
-/// exactly as long as the sandbox's pid namespace (see the call site).
+/// Spawn an in-sandbox bridge (127.0.0.1:<port> -> Unix `socket`) as a
+/// child of the landlock wrapper: the filtered-egress proxy bridge, or a
+/// `--forward-port` bridge. Fatal on spawn failure: without the bridge,
+/// the port the launch asked for silently leads nowhere. The child is
+/// never reaped or waited on -- it lives exactly as long as the
+/// sandbox's pid namespace (see the call site).
 #[cfg(target_os = "linux")]
-fn spawn_proxy_bridge(port: u16) -> Result<(), String> {
+fn spawn_bridge(port: u16, socket: &std::path::Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| {
-        format!("Cannot resolve ai-jail binary for the proxy bridge: {e}")
+        format!("Cannot resolve ai-jail binary for the bridge on {port}: {e}")
     })?;
     std::process::Command::new(exe)
-        .args([
-            "--proxy-bridge",
-            port.to_string().as_str(),
-            proxy::IN_SANDBOX_SOCK_PATH,
-        ])
+        .arg("--proxy-bridge")
+        .arg(port.to_string())
+        .arg(socket)
         // The internal-mode marker --proxy-bridge refuses to run
         // without; an agent that can already reach the proxy socket
         // gains nothing by setting it itself.
         .env("AI_JAIL_PROXY_BRIDGE", "1")
         .spawn()
-        .map_err(|e| format!("Failed to spawn the proxy bridge: {e}"))?;
+        .map_err(|e| format!("Failed to spawn the bridge on {port}: {e}"))?;
     Ok(())
 }
 
@@ -934,6 +965,27 @@ fn run() -> Result<i32, String> {
         None
     };
 
+    // Port forwards (Linux): one host-side Unix listener per port, bound
+    // before the sandbox is built so bwrap can mount each socket. Like the
+    // proxy handle, they must outlive the child (dropping unlinks them).
+    #[cfg(target_os = "linux")]
+    let port_forwards = config
+        .forward_ports()
+        .iter()
+        .map(|&port| {
+            proxy::PortForward::start(port).map_err(|e| {
+                format!("Failed to start the forward for port {port}: {e}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(target_os = "linux")]
+    let forward_sockets: Vec<(u16, std::path::PathBuf)> = port_forwards
+        .iter()
+        .map(|f| (f.port(), f.unix_path().to_path_buf()))
+        .collect();
+    #[cfg(not(target_os = "linux"))]
+    let forward_sockets: Vec<(u16, std::path::PathBuf)> = Vec::new();
+
     let project_dir = std::env::current_dir()
         .map_err(|e| format!("Cannot determine current directory: {e}"))?;
 
@@ -957,6 +1009,7 @@ fn run() -> Result<i32, String> {
             &project_dir,
             cli.verbose,
             egress_proxy.as_ref(),
+            &forward_sockets,
         )?;
         output::dry_run_line(&formatted);
         return Ok(0);
@@ -1052,6 +1105,7 @@ fn run() -> Result<i32, String> {
         cli.verbose,
         sandbox_tty.as_deref(),
         egress_proxy.as_ref(),
+        &forward_sockets,
     )?;
 
     // Apply NOFILE and CORE limits on the parent (inherited by child
@@ -1328,6 +1382,34 @@ mod tests {
         let error = validate_network_flags(&config).unwrap_err();
         assert!(error.contains("--allow-tcp-port is disabled"));
         assert!(error.contains("--allow-host"));
+    }
+
+    #[test]
+    fn forward_port_contradictions_hard_error() {
+        let with_network = Config {
+            network: Some(true),
+            forward_ports: vec![49374],
+            ..Config::default()
+        };
+        let error = validate_network_flags(&with_network).unwrap_err();
+        assert!(error.contains("mutually exclusive"));
+        for port in [0, crate::proxy::BRIDGE_PORT] {
+            let config = Config {
+                forward_ports: vec![port],
+                ..Config::default()
+            };
+            assert!(validate_network_flags(&config).is_err(), "port {port}");
+        }
+        let ok = Config {
+            forward_ports: vec![49374],
+            allow_hosts: vec!["api.anthropic.com".into()],
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        assert_eq!(
+            validate_network_flags(&ok).is_ok(),
+            cfg!(target_os = "linux")
+        );
     }
 
     #[test]

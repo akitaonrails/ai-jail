@@ -126,6 +126,9 @@ OPTIONS:
     --allow-host <HOST>            Allow CONNECT egress to HOST and its subdomains via the
                                    built-in filtered proxy (repeatable; implies filtered
                                    network mode; cannot combine with --network)
+    --forward-port <PORT>          Expose the host's 127.0.0.1:PORT on the sandbox's own
+                                   loopback (repeatable; cannot combine with --network;
+                                   the service behind PORT is reachable in full)
     --claude-dir <PATH>            Use PATH as Claude config dir (sets CLAUDE_CONFIG_DIR)
     --clean                        Ignore project .ai-jail config, start fresh
     --dry-run                      Print the sandbox command without executing
@@ -181,6 +184,7 @@ pub struct CliArgs {
     pub status_bar_style: Option<String>,
     pub allow_tcp_ports: Vec<u16>,
     pub allow_hosts: Vec<String>,
+    pub forward_ports: Vec<u16>,
     pub claude_dir: Option<PathBuf>,
     pub agent_state: Option<bool>,
     pub inherit_env: Option<bool>,
@@ -364,6 +368,14 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     return Err("--allow-host requires a non-empty host".into());
                 }
                 args.allow_hosts.push(host.into_owned());
+            }
+            Long("forward-port") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let port_text = val.to_string_lossy();
+                let port: u16 = port_text
+                    .parse()
+                    .map_err(|_| format!("invalid port number: {port_text}"))?;
+                args.forward_ports.push(port);
             }
             Long("claude-dir") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -1728,6 +1740,27 @@ mod tests {
     fn parse_status_bar_eq_invalid() {
         let result = parse_test(&["--status-bar=neon", "bash"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_forward_port_repeatable() {
+        let args = parse_test(&[
+            "--forward-port",
+            "49374",
+            "--forward-port",
+            "64342",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.forward_ports, vec![49374, 64342]);
+        assert_eq!(args.command, vec!["bash"]);
+    }
+
+    #[test]
+    fn parse_forward_port_invalid() {
+        assert!(parse_test(&["--forward-port", "70000", "bash"]).is_err());
+        assert!(parse_test(&["--forward-port", "http", "bash"]).is_err());
+        assert!(parse_test(&["--forward-port"]).is_err());
     }
 
     #[test]

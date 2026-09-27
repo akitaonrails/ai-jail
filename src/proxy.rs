@@ -910,6 +910,82 @@ pub(crate) fn run_bridge(port: u16, socket: &Path) -> Result<(), String> {
     }
 }
 
+/// Fixed path inside the sandbox where the host-side Unix socket of a
+/// `--forward-port` is bind-mounted (Linux). One per port, under the
+/// same fresh /tmp tmpfs as the proxy socket.
+#[cfg(target_os = "linux")]
+pub(crate) fn forward_in_sandbox_path(port: u16) -> PathBuf {
+    PathBuf::from(format!("/tmp/.ai-jail-forward.{port}.sock"))
+}
+
+/// Host-side end of a `--forward-port` (Linux): a Unix listener whose
+/// every connection is relayed to the host's 127.0.0.1:<port>. Inside
+/// the sandbox the same `run_bridge` that serves the proxy listens on
+/// 127.0.0.1:<port> and pumps into this socket, so the private netns
+/// stays up and only the named port crosses it -- no allowlist, no
+/// SSRF guard: forwarding a port is the explicit decision to trust the
+/// service behind it.
+#[cfg(target_os = "linux")]
+pub(crate) struct PortForward {
+    port: u16,
+    unix_path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl PortForward {
+    /// Bind the Unix listener (mode 0600) at a per-launch nonce path and
+    /// serve it on a dedicated accept thread. A host service that is
+    /// down only fails the connection that needed it, as on the host.
+    pub(crate) fn start(port: u16) -> io::Result<PortForward> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = std::env::temp_dir().join(format!(
+            "ai-jail-forward.{}.{}.{port}.sock",
+            std::process::id(),
+            nonce
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path)?;
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(0o600),
+        )?;
+        thread::spawn(move || {
+            for client in listener.incoming().map_while(Result::ok) {
+                thread::spawn(move || {
+                    if let Ok(upstream) =
+                        TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                    {
+                        relay(client, upstream);
+                    }
+                });
+            }
+        });
+        Ok(PortForward {
+            port,
+            unix_path: path,
+        })
+    }
+
+    /// Host loopback port this forward reaches.
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Host-side Unix socket path.
+    pub(crate) fn unix_path(&self) -> &Path {
+        &self.unix_path
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PortForward {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.unix_path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
