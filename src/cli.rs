@@ -726,6 +726,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-terminal-passthrough",
     "--agent-state",
     "--no-agent-state",
+    "--forward-port",
     "--inherit-env",
     "--no-inherit-env",
     "--update-check",
@@ -1754,6 +1755,14 @@ mod tests {
         .unwrap();
         assert_eq!(args.forward_ports, vec![49374, 64342]);
         assert_eq!(args.command, vec!["bash"]);
+    }
+
+    #[test]
+    fn forward_port_after_the_command_is_refused() {
+        // It would otherwise reach the child as its own argument.
+        assert!(parse_test(&["bash", "--forward-port", "49374"]).is_err());
+        // After `--` it belongs to the child, as for every sandbox flag.
+        assert!(parse_test(&["bash", "--", "--forward-port", "49374"]).is_ok());
     }
 
     #[test]
