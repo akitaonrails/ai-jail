@@ -2371,6 +2371,11 @@ fn discover_command_binary(
             paths.push(path);
         }
     }
+    // A path under an already-bound directory is redundant, and binding it
+    // can fail: after `~/.local/bin` is mounted, `~/.local/bin/claude` is a
+    // dangling symlink until its versions dir is mounted (#138).
+    let all = paths.clone();
+    paths.retain(|p| !all.iter().any(|a| a != p && p.starts_with(a)));
     paths
         .into_iter()
         .map(|path| {
@@ -4646,6 +4651,59 @@ mod tests {
             &args,
             &home.join(".local/share/agent/versions")
         ));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn private_home_skips_command_paths_under_bound_dir() {
+        // Regression for #138: with ai-memory and the Claude installer
+        // symlink both in ~/.local/bin, binding `~/.local/bin/claude` after
+        // the whole dir made bwrap follow a dangling symlink and abort.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-bwrap-cmd-home-nested-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let bin = home.join(".local/bin");
+        let versions = home.join(".local/share/claude/versions");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&versions).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for exe in [versions.join("1.0"), bin.join("ai-memory")] {
+            std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(
+                &exe,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink(versions.join("1.0"), bin.join("claude"))
+            .unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path = EnvVarGuard::set("PATH", prepend_path(&bin));
+
+        let config = Config {
+            command: vec!["ai-memory".into(), "run".into(), "claude".into()],
+            private_home: Some(true),
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &home.join("project"),
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        assert!(has_ro_bind(&args, &bin));
+        assert!(has_ro_bind(&args, &versions));
+        assert!(!has_ro_bind(&args, &bin.join("claude")));
 
         let _ = std::fs::remove_dir_all(&home);
     }
