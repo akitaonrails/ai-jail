@@ -401,6 +401,15 @@ profile bwrap /usr/bin/bwrap flags=(unconfined) {
 
 Then `sudo apparmor_parser -r /etc/apparmor.d/bwrap`.
 
+**opencode hangs at "Starting background server...".** opencode 2.x runs as a
+client of a shared background service whose socket lives under
+`~/.local/share/opencode`. The jail is a one-shot wrapper with a fresh tmpfs
+home, so that service can neither persist nor be found across runs — a shared
+daemon model does not fit the jail by design. Run opencode's own
+self-contained mode instead, pinned in the config so it is not typed each
+time (`command = ["opencode", "--standalone"]`). ai-jail also warns about
+this at launch when the command is opencode without `--standalone`.
+
 **`Failed to create stream fd: No such file or directory` at startup.**
 This comes from mise setup, not from ai-jail. mise activation runs under a
 login shell, which sources `/etc/profile.d/*.sh`; on Ubuntu desktop one of

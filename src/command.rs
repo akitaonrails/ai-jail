@@ -214,6 +214,17 @@ pub(crate) fn capability_gap_warnings(
              pass --agent-state; see `ai-jail status`"
         ));
     }
+    if name == "opencode"
+        && !config.command.iter().any(|arg| arg == "--standalone")
+    {
+        warnings.push(
+            "ai-jail: opencode 2.x runs as a client of a shared background \
+             server, which does not survive the jail — if startup hangs at \
+             \"Starting background server\", add `--standalone` to the \
+             command (issue #137)"
+                .to_string(),
+        );
+    }
     warnings
 }
 
@@ -382,6 +393,20 @@ mod tests {
     fn capability_gap_silent_for_unknown_command() {
         let warnings = capability_gap_warnings(&gap_config("bash", None, None));
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn capability_gap_warns_opencode_without_standalone() {
+        // Issue #137: opencode 2.x is a client of a shared background
+        // server that does not survive the jail; --standalone avoids it.
+        let mut config = gap_config("opencode", Some(true), Some(true));
+        let warnings = capability_gap_warnings(&config);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("--standalone"));
+        assert!(warnings[0].contains("#137"));
+
+        config.command = args(&["opencode", "--standalone"]);
+        assert!(capability_gap_warnings(&config).is_empty());
     }
 
     #[test]
