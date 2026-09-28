@@ -2,7 +2,7 @@
 
 pkgname=ai-jail
 pkgver=2.2.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Sandbox wrapper for AI coding agents"
 arch=('x86_64' 'aarch64')
 url="https://github.com/akitaonrails/ai-jail"
@@ -16,7 +16,7 @@ optdepends=(
 # Cargo's release profile strips symbols, so the auto-generated -debug split
 # would be empty and would collide with ai-jail-bin-debug if both package
 # variants were ever installed on the same machine.
-options=('!debug')
+options=('!debug' '!lto')
 conflicts=('ai-jail-bin')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('811aae1ecb1141f8ac2873e40e10595ecb69540ac53029a112b0ca8bced3f0b1')
