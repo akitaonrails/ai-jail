@@ -996,14 +996,10 @@ impl PortForward {
         )?;
         let active = Arc::new(AtomicUsize::new(0));
         thread::spawn(move || {
-            for client in listener.incoming() {
-                let client = match client {
-                    Ok(client) => client,
-                    Err(_) => {
-                        thread::sleep(Duration::from_millis(50));
-                        continue;
-                    }
-                };
+            loop {
+                let client = accept_next("forward listener", &mut || {
+                    listener.accept().map(|(stream, _)| stream)
+                });
                 if active.fetch_add(1, Ordering::SeqCst)
                     >= MAX_FORWARD_CONNECTIONS
                 {

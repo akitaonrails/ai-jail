@@ -224,9 +224,9 @@ joins the Landlock V4 connect allow set), and is Linux-only. Ports below
 1024 are refused: the sandbox cannot bind them.
 
 It cannot combine with `--network`, where the host loopback is already
-reachable — so a `forward_ports` entry in the global config fails every
-`--network` or `--browser` launch; put it under a command-specific table
-instead.
+reachable, and it is refused outside Linux — so a `forward_ports` entry in
+the global config fails every `--network` or `--browser` launch, and every
+launch on macOS; put it under a command-specific table instead.
 
 A forwarded port is trusted in full: there is no allowlist, inspection or
 audit record on it, so the agent can do whatever the service behind it
