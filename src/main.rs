@@ -247,6 +247,14 @@ fn validate_forward_ports(config: &config::Config) -> Result<(), String> {
         if port == 0 {
             return Err("--forward-port 0 is not a port".into());
         }
+        // The sandbox's own network namespace keeps the kernel default
+        // ip_unprivileged_port_start (1024), and the bridge holds no
+        // capability to bind below it.
+        if port < 1024 {
+            return Err(format!(
+                "--forward-port {port}: ports below 1024 cannot be bound inside the sandbox"
+            ));
+        }
         if port == proxy::BRIDGE_PORT {
             return Err(format!(
                 "--forward-port {port} collides with the in-sandbox proxy bridge port"
@@ -415,13 +423,17 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     // below -- exits.
     #[cfg(target_os = "linux")]
     if let Some(port) = cli.proxy_bridge_port {
-        spawn_bridge(port, std::path::Path::new(proxy::IN_SANDBOX_SOCK_PATH))?;
+        spawn_bridge(
+            port,
+            std::path::Path::new(proxy::IN_SANDBOX_SOCK_PATH),
+            false,
+        )?;
     }
     // Port forwards: the same bridge, one per port, pumping into the
     // host-side forward socket bwrap mounted at the per-port path.
     #[cfg(target_os = "linux")]
     for &port in config.forward_ports() {
-        spawn_bridge(port, &proxy::forward_in_sandbox_path(port))?;
+        spawn_bridge(port, &proxy::forward_in_sandbox_path(port), true)?;
     }
 
     // Apply Landlock inside the sandbox (after bwrap namespace setup).
@@ -481,21 +493,52 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
 /// the port the launch asked for silently leads nowhere. The child is
 /// never reaped or waited on -- it lives exactly as long as the
 /// sandbox's pid namespace (see the call site).
+///
+/// With `wait_ready`, also fatal when the bridge cannot bind, and the
+/// agent is not exec'd until the port is listening: the bridge reports
+/// `ready` on a piped stdout once bound, and exits (EOF) if it cannot.
+/// Without it (the proxy bridge) behaviour is unchanged: the bridge
+/// inherits the agent's stdout, which it must never write to.
 #[cfg(target_os = "linux")]
-fn spawn_bridge(port: u16, socket: &std::path::Path) -> Result<(), String> {
+fn spawn_bridge(
+    port: u16,
+    socket: &std::path::Path,
+    wait_ready: bool,
+) -> Result<(), String> {
+    use std::io::BufRead;
     let exe = std::env::current_exe().map_err(|e| {
         format!("Cannot resolve ai-jail binary for the bridge on {port}: {e}")
     })?;
-    std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .arg("--proxy-bridge")
         .arg(port.to_string())
         .arg(socket)
         // The internal-mode marker --proxy-bridge refuses to run
         // without; an agent that can already reach the proxy socket
         // gains nothing by setting it itself.
-        .env("AI_JAIL_PROXY_BRIDGE", "1")
+        .env("AI_JAIL_PROXY_BRIDGE", "1");
+    if wait_ready {
+        command
+            .env(proxy::BRIDGE_READY_ENV, "1")
+            .stdout(std::process::Stdio::piped());
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to spawn the bridge on {port}: {e}"))?;
+    if wait_ready {
+        let mut line = String::new();
+        let ready = child
+            .stdout
+            .take()
+            .map(|out| std::io::BufReader::new(out).read_line(&mut line))
+            .is_some_and(|r| r.is_ok());
+        if !ready || line.trim() != "ready" {
+            return Err(format!(
+                "--forward-port {port}: the in-sandbox bridge did not come up"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -973,7 +1016,7 @@ fn run() -> Result<i32, String> {
         .forward_ports()
         .iter()
         .map(|&port| {
-            proxy::PortForward::start(port).map_err(|e| {
+            proxy::PortForward::start(port, cli.verbose).map_err(|e| {
                 format!("Failed to start the forward for port {port}: {e}")
             })
         })
@@ -1393,7 +1436,7 @@ mod tests {
         };
         let error = validate_network_flags(&with_network).unwrap_err();
         assert!(error.contains("mutually exclusive"));
-        for port in [0, crate::proxy::BRIDGE_PORT] {
+        for port in [0, 80, 443, 1023, crate::proxy::BRIDGE_PORT] {
             let config = Config {
                 forward_ports: vec![port],
                 ..Config::default()

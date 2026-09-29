@@ -883,6 +883,9 @@ pub(crate) fn env_vars(port: u16) -> Vec<(String, String)> {
     vars
 }
 
+/// Env var asking the bridge to print `ready` on stdout once bound.
+pub(crate) const BRIDGE_READY_ENV: &str = "AI_JAIL_BRIDGE_READY";
+
 /// The in-sandbox bridge end of filtered egress (Linux, phase 3 of
 /// docs/connect-proxy-plan.md): listen on 127.0.0.1:<port> inside the
 /// private netns and pump each accepted connection to the outer proxy's
@@ -893,10 +896,30 @@ pub(crate) fn env_vars(port: u16) -> Vec<(String, String)> {
 /// before apply_landlock/apply_seccomp, and those only restrict the
 /// caller and its future children.
 pub(crate) fn run_bridge(port: u16, socket: &Path) -> Result<(), String> {
-    let listener =
-        TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(|e| {
-            format!("proxy bridge cannot bind 127.0.0.1:{port}: {e}")
-        })?;
+    // Test-only (tests/port_forward.rs): hold the bind back so a spawner
+    // that does not wait for readiness loses the race every time. Never
+    // documented, and honoured only by bridges whose spawner waits for
+    // them (a `--forward-port` bridge): it can only delay the launch, never
+    // leave the proxy bridge unbound while the agent runs.
+    let wait_ready = std::env::var_os(BRIDGE_READY_ENV).is_some();
+    if let Some(ms) = std::env::var("AI_JAIL_TEST_BRIDGE_DELAY_MS")
+        .ok()
+        .filter(|_| wait_ready)
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        thread::sleep(Duration::from_millis(ms.min(5_000)));
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .map_err(|e| format!("bridge cannot bind 127.0.0.1:{port}: {e}"))?;
+    // A spawner that waits for the port (a `--forward-port` bridge) sets
+    // this and pipes stdout; the proxy bridge inherits the agent's stdout
+    // and must never write to it.
+    if wait_ready {
+        let mut out = io::stdout();
+        out.write_all(b"ready\n")
+            .and_then(|()| out.flush())
+            .map_err(|e| format!("bridge cannot report readiness: {e}"))?;
+    }
     loop {
         let client = accept_next("proxy bridge listener", &mut || {
             listener.accept().map(|(stream, _)| stream)
@@ -918,6 +941,20 @@ pub(crate) fn forward_in_sandbox_path(port: u16) -> PathBuf {
     PathBuf::from(format!("/tmp/.ai-jail-forward.{port}.sock"))
 }
 
+/// Simultaneous relays one `--forward-port` serves; the same bound the
+/// egress proxy applies to its tunnels.
+#[cfg(target_os = "linux")]
+pub(crate) const MAX_FORWARD_CONNECTIONS: usize = 256;
+
+/// Dial the host's loopback on `port`: IPv4 first, then IPv6. A service
+/// that binds `localhost` may listen on `::1` only (Node >= 17 dev
+/// servers do); the sandbox side always listens on 127.0.0.1.
+#[cfg(target_os = "linux")]
+fn connect_host_loopback(port: u16) -> io::Result<TcpStream> {
+    TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .or_else(|_| TcpStream::connect((Ipv6Addr::LOCALHOST, port)))
+}
+
 /// Host-side end of a `--forward-port` (Linux): a Unix listener whose
 /// every connection is relayed to the host's 127.0.0.1:<port>. Inside
 /// the sandbox the same `run_bridge` that serves the proxy listens on
@@ -936,7 +973,13 @@ impl PortForward {
     /// Bind the Unix listener (mode 0600) at a per-launch nonce path and
     /// serve it on a dedicated accept thread. A host service that is
     /// down only fails the connection that needed it, as on the host.
-    pub(crate) fn start(port: u16) -> io::Result<PortForward> {
+    ///
+    /// Bounded like the egress proxy: at most [`MAX_FORWARD_CONNECTIONS`]
+    /// relays at once (each costs host threads and fds, and the sandbox
+    /// decides how many it opens); excess connections are closed. Accept
+    /// errors (EMFILE, ECONNABORTED) back off and retry instead of ending
+    /// the forward for the rest of the launch.
+    pub(crate) fn start(port: u16, verbose: bool) -> io::Result<PortForward> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -951,14 +994,33 @@ impl PortForward {
             &path,
             std::fs::Permissions::from_mode(0o600),
         )?;
+        let active = Arc::new(AtomicUsize::new(0));
         thread::spawn(move || {
-            for client in listener.incoming().map_while(Result::ok) {
-                thread::spawn(move || {
-                    if let Ok(upstream) =
-                        TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-                    {
-                        relay(client, upstream);
+            for client in listener.incoming() {
+                let client = match client {
+                    Ok(client) => client,
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(50));
+                        continue;
                     }
+                };
+                if active.fetch_add(1, Ordering::SeqCst)
+                    >= MAX_FORWARD_CONNECTIONS
+                {
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    drop(client);
+                    continue;
+                }
+                let active = Arc::clone(&active);
+                thread::spawn(move || {
+                    match connect_host_loopback(port) {
+                        Ok(upstream) => relay(client, upstream),
+                        Err(e) if verbose => crate::output::verbose(&format!(
+                            "forward {port}: host service unreachable: {e}"
+                        )),
+                        Err(_) => {}
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });

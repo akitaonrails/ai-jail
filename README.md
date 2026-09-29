@@ -214,16 +214,26 @@ on the host's `127.0.0.1` — a local MCP server, an editor's IDE socket, a
 dev database — are unreachable. `--forward-port 49374` (repeatable, or
 `forward_ports = [...]` in the global config) relays exactly that port: the
 supervisor connects a per-launch Unix socket to the host's
-`127.0.0.1:49374`, and an in-sandbox bridge listens on the sandbox's own
-`127.0.0.1:49374` and pumps into it. The private network namespace stays
-up; every other host port stays unreachable. It combines with filtered
-egress and `--lockdown` (the port joins the Landlock V4 connect allow set),
-cannot combine with `--network` (the host loopback is already reachable
-there), and is Linux-only.
+`127.0.0.1:49374` (falling back to `[::1]:49374`, for services bound to
+`localhost` over IPv6 only), and an in-sandbox bridge listens on the
+sandbox's own `127.0.0.1:49374` and pumps into it. The agent starts only
+once every bridge is listening, and a bridge that cannot bind fails the
+launch. The private network namespace stays up; every other host port stays
+unreachable. It combines with filtered egress and `--lockdown` (the port
+joins the Landlock V4 connect allow set), and is Linux-only. Ports below
+1024 are refused: the sandbox cannot bind them.
 
-A forwarded port is trusted in full: there is no allowlist or inspection on
-it, so the agent can do whatever the service behind it accepts. A project
-`.ai-jail` may only shrink the list, never grow it.
+It cannot combine with `--network`, where the host loopback is already
+reachable — so a `forward_ports` entry in the global config fails every
+`--network` or `--browser` launch; put it under a command-specific table
+instead.
+
+A forwarded port is trusted in full: there is no allowlist, inspection or
+audit record on it, so the agent can do whatever the service behind it
+accepts. At most 256 relays run at once. Only the CLI and global config can
+open a forward: a project `.ai-jail` cannot, unless the global config lists
+it under `trust_project_config`. Forwards are never written into a project
+file by auto-save or `--init`.
 
 `--allow-tcp-port` remains accepted for backward compatibility, but launch
 fails closed because UDP cannot be securely constrained through this option —

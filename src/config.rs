@@ -2043,8 +2043,18 @@ pub fn project_config_for_init(
     invocation_cwd: &Path,
 ) -> Config {
     let mut to_save = merge(cli, project);
+    drop_launch_only_fields(&mut to_save);
     absolutize_user_paths(&mut to_save, invocation_cwd);
     to_save
+}
+
+/// Fields a project file must not carry even when the CLI set them.
+/// `forward_ports` is trusted-only -- written into the untrusted project
+/// file it could never take effect and would only warn on every launch --
+/// and the ports it names (an editor's IDE socket, a dev server) usually
+/// change from one launch to the next.
+fn drop_launch_only_fields(to_save: &mut Config) {
+    to_save.forward_ports.clear();
 }
 
 pub fn project_config_for_auto_save(
@@ -2062,6 +2072,7 @@ pub fn project_config_for_auto_save(
         to_save.command = stored_project_command;
     }
 
+    drop_launch_only_fields(&mut to_save);
     absolutize_user_paths(&mut to_save, invocation_cwd);
     to_save
 }
@@ -4790,6 +4801,27 @@ ro_maps = []
                 .iter()
                 .any(|w| w.contains("forward_ports") && w.contains("5432"))
         );
+    }
+
+    #[test]
+    fn forward_ports_are_never_saved_into_the_project() {
+        let cli = CliArgs {
+            forward_ports: vec![49374],
+            ..CliArgs::default()
+        };
+        let project = Config {
+            forward_ports: vec![5432],
+            ..Config::default()
+        };
+        let auto = project_config_for_auto_save(
+            &cli,
+            project.clone(),
+            Path::new("/project"),
+        );
+        assert!(auto.forward_ports.is_empty());
+        let init =
+            project_config_for_init(&cli, project, Path::new("/project"));
+        assert!(init.forward_ports.is_empty());
     }
 
     #[test]
