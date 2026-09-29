@@ -185,6 +185,14 @@ stripping). Entries apply like `--env`, and `--env` wins on conflicts.
 Auto-save strips them, but don't rely on it: write secrets into files or
 your shell, never into config.
 
+## Audit log
+
+Use `--audit-log` to record launches and filtered network decisions locally.
+`ai-jail --audit-show` prints a readable summary; `--audit-verify` checks the
+hash chain. The log is `~/.local/share/ai-jail/history.jsonl` and includes
+command arguments: avoid secrets in arguments. Display exits with 0 on
+success, 1 on malformed records or I/O errors, and 2 when no log exists.
+
 ## Project secrets
 
 The project directory is writable by default, so secrets inside it are

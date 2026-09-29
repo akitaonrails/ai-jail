@@ -25,6 +25,150 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::output;
 
+pub(crate) struct ShowReport {
+    pub total: u64,
+    pub invalid: u64,
+}
+
+/// Open one entry relative to a pinned directory, without following symlinks.
+fn open_entry(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+    flags: nix::libc::c_int,
+) -> std::io::Result<std::fs::File> {
+    use nix::libc;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    // SAFETY: parent is live and name is a NUL-terminated C string. No
+    // creation flag is used, so openat does not need a mode argument.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | flags,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh descriptor owned by this function.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Read existing events only. The writer receives one safe line per record;
+/// malformed records are marked and counted, and I/O errors propagate.
+pub(crate) fn show(
+    home: &Path,
+    writer: &mut impl Write,
+) -> std::io::Result<Option<ShowReport>> {
+    use nix::libc;
+    use std::io::{BufRead, Error, ErrorKind};
+    use std::os::unix::fs::MetadataExt;
+
+    let open_log = || -> std::io::Result<std::fs::File> {
+        let mut parent = std::fs::File::open(home)?;
+        for name in [c".local", c"share", c"ai-jail"] {
+            parent = open_entry(&parent, name, libc::O_DIRECTORY)?;
+        }
+        // NONBLOCK avoids hanging on a FIFO before checking the file type.
+        open_entry(&parent, c"history.jsonl", libc::O_NONBLOCK)
+    };
+    let file = match open_log() {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "audit log is not a regular file",
+        ));
+    }
+    // SAFETY: geteuid has no preconditions.
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "audit log must be owned by this user with no group/other permissions",
+        ));
+    }
+
+    let mut report = ShowReport {
+        total: 0,
+        invalid: 0,
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        report.total += 1;
+        let summary = serde_json::from_slice::<serde_json::Value>(&line)
+            .ok()
+            .and_then(|record| summarize(&record));
+        let summary = summary.unwrap_or_else(|| {
+            report.invalid += 1;
+            format!("[invalid record at line {}]", report.total)
+        });
+        let mut safe = String::with_capacity(summary.len());
+        for ch in summary.chars() {
+            // Also escape Unicode bidi controls and line/paragraph separators.
+            if ch.is_control()
+                || matches!(
+                    ch,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{2028}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+            {
+                safe.extend(ch.escape_default());
+            } else {
+                safe.push(ch);
+            }
+        }
+        writeln!(writer, "{safe}")?;
+    }
+    writer.flush()?;
+    Ok(Some(report))
+}
+
+fn summarize(record: &serde_json::Value) -> Option<String> {
+    let ts = record.get("ts")?.as_str()?;
+    let kind = record.get("type")?.as_str()?;
+    Some(match kind {
+        "launch" => {
+            let command = record.get("command")?.as_array()?;
+            if !command.iter().all(serde_json::Value::is_string) {
+                return None;
+            }
+            let command = serde_json::to_string(command).ok()?;
+            let code = record.get("exit_code")?.as_i64()?;
+            let duration = record.get("duration_s")?.as_f64()?;
+            format!("{ts}  launch {command}  (exit {code}, {duration:.1}s)")
+        }
+        "connect" => {
+            let host = record.get("host")?.as_str()?;
+            let port = u16::try_from(record.get("port")?.as_u64()?).ok()?;
+            let verdict = record.get("verdict")?.as_str()?;
+            let reason = record.get("reason")?.as_str()?;
+            format!("{ts}  connect {host}:{port}  {verdict} ({reason})")
+        }
+        "secret_inject" => {
+            let key = record.get("key")?.as_str()?;
+            let host = record.get("host")?.as_str()?;
+            let count = record.get("substitutions")?.as_u64()?;
+            format!("{ts}  credential {key} -> {host}  ({count} substitutions)")
+        }
+        _ => format!("{ts}  {kind}  (unrecognized audit record)"),
+    })
+}
+
 /// Append-only JSONL audit log handle. Cheap to share: the proxy
 /// threads hold an `Arc<AuditLog>` clone of the supervisor's handle.
 pub(crate) struct AuditLog {
