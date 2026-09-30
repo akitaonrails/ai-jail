@@ -201,12 +201,12 @@ fn run_audit_verify(cli: &cli::CliArgs) -> Result<i32, String> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
     let path = home.join(".local/share/ai-jail/history.jsonl");
-    if !path.exists() {
+    let Some(report) = audit::verify(&home)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?
+    else {
         output::info(&format!("No audit log at {}", path.display()));
         return Ok(2);
-    }
-    let report = audit::verify(&path)
-        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    };
     if cli.verbose {
         output::verbose(&format!(
             "Audit log: {} chained records",

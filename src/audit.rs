@@ -55,14 +55,11 @@ fn open_entry(
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
-/// Read existing events only. The writer receives one safe line per record;
-/// malformed records are marked and counted, and I/O errors propagate.
-pub(crate) fn show(
-    home: &Path,
-    writer: &mut impl Write,
-) -> std::io::Result<Option<ShowReport>> {
+/// Pin the audit path and validate the opened file before either reader uses
+/// it. HOME is the trusted root; no component below it may be a symlink.
+fn open_read_log(home: &Path) -> std::io::Result<Option<std::fs::File>> {
     use nix::libc;
-    use std::io::{BufRead, Error, ErrorKind};
+    use std::io::{Error, ErrorKind};
     use std::os::unix::fs::MetadataExt;
 
     let open_log = || -> std::io::Result<std::fs::File> {
@@ -94,6 +91,20 @@ pub(crate) fn show(
             "audit log must be owned by this user with no group/other permissions",
         ));
     }
+    Ok(Some(file))
+}
+
+/// Read existing events only. The writer receives one safe line per record;
+/// malformed records are marked and counted, and I/O errors propagate.
+pub(crate) fn show(
+    home: &Path,
+    writer: &mut impl Write,
+) -> std::io::Result<Option<ShowReport>> {
+    use std::io::BufRead;
+
+    let Some(file) = open_read_log(home)? else {
+        return Ok(None);
+    };
 
     let mut report = ShowReport {
         total: 0,
@@ -473,10 +484,12 @@ pub(crate) struct VerifyReport {
 ///
 /// Every expectation is computed from the actual bytes on disk, so a
 /// break does not cascade: `first_break` is the first offending line.
-pub(crate) fn verify(path: &Path) -> std::io::Result<VerifyReport> {
+pub(crate) fn verify(home: &Path) -> std::io::Result<Option<VerifyReport>> {
     use std::io::BufRead;
 
-    let file = std::fs::File::open(path)?;
+    let Some(file) = open_read_log(home)? else {
+        return Ok(None);
+    };
     let mut reader = std::io::BufReader::new(file);
     let mut report = VerifyReport {
         total: 0,
@@ -530,7 +543,7 @@ pub(crate) fn verify(path: &Path) -> std::io::Result<VerifyReport> {
         }
         prev_hash = Some(sha256_hex(line));
     }
-    Ok(report)
+    Ok(Some(report))
 }
 
 #[cfg(test)]
@@ -676,7 +689,7 @@ mod tests {
             serde_json::from_str(content.trim()).unwrap();
         assert_eq!(line["seq"], 0);
         assert_eq!(line["prev"], serde_json::Value::Null);
-        let report = verify(&log_path(&home)).unwrap();
+        let report = verify(&home).unwrap().unwrap();
         assert_eq!(report.total, 1);
         assert_eq!(report.chained, 1);
         assert_eq!(report.legacy, 0);
@@ -715,7 +728,7 @@ mod tests {
             lines[2]["prev"].as_str().unwrap(),
             sha256_hex(raw[1].as_bytes())
         );
-        let report = verify(&log_path(&home)).unwrap();
+        let report = verify(&home).unwrap().unwrap();
         assert_eq!(report.first_break, None);
         assert_eq!(report.chained, 3);
         let _ = std::fs::remove_dir_all(&home);
@@ -738,7 +751,7 @@ mod tests {
         let tampered = content.replacen("\"probe\":2", "\"probe\":99", 1);
         std::fs::write(&path, tampered).unwrap();
 
-        let report = verify(&path).unwrap();
+        let report = verify(&home).unwrap().unwrap();
         assert_eq!(report.first_break, Some(3));
         assert_eq!(report.total, 3);
         let _ = std::fs::remove_dir_all(&home);
@@ -755,7 +768,9 @@ mod tests {
              {\"ts\":\"2026-01-01T00:01:00Z\",\"type\":\"launch\"}\n",
         )
         .unwrap();
-        let report = verify(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let report = verify(&home).unwrap().unwrap();
         assert_eq!(report.total, 2);
         assert_eq!(report.legacy, 2);
         assert_eq!(report.chained, 0);
@@ -787,7 +802,7 @@ mod tests {
             lines[1]["prev"].as_str().unwrap(),
             sha256_hex(legacy.as_bytes())
         );
-        let report = verify(&path).unwrap();
+        let report = verify(&home).unwrap().unwrap();
         assert_eq!(report.first_break, None);
         assert_eq!(report.legacy, 1);
         assert_eq!(report.chained, 1);
@@ -813,7 +828,7 @@ mod tests {
         probe(&log, 3);
         drop(log);
 
-        let report = verify(&path).unwrap();
+        let report = verify(&home).unwrap().unwrap();
         assert_eq!(report.first_break, Some(2));
         assert_eq!(report.total, 3);
         assert_eq!(report.chained, 2);
