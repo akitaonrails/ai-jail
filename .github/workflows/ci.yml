@@ -52,7 +52,7 @@ jobs:
           exit 1
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo test --locked --features test-hooks
       # musl types some libc constants differently from glibc — TIOCSCTTY and
       # TIOCSTI are c_int there and c_ulong here — so ai-jail stopped building
       # on Alpine without anything on the glibc runner noticing (#127). The
@@ -83,7 +83,7 @@ jobs:
         with:
           toolchain: 1.97.1
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo test --locked --features test-hooks
 
   nix:
     # The Nix build path had no CI coverage, so NixOS regressions reached

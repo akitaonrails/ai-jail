@@ -1,3 +1,9 @@
+// These end-to-end tests drive the proxy through the test-only escape
+// hatches (SSRF guard off, self-signed TLS root), which exist only under
+// the `test-hooks` feature. Without it the hatches compile out and these
+// tests cannot work, so the whole file is gated: run with
+// `cargo test --features test-hooks`.
+#![cfg(feature = "test-hooks")]
 // End-to-end tests for phantom credential injection (issue #135): the
 // sandbox sees a placeholder, and only the supervisor-side proxy swaps
 // in the real value for requests terminating at the bound host.
@@ -270,6 +276,55 @@ fn phantom_absolute_form_to_non_secret_host_is_405() {
         stdout.contains("405"),
         "expected 405: stdout={stdout:?} stderr={stderr:?}"
     );
+}
+
+#[test]
+fn phantom_duplicate_env_entries_do_not_leak_real_value() {
+    // Regression: apply_env_pass makes the LAST entry win, so a duplicate
+    // `KEY=real` after `KEY=first` (or a bare `--env KEY` after a credential
+    // file) must not deliver the real value to the child. --dry-run is enough;
+    // no bwrap or network needed. The real values must not appear in the
+    // emitted bwrap argv, and the only value set for the key is a placeholder.
+    let cases: &[&[&str]] = &[&[
+        "--clean",
+        "--dry-run",
+        "--no-save-config",
+        "--allow-host",
+        "api.example.com",
+        "--env",
+        "TOK=firstval",
+        "--env",
+        "TOK=REALSECRET_LEAK",
+        "--secret",
+        "TOK=api.example.com",
+        "true",
+    ]];
+    for args in cases {
+        let output = Command::new(ai_jail())
+            .args(*args)
+            .env("HOME", std::env::temp_dir())
+            .output()
+            .expect("failed to spawn ai-jail");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "args {args:?}: {combined}");
+        assert!(
+            !combined.contains("REALSECRET_LEAK")
+                && !combined.contains("firstval"),
+            "a real value reached the emitted argv: {combined}"
+        );
+        assert!(
+            combined.contains("AIJAIL-PHANTOM-"),
+            "expected a placeholder in the argv: {combined}"
+        );
+        // Exactly one setenv for TOK (the placeholder), no duplicate.
+        let toks = combined.matches("--setenv TOK ").count()
+            + combined.matches("setenv TOK ").count();
+        assert!(toks >= 1, "TOK not set at all: {combined}");
+    }
 }
 
 #[test]

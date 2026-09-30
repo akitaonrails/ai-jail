@@ -2991,8 +2991,17 @@ const OVERLAY_STORAGE_DIR: &str = ".ai-jail-overlays";
 /// becomes `home_u_.claude`. Preserving the full path keeps distinct
 /// destinations collision-free.
 fn overlay_storage_name(dest: &Path) -> String {
+    // A readable prefix plus a hash suffix. The prefix alone is ambiguous —
+    // it maps every non-alphanumeric character to `_`, so `/a/b` and `/a_b`
+    // collapse to the same name and two distinct overlays would share one
+    // upper/work directory (silent data confusion). The suffix is a hash of
+    // the canonicalized destination, so distinct destinations never collide.
+    use std::os::unix::ffi::OsStrExt;
+    let canonical =
+        std::fs::canonicalize(dest).unwrap_or_else(|_| dest.to_path_buf());
+    let digest = crate::audit::sha256_hex(canonical.as_os_str().as_bytes());
     let s = dest.to_string_lossy();
-    let mut name = String::with_capacity(s.len());
+    let mut name = String::with_capacity(s.len() + 17);
     for ch in s.trim_start_matches('/').chars() {
         if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
             name.push(ch);
@@ -3003,6 +3012,8 @@ fn overlay_storage_name(dest: &Path) -> String {
     if name.is_empty() {
         name.push_str("root");
     }
+    name.push('-');
+    name.push_str(&digest[..16]);
     name
 }
 
@@ -3018,7 +3029,8 @@ fn overlay_storage_name(dest: &Path) -> String {
 ///
 /// Returns `(overlay_mounts, storage_hide_mounts)`. Overlays that
 /// cannot be set up (missing source, unwritable storage, overlapping
-/// destination) are skipped with a warning — never fatal.
+/// destination) now fail the launch (fail closed): a requested overlay that
+/// silently degraded to the writable original was a security bug.
 fn overlay_mounts(
     overlay_maps: &[PathBuf],
     project_dir: &Path,
@@ -3043,12 +3055,17 @@ fn overlay_mounts(
     let mut accepted: Vec<PathBuf> = Vec::new();
 
     for dest in overlay_maps {
+        // Fail closed on every setup failure. Skipping a requested overlay
+        // (the previous behaviour) left the plain read-write project bind in
+        // place, so a user relying on copy-on-write silently modified the
+        // real files instead (audit finding; overlay is opt-in — if it cannot
+        // be provided the launch must not proceed as if it were).
         if !super::path_exists(dest) {
-            output::warn(&format!(
-                "Overlay map {} not found, skipping.",
+            return Err(format!(
+                "overlay map {} not found; refusing to launch without the \
+                 requested copy-on-write layer",
                 dest.display()
             ));
-            continue;
         }
         // Reject overlapping destinations (equal / parent / child):
         // two overlays sharing a subtree give overlayfs ambiguous
@@ -3057,12 +3074,11 @@ fn overlay_mounts(
             .iter()
             .find(|a| *a == dest || a.starts_with(dest) || dest.starts_with(a))
         {
-            output::warn(&format!(
-                "Overlay map {} overlaps {}, skipping.",
+            return Err(format!(
+                "overlay map {} overlaps {}; refusing ambiguous overlay layering",
                 dest.display(),
                 conflict.display()
             ));
-            continue;
         }
 
         let base = storage_root.join(overlay_storage_name(dest));
@@ -3071,13 +3087,11 @@ fn overlay_mounts(
         if let Err(e) =
             create_safe_overlay_dirs(&[&storage_root, &base, &upper, &work])
         {
-            output::warn(&format!(
-                "Overlay map {}: cannot create layer storage {}: {e}; \
-                 skipping.",
+            return Err(format!(
+                "overlay map {}: cannot create layer storage {}: {e}",
                 dest.display(),
                 base.display()
             ));
-            continue;
         }
 
         // Always surface this, even without --verbose: the feature is
@@ -5179,11 +5193,17 @@ mod tests {
 
     #[test]
     fn overlay_storage_name_sanitizes_path() {
-        assert_eq!(
-            overlay_storage_name(Path::new("/home/u/.claude")),
-            "home_u_.claude"
-        );
-        assert_eq!(overlay_storage_name(Path::new("/a b/c@d")), "a_b_c_d");
+        // Readable sanitized prefix, then a `-<16 hex>` collision-resistant
+        // suffix hashed from the canonical destination.
+        let name = overlay_storage_name(Path::new("/home/u/.claude"));
+        assert!(name.starts_with("home_u_.claude-"), "got: {name}");
+        let (prefix, hash) = name.rsplit_once('-').unwrap();
+        assert_eq!(prefix, "home_u_.claude");
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let name2 = overlay_storage_name(Path::new("/a b/c@d"));
+        assert!(name2.starts_with("a_b_c_d-"), "got: {name2}");
     }
 
     #[test]
@@ -5226,27 +5246,38 @@ mod tests {
     }
 
     #[test]
-    fn overlay_mounts_skips_overlapping() {
+    fn overlay_mounts_overlapping_fails_closed() {
+        // Fail closed: an overlapping destination must abort the launch, not
+        // silently drop one overlay and leave its original writable.
         let (project, source) = overlay_test_dirs("overlap");
         let child = source.join("sub");
         std::fs::create_dir_all(&child).unwrap();
-        // child overlaps source → only the first (source) is accepted.
         let maps = vec![source.clone(), child];
-        let (mounts, _hide) = overlay_mounts(&maps, &project, false).unwrap();
-        assert_eq!(mounts.len(), 1);
+        let err = overlay_mounts(&maps, &project, false).unwrap_err();
+        assert!(err.contains("overlaps"), "got: {err}");
         let _ = std::fs::remove_dir_all(project.parent().unwrap());
     }
 
     #[test]
-    fn overlay_mounts_skips_missing_source() {
+    fn overlay_mounts_missing_source_fails_closed() {
+        // Fail closed: a missing overlay source must abort, not degrade to the
+        // writable original.
         let (project, _source) = overlay_test_dirs("missing");
         let missing = project.join("does-not-exist");
-        let (mounts, hide) =
+        let err =
             overlay_mounts(std::slice::from_ref(&missing), &project, false)
-                .unwrap();
-        assert!(mounts.is_empty());
-        assert!(hide.is_empty());
+                .unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
         let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+
+    #[test]
+    fn overlay_storage_name_distinguishes_colliding_prefixes() {
+        // `/a/b` and `/a_b` sanitize to the same prefix; the hash suffix must
+        // keep their storage directories distinct.
+        let a = overlay_storage_name(Path::new("/a/b"));
+        let b = overlay_storage_name(Path::new("/a_b"));
+        assert_ne!(a, b, "distinct destinations must not share storage");
     }
 
     #[test]

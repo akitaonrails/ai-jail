@@ -131,10 +131,18 @@ on their own terminal to enter raw mode, and SBPL cannot filter by ioctl
 request, so the grant is scoped by path to the single PTY ai-jail allocated
 for that run — never a pattern covering every `/dev/ttys*`, which would let a
 compromised agent use `TIOCSTI` to inject input into another of your shells.
-When ai-jail is not proxying a PTY, no terminal ioctl is granted at all.
-`/dev/ptmx` stays available so the sandbox can allocate its own PTYs; a PTY
-created inside the sandbox is not covered by the path-scoped rule. Linux
-denies `TIOCSTI` outright through seccomp.
+Terminal read/write is scoped the same way — the allocated PTY plus the
+caller's own `/dev/tty` — rather than a blanket `/dev/ttys*` grant, so the
+sandbox cannot open another of your terminals by path and write escape
+sequences to it. When ai-jail is not proxying a PTY, no terminal ioctl is
+granted at all. `/dev/ptmx` stays available so the sandbox can allocate its own
+PTYs; a PTY created inside the sandbox is not covered by the path-scoped rule.
+Masked project paths (`--mask`) are denied for writes as well as reads, so a
+file the agent cannot read cannot be blindly overwritten either. Linux denies
+`TIOCSTI` outright through seccomp, and compares the ioctl request as the
+kernel does (32-bit) so a high-bit variant cannot slip past the filter.
+On kernels ≥ 6.12 Landlock also scopes abstract Unix sockets and signals
+(best-effort) as a further backstop.
 
 Phantom credentials (`--secret KEY=host`, filtered egress only) shift part of
 the trust boundary to the supervisor: the sandbox env holds an

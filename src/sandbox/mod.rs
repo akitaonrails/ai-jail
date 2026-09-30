@@ -776,9 +776,39 @@ fn validate_linked_git_worktree(
         ));
     }
 
+    // Structural check (advisory GHSA-w976-gw52-hvx2 #1): every value above is
+    // authored by the repository being validated, so the reverse-gitdir link
+    // alone is circular. In a genuine linked worktree git lays the per-worktree
+    // dir out as `<common>/worktrees/<name>`, so the common dir is not free —
+    // it is exactly the grandparent of the worktree dir. Without this, a
+    // hostile `commondir` file names an arbitrary existing host directory and
+    // it gets bind-mounted read-write. Canonicalize both sides (fail closed if
+    // either cannot be resolved) and require that exact relationship.
+    let git_dir_canon = std::fs::canonicalize(&git_dir).map_err(|e| {
+        format!("cannot resolve worktree git dir {}: {e}", git_dir.display())
+    })?;
+    let common_dir_canon = std::fs::canonicalize(&common_dir).map_err(|e| {
+        format!("cannot resolve commondir {}: {e}", common_dir.display())
+    })?;
+    let under_worktrees = git_dir_canon
+        .parent()
+        .filter(|worktrees| {
+            worktrees.file_name() == Some(OsStr::new("worktrees"))
+        })
+        .and_then(Path::parent)
+        .is_some_and(|grandparent| grandparent == common_dir_canon);
+    if !under_worktrees {
+        return Err(format!(
+            "worktree git dir {} is not <commondir>/worktrees/<name> of {}; \
+             refusing to trust repository-authored worktree metadata",
+            git_dir_canon.display(),
+            common_dir_canon.display()
+        ));
+    }
+
     Ok(Some(GitWorktreePaths {
-        git_dir,
-        common_dir,
+        git_dir: git_dir_canon,
+        common_dir: common_dir_canon,
     }))
 }
 
@@ -2030,6 +2060,53 @@ mod tests {
         let err =
             validate_linked_git_worktree(&fixture.project_dir).unwrap_err();
         assert!(err.contains("does not point back"));
+    }
+
+    #[test]
+    fn worktree_commondir_pointing_outside_is_rejected() {
+        // Advisory GHSA-w976-gw52-hvx2 #1: a hostile repo authors a `.git`
+        // gitfile, a reverse `gitdir`, and a `commondir` that names an
+        // arbitrary existing host directory. The reverse-gitdir link is
+        // satisfied, but the commondir must not be trusted to point anywhere.
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-wt-evil-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        let fake_git = project.join("fake");
+        let outside = root.join("OUTSIDE_TARGET");
+        std::fs::create_dir_all(&fake_git).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // project/.git -> project/fake ; fake/gitdir -> ../.git (points back)
+        std::fs::write(project.join(".git"), "gitdir: ./fake\n").unwrap();
+        std::fs::write(fake_git.join("gitdir"), "../.git\n").unwrap();
+        // The lie: commondir names a directory outside the worktree layout.
+        std::fs::write(
+            fake_git.join("commondir"),
+            format!("{}\n", outside.display()),
+        )
+        .unwrap();
+
+        let err = validate_linked_git_worktree(&project).unwrap_err();
+        assert!(
+            err.contains("worktrees"),
+            "expected structural rejection, got: {err}"
+        );
+        // The outside directory must not appear in any discovered path.
+        let config = Config {
+            no_worktree: Some(false),
+            ..Config::default()
+        };
+        assert!(
+            discover_git_worktree_paths(&config, &project, false).is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

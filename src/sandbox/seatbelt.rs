@@ -293,7 +293,8 @@ fn generate_sbpl_profile_for_tty(
         // appended below, after this retain.
         deny_paths.retain(|p| !agent_state.contains(p));
     }
-    deny_paths.extend(super::effective_mask_patterns(config, project_dir));
+    let mask_patterns = super::effective_mask_patterns(config, project_dir);
+    deny_paths.extend(mask_patterns.clone());
     let explicit_deny_paths = super::expand_mask_patterns(
         &config.deny_paths,
         &config.deny_path_exceptions,
@@ -308,6 +309,10 @@ fn generate_sbpl_profile_for_tty(
     // write allowance (#83). Overlay maps are read-only fallbacks on
     // macOS (no overlayfs), so they get the same deny.
     let mut write_deny_paths = explicit_deny_paths.clone();
+    // Masks are read-deny AND write-deny (advisory GHSA-w976-gw52-hvx2 #5):
+    // without the write deny, a `--mask`ed project file the agent cannot read
+    // could still be overwritten blindly through the project write allowance.
+    write_deny_paths.extend(mask_patterns);
     write_deny_paths.extend(
         config
             .ro_maps
@@ -523,9 +528,22 @@ fn push_static_sections(
     profile.push_str("(allow pseudo-tty)\n");
     profile
         .push_str("(allow file-read* file-write* (literal \"/dev/ptmx\"))\n");
-    profile.push_str(
-        "(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+\"))\n",
-    );
+    // Read/write is scoped to this run's own terminals, not every
+    // /dev/ttysN (advisory GHSA-w976-gw52-hvx2 #4). A blanket
+    // `^/dev/ttys[0-9]+` let a sandboxed process open and WRITE another of
+    // the user's terminals by path — escape sequences straight past the PTY
+    // output filter. `/dev/tty` is always the caller's own controlling
+    // terminal (writing it is writing your own screen), and the allocated
+    // PTY below is this run's. Inherited stdio fds keep working regardless,
+    // since SBPL checks file-read*/file-write* at open(), not on an already
+    // open descriptor.
+    profile.push_str("(allow file-read* file-write* (literal \"/dev/tty\"))\n");
+    if let Some(tty) = sandbox_tty {
+        profile.push_str(&format!(
+            "(allow file-read* file-write* (literal \"{}\"))\n",
+            sbpl_path(tty)
+        ));
+    }
     // Terminal ioctl, scoped to the one PTY ai-jail allocated for this
     // child.
     //
@@ -1245,6 +1263,49 @@ mod tests {
     fn create_linked_worktree_fixture()
     -> crate::sandbox::test_support::LinkedWorktreeFixture {
         linked_worktree_fixture("seatbelt-worktree")
+    }
+
+    #[test]
+    fn masked_project_path_is_read_and_write_denied() {
+        // Advisory GHSA-w976-gw52-hvx2 #5: a masked project file must be denied
+        // for writes as well as reads, or the agent could blindly overwrite it
+        // through the project write allowance.
+        let project = std::env::temp_dir().join(format!(
+            "ai-jail-mask-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+        let secret = project.join(".env");
+        std::fs::write(&secret, "TOKEN=xyz\n").unwrap();
+        let config = Config {
+            command: vec!["bash".into()],
+            no_mise: Some(true),
+            mask: vec![secret.clone()],
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile(&config, &project);
+        let path = sbpl_path(&secret);
+        assert!(
+            profile
+                .contains(&format!("(deny file-read* (subpath \"{path}\"))"))
+                || profile.contains(&format!(
+                    "(deny file-read* (literal \"{path}\"))"
+                )),
+            "masked path must be read-denied:\n{profile}"
+        );
+        assert!(
+            profile
+                .contains(&format!("(deny file-write* (subpath \"{path}\"))"))
+                || profile.contains(&format!(
+                    "(deny file-write* (literal \"{path}\"))"
+                )),
+            "masked path must be write-denied:\n{profile}"
+        );
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]
@@ -2247,6 +2308,23 @@ mod tests {
             !profile
                 .contains("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+\"))"),
             "terminal ioctl must not be granted on every /dev/ttys*"
+        );
+        // Advisory GHSA-w976-gw52-hvx2 #4: read/write must not be a blanket
+        // regex over every terminal either — only this run's PTY and the
+        // caller's own /dev/tty.
+        assert!(
+            !profile.contains(
+                "(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+\"))"
+            ),
+            "terminal read/write must not be granted on every /dev/ttys*"
+        );
+        assert!(profile.contains(
+            "(allow file-read* file-write* (literal \"/dev/ttys003\"))"
+        ));
+        assert!(
+            profile.contains(
+                "(allow file-read* file-write* (literal \"/dev/tty\"))"
+            )
         );
     }
 

@@ -281,6 +281,17 @@ fn seccomp_blocks_io_uring_setup() {
 }
 
 #[test]
+fn seccomp_blocks_tiocsti_high_bits() {
+    // Advisory GHSA-w976-gw52-hvx2 #2: TIOCSTI with the upper 32 bits set must
+    // still be denied — the kernel truncates the request to 32 bits, so a
+    // 64-bit compare was a terminal-injection bypass.
+    require_bwrap!();
+    require_helper!();
+    let out = helper_normal("tiocsti_highbits");
+    assert_blocked(&out, "ioctl(TIOCSTI | 1<<32)");
+}
+
+#[test]
 fn seccomp_blocks_bpf() {
     require_bwrap!();
     require_helper!();

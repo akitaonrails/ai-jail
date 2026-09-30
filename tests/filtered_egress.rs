@@ -1,3 +1,9 @@
+// These end-to-end tests drive the proxy through the test-only escape
+// hatches (SSRF guard off, self-signed TLS root), which exist only under
+// the `test-hooks` feature. Without it the hatches compile out and these
+// tests cannot work, so the whole file is gated: run with
+// `cargo test --features test-hooks`.
+#![cfg(feature = "test-hooks")]
 // End-to-end tests for filtered egress (phase 3 of
 // docs/connect-proxy-plan.md): a real sandbox whose private netns can
 // reach nothing but the in-sandbox proxy bridge.
