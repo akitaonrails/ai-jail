@@ -224,6 +224,26 @@ fn run_audit_verify(cli: &cli::CliArgs) -> Result<i32, String> {
     Ok(0)
 }
 
+fn run_audit_show() -> Result<i32, String> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or("HOME is not set")?;
+    let report = audit::show(&home, &mut std::io::stdout().lock())
+        .map_err(|error| format!("Cannot display audit log: {error}"))?;
+    match report {
+        None => {
+            output::info("No audit log found. Enable it with --audit-log.");
+            Ok(2)
+        }
+        Some(report) => {
+            if report.total == 0 {
+                output::info("Audit log is empty.");
+            }
+            Ok(i32::from(report.invalid > 0))
+        }
+    }
+}
+
 fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     use std::os::unix::process::CommandExt;
 
@@ -437,8 +457,10 @@ fn run() -> Result<i32, String> {
         return proxy::run_bridge(*port, socket).map(|()| 0);
     }
 
-    // --audit-verify: offline hash-chain check of the audit log. No
-    // config, no sandbox, no proxy.
+    // Offline audit commands bypass configuration and sandbox setup.
+    if cli.audit_show {
+        return run_audit_show();
+    }
     if cli.audit_verify {
         return run_audit_verify(&cli);
     }

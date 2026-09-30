@@ -76,6 +76,7 @@ OPTIONS:
     --audit-log / --no-audit-log    Enable/disable the launch audit log at
                                     ~/.local/share/ai-jail/history.jsonl
                                     (default: off; project .ai-jail cannot enable)
+    --audit-show                   Show the local audit log and exit
     --audit-verify                 Verify the audit log's hash chain and exit
     --worktree / --no-worktree     Enable/disable linked Git worktree metadata passthrough
     --no-mise / --mise             Disable/enable mise integration
@@ -149,6 +150,7 @@ pub struct CliArgs {
     pub update_check: Option<bool>,
     pub audit_log: Option<bool>,
     pub audit_verify: bool,
+    pub audit_show: bool,
     pub env_from_file: Vec<PathBuf>,
     /// Phantom credential bindings (`--secret KEY=host`, repeatable):
     /// the sandbox sees a placeholder; the proxy substitutes the real
@@ -341,6 +343,7 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 args.audit_log = Some(s == "audit-log");
             }
             Long("audit-verify") => args.audit_verify = true,
+            Long("audit-show") => args.audit_show = true,
             Long("env") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
                 let s = val.to_string_lossy();
@@ -524,6 +527,22 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
         }
     }
 
+    if args.audit_show
+        && (!args.command.is_empty()
+            || args.status
+            || args.audit_verify
+            || args.init
+            || args.bootstrap
+            || args.dry_run
+            || args.landlock_exec
+            || args.proxy_bridge.is_some())
+    {
+        return Err(
+            "--audit-show cannot be combined with another command or action"
+                .into(),
+        );
+    }
+
     Ok(args)
 }
 
@@ -595,6 +614,7 @@ fn is_sandbox_long_flag(arg: &str) -> bool {
             | "--audit-log"
             | "--no-audit-log"
             | "--audit-verify"
+            | "--audit-show"
             | "--env"
             | "--env-from-file"
             | "--secret"
@@ -1554,6 +1574,45 @@ mod tests {
         assert!(args.audit_verify);
         let error = parse_test(&["claude", "--audit-verify"]).unwrap_err();
         assert!(error.contains("after command"));
+    }
+
+    #[test]
+    fn audit_show_preserves_positional_commands() {
+        assert!(parse_test(&["--audit-show"]).unwrap().audit_show);
+        for argv in [vec!["audit", "report"], vec!["--", "audit", "report"]] {
+            let args = parse_test(&argv).unwrap();
+            assert_eq!(args.command, ["audit", "report"]);
+            assert!(!args.audit_show);
+        }
+        let error = parse_test(&["claude", "--audit-show"]).unwrap_err();
+        assert!(error.contains("after command"));
+        let args = parse_test(&["claude", "--", "--audit-show"]).unwrap();
+        assert_eq!(args.command, ["claude", "--", "--audit-show"]);
+    }
+
+    #[test]
+    fn audit_show_rejects_conflicting_actions() {
+        for action in [
+            "bash",
+            "status",
+            "--audit-verify",
+            "--init",
+            "--bootstrap",
+            "--dry-run",
+            "--landlock-exec",
+        ] {
+            let error = parse_test(&["--audit-show", action]).unwrap_err();
+            assert!(error.contains("cannot be combined"), "{action}: {error}");
+        }
+        assert!(
+            parse_test(&[
+                "--audit-show",
+                "--proxy-bridge",
+                "8080",
+                "/tmp/socket"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
