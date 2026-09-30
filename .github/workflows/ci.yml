@@ -53,6 +53,14 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      # Root can read another UID's file, so exercise the fd ownership
+      # policy rather than an OS permission failure. Elevate only this test.
+      - name: Test credential file ownership
+        run: |
+          config_unit_tests=$(cargo test --locked --bin ai-jail --no-run --message-format=json |
+            jq -er 'select(.reason == "compiler-artifact" and .profile.test and .target.name == "ai-jail") | .executable')
+          test -x "$config_unit_tests"
+          sudo -- "$config_unit_tests" --ignored --exact config::tests::env_from_file_refuses_foreign_owner_with_readable_fd --nocapture
       # musl types some libc constants differently from glibc — TIOCSCTTY and
       # TIOCSTI are c_int there and c_ulong here — so ai-jail stopped building
       # on Alpine without anything on the glibc runner noticing (#127). The

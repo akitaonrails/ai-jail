@@ -43,6 +43,41 @@ impl TestTree {
             .output()
             .expect("failed to run ai-jail")
     }
+
+    fn run_bounded(&self, args: &[&str]) -> Output {
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        struct ChildGuard(Option<std::process::Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(child) = &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let mut child = ChildGuard(Some(
+            Command::new(env!("CARGO_BIN_EXE_ai-jail"))
+                .args(args)
+                .current_dir(&self.project)
+                .env("HOME", &self.home)
+                .env_remove("AI_JAIL_QUIET")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+                return child.0.take().unwrap().wait_with_output().unwrap();
+            }
+            assert!(Instant::now() < deadline, "credential reader blocked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 impl Drop for TestTree {
@@ -263,4 +298,69 @@ fn dangling_global_config_symlink_is_fatal() {
     let output = tree.run(&["--clean", "status"]);
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("symlink"));
+}
+
+#[test]
+fn env_from_file_refusals_are_bounded_and_visible_in_exec_mode() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    for kind in ["symlink", "directory", "fifo", "loose", "inside"] {
+        let tree = TestTree::new(&format!("env-file-{kind}"));
+        let file = if kind == "inside" {
+            tree.project.join("keys")
+        } else {
+            tree.root.join("keys")
+        };
+        let victim = tree.root.join("victim");
+        let content = "TOKEN=fixture-secret\n";
+        std::fs::write(&victim, content).unwrap();
+        std::fs::set_permissions(&victim, PermissionsExt::from_mode(0o600))
+            .unwrap();
+        match kind {
+            "symlink" => std::os::unix::fs::symlink(&victim, &file).unwrap(),
+            "directory" => std::fs::create_dir(&file).unwrap(),
+            "fifo" => {
+                let name = std::ffi::CString::new(file.as_os_str().as_bytes())
+                    .unwrap();
+                // SAFETY: name is a valid NUL-terminated pathname.
+                assert_eq!(
+                    unsafe { nix::libc::mkfifo(name.as_ptr(), 0o600) },
+                    0
+                );
+            }
+            "loose" | "inside" => {
+                std::fs::write(&file, content).unwrap();
+                std::fs::set_permissions(
+                    &file,
+                    PermissionsExt::from_mode(if kind == "loose" {
+                        0o644
+                    } else {
+                        0o600
+                    }),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let output = tree.run_bounded(&[
+            "--clean",
+            "--exec",
+            "--no-save-config",
+            "--dry-run",
+            "--env-from-file",
+            file.to_str().unwrap(),
+            "/bin/true",
+        ]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--env-from-file"), "{output:?}");
+        assert!(!stderr.contains("fixture-secret"), "{output:?}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), content);
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }
