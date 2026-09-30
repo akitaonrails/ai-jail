@@ -55,6 +55,156 @@ fn run(project: &PathBuf, home: &PathBuf, args: &[&str]) -> Output {
         .expect("failed to run ai-jail")
 }
 
+struct Fixture {
+    project: PathBuf,
+    home: PathBuf,
+}
+
+impl Fixture {
+    fn new(name: &str) -> Self {
+        let (project, home) = test_tree(name);
+        Self { project, home }
+    }
+
+    fn log(&self) -> PathBuf {
+        self.home.join(".local/share/ai-jail/history.jsonl")
+    }
+
+    fn run_bounded(&self) -> Output {
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        struct ChildGuard(Option<std::process::Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(child) = &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let mut child = ChildGuard(Some(
+            Command::new(ai_jail())
+                .args([
+                    "--clean",
+                    "--no-status-bar",
+                    "--exec",
+                    "--audit-log",
+                    "sh",
+                    "-c",
+                    "exit 3",
+                ])
+                .current_dir(&self.project)
+                .env("HOME", &self.home)
+                .env_remove("AI_JAIL_QUIET")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+                return child.0.take().unwrap().wait_with_output().unwrap();
+            }
+            assert!(Instant::now() < deadline, "audit log blocked the launch");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.project.parent().unwrap());
+    }
+}
+
+#[test]
+fn audit_log_refusals_preserve_launch_exit_code_and_warn_in_exec_mode() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    if !bwrap_available() {
+        eprintln!("SKIPPED: bwrap cannot create user namespaces");
+        return;
+    }
+    for kind in ["symlink", "directory", "fifo"] {
+        let fixture = Fixture::new(kind);
+        let log = fixture.log();
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let victim = fixture.home.join("victim");
+        std::fs::write(&victim, "untouched\n").unwrap();
+        std::fs::set_permissions(
+            &victim,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        match kind {
+            "symlink" => std::os::unix::fs::symlink(&victim, &log).unwrap(),
+            "directory" => std::fs::create_dir(&log).unwrap(),
+            "fifo" => {
+                let path =
+                    std::ffi::CString::new(log.as_os_str().as_bytes()).unwrap();
+                // SAFETY: path is a valid NUL-terminated pathname.
+                assert_eq!(
+                    unsafe { nix::libc::mkfifo(path.as_ptr(), 0o600) },
+                    0
+                );
+            }
+            _ => unreachable!(),
+        }
+        let output = fixture.run_bounded();
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("audit log disabled:"),
+            "{output:?}"
+        );
+        assert!(output.stdout.is_empty());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched\n");
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+}
+
+#[test]
+fn audit_log_appends_to_legacy_and_write_only_files_then_verifies() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !bwrap_available() {
+        eprintln!("SKIPPED: bwrap cannot create user namespaces");
+        return;
+    }
+    for mode in [0o644, 0o200] {
+        let fixture = Fixture::new(&format!("legacy-{mode}"));
+        let path = fixture.log();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = "{\"legacy\":true}";
+        // No trailing newline: the append must terminate the old record.
+        std::fs::write(&path, legacy).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .unwrap();
+        let output = fixture.run_bounded();
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with(&format!("{legacy}\n")));
+        let record: serde_json::Value =
+            serde_json::from_str(content.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(record["seq"], 1);
+        assert_eq!(record["exit_code"], 3);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let verified =
+            run(&fixture.project, &fixture.home, &["--audit-verify"]);
+        assert!(verified.status.success(), "{verified:?}");
+    }
+}
+
 #[test]
 fn audit_log_records_one_launch_with_exit_code() {
     if !bwrap_available() {

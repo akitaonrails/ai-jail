@@ -53,6 +53,15 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      # Root can open another UID's entries, so this checks our ownership
+      # policy rather than relying on an OS permission error. Build as the
+      # runner and elevate only this ignored regression.
+      - name: Test audit writer ownership
+        run: |
+          audit_unit_tests=$(cargo test --locked --bin ai-jail --no-run --message-format=json |
+            jq -er 'select(.reason == "compiler-artifact" and .profile.test and .target.name == "ai-jail") | .executable')
+          test -x "$audit_unit_tests"
+          sudo -- "$audit_unit_tests" --ignored --exact audit::tests::writer_refuses_foreign_owned_entries --nocapture
       # musl types some libc constants differently from glibc — TIOCSCTTY and
       # TIOCSTI are c_int there and c_ulong here — so ai-jail stopped building
       # on Alpine without anything on the glibc runner noticing (#127). The

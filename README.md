@@ -192,6 +192,12 @@ Use `--audit-log` to record launches and filtered network decisions locally.
 hash chain. The log is `~/.local/share/ai-jail/history.jsonl` and includes
 command arguments: avoid secrets in arguments. Display exits with 0 on
 success, 1 on malformed records or I/O errors, and 2 when no log exists.
+The writer refuses symlinks below home and non-regular logs. The log and
+its `ai-jail` directory must be owned by the current user. It sets private
+permissions through the opened descriptors; logging failures leave the
+launched command running. Existing user-owned logs are preserved and
+corrected to 0600. Audit directories must be readable and searchable;
+existing `.local` and `share` permissions are left unchanged.
 
 ## Project secrets
 
