@@ -187,11 +187,37 @@ your shell, never into config.
 
 ## Audit log
 
-Use `--audit-log` to record launches and filtered network decisions locally.
-`ai-jail --audit-show` prints a readable summary; `--audit-verify` checks the
-hash chain. The log is `~/.local/share/ai-jail/history.jsonl` and includes
-command arguments: avoid secrets in arguments. Display exits with 0 on
-success, 1 on malformed records or I/O errors, and 2 when no log exists.
+Use `--audit-log` to record launches and filtered network decisions locally in
+`~/.local/share/ai-jail/history.jsonl`. `ai-jail --audit-show` prints a
+readable summary of recognized record syntax; it does not verify hash-chain
+integrity. Use `ai-jail --audit-verify` for that separate check. HOME is the
+trusted starting directory and may itself be a symlink (including through
+symlinked ancestors); after HOME is opened, no symlink is followed in
+`.local/share/ai-jail/history.jsonl`. Both readers reject special files, files
+owned by another user, and files with group or other permissions. For backward
+compatibility, the writer accepts an existing user-owned regular log with loose
+permissions and tightens that same opened file descriptor to mode 0600 before
+use.
+
+Record reads are bounded for display, verification, and append-time chain
+seeding. Oversized records are treated as malformed during display and
+verification rather than being buffered without limit. `--audit-show` exits 0
+after a successful display (including an empty log), 1 for malformed records,
+a missing/invalid HOME, or an I/O/security error, and 2 when the log does not
+exist under a valid HOME. `--audit-verify` uses 0 for an intact chain, 1 for a
+broken chain, missing/invalid HOME, or read/security error, and 2 when the log
+does not exist under a valid HOME. Failures specific to optional audit logging,
+including a missing, empty, or unusable HOME at audit-log setup, are
+best-effort: logging is disabled with a warning and does not prevent launch or
+override the child's exit status. Configuration and sandbox validation errors
+remain fatal. No fallback audit log is written under `/tmp`.
+
+The SHA-256 chain provides tamper-evident internal consistency, not keyed
+authenticity: it does not prove who wrote the records and cannot by itself
+detect wholesale replacement with a newly generated consistent log. Launch
+summaries may display the command and its arguments, so avoid putting secrets
+in argv. The audit file is local sensitive data; safe opening and restrictive
+permissions do not remove that privacy limit.
 
 ## Project secrets
 

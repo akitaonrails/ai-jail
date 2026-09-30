@@ -6,6 +6,7 @@
 // tests/sandbox_escape.rs.
 #![cfg(target_os = "linux")]
 
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::OnceLock;
@@ -105,6 +106,106 @@ fn audit_log_records_one_launch_with_exit_code() {
 
     let _ = std::fs::remove_dir_all(&project)
         .and_then(|()| std::fs::remove_dir_all(project.parent().unwrap()));
+}
+
+#[test]
+fn audit_log_supports_symlinked_home() {
+    if !bwrap_available() {
+        eprintln!("SKIPPED: bwrap cannot create user namespaces");
+        return;
+    }
+    let (project, home) = test_tree("symlink-home");
+    let real_home = home.with_file_name("real-home");
+    std::fs::rename(&home, &real_home).unwrap();
+    symlink(&real_home, &home).unwrap();
+    let output = run(
+        &project,
+        &home,
+        &[
+            "--clean",
+            "--no-status-bar",
+            "--exec",
+            "--audit-log",
+            "true",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        real_home
+            .join(".local/share/ai-jail/history.jsonl")
+            .is_file()
+    );
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+#[test]
+fn audit_open_security_failure_preserves_child_exit() {
+    if !bwrap_available() {
+        eprintln!("SKIPPED: bwrap cannot create user namespaces");
+        return;
+    }
+    let (project, home) = test_tree("symlink-failure");
+    let outside = home.with_file_name("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, home.join(".local")).unwrap();
+    let output = run(
+        &project,
+        &home,
+        &[
+            "--clean",
+            "--no-status-bar",
+            "--exec",
+            "--audit-log",
+            "bash",
+            "-c",
+            "exit 7",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(7));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("audit log disabled")
+    );
+    assert!(!outside.join("share/ai-jail/history.jsonl").exists());
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+#[test]
+fn missing_home_disables_audit_without_changing_child_exit() {
+    if !bwrap_available() {
+        eprintln!("SKIPPED: bwrap cannot create user namespaces");
+        return;
+    }
+    let (project, home) = test_tree("missing-home");
+    let fallback_log = PathBuf::from("/tmp/.local/share/ai-jail/history.jsonl");
+    let fallback_before = std::fs::metadata(&fallback_log)
+        .ok()
+        .map(|metadata| (metadata.len(), metadata.modified().ok()));
+    let output = Command::new(ai_jail())
+        .args([
+            "--clean",
+            "--no-status-bar",
+            "--exec",
+            "--audit-log",
+            "bash",
+            "-c",
+            "exit 9",
+        ])
+        .current_dir(&project)
+        .env_remove("HOME")
+        .env_remove("AI_JAIL_QUIET")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(9));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("audit log disabled: HOME is not set or empty")
+    );
+    let fallback_after = std::fs::metadata(&fallback_log)
+        .ok()
+        .map(|metadata| (metadata.len(), metadata.modified().ok()));
+    assert_eq!(fallback_after, fallback_before);
+    assert!(!home.join(".local/share/ai-jail/history.jsonl").exists());
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
 #[test]

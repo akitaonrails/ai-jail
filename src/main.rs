@@ -196,16 +196,22 @@ fn default_resize_redraw_key(command: &[String]) -> Option<&'static str> {
 
 /// `--audit-verify`: walk the audit log and check its hash chain.
 /// Exit 0 intact, 1 broken, 2 when no log exists.
-fn run_audit_verify(cli: &cli::CliArgs) -> Result<i32, String> {
-    let home = std::env::var_os("HOME")
+fn audit_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+}
+
+fn run_audit_verify(cli: &cli::CliArgs) -> Result<i32, String> {
+    let home = audit_home().ok_or("HOME is not set or empty")?;
     let path = home.join(".local/share/ai-jail/history.jsonl");
-    if !path.exists() {
+    let Some(file) = audit::open_history(&home)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?
+    else {
         output::info(&format!("No audit log at {}", path.display()));
         return Ok(2);
-    }
-    let report = audit::verify(&path)
+    };
+    let report = audit::verify(file)
         .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
     if cli.verbose {
         output::verbose(&format!(
@@ -225,9 +231,7 @@ fn run_audit_verify(cli: &cli::CliArgs) -> Result<i32, String> {
 }
 
 fn run_audit_show() -> Result<i32, String> {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .ok_or("HOME is not set")?;
+    let home = audit_home().ok_or("HOME is not set or empty")?;
     let report = audit::show(&home, &mut std::io::stdout().lock())
         .map_err(|error| format!("Cannot display audit log: {error}"))?;
     match report {
@@ -588,11 +592,17 @@ fn run() -> Result<i32, String> {
     // a supervisor-side JSONL file the sandbox never sees. Opened here
     // so the filtered-egress proxy below can share the handle; the
     // launch record itself is appended when the child exits.
+    let audit_home = audit_home();
     let audit_log = if config.audit_log_enabled() {
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-        audit::AuditLog::open(&home)
+        match audit_home.as_deref() {
+            Some(home) => audit::AuditLog::open(home),
+            None => {
+                output::security_warn(
+                    "audit log disabled: HOME is not set or empty",
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -848,9 +858,6 @@ fn run() -> Result<i32, String> {
     // Append the launch record only now: exit code and duration are
     // what make it an audit trail rather than a log of intentions.
     if let Some(log) = &audit_log {
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
         let network = match config.network_mode() {
             config::NetworkMode::Off => "off",
             config::NetworkMode::Filtered => "filtered",
@@ -869,7 +876,9 @@ fn run() -> Result<i32, String> {
             project_config: !cli.clean
                 && invocation_cwd.join(".ai-jail").is_file(),
             project_trusted,
-            global_config: home.join(".ai-jail").exists(),
+            global_config: audit_home
+                .as_ref()
+                .is_some_and(|home| home.join(".ai-jail").exists()),
             exit_code,
             duration: launch_start.elapsed(),
         }));

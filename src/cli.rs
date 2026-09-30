@@ -614,7 +614,6 @@ fn is_sandbox_long_flag(arg: &str) -> bool {
             | "--audit-log"
             | "--no-audit-log"
             | "--audit-verify"
-            | "--audit-show"
             | "--env"
             | "--env-from-file"
             | "--secret"
@@ -1584,10 +1583,18 @@ mod tests {
             assert_eq!(args.command, ["audit", "report"]);
             assert!(!args.audit_show);
         }
-        let error = parse_test(&["claude", "--audit-show"]).unwrap_err();
-        assert!(error.contains("after command"));
-        let args = parse_test(&["claude", "--", "--audit-show"]).unwrap();
-        assert_eq!(args.command, ["claude", "--", "--audit-show"]);
+        for argv in [
+            vec!["command", "--audit-show"],
+            vec!["--", "command", "--audit-show"],
+            vec!["command", "--", "--audit-show"],
+        ] {
+            let args = parse_test(&argv).unwrap();
+            assert_eq!(
+                args.command,
+                argv[argv.iter().position(|v| *v == "command").unwrap()..]
+            );
+            assert!(!args.audit_show);
+        }
     }
 
     #[test]

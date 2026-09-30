@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+const MAX_RECORD: usize = 8 * 1024 * 1024;
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
 struct Fixture {
@@ -157,6 +158,42 @@ fn invalid_utf8_records_do_not_hide_later_events() {
 }
 
 #[test]
+fn oversized_records_are_invalid_and_later_records_are_displayed() {
+    let fixture = Fixture::new();
+    let mut content = vec![b'x'; MAX_RECORD + 1];
+    content.push(b'\n');
+    content.extend_from_slice(event().as_bytes());
+    fixture.write(content);
+    let output = fixture.run();
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("[invalid record at line 1]"));
+    assert!(text.contains("connect api.example.com:443"));
+
+    fixture.write(vec![b'x'; MAX_RECORD + 1]);
+    let output = fixture.run();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "[invalid record at line 1]\n"
+    );
+}
+
+#[test]
+fn many_small_records_can_exceed_record_cap_in_aggregate() {
+    let fixture = Fixture::new();
+    let line = event();
+    let count = MAX_RECORD / line.len() + 1;
+    fixture.write(line.repeat(count));
+    let output = fixture.run();
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout.iter().filter(|byte| **byte == b'\n').count(),
+        count
+    );
+}
+
+#[test]
 fn refuses_public_log_but_allows_private_read_only_log() {
     let fixture = Fixture::new();
     fixture.write(event());
@@ -187,6 +224,31 @@ fn refuses_symlinks_at_each_log_path_component() {
         let output = fixture.run();
         assert_eq!(output.status.code(), Some(1), "{relative}: {output:?}");
         assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn supports_trusted_symlinked_home_spellings() {
+    let fixture = Fixture::new();
+    fixture.write(event());
+    let real_home = fixture.root.join("real-home");
+    fs::rename(&fixture.home, &real_home).unwrap();
+    symlink(&real_home, &fixture.home).unwrap();
+
+    let ancestor = fixture.root.join("ancestor-link");
+    symlink(&fixture.root, &ancestor).unwrap();
+    for home in [
+        fixture.home.clone(),
+        PathBuf::from(format!("{}/", fixture.home.display())),
+        fixture.home.join("."),
+        ancestor.join("home"),
+    ] {
+        let output = fixture.command().env("HOME", home).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("connect api.example.com:443")
+        );
     }
 }
 
@@ -299,11 +361,16 @@ fn output_failure_returns_error() {
 }
 
 #[test]
-fn missing_home_is_an_error() {
+fn missing_or_empty_home_is_an_error() {
     let fixture = Fixture::new();
-    let output = fixture.command().env_remove("HOME").output().unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("HOME is not set")
-    );
+    for output in [
+        fixture.command().env_remove("HOME").output().unwrap(),
+        fixture.command().env("HOME", "").output().unwrap(),
+    ] {
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("HOME is not set or empty")
+        );
+    }
 }
