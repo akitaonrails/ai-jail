@@ -15,6 +15,28 @@ const AI_MEMORY_RUN_VALUE_OPTIONS: &[&str] = &[
     "--workstream",
     "--new",
     "--executable",
+    // Wrapper value options that may precede the harness (#151). Missing
+    // ones made effective_name() fall back to "ai-memory", so the harness
+    // started without its agent-state mounts.
+    "--env",
+    "--env-file",
+    "--profile",
+];
+
+/// ai-memory `run` boolean/toggle options that take no value and may
+/// precede the harness. `--jail` is special: it is valid both bare and as
+/// `--jail=TOGGLES` (e.g. `--jail=ssh,github`), handled in the `=` branch
+/// below. Parsed so these pre-harness flags do not hide the real harness
+/// (#151); unknown pre-harness tokens still fail closed to the outer
+/// command.
+const AI_MEMORY_RUN_BOOL_OPTIONS: &[&str] = &[
+    "--yolo",
+    "--true-yolo",
+    "--jail",
+    "--no-jail",
+    "--fresh",
+    "--no-autowire",
+    "--force-unlock",
 ];
 
 /// A harness selected by `ai-memory run`.
@@ -75,12 +97,24 @@ pub(crate) fn managed_harness(
         if !options_ended
             && let Some((option, value)) = argument.split_once('=')
         {
+            // Attached-value form (--opt=value). Boolean toggles such as
+            // --jail=ssh,github may carry a value; value options require a
+            // non-empty one. Anything else fails closed.
+            if is_run_bool_option(option) {
+                index += 1;
+                continue;
+            }
             if !is_run_value_option(option) || value.is_empty() {
                 return None;
             }
             if option == "--executable" {
                 executable = Some(value);
             }
+            index += 1;
+            continue;
+        }
+
+        if !options_ended && is_run_bool_option(argument) {
             index += 1;
             continue;
         }
@@ -125,6 +159,10 @@ fn skip_value_option(
 fn is_run_value_option(argument: &str) -> bool {
     AI_MEMORY_GLOBAL_VALUE_OPTIONS.contains(&argument)
         || AI_MEMORY_RUN_VALUE_OPTIONS.contains(&argument)
+}
+
+fn is_run_bool_option(argument: &str) -> bool {
+    AI_MEMORY_RUN_BOOL_OPTIONS.contains(&argument)
 }
 
 /// Command name used for terminal and automatic-profile behavior.
@@ -326,6 +364,70 @@ mod tests {
         let harness = managed_harness(&command).unwrap();
         assert_eq!(harness.name, "claude");
         assert_eq!(harness.executable(), "claude");
+    }
+
+    #[test]
+    fn ai_memory_run_detects_harness_behind_pre_harness_wrapper_flags() {
+        // Regression for #151: pre-harness wrapper flags (notably
+        // --jail=TOGGLES) must not hide the harness, or agent-state mounts
+        // are suppressed and the harness re-authenticates.
+        let cases: &[&[&str]] = &[
+            &[
+                "ai-memory",
+                "run",
+                "--jail=ssh,github,toolchains,mise",
+                "claude",
+                "--yolo",
+                "--true-yolo",
+            ],
+            &["ai-memory", "run", "--jail", "claude"],
+            &[
+                "ai-memory",
+                "run",
+                "--fresh",
+                "--no-autowire",
+                "--jail=ssh",
+                "claude",
+            ],
+            &["ai-memory", "run", "--yolo", "--true-yolo", "claude"],
+            &["ai-memory", "run", "--no-jail", "--force-unlock", "claude"],
+        ];
+        for case in cases {
+            let command = args(case);
+            assert_eq!(
+                effective_name(&command),
+                Some("claude"),
+                "harness hidden by wrapper flags in {case:?}"
+            );
+        }
+
+        // Pre-harness value options (--env/--env-file/--profile) too.
+        let command = args(&[
+            "ai-memory",
+            "run",
+            "--env",
+            "FOO=bar",
+            "--env-file",
+            "/tmp/e",
+            "--profile=work",
+            "codex",
+        ]);
+        assert_eq!(effective_name(&command), Some("codex"));
+    }
+
+    #[test]
+    fn ai_memory_run_pre_harness_flags_still_fail_closed_on_unknowns() {
+        // The allowlist is extended, not opened: unknown or incomplete
+        // pre-harness tokens still resolve to the outer command.
+        for command in [
+            args(&["ai-memory", "run", "--jail=ssh", "--unknown", "claude"]),
+            args(&["ai-memory", "run", "--env"]), // missing value
+            args(&["ai-memory", "run", "--jail=ssh"]), // no harness follows
+            args(&["ai-memory", "run", "--yolo", "not-a-harness"]),
+        ] {
+            assert_eq!(effective_name(&command), Some("ai-memory"));
+            assert_eq!(managed_harness(&command), None);
+        }
     }
 
     #[test]
