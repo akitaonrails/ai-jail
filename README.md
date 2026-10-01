@@ -87,24 +87,36 @@ explicit, narrow alternatives.
 The following capabilities default **off**: network, GPU, KVM, display, linked Git
 worktree metadata, X11, host shared memory, terminal passthrough, update
 check, and macOS host IPC. Docker, SSH, Pictures, Tailscale, and the systemd
-user bus are also off by default.
+user bus are also off by default. Tool credential passthrough (`--github`,
+`--aws`, `--kube`, `--gcloud`, `--docker-config`) is also off by default — see
+[Tool credentials](#tool-credentials). The one exception is dev-toolchain
+support (`--toolchains`), which is **on** by default and, when the network
+posture is otherwise unset, also default-allows filtered egress to package
+registries so builds work out of the box — see
+[Dev toolchains](#dev-toolchains).
 
-| Flag pair                                              | Effect and security consequence                                                                                                                                                                  |
-| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `--network` / `--no-network`                           | Enables/disables unrestricted network. `--network` permits full network exfiltration of any readable data.                                                                                       |
-| `--gpu` / `--no-gpu`                                   | Enables/disables GPU device access.                                                                                                                                                              |
-| `--display` / `--no-display`                           | Enables/disables display access. Only the validated Wayland socket is mounted; ai-jail never mounts all of `XDG_RUNTIME_DIR`. X11 is separate (`--x11`).                                         |
-| `--x11` / `--no-x11`                                   | Enables/disables X11 separately. X11 access permits keylogging and screenshots.                                                                                                                  |
-| `--audio` / `--no-audio`                               | Enables/disables host audio (Linux only). Binds the validated PipeWire/PulseAudio sockets in `XDG_RUNTIME_DIR` plus `/dev/snd`; anything in the sandbox can record and play audio while enabled. |
-| `--kvm` / `--no-kvm`                                   | Enables/disables `/dev/kvm` (Linux only) for hardware-accelerated VMs; exposes the host kernel's KVM ioctl interface. No `/dev/net/tun` or vhost devices; guests get only the sandbox's network. |
-| `--host-shm` / `--no-host-shm`                         | Enables/disables host `/dev/shm`; enabling it opens host cross-process IPC.                                                                                                                      |
-| `--terminal-passthrough` / `--no-terminal-passthrough` | Enables/disables raw terminal forwarding. Output is filtered through a VT parser by default; raw forwarding exposes terminal clipboard, query, and parser surface.                               |
-| `--agent-state` / `--no-agent-state`                   | Enables/disables mounting the invoked command's credential state (default off). Enables the agent to authenticate — and lets anything in the sandbox use those credentials.                      |
-| `--inherit-env` / `--no-inherit-env`                   | Default is a minimal environment allowlist. `--inherit-env` passes the full parent environment, secrets included.                                                                                |
-| `--update-check` / `--no-update-check`                 | Enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active (default off; all other launches make no network requests).        |
-| `--macos-host-ipc` / `--no-macos-host-ipc`             | Enables/disables macOS Mach, IOKit, and host IPC exposure.                                                                                                                                       |
-| `--worktree` / `--no-worktree`                         | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only.   |
-| `--private-home` / `--no-private-home`                 | Enables/disables the default private home. Disabling it is broad host-home access.                                                                                                               |
+| Flag pair                                              | Effect and security consequence                                                                                                                                                                                                                                                                              |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--network` / `--no-network`                           | Enables/disables unrestricted network. `--network` permits full network exfiltration of any readable data.                                                                                                                                                                                                   |
+| `--gpu` / `--no-gpu`                                   | Enables/disables GPU device access.                                                                                                                                                                                                                                                                          |
+| `--display` / `--no-display`                           | Enables/disables display access. Only the validated Wayland socket is mounted; ai-jail never mounts all of `XDG_RUNTIME_DIR`. X11 is separate (`--x11`).                                                                                                                                                     |
+| `--x11` / `--no-x11`                                   | Enables/disables X11 separately. X11 access permits keylogging and screenshots.                                                                                                                                                                                                                              |
+| `--audio` / `--no-audio`                               | Enables/disables host audio (Linux only). Binds the validated PipeWire/PulseAudio sockets in `XDG_RUNTIME_DIR` plus `/dev/snd`; anything in the sandbox can record and play audio while enabled.                                                                                                             |
+| `--kvm` / `--no-kvm`                                   | Enables/disables `/dev/kvm` (Linux only) for hardware-accelerated VMs; exposes the host kernel's KVM ioctl interface. No `/dev/net/tun` or vhost devices; guests get only the sandbox's network.                                                                                                             |
+| `--host-shm` / `--no-host-shm`                         | Enables/disables host `/dev/shm`; enabling it opens host cross-process IPC.                                                                                                                                                                                                                                  |
+| `--terminal-passthrough` / `--no-terminal-passthrough` | Enables/disables raw terminal forwarding. Output is filtered through a VT parser by default; raw forwarding exposes terminal clipboard, query, and parser surface.                                                                                                                                           |
+| `--agent-state` / `--no-agent-state`                   | Enables/disables mounting the invoked command's credential state (default off). Enables the agent to authenticate — and lets anything in the sandbox use those credentials.                                                                                                                                  |
+| `--inherit-env` / `--no-inherit-env`                   | Default is a minimal environment allowlist. `--inherit-env` passes the full parent environment, secrets included.                                                                                                                                                                                            |
+| `--update-check` / `--no-update-check`                 | Enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active (default off; all other launches make no network requests).                                                                                                                    |
+| `--macos-host-ipc` / `--no-macos-host-ipc`             | Enables/disables macOS Mach, IOKit, and host IPC exposure.                                                                                                                                                                                                                                                   |
+| `--worktree` / `--no-worktree`                         | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only.                                                                                                               |
+| `--private-home` / `--no-private-home`                 | Enables/disables the default private home. Disabling it is broad host-home access.                                                                                                                                                                                                                           |
+| `--toolchains` / `--no-toolchains`                     | On by default. Persists dependency caches (cargo/npm/go/maven/...) in a jail-owned store and maps Rust's toolchain binaries read-only; when the network posture is otherwise unset, also default-allows filtered egress to package registries. `--no-toolchains` disables both; disabled under `--lockdown`. |
+| `--github` / `--no-github`                             | Enables/disables read-only `~/.config/gh` (GitHub CLI credentials). Off by default; anything in the sandbox can then act as you on GitHub.                                                                                                                                                                   |
+| `--aws` / `--no-aws`                                   | Enables/disables read-only `~/.aws`. Off by default; anything in the sandbox can then act as you on AWS.                                                                                                                                                                                                     |
+| `--kube` / `--no-kube`                                 | Enables/disables read-only `~/.kube`. Off by default; anything in the sandbox can then act as you against your clusters.                                                                                                                                                                                     |
+| `--gcloud` / `--no-gcloud`                             | Enables/disables read-only `~/.config/gcloud`. Off by default; anything in the sandbox can then act as you on GCP.                                                                                                                                                                                           |
+| `--docker-config` / `--no-docker-config`               | Enables/disables read-only `~/.docker/config.json`. Off by default; anything in the sandbox can then push/pull as you against your registries.                                                                                                                                                               |
 
 `--allow-host HOST` (repeatable, or `allow_hosts = [...]` in `.ai-jail`)
 enables filtered egress instead: the sandbox keeps no route off the host
@@ -141,6 +153,60 @@ the daemon can create host-mounted containers. `DOCKER_HOST` must identify an
 actual Unix socket; TCP/SSH endpoints are not mounted. `~/.docker` is not
 broadly mounted. `--systemd-user` exposes only explicit user-bus sockets, but
 can still ask the host user manager to run services.
+
+### Dev toolchains
+
+`--toolchains` / `--no-toolchains` (on by default) persists dependency caches
+across sessions without exposing your real toolchain state. ai-jail maps a
+jail-owned cache store at `~/.local/share/ai-jail/cache/`, separate from your
+host caches, so a jailed build can never poison what the host builds from:
+
+- Rust: `~/.cargo/bin` and `~/.rustup` are mounted **read-only** so
+  `cargo`/`rustc` resolve; `~/.cargo/{registry,git}` are mounted
+  **read-write** to the jail store instead. Cargo's own `config.toml` and
+  credentials are never mapped. `cargo install` to the global bin is
+  unsupported in-jail — use `cargo install --root`.
+- Other ecosystems get a jail-owned cache at their default path when the
+  tool's home dir exists on the host: `~/.cache` (pip, go build cache, yarn,
+  deno, coursier, crystal, zig, composer), `~/go/pkg/mod`, `~/.npm`,
+  `~/.m2/repository`, `~/.gradle/caches`, `~/.bun/install/cache`, and
+  `~/.local/share/pnpm/store`.
+
+When toolchains are enabled and the network posture is otherwise unset (no
+`--network`, no `--no-network`, not `--lockdown`, not a browser launch),
+ai-jail also default-allows filtered egress to the package registries
+dependency managers actually need — `crates.io`, `registry.npmjs.org`,
+`registry.yarnpkg.com`, `pypi.org`, `files.pythonhosted.org`,
+`proxy.golang.org`, `sum.golang.org`, `repo1.maven.org`,
+`repo.maven.apache.org`, `repo.clojars.org`, `repo.packagist.org`,
+`github.com`, `codeload.github.com`, and `objects.githubusercontent.com` — so
+a fresh `npm install`/`cargo build`/`go get` works without passing
+`--allow-host`. Deny-by-default still holds: nothing else is reachable, and
+an explicit `--allow-host` set is unioned with this list. The default is
+gated on an unprivileged network-namespace probe: where netns is unavailable
+(hardened kernels, some nested containers, restricted CI) it silently stays
+offline instead of breaking the launch — an explicit `--allow-host` keeps its
+fail-closed guarantee regardless. `--no-network` always keeps the sandbox
+fully offline; `--network` gives unrestricted access instead of filtered
+egress.
+
+`--no-toolchains` (or `no_toolchains = true`) disables both the cache maps
+and the registry default together. The untrusted project `.ai-jail` may only
+disable it, never enable it, and `--lockdown` disables it outright.
+
+### Tool credentials
+
+Five flags mount one external tool's host credentials **read-only** into the
+sandbox, each off by default: `--github` (`~/.config/gh`), `--aws`
+(`~/.aws`), `--kube` (`~/.kube`), `--gcloud` (`~/.config/gcloud`), and
+`--docker-config` (`~/.docker/config.json`). Each is monotonic — the
+untrusted project `.ai-jail` may only disable one, never enable it — and all
+five are disabled under `--lockdown`.
+
+Read-only protects the file from modification, not the credential from use:
+anything running inside the sandbox can authenticate to that service as you
+for as long as the credential is valid. Turn these on only when the agent
+genuinely needs that specific service.
 
 ## Environment policy
 

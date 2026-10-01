@@ -55,6 +55,19 @@ This is the single most important invariant of the project. Users generate `.ai-
   global config; broad home exposure requires explicit `--no-private-home`.
 - Network, GPU, display, X11, host shared memory, terminal passthrough, macOS
   host IPC, and worktree metadata are opt-in. Do not weaken these defaults.
+- Network is the one default with a built-in exception: when dev-toolchain
+  support is enabled (the default) and neither `--network` nor
+  `--no-network` is set, ai-jail default-allows filtered egress to a fixed
+  list of package-registry hosts (`TOOLCHAIN_REGISTRY_HOSTS` in
+  `sandbox/mod.rs`) so dependency fetches work out of the box. This is gated
+  on an unprivileged network-namespace probe (`unprivileged_netns_available`)
+  that falls back to fully offline when unavailable, never to unrestricted
+  access. `--no-network` always forces strict offline regardless.
+- Dev-toolchain cache persistence (`--toolchains`/`no_toolchains`, on by
+  default) and the opt-in read-only credential flags (`--github`, `--aws`,
+  `--kube`, `--gcloud`, `--docker-config`) are monotonic capabilities: a
+  project `.ai-jail` may only disable them, never enable them, and all are
+  disabled under `--lockdown`.
 - Project `.ai-jail` is untrusted monotonic policy. It may tighten the effective
   sandbox but cannot enable capabilities, outside maps, ports, `claude_dir`, or
   exceptions. Capability opt-ins belong in global config or on the CLI.
