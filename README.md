@@ -144,7 +144,7 @@ only when deliberately granting broad host-home access; `--map` and
 | `--macos-host-ipc` / `--no-macos-host-ipc`             | Enables/disables macOS Mach, IOKit, and host IPC exposure.                                                                                                                                                                                                                                                                                                              |
 | `--worktree` / `--no-worktree`                         | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only.                                                                                                                                                                          |
 | `--private-home` / `--no-private-home`                 | Enables/disables the default private home. Disabling it is broad host-home access.                                                                                                                                                                                                                                                                                      |
-| `--toolchains` / `--no-toolchains`                     | On by default. Persists dependency caches (cargo/npm/go/maven/...) in a jail-owned store and maps Rust's toolchain binaries read-only; when the network posture is otherwise unset, also default-allows filtered egress to package registries. `--no-toolchains` disables both; disabled under `--lockdown`.                                                            |
+| `--toolchains` / `--no-toolchains`                     | On by default (Linux only; issue #148). Persists dependency caches (cargo/npm/go/maven/...) in a jail-owned store and maps Rust's toolchain binaries read-only; when the network posture is otherwise unset, also default-allows filtered egress to package registries. `--no-toolchains` disables both; disabled under `--lockdown`; no effect on macOS.               |
 | `--github` / `--no-github`                             | Enables/disables read-only `~/.config/gh` (GitHub CLI credentials). Off by default; anything in the sandbox can then act as you on GitHub.                                                                                                                                                                                                                              |
 | `--aws` / `--no-aws`                                   | Enables/disables read-only `~/.aws`. Off by default; anything in the sandbox can then act as you on AWS.                                                                                                                                                                                                                                                                |
 | `--kube` / `--no-kube`                                 | Enables/disables read-only `~/.kube`. Off by default; anything in the sandbox can then act as you against your clusters.                                                                                                                                                                                                                                                |
@@ -213,10 +213,12 @@ can still ask the host user manager to run services.
 
 ### Dev toolchains
 
-`--toolchains` / `--no-toolchains` (on by default) persists dependency caches
-across sessions without exposing your real toolchain state. ai-jail maps a
-jail-owned cache store at `~/.local/share/ai-jail/cache/`, separate from your
-host caches, so a jailed build can never poison what the host builds from:
+`--toolchains` / `--no-toolchains` (on by default, **Linux only** — macOS
+seatbelt cannot express the alternate-destination cache mounts, issue #148)
+persists dependency caches across sessions without exposing your real toolchain
+state. ai-jail maps a jail-owned cache store at
+`~/.local/share/ai-jail/cache/`, separate from your host caches, so a jailed
+build can never poison what the host builds from:
 
 - Rust: `~/.cargo/bin` and `~/.rustup` are mounted **read-only** so
   `cargo`/`rustc` resolve; `~/.cargo/{registry,git}` are mounted
@@ -279,6 +281,16 @@ ai-jail --env CI --env API_BASE=https://internal.example claude
 - Both forms are repeatable; a later `--env` for the same name wins.
 - `--inherit-env` passes the entire parent environment instead. This exports
   every secret currently in your shell into the sandbox; avoid it.
+
+Both `--env` and `--env-from-file` place the value on the sandbox launcher's
+argv (`bwrap --setenv NAME VALUE`), so another process of the **same user** can
+read it via `/proc/<pid>/cmdline` while the jail runs (issue #147). On a
+single-user desktop this is usually fine; in a shared or multi-process
+environment (a container running other tasks) it is a real exposure. For a
+genuine secret bound to one host, prefer `--secret KEY=host` (filtered egress):
+the real value never reaches the sandbox argv or env — the child sees a
+placeholder and the egress proxy substitutes it. (A descriptor-based fix to keep
+all `--env`/`--env-from-file` values off argv is tracked as a follow-up.)
 
 The same thing is available from trusted config as `env_pass`, so you do not
 have to repeat `--env` on every launch:

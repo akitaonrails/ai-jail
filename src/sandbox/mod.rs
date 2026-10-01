@@ -1047,6 +1047,17 @@ pub(crate) fn toolchain_cache_root() -> PathBuf {
 
 /// Build the toolchain cache maps for the tools present on this host.
 pub(crate) fn toolchain_maps() -> ToolchainMaps {
+    // Linux only (issue #148). The cache maps bind a jail-owned store at the
+    // tool's path with SOURCE != DESTINATION, which macOS seatbelt cannot
+    // express ("alternate map destinations are not supported"); emitting them on
+    // macOS broke every default launch in v2.5.0. The feature is documented as
+    // Linux-only, so return nothing elsewhere.
+    if !cfg!(target_os = "linux") {
+        return ToolchainMaps {
+            ro: Vec::new(),
+            rw: Vec::new(),
+        };
+    }
     toolchain_maps_from(
         &home_dir(),
         &toolchain_cache_root(),
@@ -2111,6 +2122,16 @@ mod tests {
         // The binary is still read-only mapped, but no rw cache map is emitted
         // when the jail store cannot be created.
         assert_eq!(maps.ro, vec!["/home/u/.cargo/bin".to_string()]);
+        assert!(maps.rw.is_empty());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn toolchain_maps_empty_off_linux() {
+        // Issue #148: the SOURCE:DEST cache maps are Linux-only; macOS seatbelt
+        // cannot express alternate destinations.
+        let maps = toolchain_maps();
+        assert!(maps.ro.is_empty());
         assert!(maps.rw.is_empty());
     }
 

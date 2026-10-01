@@ -314,7 +314,12 @@ fn run_audit_show() -> Result<i32, String> {
 /// `--no-network` (which keeps the sandbox fully offline) — and not a browser
 /// launch (browsers need real DNS and many domains).
 fn default_registry_egress_applies(config: &config::Config) -> bool {
-    config.toolchains_enabled()
+    // Linux only (issue #148): the toolchain default behavior — cache maps and
+    // this registry egress — is a Linux feature. macOS keeps its pre-v2.5.0
+    // posture (fully offline by default) rather than an unvalidated seatbelt
+    // egress path.
+    cfg!(target_os = "linux")
+        && config.toolchains_enabled()
         && !config.lockdown_enabled()
         && config.network.is_none()
         && config.browser_profile.is_none()
@@ -1114,8 +1119,12 @@ mod tests {
 
     #[test]
     fn default_registry_egress_only_when_posture_unset() {
-        // Default: toolchains on, network unset, no browser -> applies.
-        assert!(default_registry_egress_applies(&Config::default()));
+        // Default: toolchains on, network unset, no browser -> applies on
+        // Linux (the feature is Linux-only; macOS stays offline, issue #148).
+        assert_eq!(
+            default_registry_egress_applies(&Config::default()),
+            cfg!(target_os = "linux")
+        );
         // --no-network keeps the sandbox fully offline.
         assert!(!default_registry_egress_applies(&Config {
             network: Some(false),

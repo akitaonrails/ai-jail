@@ -78,7 +78,12 @@ OPTIONS:
                                     default: off; project .ai-jail cannot enable)
     --env <NAME[=VALUE]>            Pass environment variable NAME (value copied from
                                     the host) or NAME=VALUE into the sandbox
-                                    (repeatable; not persisted to .ai-jail)
+                                    (repeatable; not persisted to .ai-jail).
+                                    NOTE: the value is placed on the sandbox
+                                    launcher's argv, so another process of the
+                                    same user can read it via /proc/<pid>/cmdline
+                                    (#147). For a real secret prefer --secret
+                                    (value kept off argv), not --env.
     --env-from-file <PATH>          Read KEY=VALUE lines from PATH (repeatable; file
                                     must be user-owned, mode 0600, outside the project;
                                     applies like --env, which wins on conflicts)

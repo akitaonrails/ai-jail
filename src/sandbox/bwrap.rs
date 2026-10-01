@@ -1728,9 +1728,16 @@ fn split_by_project(
     mounts: Vec<Mount>,
     project_dir: &Path,
 ) -> (Vec<Mount>, Vec<Mount>) {
-    mounts
-        .into_iter()
-        .partition(|m| !m.dest().starts_with(project_dir))
+    // "Inside the project" means a *proper descendant* of the project dir, which
+    // (per #83) is emitted after the project bind so the project does not shadow
+    // it. A mount of the project dir *itself* is NOT inside: it must stay before
+    // the project bind so the project's own read-write bind wins over, say, a
+    // global read-only `--map` of the project path (issue #149) — otherwise the
+    // whole project becomes read-only.
+    mounts.into_iter().partition(|m| {
+        let dest = m.dest();
+        !(dest.starts_with(project_dir) && dest != project_dir)
+    })
 }
 
 /// SSH agent socket + ~/.ssh + tmpfs over /etc/ssh/ssh_config.d.
@@ -4607,6 +4614,48 @@ mod tests {
         let project_at = mount_arg_index(&args, "--bind", &project, &project);
         let ro_map_at = mount_arg_index(&args, "--ro-bind", &outside, &outside);
         assert!(ro_map_at < project_at);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn project_dir_ro_map_does_not_shadow_the_project_rw_bind() {
+        // Issue #149: a global ro-map of the project directory itself must not
+        // win over the project's own read-write bind (which would make the whole
+        // project read-only). The ro-map is emitted BEFORE the project bind so
+        // the later rw project bind takes precedence.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-map-order-projdir-home-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let config = Config {
+            ro_maps: vec![project.clone()],
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        let project_at = mount_arg_index(&args, "--bind", &project, &project);
+        let ro_map_at = mount_arg_index(&args, "--ro-bind", &project, &project);
+        assert!(
+            ro_map_at < project_at,
+            "project-dir ro-map must precede the project rw bind so rw wins"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }
