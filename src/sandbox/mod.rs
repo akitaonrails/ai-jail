@@ -1044,6 +1044,40 @@ fn toolchain_maps_from(
         }
     }
 
+    // Other ecosystems. Each binds a persistent, jail-owned cache directory at
+    // the tool's *default* cache path, so dependency fetches survive across
+    // sessions without any env plumbing and without touching the host's own
+    // cache. The store is always jail-owned (never the host dir), so there is no
+    // credential or host-cache exposure; an absent tool just gets an empty cache
+    // dir. `~/.cache` (XDG) covers pip/uv, go-build, yarn-v1, deno, coursier
+    // (clojure/scala), crystal, zig, composer and others in one bind. `~/.m2`
+    // serves maven/clojure/scala; the rest are per-tool package stores.
+    // Each entry maps only when the tool's home dir exists on the host (so a
+    // launch gets a cache only for ecosystems the user actually uses).
+    // (store subdir, destination relative to home, host indicator dir)
+    let caches = [
+        ("xdg", ".cache", ".cache"),
+        ("go/pkg-mod", "go/pkg/mod", "go"),
+        ("npm", ".npm", ".npm"),
+        ("maven", ".m2/repository", ".m2"),
+        ("gradle", ".gradle/caches", ".gradle"),
+        ("bun", ".bun/install/cache", ".bun"),
+        ("pnpm", ".local/share/pnpm/store", ".local/share/pnpm"),
+    ];
+    for (store_sub, dest_rel, indicator) in caches {
+        if !is_dir(&home.join(indicator)) {
+            continue;
+        }
+        let src = cache_root.join(store_sub);
+        if make_dir(&src).is_ok() {
+            rw.push(format!(
+                "{}:{}",
+                src.display(),
+                home.join(dest_rel).display()
+            ));
+        }
+    }
+
     ToolchainMaps { ro, rw }
 }
 
@@ -2019,6 +2053,34 @@ mod tests {
         // when the jail store cannot be created.
         assert_eq!(maps.ro, vec!["/home/u/.cargo/bin".to_string()]);
         assert!(maps.rw.is_empty());
+    }
+
+    #[test]
+    fn toolchain_maps_generic_caches_only_for_present_tools() {
+        let home = Path::new("/home/u");
+        let present: std::collections::HashSet<PathBuf> =
+            [home.join("go"), home.join(".npm"), home.join(".cache")]
+                .into_iter()
+                .collect();
+        let maps = toolchain_maps_from(
+            home,
+            Path::new("/cache"),
+            None,
+            None,
+            |p| present.contains(p),
+            |_| Ok(()),
+        );
+        assert!(
+            maps.rw
+                .iter()
+                .any(|s| s == "/cache/go/pkg-mod:/home/u/go/pkg/mod")
+        );
+        assert!(maps.rw.iter().any(|s| s == "/cache/npm:/home/u/.npm"));
+        assert!(maps.rw.iter().any(|s| s == "/cache/xdg:/home/u/.cache"));
+        // Tools whose home dir is absent get no cache map.
+        assert!(!maps.rw.iter().any(|s| s.contains(".gradle")));
+        assert!(!maps.rw.iter().any(|s| s.contains(".m2")));
+        assert!(!maps.rw.iter().any(|s| s.contains(".bun")));
     }
 
     #[test]
