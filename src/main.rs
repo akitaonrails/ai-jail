@@ -677,6 +677,19 @@ fn run() -> Result<i32, String> {
                 config.ro_maps.push(dir);
             }
         }
+        // mise's data dir is mapped read-only above, so mise can never finish
+        // an auto-install of a declared-but-missing tool inside the jail — it
+        // only fails noisily ("Read-only file system") on every shim call.
+        // Disable the doomed attempt so a missing tool fails once, cleanly.
+        // A user's explicit --env for the same name still wins.
+        let var = "MISE_NOT_FOUND_AUTO_INSTALL";
+        let already = config
+            .env_pass
+            .iter()
+            .any(|e| e == var || e.starts_with(&format!("{var}=")));
+        if !already {
+            config.env_pass.push(format!("{var}=false"));
+        }
     }
 
     // Dev-toolchain cache persistence (Part A). On by default outside lockdown;
