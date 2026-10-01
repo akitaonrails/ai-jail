@@ -179,6 +179,7 @@ struct MountSet {
     command_binary: Vec<Mount>,
     git_worktree: Vec<Mount>,
     gpu: Vec<Mount>,
+    kvm: Vec<Mount>,
     docker: Vec<Mount>,
     tailscale: Vec<Mount>,
     shm: Vec<Mount>,
@@ -218,11 +219,12 @@ struct MountSet {
 }
 
 impl MountSet {
-    fn ordered_mounts(&self) -> [&[Mount]; 26] {
+    fn ordered_mounts(&self) -> [&[Mount]; 27] {
         [
             &self.base,
             &self.sys_masks,
             &self.gpu,
+            &self.kvm,
             &self.docker,
             &self.tailscale,
             &self.shm,
@@ -1187,6 +1189,11 @@ fn landlock_wrapper_args(
     } else {
         "--no-gpu".into()
     });
+    args.push(if config.kvm_enabled() {
+        "--kvm".into()
+    } else {
+        "--no-kvm".into()
+    });
     args.push(if config.docker_enabled() {
         "--docker".into()
     } else {
@@ -1520,6 +1527,7 @@ fn discover_mounts_full(
     let private_home =
         lockdown || browser_mode || config.private_home_enabled();
     let enable_gpu = !lockdown && config.gpu_enabled();
+    let enable_kvm = !lockdown && config.kvm_enabled();
     let enable_docker = !lockdown && config.docker_enabled();
     let enable_tailscale = !lockdown && config.tailscale_enabled();
     let enable_display = !lockdown && config.display_enabled();
@@ -1665,6 +1673,11 @@ fn discover_mounts_full(
         git_worktree: git_worktree_mounts(config, project_dir, verbose),
         gpu: if enable_gpu {
             discover_gpu(verbose)
+        } else {
+            vec![]
+        },
+        kvm: if enable_kvm {
+            discover_kvm(verbose)
         } else {
             vec![]
         },
@@ -2494,6 +2507,43 @@ fn discover_gpu(verbose: bool) -> Vec<Mount> {
     }
 
     mounts
+}
+
+/// `/dev/kvm` for hardware-accelerated virtualization (QEMU,
+/// Firecracker, the Android emulator). Opt-in via `--kvm`: the KVM
+/// ioctl interface is a large kernel attack surface. Disabled under
+/// `--lockdown`.
+fn discover_kvm(verbose: bool) -> Vec<Mount> {
+    discover_kvm_at(Path::new("/dev/kvm"), verbose)
+}
+
+/// Bind `kvm` only when it is a character device. `symlink_metadata`
+/// refuses a symlink instead of following it.
+fn discover_kvm_at(kvm: &Path, verbose: bool) -> Vec<Mount> {
+    match std::fs::symlink_metadata(kvm) {
+        Ok(meta) if meta.file_type().is_char_device() => {}
+        Ok(_) => {
+            output::warn(&format!(
+                "--kvm: {} is not a character device, skipping",
+                kvm.display()
+            ));
+            return vec![];
+        }
+        Err(_) => {
+            output::warn(&format!(
+                "--kvm: {} not found, skipping",
+                kvm.display()
+            ));
+            return vec![];
+        }
+    }
+    if verbose {
+        output::verbose(&format!("kvm: {}", kvm.display()));
+    }
+    vec![Mount::DevBind {
+        src: kvm.to_path_buf(),
+        dest: kvm.to_path_buf(),
+    }]
 }
 
 fn discover_docker() -> Vec<Mount> {
@@ -3873,6 +3923,62 @@ mod tests {
         for sub in AUDIO_SOCKET_SUBPATHS {
             assert!(!args.iter().any(|arg| arg.contains(sub)));
         }
+    }
+
+    #[test]
+    fn kvm_dry_run_binds_dev_kvm_only_when_enabled() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let sources = MountSources::from_guard(&guard);
+        let has_kvm = |config: &Config| {
+            build_dry_run_args_full(
+                config,
+                &std::env::temp_dir(),
+                &sources,
+                false,
+                None,
+            )
+            .unwrap()
+            .windows(3)
+            .any(|w| w == ["--dev-bind", "/dev/kvm", "/dev/kvm"])
+        };
+
+        assert!(!has_kvm(&minimal_test_config()));
+        assert!(!has_kvm(&Config {
+            kvm: Some(true),
+            lockdown: Some(true),
+            ..minimal_test_config()
+        }));
+        let enabled = Config {
+            kvm: Some(true),
+            ..minimal_test_config()
+        };
+        assert_eq!(has_kvm(&enabled), Path::new("/dev/kvm").exists());
+    }
+
+    #[test]
+    fn discover_kvm_binds_only_a_character_device() {
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-kvm-node-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("file");
+        std::fs::write(&file, "").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+
+        // /dev/null stands in for /dev/kvm: any character device binds.
+        let null = Path::new("/dev/null");
+        assert!(matches!(
+            discover_kvm_at(null, false).as_slice(),
+            [Mount::DevBind { src, dest }] if src == null && dest == null
+        ));
+        assert!(discover_kvm_at(&file, false).is_empty());
+        assert!(discover_kvm_at(&root, false).is_empty());
+        assert!(discover_kvm_at(&link, false).is_empty());
+        assert!(discover_kvm_at(&root.join("missing"), false).is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5685,6 +5791,24 @@ mod tests {
         assert!(!wrapper_args.contains(&"--rw-map".into()));
         assert!(!wrapper_args.contains(&"--map".into()));
         assert!(wrapper_args.contains(&"--browser=hard".into()));
+    }
+
+    #[test]
+    fn landlock_wrapper_forwards_kvm() {
+        // The inner wrapper rebuilds its config from forwarded flags, so
+        // its Landlock /dev/kvm rule only exists if --kvm reaches it.
+        let wrapper_args =
+            landlock_wrapper_args(&minimal_test_config(), &[], false);
+        assert!(wrapper_args.contains(&"--no-kvm".into()));
+        assert!(!wrapper_args.contains(&"--kvm".into()));
+
+        let config = Config {
+            kvm: Some(true),
+            ..minimal_test_config()
+        };
+        let wrapper_args = landlock_wrapper_args(&config, &[], false);
+        assert!(wrapper_args.contains(&"--kvm".into()));
+        assert!(!wrapper_args.contains(&"--no-kvm".into()));
     }
 
     #[test]

@@ -49,6 +49,9 @@ pub fn platform_notes(config: &Config) {
     if config.systemd_user_enabled() {
         output::warn("--systemd-user has no effect on macOS");
     }
+    if config.kvm_enabled() {
+        output::warn("--kvm has no effect on macOS");
+    }
     if config.tailscale_enabled() {
         output::warn(
             "--tailscale has no effect on macOS (no socket bind; \

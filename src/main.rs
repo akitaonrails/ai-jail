@@ -1041,6 +1041,7 @@ fn run() -> Result<i32, String> {
             gpu: config.gpu_enabled(),
             display: config.display_enabled(),
             audio: config.audio_enabled(),
+            kvm: config.kvm_enabled(),
             browser_profile: config.browser_profile.as_deref(),
             project_config: !cli.clean
                 && invocation_cwd.join(".ai-jail").is_file(),

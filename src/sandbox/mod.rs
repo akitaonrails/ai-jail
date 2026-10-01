@@ -24,6 +24,7 @@ fn project_config_dangerous_opt_ins(
         (config.kube_enabled(), "Kube credentials"),
         (config.gcloud_enabled(), "gcloud credentials"),
         (config.docker_config_enabled(), "Docker config"),
+        (config.kvm_enabled(), "KVM device"),
     ] {
         if enabled {
             items.push(name.into());

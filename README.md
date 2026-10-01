@@ -84,7 +84,7 @@ running in the sandbox, so it stays opt-in. Use `--no-private-home` only when
 deliberately granting broad host-home access; `--map` and `--rw-map` remain
 explicit, narrow alternatives.
 
-The following capabilities default **off**: network, GPU, display, linked Git
+The following capabilities default **off**: network, GPU, KVM, display, linked Git
 worktree metadata, X11, host shared memory, terminal passthrough, update
 check, and macOS host IPC. Docker, SSH, Pictures, Tailscale, and the systemd
 user bus are also off by default.
@@ -96,6 +96,7 @@ user bus are also off by default.
 | `--display` / `--no-display`                           | Enables/disables display access. Only the validated Wayland socket is mounted; ai-jail never mounts all of `XDG_RUNTIME_DIR`. X11 is separate (`--x11`).                                         |
 | `--x11` / `--no-x11`                                   | Enables/disables X11 separately. X11 access permits keylogging and screenshots.                                                                                                                  |
 | `--audio` / `--no-audio`                               | Enables/disables host audio (Linux only). Binds the validated PipeWire/PulseAudio sockets in `XDG_RUNTIME_DIR` plus `/dev/snd`; anything in the sandbox can record and play audio while enabled. |
+| `--kvm` / `--no-kvm`                                   | Enables/disables `/dev/kvm` (Linux only) for hardware-accelerated VMs; exposes the host kernel's KVM ioctl interface. No `/dev/net/tun` or vhost devices; guests get only the sandbox's network. |
 | `--host-shm` / `--no-host-shm`                         | Enables/disables host `/dev/shm`; enabling it opens host cross-process IPC.                                                                                                                      |
 | `--terminal-passthrough` / `--no-terminal-passthrough` | Enables/disables raw terminal forwarding. Output is filtered through a VT parser by default; raw forwarding exposes terminal clipboard, query, and parser surface.                               |
 | `--agent-state` / `--no-agent-state`                   | Enables/disables mounting the invoked command's credential state (default off). Enables the agent to authenticate — and lets anything in the sandbox use those credentials.                      |
@@ -296,7 +297,7 @@ masks) append.
 Common fields: `command`, `rw_maps`, `ro_maps`, `overlay_maps`, `mask`,
 `deny_paths`, `mask_exceptions`, `deny_path_exceptions`, `hide_dotdirs`,
 `network`, `x11`, `host_shm`, `terminal_passthrough`, `macos_host_ipc`,
-`systemd_user`, `ssh`, `pictures`, `private_home`, `lockdown`,
+`systemd_user`, `kvm`, `ssh`, `pictures`, `private_home`, `lockdown`,
 `browser_profile`, `claude_dir`, `allow_tcp_ports`, `status_bar_style`.
 
 Global config only: `env_pass` (see Environment policy above) and
