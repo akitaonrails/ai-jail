@@ -80,6 +80,9 @@ OPTIONS:
     --audit-verify                 Verify the audit log's hash chain and exit
     --worktree / --no-worktree     Enable/disable linked Git worktree metadata passthrough
     --no-mise / --mise             Disable/enable mise integration
+    --no-toolchains / --toolchains Disable/enable dev-toolchain cache
+                                   persistence (rust/cargo, go, node, …;
+                                   default: on; Linux)
     --ssh / --no-ssh               Share ~/.ssh read-only + forward SSH_AUTH_SOCK (default: off)
     --pictures / --no-pictures     Share ~/Pictures read-only (default: off)
     --browser[=PROFILE]            Use browser isolation profile (hard | soft; default hard)
@@ -135,6 +138,7 @@ pub struct CliArgs {
     pub terminal_passthrough: Option<bool>,
     pub worktree: Option<bool>,
     pub mise: Option<bool>,
+    pub toolchains: Option<bool>,
     pub save_config: Option<bool>,
     pub hide_config: Option<bool>,
     pub ssh: Option<bool>,
@@ -414,6 +418,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long(s @ ("mise" | "no-mise")) => {
                 args.mise = Some(s == "mise");
             }
+            Long(s @ ("toolchains" | "no-toolchains")) => {
+                args.toolchains = Some(s == "toolchains");
+            }
             Long(s @ ("save-config" | "no-save-config")) => {
                 args.save_config = Some(s == "save-config");
             }
@@ -649,6 +656,8 @@ fn is_sandbox_long_flag(arg: &str) -> bool {
             | "--secret"
             | "--mise"
             | "--no-mise"
+            | "--toolchains"
+            | "--no-toolchains"
             | "--save-config"
             | "--no-save-config"
             | "--hide-config"
@@ -977,6 +986,22 @@ mod tests {
         // The ambiguous no-`--` case must keep erroring.
         let err = parse_test(&["claude", "--network"]).unwrap_err();
         assert!(err.contains("after command"), "{err}");
+    }
+
+    #[test]
+    fn parse_toolchains() {
+        assert_eq!(
+            parse_test(&["--no-toolchains", "bash"]).unwrap().toolchains,
+            Some(false)
+        );
+        assert_eq!(
+            parse_test(&["--toolchains", "bash"]).unwrap().toolchains,
+            Some(true)
+        );
+        // Forwarded verbatim as a child flag after `--`.
+        let args = parse_test(&["--", "bash", "--toolchains"]).unwrap();
+        assert_eq!(args.toolchains, None);
+        assert_eq!(args.command, ["bash", "--toolchains"]);
     }
 
     #[test]

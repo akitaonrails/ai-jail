@@ -303,6 +303,24 @@ fn run_audit_show() -> Result<i32, String> {
     }
 }
 
+/// True when the destination of a toolchain map spec is already the destination
+/// of a user-supplied ro/rw/overlay map, so the user's explicit mapping wins
+/// over the auto-injected toolchain cache map.
+fn toolchain_dest_already_mapped(config: &config::Config, spec: &str) -> bool {
+    let dest = |p: &std::path::Path| {
+        config::MapSpec::parse(p)
+            .map(|s| s.destination)
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    let target = dest(std::path::Path::new(spec));
+    config
+        .ro_maps
+        .iter()
+        .chain(config.rw_maps.iter())
+        .chain(config.overlay_maps.iter())
+        .any(|entry| dest(entry) == target)
+}
+
 fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     use std::os::unix::process::CommandExt;
 
@@ -638,6 +656,29 @@ fn run() -> Result<i32, String> {
             if !config.ro_maps.contains(&dir) && !config.rw_maps.contains(&dir)
             {
                 config.ro_maps.push(dir);
+            }
+        }
+    }
+
+    // Dev-toolchain cache persistence (Part A). On by default outside lockdown;
+    // `--no-toolchains` and the untrusted project `.ai-jail` can only disable
+    // it. Read-only toolchain binaries and a persistent jail-owned dependency
+    // cache are injected as maps so they flow through the same bwrap mount and
+    // Landlock rule path as every other map. Injected here, after the
+    // status/--init/bootstrap early returns and the save paths, so these
+    // derived, host-specific paths are never written into a saved `.ai-jail`
+    // nor shown as user maps in `ai-jail status`. A user's own explicit map for
+    // the same destination always wins.
+    if config.toolchains_enabled() && !config.lockdown_enabled() {
+        let maps = sandbox::toolchain_maps();
+        for spec in maps.ro {
+            if !toolchain_dest_already_mapped(&config, &spec) {
+                config.ro_maps.push(std::path::PathBuf::from(spec));
+            }
+        }
+        for spec in maps.rw {
+            if !toolchain_dest_already_mapped(&config, &spec) {
+                config.rw_maps.push(std::path::PathBuf::from(spec));
             }
         }
     }

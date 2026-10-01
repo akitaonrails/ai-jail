@@ -931,6 +931,86 @@ fn mise_auto_map_dirs_from(
     dirs
 }
 
+/// Encoded map specs for dev-toolchain cache persistence (issue: Part A).
+/// `ro` holds read-only host paths (`src==dest`): toolchain binaries that must
+/// resolve inside the jail. `rw` holds `src:dest` entries binding a persistent,
+/// jail-owned cache directory at the tool's cache path, so dependency fetches
+/// survive across sessions without touching the host's real cache or exposing
+/// credential/config files under the toolchain home.
+pub(crate) struct ToolchainMaps {
+    pub ro: Vec<String>,
+    pub rw: Vec<String>,
+}
+
+/// The persistent, jail-owned cache store root on the host.
+pub(crate) fn toolchain_cache_root() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".local/share"))
+        .join("ai-jail/cache")
+}
+
+/// Build the toolchain cache maps for the tools present on this host.
+pub(crate) fn toolchain_maps() -> ToolchainMaps {
+    toolchain_maps_from(
+        &home_dir(),
+        &toolchain_cache_root(),
+        std::env::var_os("CARGO_HOME").map(PathBuf::from),
+        std::env::var_os("RUSTUP_HOME").map(PathBuf::from),
+        |p| p.is_dir(),
+        |p| std::fs::create_dir_all(p),
+    )
+}
+
+/// Inner, injectable implementation so the mapping logic is unit-testable
+/// without mutating process env or touching real home/cache directories.
+fn toolchain_maps_from(
+    home: &Path,
+    cache_root: &Path,
+    cargo_home: Option<PathBuf>,
+    rustup_home: Option<PathBuf>,
+    is_dir: impl Fn(&Path) -> bool,
+    make_dir: impl Fn(&Path) -> std::io::Result<()>,
+) -> ToolchainMaps {
+    let mut ro = Vec::new();
+    let mut rw = Vec::new();
+
+    // Rust (cargo/rustup). Read-only map the real toolchain binaries so
+    // `cargo`/`rustc` resolve (they live under CARGO_HOME/bin and RUSTUP_HOME,
+    // which the private home does not otherwise mount). Read-write map a
+    // persistent jail-owned cache at CARGO_HOME/{registry,git} so crate fetches
+    // work and survive across sessions. The toolchain home's `config.toml` and
+    // `credentials*` are never mapped (safe by omission on the tmpfs home), and
+    // the host's own registry/git caches are never bound, so a jailed build
+    // cannot poison what the host's non-jailed builds compile from. `bin` stays
+    // read-only because it is on the host PATH; `cargo install` to the global
+    // bin is therefore unsupported in-jail (use `cargo install --root`).
+    let cargo = cargo_home.unwrap_or_else(|| home.join(".cargo"));
+    let rustup = rustup_home.unwrap_or_else(|| home.join(".rustup"));
+    let cargo_bin = cargo.join("bin");
+    let have_rust = is_dir(&cargo_bin);
+    if have_rust {
+        ro.push(cargo_bin.to_string_lossy().into_owned());
+    }
+    if is_dir(&rustup) {
+        ro.push(rustup.to_string_lossy().into_owned());
+    }
+    if have_rust {
+        for sub in ["registry", "git"] {
+            let src = cache_root.join("cargo").join(sub);
+            if make_dir(&src).is_ok() {
+                rw.push(format!(
+                    "{}:{}",
+                    src.display(),
+                    cargo.join(sub).display()
+                ));
+            }
+        }
+    }
+
+    ToolchainMaps { ro, rw }
+}
+
 fn default_launch_command(config: &Config) -> LaunchCommand {
     if config.command.is_empty() {
         return LaunchCommand {
@@ -1769,6 +1849,98 @@ mod tests {
         let home = Path::new("/home/dev");
         let dirs = mise_auto_map_dirs_from(home, None, None, None, |_| false);
         assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn toolchain_maps_rust_ro_bins_and_rw_cache() {
+        let home = Path::new("/home/u");
+        let cache = Path::new("/cache");
+        let present: std::collections::HashSet<PathBuf> =
+            [home.join(".cargo/bin"), home.join(".rustup")]
+                .into_iter()
+                .collect();
+        let maps = toolchain_maps_from(
+            home,
+            cache,
+            None,
+            None,
+            |p| present.contains(p),
+            |_| Ok(()),
+        );
+        assert_eq!(
+            maps.ro,
+            vec![
+                "/home/u/.cargo/bin".to_string(),
+                "/home/u/.rustup".to_string(),
+            ]
+        );
+        assert_eq!(
+            maps.rw,
+            vec![
+                "/cache/cargo/registry:/home/u/.cargo/registry".to_string(),
+                "/cache/cargo/git:/home/u/.cargo/git".to_string(),
+            ]
+        );
+        // Credentials and config are never mapped (safe by omission).
+        assert!(!maps.ro.iter().chain(maps.rw.iter()).any(|s| {
+            s.contains("credentials") || s.contains("config.toml")
+        }));
+    }
+
+    #[test]
+    fn toolchain_maps_absent_rust_is_empty() {
+        let maps = toolchain_maps_from(
+            Path::new("/home/u"),
+            Path::new("/cache"),
+            None,
+            None,
+            |_| false,
+            |_| Ok(()),
+        );
+        assert!(maps.ro.is_empty());
+        assert!(maps.rw.is_empty());
+    }
+
+    #[test]
+    fn toolchain_maps_honor_cargo_home_and_rustup_home() {
+        let cargo = PathBuf::from("/opt/cargo");
+        let rustup = PathBuf::from("/opt/rustup");
+        let present: std::collections::HashSet<PathBuf> =
+            [cargo.join("bin"), rustup.clone()].into_iter().collect();
+        let maps = toolchain_maps_from(
+            Path::new("/home/u"),
+            Path::new("/cache"),
+            Some(cargo),
+            Some(rustup),
+            |p| present.contains(p),
+            |_| Ok(()),
+        );
+        assert!(maps.ro.contains(&"/opt/cargo/bin".to_string()));
+        assert!(maps.ro.contains(&"/opt/rustup".to_string()));
+        assert!(
+            maps.rw
+                .iter()
+                .any(|s| s == "/cache/cargo/registry:/opt/cargo/registry")
+        );
+    }
+
+    #[test]
+    fn toolchain_maps_skip_cache_when_store_cannot_be_created() {
+        let home = Path::new("/home/u");
+        let present: std::collections::HashSet<PathBuf> =
+            [home.join(".cargo/bin")].into_iter().collect();
+        let maps = toolchain_maps_from(
+            home,
+            Path::new("/cache"),
+            None,
+            None,
+            |p| present.contains(p),
+            |_| Err(std::io::Error::other("read-only")),
+        );
+        // The binary is still read-only mapped, but no rw cache map is emitted
+        // when the jail store cannot be created.
+        assert_eq!(maps.ro, vec!["/home/u/.cargo/bin".to_string()]);
+        assert!(maps.rw.is_empty());
     }
 
     #[test]

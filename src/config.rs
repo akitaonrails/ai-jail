@@ -198,6 +198,13 @@ pub struct Config {
     pub no_worktree: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_mise: Option<bool>,
+    /// Dev-toolchain cache persistence (rust/cargo, go, node, …): enabled by
+    /// default. ai-jail maps a persistent jail-owned cache store and (for
+    /// rust) the host toolchain binaries read-only, so builds work and their
+    /// caches survive across sessions. The untrusted project `.ai-jail` may
+    /// only disable it, never enable it. `--lockdown` disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_toolchains: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_save_config: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -350,6 +357,9 @@ impl Config {
     }
     pub fn mise_enabled(&self) -> bool {
         self.no_mise != Some(true)
+    }
+    pub fn toolchains_enabled(&self) -> bool {
+        self.no_toolchains != Some(true)
     }
     pub fn worktree_enabled(&self) -> bool {
         self.no_worktree == Some(false)
@@ -990,6 +1000,7 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(host_shm);
     take!(terminal_passthrough);
     take!(no_mise);
+    take!(no_toolchains);
     take!(no_worktree);
     take!(no_save_config);
     take!(no_hide_config);
@@ -1345,6 +1356,7 @@ pub fn merge_with_global_report(
     monotonic!(systemd_user, |config: &Config| config
         .systemd_user_enabled());
     monotonic!(no_mise, |config: &Config| config.mise_enabled());
+    monotonic!(no_toolchains, |config: &Config| config.toolchains_enabled());
     monotonic!(no_worktree, |config: &Config| config.worktree_enabled());
     monotonic!(agent_state, |config: &Config| config.agent_state_enabled());
     monotonic!(inherit_env, |config: &Config| config.inherit_env_enabled());
@@ -1820,6 +1832,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     direct!(update_check);
     direct!(audit_log);
     invert!(mise, no_mise);
+    invert!(toolchains, no_toolchains);
     invert!(save_config, no_save_config);
     invert!(hide_config, no_hide_config);
     direct!(ssh);
@@ -1967,6 +1980,7 @@ pub fn display_status(config: &Config) {
     print_opt_in_enabled("  Audit log", config.audit_log);
     print_opt_in_tristate("  Git worktree", config.no_worktree);
     print_auto_tristate("  Mise", config.no_mise);
+    print_auto_tristate("  Toolchains", config.no_toolchains);
     print_default_on_tristate("  Save config", config.no_save_config);
     print_default_on_tristate("  Hide .ai-jail", config.no_hide_config);
     print_shared_or_hidden("  SSH keys", config.ssh);
@@ -3269,6 +3283,7 @@ no_gpu = true
             terminal_passthrough: Some(true),
             no_worktree: Some(false),
             no_mise: None,
+            no_toolchains: None,
             no_save_config: Some(true),
             no_hide_config: Some(false),
             ssh: Some(true),
@@ -5229,6 +5244,39 @@ ANTHROPIC_API_KEY = "api.anthropic.com"
     }
 
     #[test]
+    fn toolchains_enabled_by_default_and_project_cannot_enable() {
+        // Default on; a config without the key parses and stays enabled.
+        let cfg = parse_toml("command = [\"claude\"]\n").unwrap();
+        assert_eq!(cfg.no_toolchains, None);
+        assert!(cfg.toolchains_enabled());
+
+        // Globally disabled, a project .ai-jail cannot re-enable it (monotonic).
+        let global = Config {
+            no_toolchains: Some(true),
+            ..Config::default()
+        };
+        let project = Config {
+            no_toolchains: Some(false),
+            ..Config::default()
+        };
+        let (merged, _) =
+            merge_with_global_report(global, project, Path::new("/project"));
+        assert!(!merged.toolchains_enabled());
+
+        // A project may still disable a globally enabled toolchain pass.
+        let project = Config {
+            no_toolchains: Some(true),
+            ..Config::default()
+        };
+        let (merged, _) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(!merged.toolchains_enabled());
+    }
+
+    #[test]
     fn mise_enabled_accessor() {
         assert!(
             Config {
@@ -5972,6 +6020,7 @@ hide_dotdirs = [".my_secrets"]
             terminal_passthrough: None,
             no_worktree: None,
             no_mise: None,
+            no_toolchains: None,
             no_save_config: Some(true),
             no_hide_config: None,
             ssh: None,
