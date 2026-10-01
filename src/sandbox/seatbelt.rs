@@ -2641,21 +2641,46 @@ mod tests {
     }
 
     #[test]
-    fn agent_state_is_gated_off_by_default() {
+    fn agent_state_is_on_by_default_and_opt_out_and_lockdown_disable_it() {
         let fixture = agent_state_fixture_home("state-default");
         let home = &fixture.home;
+        let project = PathBuf::from("/tmp/test-project");
+
+        // Default (agent-state on): ~/.claude and ~/.claude.json are writable
+        // so the harness starts pre-authenticated.
         let config = Config {
             command: vec!["claude".into()],
             no_mise: Some(true),
             ..Config::default()
         };
-        assert!(agent_state_paths(&config).is_empty());
-        let project = PathBuf::from("/tmp/test-project");
+        assert_eq!(
+            agent_state_paths(&config),
+            vec![home.join(".claude"), home.join(".claude.json")]
+        );
         let writable = macos_writable_paths(&project, &config, false);
+        assert!(writable.contains(&home.join(".claude")));
+        assert!(writable.contains(&home.join(".claude.json")));
+        assert!(
+            generate_sbpl_profile(&config, &project).contains(".claude.json")
+        );
+
+        // Opt out with --no-agent-state: state dir and file stay hidden.
+        let opted_out = Config {
+            agent_state: Some(false),
+            ..config.clone()
+        };
+        assert!(agent_state_paths(&opted_out).is_empty());
+        let writable = macos_writable_paths(&project, &opted_out, false);
         assert!(!writable.contains(&home.join(".claude")));
         assert!(!writable.contains(&home.join(".claude.json")));
-        let profile = generate_sbpl_profile(&config, &project);
-        assert!(!profile.contains(".claude.json"));
+
+        // Lockdown always disables it, even with no explicit opt-out.
+        let locked = Config {
+            lockdown: Some(true),
+            ..config.clone()
+        };
+        assert!(agent_state_paths(&locked).is_empty());
+
         let _ = std::fs::remove_dir_all(home);
     }
 
