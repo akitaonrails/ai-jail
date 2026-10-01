@@ -19,6 +19,13 @@ exclude = [
   ".lobster/",
 ]
 
+[features]
+# Test-only escape hatches for the filtered-egress / phantom-secret
+# integration tests (SSRF guard off, extra TLS root). Never enabled by a
+# release build or `cargo install`; run the suite with
+# `cargo test --features test-hooks`.
+test-hooks = []
+
 [dependencies]
 lexopt = "0.3"
 serde = { version = "1", features = ["derive"] }
