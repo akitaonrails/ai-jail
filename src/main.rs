@@ -72,6 +72,7 @@ fn apply_browser_profile(config: &mut config::Config, command_trusted: bool) {
     config.no_docker = Some(true);
     config.no_worktree = Some(true);
     config.no_mise = Some(true);
+    config.no_toolchains = Some(true);
     config.no_save_config = Some(true);
     config.ssh = Some(false);
     config.pictures = Some(false);
@@ -306,6 +307,18 @@ fn run_audit_show() -> Result<i32, String> {
 /// True when the destination of a toolchain map spec is already the destination
 /// of a user-supplied ro/rw/overlay map, so the user's explicit mapping wins
 /// over the auto-injected toolchain cache map.
+/// Whether the default package-registry egress should be injected: toolchain
+/// support on, not lockdown, and the network posture unset — neither
+/// `--network` (unrestricted, which cannot combine with filtered egress) nor
+/// `--no-network` (which keeps the sandbox fully offline) — and not a browser
+/// launch (browsers need real DNS and many domains).
+fn default_registry_egress_applies(config: &config::Config) -> bool {
+    config.toolchains_enabled()
+        && !config.lockdown_enabled()
+        && config.network.is_none()
+        && config.browser_profile.is_none()
+}
+
 fn toolchain_dest_already_mapped(config: &config::Config, spec: &str) -> bool {
     let dest = |p: &std::path::Path| {
         config::MapSpec::parse(p)
@@ -683,6 +696,23 @@ fn run() -> Result<i32, String> {
         }
     }
 
+    // Default-allow the package registries (filtered egress) so dependency
+    // fetches work without the user passing --allow-host. Deny-by-default still
+    // holds: only these hosts become reachable. An explicit --allow-host set is
+    // unioned with these. Gated on netns availability: filtered egress fences
+    // the sandbox in a private netns and fails closed, so where netns is
+    // unavailable the auto-default stays offline rather than breaking the launch
+    // (an explicit --allow-host keeps its fail-closed behavior).
+    if default_registry_egress_applies(&config)
+        && sandbox::unprivileged_netns_available()
+    {
+        for host in sandbox::TOOLCHAIN_REGISTRY_HOSTS {
+            if !config.allow_hosts.iter().any(|h| h == host) {
+                config.allow_hosts.push((*host).to_string());
+            }
+        }
+    }
+
     // Opt-in, read-only credential passthrough (github/aws/kube/gcloud/
     // docker_config): off by default, disabled under --lockdown. Injected
     // here, after the status/--init/bootstrap early returns and the save
@@ -1047,15 +1077,47 @@ fn main() {
 mod tests {
     use super::{
         apply_browser_profile, command_is_browser, command_needs_direct_tty,
-        default_resize_redraw_key, exec_requires_terminal_passthrough,
-        prune_missing_path_entries, pty_proxy_active, resolve_browser_profile,
-        running_inside_multiplexer, should_auto_save_project_config,
-        should_check_update, should_save_global_preferences,
-        validate_network_flags, validate_write_flags,
+        default_registry_egress_applies, default_resize_redraw_key,
+        exec_requires_terminal_passthrough, prune_missing_path_entries,
+        pty_proxy_active, resolve_browser_profile, running_inside_multiplexer,
+        should_auto_save_project_config, should_check_update,
+        should_save_global_preferences, validate_network_flags,
+        validate_write_flags,
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
     use crate::test_utils::{ENV_LOCK, EnvVarGuard};
+
+    #[test]
+    fn default_registry_egress_only_when_posture_unset() {
+        // Default: toolchains on, network unset, no browser -> applies.
+        assert!(default_registry_egress_applies(&Config::default()));
+        // --no-network keeps the sandbox fully offline.
+        assert!(!default_registry_egress_applies(&Config {
+            network: Some(false),
+            ..Config::default()
+        }));
+        // --network is unrestricted; no filtered-egress injection.
+        assert!(!default_registry_egress_applies(&Config {
+            network: Some(true),
+            ..Config::default()
+        }));
+        // Lockdown stays offline.
+        assert!(!default_registry_egress_applies(&Config {
+            lockdown: Some(true),
+            ..Config::default()
+        }));
+        // Opted out of toolchains.
+        assert!(!default_registry_egress_applies(&Config {
+            no_toolchains: Some(true),
+            ..Config::default()
+        }));
+        // Browser launches need real DNS, not filtered egress.
+        assert!(!default_registry_egress_applies(&Config {
+            browser_profile: Some("hard".into()),
+            ..Config::default()
+        }));
+    }
 
     #[test]
     fn crush_requires_direct_tty() {

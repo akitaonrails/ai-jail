@@ -71,6 +71,10 @@ fn audit_log_records_one_launch_with_exit_code() {
             "--no-status-bar",
             "--exec",
             "--audit-log",
+            // This test is about the audit record, not the network posture;
+            // pin --no-network so the logged `network` stays "off" regardless
+            // of the default registry-egress behavior.
+            "--no-network",
             "bash",
             "-c",
             "exit 3",

@@ -978,6 +978,64 @@ pub(crate) struct ToolchainMaps {
     pub rw: Vec<String>,
 }
 
+/// Package registries reached by default (filtered egress) when toolchain
+/// support is on, so dependency fetches work out of the box without the user
+/// passing `--allow-host`. Deny-by-default still holds: only these hosts (and
+/// their subdomains) are reachable, nothing else. `--no-network` keeps the
+/// sandbox fully offline; `--network` gives unrestricted access instead.
+pub(crate) const TOOLCHAIN_REGISTRY_HOSTS: &[&str] = &[
+    "crates.io",                     // rust
+    "registry.npmjs.org",            // npm / node
+    "registry.yarnpkg.com",          // yarn
+    "pypi.org",                      // python
+    "files.pythonhosted.org",        // python wheels
+    "proxy.golang.org",              // go modules
+    "sum.golang.org",                // go checksum db
+    "repo1.maven.org",               // maven central (java/clojure/scala)
+    "repo.maven.apache.org",         // maven central mirror
+    "repo.clojars.org",              // clojure
+    "repo.packagist.org",            // php / composer
+    "github.com",                    // git-based deps (go, crystal, cargo git)
+    "codeload.github.com",           // github tarballs
+    "objects.githubusercontent.com", // github release assets
+];
+
+/// Whether an unprivileged network namespace can be created, cached for the
+/// process. Filtered egress fences the sandbox in a private netns
+/// (`bwrap --unshare-net`) and fails closed if it cannot, so the auto-injected
+/// default registry egress is gated on this: where netns is unavailable
+/// (hardened kernels, some nested containers, restricted CI) the default simply
+/// stays offline instead of breaking every launch. An *explicit* `--allow-host`
+/// is never gated by this — it keeps its fail-closed guarantee.
+#[cfg(target_os = "linux")]
+pub(crate) fn unprivileged_netns_available() -> bool {
+    use std::sync::OnceLock;
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        std::process::Command::new("bwrap")
+            .args([
+                "--ro-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--unshare-net",
+                "--",
+                "true",
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// macOS filtered egress is a seatbelt loopback rule, not a network namespace,
+/// so there is nothing to probe.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn unprivileged_netns_available() -> bool {
+    true
+}
+
 /// The persistent, jail-owned cache store root on the host.
 pub(crate) fn toolchain_cache_root() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
