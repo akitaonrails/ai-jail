@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -297,6 +298,45 @@ static void test_write_sys(void)
     ALLOWED("(file created in %s!)", target);
 }
 
+/*
+ * Cross-directory rename(2) within a writable tree (/tmp). rustc stages
+ * each output in a temp dir and renames it into deps/; rustup stages then
+ * renames into toolchains/. A stacked Landlock layer that does not handle
+ * LANDLOCK_ACCESS_FS_REFER makes every such reparent fail with EXDEV, which
+ * silently breaks all Rust compilation in the jail. This MUST succeed; it
+ * prints REFER_OK (exit 0) on success, REFER_FAIL (exit 1) on EXDEV.
+ */
+static void test_refer_rename(void)
+{
+    mkdir("/tmp/.aijail_refer", 0700);
+    mkdir("/tmp/.aijail_refer/a", 0700);
+    mkdir("/tmp/.aijail_refer/b", 0700);
+    int fd = open("/tmp/.aijail_refer/a/f", O_CREAT | O_WRONLY, 0600);
+    if (fd >= 0)
+        close(fd);
+    errno = 0;
+    if (rename("/tmp/.aijail_refer/a/f", "/tmp/.aijail_refer/b/f") == 0) {
+        puts("REFER_OK");
+        exit(0);
+    }
+    printf("REFER_FAIL (errno=%d)\n", errno);
+    exit(1);
+}
+
+/*
+ * Adversarial: reparent a file OUT of a read-only mapped tree into a
+ * writable one. REFER is granted only on read-write paths, never read-only
+ * ones, so the source directory has no REFER right and this must stay denied
+ * even though /tmp is writable. Expected BLOCKED (EXDEV/EACCES/EPERM).
+ */
+static void test_refer_escape(void)
+{
+    errno = 0;
+    if (rename("/tmp/aijail_rosrc/f", "/tmp/escaped") == 0)
+        ALLOWED("reparent out of read-only map succeeded");
+    BLOCKED();
+}
+
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
@@ -323,6 +363,8 @@ int main(int argc, char *argv[])
     if (strcmp(t, "netlink_route") == 0) test_netlink_route();
     if (strcmp(t, "netlink_audit") == 0) test_netlink_audit();
     if (strcmp(t, "write_sys") == 0)     test_write_sys();
+    if (strcmp(t, "refer_rename") == 0)  test_refer_rename();
+    if (strcmp(t, "refer_escape") == 0)  test_refer_escape();
 
     fprintf(stderr, "Unknown test: %s\n", t);
     return 2;

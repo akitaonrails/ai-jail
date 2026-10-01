@@ -80,13 +80,15 @@ pub fn apply(
         return Ok(());
     }
 
-    let fs_result = match do_apply(
+    let (ro_paths, rw_paths) = collect_landlock_paths(
         config,
         project_dir,
         mounted_ro_paths,
         mounted_rw_paths,
         verbose,
-    ) {
+    );
+
+    let fs_result = match do_apply(&ro_paths, &rw_paths) {
         Ok(status) => match status {
             RulesetStatus::FullyEnforced => {
                 output::info("Landlock: fully enforced");
@@ -140,12 +142,12 @@ pub fn apply(
     // V4 network rules are stacked as a separate ruleset so
     // filesystem enforcement is preserved on kernels without
     // V4 support.
-    apply_net_rules(config, verbose)?;
+    apply_net_rules(config, &rw_paths, verbose)?;
 
     // V6 scope rules (abstract Unix sockets + signals) are stacked as a
     // third best-effort ruleset so the fs (V3) and net (V4) layers are
     // preserved on kernels without V6.
-    apply_scope_rules(verbose)
+    apply_scope_rules(&rw_paths, verbose)
 }
 
 /// Stack the Landlock V6 scope ruleset: restrict connecting to abstract Unix
@@ -162,11 +164,29 @@ pub fn apply(
 /// netns already fences abstract sockets. So a kernel without V6 logs and
 /// continues even in lockdown. Intra-sandbox sockets and signals are
 /// unaffected; only crossing the sandbox boundary is scoped.
-fn apply_scope_rules(verbose: bool) -> Result<(), String> {
+fn apply_scope_rules(
+    rw_paths: &[PathBuf],
+    verbose: bool,
+) -> Result<(), String> {
+    // This is a separate stacked ruleset, and a Landlock layer that does not
+    // handle LANDLOCK_ACCESS_FS_REFER forbids every cross-directory rename/link
+    // for the restricted process (EXDEV) — even when another layer allows it.
+    // So this scope layer must also handle Refer and grant it on the same
+    // writable paths the fs ruleset does, or it would re-break reparenting
+    // (rustc's temp→deps rename, rustup, atomic saves). Refer is granted only
+    // on rw_paths, never on read-only paths, so reparenting into or out of a
+    // read-only/denied tree stays blocked. Best-effort: on kernels without
+    // Refer (< ABI v2) it is dropped, matching the pre-v2 "reparent denied"
+    // behavior; on kernels without scope (< V6) the scope part is dropped.
     let result = Ruleset::default()
-        .scope(Scope::AbstractUnixSocket | Scope::Signal)
+        .handle_access(AccessFs::Refer)
+        .and_then(|r| r.scope(Scope::AbstractUnixSocket | Scope::Signal))
         .and_then(landlock::Ruleset::create)
-        .and_then(|created| created.restrict_self());
+        .and_then(|created| {
+            created
+                .add_rules(path_beneath_rules(rw_paths, AccessFs::Refer))?
+                .restrict_self()
+        });
 
     match result {
         Ok(status) => {
@@ -190,27 +210,17 @@ fn apply_scope_rules(verbose: bool) -> Result<(), String> {
     }
 }
 
-/// Collect paths that need read-only access and paths that
-/// need read-write access, then build and apply the ruleset.
-///
-/// Two rulesets are stacked:
-///  1. Filesystem (V3): ro/rw path rules. handle_access(all)
-///     means any filesystem operation not covered by a rule is
-///     denied — this is an allowlist, not a blocklist.
-///  2. Network (V4): TCP bind/connect rules, lockdown only.
-///     Stacked separately so V3-only kernels still get full
-///     filesystem protection.
-fn do_apply(
+/// Resolve the read-only and read-write path sets for the active mode,
+/// computed once in `apply` so that the fs, net, and scope rulesets all grant
+/// `AccessFs::Refer` on the same writable paths.
+fn collect_landlock_paths(
     config: &Config,
     project_dir: &Path,
     mounted_ro_paths: &[PathBuf],
     mounted_rw_paths: &[PathBuf],
     verbose: bool,
-) -> Result<RulesetStatus, landlock::RulesetError> {
-    let access_all = AccessFs::from_all(ABI_VERSION);
-    let access_read = AccessFs::from_read(ABI_VERSION);
-
-    let (ro_paths, rw_paths) = if config.lockdown_enabled() {
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    if config.lockdown_enabled() {
         collect_lockdown_paths(config, project_dir, verbose)
     } else {
         collect_normal_paths_with_mounted_paths(
@@ -220,7 +230,20 @@ fn do_apply(
             mounted_rw_paths,
             verbose,
         )
-    };
+    }
+}
+
+/// Build and apply the filesystem (V3) ruleset: read-only rules on `ro_paths`,
+/// read-write (all access, including `Refer`) on `rw_paths`. `handle_access`
+/// covers every filesystem right, so any operation not granted by a rule is
+/// denied — an allowlist, not a blocklist. The net (V4) and scope (V6) layers
+/// are stacked separately by `apply` so a V3-only kernel still enforces this.
+fn do_apply(
+    ro_paths: &[PathBuf],
+    rw_paths: &[PathBuf],
+) -> Result<RulesetStatus, landlock::RulesetError> {
+    let access_all = AccessFs::from_all(ABI_VERSION);
+    let access_read = AccessFs::from_read(ABI_VERSION);
 
     let status = Ruleset::default()
         .handle_access(access_all)?
@@ -265,7 +288,11 @@ fn do_apply(
 /// is unrestricted. Seccomp blocks raw/packet sockets (the netlink route
 /// exception for getifaddrs() never applies in lockdown) but
 /// regular UDP datagrams can still be sent and received.
-fn apply_net_rules(config: &Config, verbose: bool) -> Result<(), String> {
+fn apply_net_rules(
+    config: &Config,
+    rw_paths: &[PathBuf],
+    verbose: bool,
+) -> Result<(), String> {
     if !config.lockdown_enabled() {
         return Ok(());
     }
@@ -283,11 +310,18 @@ fn apply_net_rules(config: &Config, verbose: bool) -> Result<(), String> {
     // listens, and every other TCP operation stays denied.
     let allowed = allowed_connect_ports(config);
 
+    // This stacked layer must also handle+grant Refer on the writable paths,
+    // or it forbids every cross-directory rename/link under lockdown (EXDEV):
+    // a Landlock layer that omits Refer blocks reparenting even when the fs
+    // layer allows it. Granted only on rw_paths (never read-only), so moving
+    // into/out of a read-only tree stays denied.
     let result = Ruleset::default()
         .handle_access(net_access)
+        .and_then(|r| r.handle_access(AccessFs::Refer))
         .and_then(landlock::Ruleset::create)
         .and_then(|r| {
-            let mut created = r;
+            let mut created =
+                r.add_rules(path_beneath_rules(rw_paths, AccessFs::Refer))?;
             for &port in &allowed {
                 created = created
                     .add_rule(NetPort::new(port, AccessNet::ConnectTcp))?;
@@ -1532,7 +1566,7 @@ mod tests {
     fn apply_net_rules_normal_is_noop() {
         let config = Config::default();
         assert!(!config.lockdown_enabled());
-        assert!(apply_net_rules(&config, true).is_ok());
+        assert!(apply_net_rules(&config, &[], true).is_ok());
     }
 
     #[test]
@@ -1540,7 +1574,7 @@ mod tests {
         // Kernel-independent smoke test: the V6 scope ruleset builds and
         // applies (or degrades) without panicking on any kernel, and is
         // non-fatal by contract. (advisory GHSA-frgp-q3qc-g78p)
-        let _ = apply_scope_rules(false);
+        let _ = apply_scope_rules(&[], false);
     }
 
     #[test]
@@ -1552,7 +1586,7 @@ mod tests {
         };
         // On macOS / kernels without V4: Ok (ABI_NET is empty).
         // On Linux with V4: Ok (deny-all TCP).
-        let _ = apply_net_rules(&config, true);
+        let _ = apply_net_rules(&config, &[], true);
     }
 
     #[test]
@@ -1567,7 +1601,7 @@ mod tests {
         // On Linux with V4: Ok (NetPort rules applied).
         // On Linux without V4 but with net ABI: Err (hard-fail
         //   because --unshare-net was skipped).
-        let _ = apply_net_rules(&config, true);
+        let _ = apply_net_rules(&config, &[], true);
     }
 
     /// Documents the failure-mode contract for the V4-unavailable +
@@ -1589,7 +1623,7 @@ mod tests {
             allow_tcp_ports: vec![32000],
             ..Config::default()
         };
-        if let Err(msg) = apply_net_rules(&config, false) {
+        if let Err(msg) = apply_net_rules(&config, &[], false) {
             assert!(
                 msg.contains("Landlock V4")
                     && msg.contains("refusing to start"),
@@ -1607,7 +1641,7 @@ mod tests {
         };
         // Empty ports → same as no ports → best-effort V4 or
         // fallback to --unshare-net only.
-        let _ = apply_net_rules(&config, true);
+        let _ = apply_net_rules(&config, &[], true);
     }
 
     #[test]
@@ -1650,7 +1684,7 @@ mod tests {
             allow_hosts: vec!["api.anthropic.com".into()],
             ..Config::default()
         };
-        assert!(apply_net_rules(&filtered_only, false).is_ok());
+        assert!(apply_net_rules(&filtered_only, &[], false).is_ok());
     }
 
     #[test]

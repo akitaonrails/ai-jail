@@ -467,3 +467,62 @@ fn lockdown_blocks_write_to_usr() {
     let out = helper_lockdown("write_sys");
     assert_blocked_or_skipped(&out, "write to /usr/ in lockdown");
 }
+
+// ── Landlock REFER / cross-directory rename (regression) ────────
+//
+// v2.4.0 stacked a V6 scope ruleset that did not handle
+// LANDLOCK_ACCESS_FS_REFER. A Landlock layer that omits REFER forbids every
+// cross-directory rename(2)/link(2) for the restricted process (EXDEV), even
+// when another layer allows it — which broke rustc (temp→deps rename),
+// rustup, and atomic saves for all Rust work in the jail. The fix grants
+// Refer on the writable paths in every stacked layer (fs, net, scope), never
+// on read-only paths.
+
+fn assert_refer_ok(output: &Output, name: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("REFER_OK"),
+        "{name}: expected REFER_OK (cross-dir rename allowed), got \
+         stdout={stdout:?} stderr={stderr:?} exit={:?}",
+        output.status.code()
+    );
+}
+
+#[test]
+fn landlock_allows_cross_dir_rename_normal() {
+    require_bwrap!();
+    require_helper!();
+    let out = helper_normal("refer_rename");
+    assert_refer_ok(&out, "cross-dir rename (normal)");
+}
+
+#[test]
+fn landlock_allows_cross_dir_rename_lockdown() {
+    require_bwrap_net!();
+    require_helper!();
+    // The lockdown net ruleset is another stacked layer: it must also grant
+    // Refer on rw paths (/tmp) or reparenting breaks under lockdown too.
+    let out = helper_lockdown("refer_rename");
+    assert_refer_ok(&out, "cross-dir rename (lockdown)");
+}
+
+#[test]
+fn landlock_denies_rename_out_of_readonly_map() {
+    require_bwrap!();
+    require_helper!();
+    // Refer is granted only on read-write paths. Reparenting a file OUT of a
+    // read-only map into writable /tmp must stay denied.
+    let src = PathBuf::from("/tmp/aijail_rosrc");
+    let _ = std::fs::create_dir_all(&src);
+    std::fs::write(src.join("f"), b"secret").expect("seed ro-map source");
+    let bin = helper_bin();
+    let out = sandbox_run(&[
+        "--map",
+        "/tmp/aijail_rosrc",
+        bin.to_str().unwrap(),
+        "refer_escape",
+    ]);
+    assert_blocked(&out, "reparent out of read-only map");
+    let _ = std::fs::remove_dir_all(&src);
+}
