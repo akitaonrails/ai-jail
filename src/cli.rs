@@ -181,7 +181,37 @@ pub struct CliArgs {
 }
 
 pub fn parse() -> Result<CliArgs, String> {
-    parse_from(lexopt::Parser::from_env())
+    parse_argv(std::env::args_os().skip(1).collect())
+}
+
+/// Split the argument vector on the first `--` so everything after it is the
+/// command and its arguments, verbatim: never scanned for sandbox flags, and
+/// the `--` separator itself is not forwarded to the child. Options — and a
+/// command given *without* `--` — before the separator are parsed normally,
+/// including the ambiguity guard that rejects a sandbox flag after a bare
+/// command. This is what lets `ai-jail <opts> -- <cmd> --flag` forward `--flag`
+/// (e.g. `--env`, `--network`, `--verbose`) to the child even when it collides
+/// with an ai-jail flag. lexopt consumes a leading `--` silently and exposes no
+/// way to tell "command after `--`" from "bare positional command", so the
+/// split is done here rather than inside the lexopt loop.
+pub(crate) fn parse_argv(
+    argv: Vec<std::ffi::OsString>,
+) -> Result<CliArgs, String> {
+    match argv.iter().position(|a| a.to_str() == Some("--")) {
+        Some(sep) => {
+            let (opts, rest) = argv.split_at(sep);
+            let mut args =
+                parse_from(lexopt::Parser::from_args(opts.iter().cloned()))?;
+            // rest[0] is the "--" separator; skip it, take the command as-is.
+            args.command.extend(
+                rest.iter()
+                    .skip(1)
+                    .map(|a| a.to_string_lossy().into_owned()),
+            );
+            Ok(args)
+        }
+        None => parse_from(lexopt::Parser::from_args(argv)),
+    }
 }
 
 pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
@@ -636,8 +666,7 @@ mod tests {
     use super::*;
 
     fn parse_test(args: &[&str]) -> Result<CliArgs, String> {
-        let parser = lexopt::Parser::from_args(args);
-        parse_from(parser)
+        parse_argv(args.iter().map(std::ffi::OsString::from).collect())
     }
 
     // ── Basic command parsing ──────────────────────────────────
@@ -910,6 +939,44 @@ mod tests {
     fn unknown_child_flag_after_command_is_preserved() {
         let args = parse_test(&["claude", "--foo"]).unwrap();
         assert_eq!(args.command, vec!["claude", "--foo"]);
+    }
+
+    #[test]
+    fn child_flags_after_separator_are_forwarded_not_rejected() {
+        // Regression: the guard scanned past `--` and rejected child flags
+        // whose names collide with ai-jail's own (issue: the `--` flag-guard
+        // bug). After a `--`, everything is the command + args, verbatim; the
+        // `--` is not forwarded to the child.
+        let args =
+            parse_test(&["--network", "--", "/bin/true", "--env", "X=1"])
+                .unwrap();
+        assert_eq!(args.network, Some(true));
+        assert_eq!(args.command, ["/bin/true", "--env", "X=1"]);
+
+        // Several colliding flags, all forwarded verbatim.
+        let args = parse_test(&[
+            "--",
+            "run",
+            "--env",
+            "X=1",
+            "--network",
+            "--verbose",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.command,
+            ["run", "--env", "X=1", "--network", "--verbose"]
+        );
+        // The sandbox's own flags were NOT set by the child's copies.
+        assert_eq!(args.network, None);
+        assert!(!args.verbose);
+    }
+
+    #[test]
+    fn sandbox_flag_after_bare_command_without_separator_still_errors() {
+        // The ambiguous no-`--` case must keep erroring.
+        let err = parse_test(&["claude", "--network"]).unwrap_err();
+        assert!(err.contains("after command"), "{err}");
     }
 
     #[test]
@@ -1583,6 +1650,10 @@ mod tests {
             assert_eq!(args.command, ["audit", "report"]);
             assert!(!args.audit_show);
         }
+        // `--audit-show` as or after a command positional is a child concern,
+        // never the ai-jail action. The first `--` is the option terminator:
+        // consumed, not forwarded to the child (so all three yield the same
+        // command).
         for argv in [
             vec!["command", "--audit-show"],
             vec!["--", "command", "--audit-show"],
@@ -1591,7 +1662,8 @@ mod tests {
             let args = parse_test(&argv).unwrap();
             assert_eq!(
                 args.command,
-                argv[argv.iter().position(|v| *v == "command").unwrap()..]
+                ["command", "--audit-show"],
+                "argv: {argv:?}"
             );
             assert!(!args.audit_show);
         }
