@@ -1435,7 +1435,11 @@ mod tests {
             ..Config::default()
         };
         let error = validate_network_flags(&with_network).unwrap_err();
-        assert!(error.contains("mutually exclusive"));
+        if cfg!(target_os = "linux") {
+            assert!(error.contains("mutually exclusive"), "{error}");
+        } else {
+            assert!(error.contains("Linux-only"), "{error}");
+        }
         for port in [0, 80, 443, 1023, crate::proxy::BRIDGE_PORT] {
             let config = Config {
                 forward_ports: vec![port],
