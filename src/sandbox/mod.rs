@@ -94,6 +94,7 @@ const DOTDIR_DENY: &[&str] = &[
     ".basilisk-dev",
     ".sparrow",
     ".docker",
+    ".kimi",
     ".kimi-code",
 ];
 
@@ -2502,8 +2503,10 @@ mod tests {
         assert!(is_dotdir_rw("pi"));
         assert!(is_dotdir_rw(".pi-lens"));
         assert!(is_dotdir_rw("pi-lens"));
+        assert!(!is_dotdir_rw(".kimi"));
         assert!(!is_dotdir_rw(".kimi-code"));
         assert!(!is_dotdir_rw(".docker"));
+        assert!(is_dotdir_denied(".kimi", &[], &[]));
         assert!(is_dotdir_denied(".kimi-code", &[], &[]));
         assert!(is_dotdir_denied(".docker", &[], &[]));
         assert!(!is_dotdir_rw(".aws"));

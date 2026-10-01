@@ -1906,17 +1906,21 @@ fn discover_home_dotfiles_full(
     } else if agent_state {
         // Non-private-home passthrough still gates the command-state
         // extras that the generic dotdir enumeration never mounts
-        // (.kimi-code is in DOTDIR_DENY; .claude.json is a file).
+        // (kimi's state dirs are in DOTDIR_DENY; .claude.json is a file).
         if crate::command::effective_name(&config.command)
             .is_some_and(|name| name.starts_with("kimi"))
-            && !state_path_hidden(".kimi-code", &config.hide_dotdirs)
         {
-            let path = super::home_dir().join(".kimi-code");
-            if safe_state_dir(&path) {
-                mounts.push(Mount::Bind {
-                    src: path.clone(),
-                    dest: path,
-                });
+            for relative in [".kimi", ".kimi-code"] {
+                if state_path_hidden(relative, &config.hide_dotdirs) {
+                    continue;
+                }
+                let path = super::home_dir().join(relative);
+                if safe_state_dir(&path) {
+                    mounts.push(Mount::Bind {
+                        src: path.clone(),
+                        dest: path,
+                    });
+                }
             }
         }
         let claude_json = super::home_dir().join(".claude.json");
@@ -1959,7 +1963,10 @@ fn command_state_paths(config: &Config) -> &'static [&'static str] {
         Some("codex") => &[".codex"],
         Some("opencode") => &[".config/opencode", ".local/share/opencode"],
         Some("crush") => &[".crush", ".config/crush", ".local/share/crush"],
-        Some(name) if name.starts_with("kimi") => &[".kimi-code"],
+        // kimi-cli stores its OAuth credentials and config in ~/.kimi
+        // (~/.kimi/credentials, ~/.kimi/config.toml). ~/.kimi-code is kept
+        // as a legacy alias for any older install that used it (#150).
+        Some(name) if name.starts_with("kimi") => &[".kimi", ".kimi-code"],
         Some("gemini") => &[".gemini"],
         // Antigravity stores its OAuth under ~/.gemini/antigravity-cli and
         // shares ~/.gemini's Google OAuth, so its credential home is ~/.gemini.
@@ -1979,7 +1986,7 @@ fn command_state_paths(config: &Config) -> &'static [&'static str] {
 /// capability opt-in. Unlike the generic dotdir rules, built-in
 /// DOTDIR_DENY does not apply here — these mounts exist precisely to
 /// expose the invoked agent's own state on an explicit opt-in
-/// (.kimi-code is in DOTDIR_DENY but is kimi's state dir).
+/// (.kimi is in DOTDIR_DENY but is kimi's state dir).
 fn state_path_hidden(relative: &str, hide_dotdirs: &[String]) -> bool {
     let top = relative.split('/').next().unwrap_or(relative);
     let normalized = top.strip_prefix('.').unwrap_or(top);
@@ -5933,13 +5940,14 @@ mod tests {
     }
 
     #[test]
-    fn kimi_code_home_dir_is_writable_only_for_kimi_commands() {
+    fn kimi_home_dir_is_writable_only_for_kimi_commands() {
         let _lock = ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir()
-            .join(format!("ai-jail-kimi-code-home-{}", std::process::id()));
+            .join(format!("ai-jail-kimi-home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        let kimi_code = home.join(".kimi-code");
-        std::fs::create_dir_all(kimi_code.join("sessions")).unwrap();
+        // kimi-cli's real state dir is ~/.kimi (credentials, config.toml).
+        let kimi_dir = home.join(".kimi");
+        std::fs::create_dir_all(kimi_dir.join("sessions")).unwrap();
 
         let _home = EnvVarGuard::set("HOME", &home);
         let mut kimi = minimal_test_config();
@@ -5951,9 +5959,9 @@ mod tests {
         assert!(
             mounts.iter().any(|m| matches!(
                 m,
-                Mount::Bind { src, dest } if src == &kimi_code && dest == &kimi_code
+                Mount::Bind { src, dest } if src == &kimi_dir && dest == &kimi_dir
             )),
-            "~/.kimi-code must be mounted read-write so kimi can write sessions and logs"
+            "~/.kimi must be mounted read-write so kimi can read its credentials and write sessions"
         );
 
         // Without the agent_state opt-in the state dir stays hidden.
@@ -5962,7 +5970,7 @@ mod tests {
             discover_home_dotfiles_full(&gated, false, &[], false, false);
         assert!(!mounts.iter().any(|m| matches!(
             m,
-            Mount::Bind { src, dest } if src == &kimi_code && dest == &kimi_code
+            Mount::Bind { src, dest } if src == &kimi_dir && dest == &kimi_dir
         )));
 
         let mut non_kimi = minimal_test_config();
@@ -5972,7 +5980,7 @@ mod tests {
             discover_home_dotfiles_full(&non_kimi, false, &[], false, false);
         assert!(!mounts.iter().any(|m| matches!(
             m,
-            Mount::Bind { src, dest } if src == &kimi_code && dest == &kimi_code
+            Mount::Bind { src, dest } if src == &kimi_dir && dest == &kimi_dir
         )));
 
         let _ = std::fs::remove_dir_all(&home);
@@ -6124,7 +6132,7 @@ mod tests {
             ("codex", &[".codex"]),
             ("opencode", &[".config/opencode", ".local/share/opencode"]),
             ("crush", &[".crush", ".config/crush", ".local/share/crush"]),
-            ("kimi", &[".kimi-code"]),
+            ("kimi", &[".kimi", ".kimi-code"]),
             ("gemini", &[".gemini"]),
             ("antigravity", &[".gemini"]),
             ("grok", &[".grok"]),

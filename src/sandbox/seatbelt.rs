@@ -290,7 +290,7 @@ fn generate_sbpl_profile_for_tty(
     if !agent_state.is_empty() {
         // Agent-state passthrough is an explicit opt-in; like the
         // Linux backend's per-command state binds, the mounted dirs
-        // outrank the generic dotdir-deny list (e.g. .kimi-code is a
+        // outrank the generic dotdir-deny list (e.g. .kimi is a
         // built-in hide) or the opt-in would be silently defeated.
         // Explicit --deny-path/--mask entries still win: they are
         // appended below, after this retain.
@@ -941,7 +941,12 @@ fn agent_state_paths(config: &Config) -> Vec<PathBuf> {
             push(".config/crush");
             push(".local/share/crush");
         }
-        Some(name) if name.starts_with("kimi") => push(".kimi-code"),
+        Some(name) if name.starts_with("kimi") => {
+            // kimi-cli keeps OAuth creds/config in ~/.kimi; ~/.kimi-code
+            // is a legacy alias kept for older installs (#150).
+            push(".kimi");
+            push(".kimi-code");
+        }
         Some("gemini") => push(".gemini"),
         Some("antigravity") => push(".gemini"),
         Some("grok") => push(".grok"),
@@ -2624,6 +2629,7 @@ mod tests {
             ".config/opencode",
             ".local/share/opencode",
             ".crush",
+            ".kimi",
             ".kimi-code",
             ".gemini",
             ".grok",
@@ -2720,7 +2726,7 @@ mod tests {
                 vec![".config/opencode", ".local/share/opencode"],
             ),
             (vec!["crush"], vec![".crush"]),
-            (vec!["kimi"], vec![".kimi-code"]),
+            (vec!["kimi"], vec![".kimi", ".kimi-code"]),
             (vec!["gemini"], vec![".gemini"]),
             (vec!["grok"], vec![".grok"]),
             (vec!["pi"], vec![".pi", ".pi-lens"]),
@@ -2762,13 +2768,13 @@ mod tests {
         };
         let project = PathBuf::from("/tmp/test-project");
         let profile = generate_sbpl_profile(&config, &project);
-        let kimi = home.join(".kimi-code");
+        let kimi = home.join(".kimi");
         assert!(
             !profile.contains(&format!(
                 "(deny file-read* (subpath \"{}\"))",
                 sbpl_path(&kimi)
             )),
-            ".kimi-code is a built-in hide, but the explicit state \
+            ".kimi is a built-in hide, but the explicit state \
              opt-in must outrank it"
         );
         assert!(profile.contains(&format!(
