@@ -1,8 +1,14 @@
 # Dev-toolchain & container passthrough — design note
 
-Status: proposal (pre-implementation). Targets: **v2.4.2** (blocking patch —
-Part 0) then **v2.5.0** (feature — Parts A + B). Requires maintainer approval
-before tagging. Open decision: the network default (see "Open decisions").
+Status: **implemented in v2.5.0**, kept as the design record. The v2.4.2
+blockers (Part 0) were folded into v2.5.0. Resolved decisions: everything shipped
+in one v2.5.0 minor; the network default is filtered egress to the package
+registries, gated on an unprivileged-netns probe with offline fallback (not the
+plain always-on variant sketched below); rust support also maps the toolchain
+binaries read-only so `cargo`/`rustc` resolve; credential passthrough
+(`--github`/`--aws`/`--kube`/`--gcloud`/`--docker-config`) was added opt-in.
+Part B (container-socket auto-discovery) was deferred. Implementation details
+below are the original plan and may differ in specifics from what shipped.
 
 Two workstreams, both answering "is ai-jail friendly to the tools a developer
 needs inside the jail, without leaking too much":
