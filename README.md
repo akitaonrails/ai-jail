@@ -182,6 +182,9 @@ mode 0600 or stricter, and live outside the project directory — any
 violation fails the launch. The format is strict `KEY=VALUE` lines (`#`
 comments and blank lines are skipped; no `export` prefix, no quote
 stripping). Entries apply like `--env`, and `--env` wins on conflicts.
+Validation and reading use the same opened file descriptor. Directory
+aliases remain supported, but aliases into the project are refused.
+File and directory permissions are never changed.
 Auto-save strips them, but don't rely on it: write secrets into files or
 your shell, never into config.
 

@@ -544,34 +544,157 @@ pub fn load_env_files(
     let mut entries = Vec::new();
     for path in paths {
         let absolute = to_absolute(path.clone(), project_dir);
-        validate_env_file(&absolute, project_dir)?;
-        let content = std::fs::read_to_string(&absolute).map_err(|e| {
-            format!("--env-from-file {}: {e}", absolute.display())
-        })?;
-        parse_env_file(&content, &absolute, &mut entries)?;
+        let directory = open_env_parent(&absolute, project_dir)?;
+        let file = open_env_file_at(&directory, &absolute)?;
+        read_env_file(file, &absolute, &mut entries)?;
     }
     Ok(entries)
 }
 
-/// A credential file must be an existing, user-owned regular file,
-/// mode 0600 or stricter, reached without symlinks, living outside the
-/// project directory.
-fn validate_env_file(path: &Path, project_dir: &Path) -> Result<(), String> {
+fn read_env_file(
+    mut file: std::fs::File,
+    path: &Path,
+    entries: &mut Vec<String>,
+) -> Result<(), String> {
+    use std::io::Read;
+
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|e| format!("--env-from-file {}: {e}", path.display()))?;
+    parse_env_file(&content, path, entries)
+}
+
+fn open_env_entry(
+    directory: &std::fs::File,
+    name: &std::ffi::CStr,
+    flags: nix::libc::c_int,
+) -> std::io::Result<std::fs::File> {
+    use nix::libc;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    // SAFETY: directory is live and name is NUL-terminated. No O_CREAT
+    // flag is used, so openat does not need a mode argument.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | flags,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh descriptor owned by this function.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Directory handles need lookup and metadata, not read access.
+fn env_directory_flags() -> nix::libc::c_int {
+    #[cfg(target_os = "linux")]
+    {
+        nix::libc::O_PATH | nix::libc::O_DIRECTORY
+    }
+    #[cfg(target_os = "macos")]
+    {
+        nix::libc::O_SEARCH
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        nix::libc::O_RDONLY | nix::libc::O_DIRECTORY
+    }
+}
+
+/// Check the opened directory's ancestry, rather than resolving a path
+/// which could now refer to a replacement. Directory aliases remain
+/// supported, including /tmp and /var on macOS.
+fn env_parent_is_outside_project(
+    directory: &std::fs::File,
+    project: &std::fs::File,
+) -> std::io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
 
+    let project = project.metadata()?;
+    let same = |a: &std::fs::Metadata, b: &std::fs::Metadata| {
+        a.dev() == b.dev() && a.ino() == b.ino()
+    };
+    let mut current = directory.try_clone()?;
+    loop {
+        let metadata = current.metadata()?;
+        if same(&metadata, &project) {
+            return Ok(false);
+        }
+        let parent = open_env_entry(&current, c"..", env_directory_flags())?;
+        let parent_metadata = parent.metadata()?;
+        if same(&metadata, &parent_metadata) {
+            return Ok(true);
+        }
+        current = parent;
+    }
+}
+
+fn open_env_parent(
+    path: &Path,
+    project_dir: &Path,
+) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let open_directory = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(env_directory_flags())
+            .open(path)
+    };
     let label = || format!("--env-from-file {}", path.display());
-    // lstat, not stat: a symlink is refused, never followed.
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("{}: {e}", label()))?;
-    if metadata.file_type().is_symlink() {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{}: not a regular file", label()))?;
+    let directory = open_directory(parent).map_err(|e| {
+        format!("{}: cannot open parent directory: {e}", label())
+    })?;
+    let project = open_directory(project_dir).map_err(|e| {
+        format!("{}: cannot open project directory: {e}", label())
+    })?;
+    if !env_parent_is_outside_project(&directory, &project).map_err(|e| {
+        format!("{}: cannot check directory ancestry: {e}", label())
+    })? {
         return Err(format!(
-            "{}: is a symlink; credential files are never followed through links",
+            "{}: credential files must live outside the project directory",
             label()
         ));
     }
+    Ok(directory)
+}
+
+fn open_env_file_at(
+    directory: &std::fs::File,
+    path: &Path,
+) -> Result<std::fs::File, String> {
+    let label = || format!("--env-from-file {}", path.display());
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{}: not a regular file", label()))?;
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|e| format!("{}: invalid file name: {e}", label()))?;
+    // NONBLOCK prevents a substituted FIFO from blocking before fstat.
+    let file = open_env_entry(directory, &name, nix::libc::O_NONBLOCK)
+        .map_err(|e| {
+            format!("{}: cannot open without following symlinks: {e}", label())
+        })?;
+    validate_env_file(&file, path)?;
+    Ok(file)
+}
+
+/// A credential file must be an existing, user-owned regular file,
+/// mode 0600 or stricter. Inspect the fd that will supply its contents.
+fn validate_env_file(file: &std::fs::File, path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let label = || format!("--env-from-file {}", path.display());
+    let metadata = file.metadata().map_err(|e| format!("{}: {e}", label()))?;
     if !metadata.is_file() {
         return Err(format!("{}: not a regular file", label()));
     }
+    // SAFETY: geteuid has no preconditions.
     let euid = unsafe { nix::libc::geteuid() };
     if metadata.uid() != euid {
         return Err(format!("{}: must be owned by the current user", label()));
@@ -582,12 +705,6 @@ fn validate_env_file(path: &Path, project_dir: &Path) -> Result<(), String> {
             "{}: must be mode 0600 or stricter (is {:04o})",
             label(),
             mode
-        ));
-    }
-    if resolves_inside_project(path, project_dir) {
-        return Err(format!(
-            "{}: credential files must live outside the project directory",
-            label()
         ));
     }
     Ok(())
@@ -4383,6 +4500,28 @@ env_from_file = ["/run/secrets/anthropic"]
         (root, file)
     }
 
+    struct EnvFileFixture {
+        root: PathBuf,
+        file: PathBuf,
+    }
+
+    impl EnvFileFixture {
+        fn new(name: &str) -> Self {
+            let (root, file) = env_file_fixture(name, "TOKEN=trusted\n");
+            Self { root, file }
+        }
+
+        fn project(&self) -> PathBuf {
+            self.root.join("project")
+        }
+    }
+
+    impl Drop for EnvFileFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[test]
     fn env_from_file_parses_strict_key_value_lines() {
         let (root, file) = env_file_fixture(
@@ -4401,6 +4540,253 @@ env_from_file = ["/run/secrets/anthropic"]
             ]
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn regression_v1_22_0_env_from_file_preserves_legacy_loading() {
+        let fixture = EnvFileFixture::new("legacy-loading");
+        let file = &fixture.file;
+        let text = format!(
+            "command = [\"sh\"]\nno_gpu = true\nenv_from_file = [{}]\nenv_pass = [\"TOKEN=cli\"]\n",
+            toml::Value::String(file.to_string_lossy().into_owned())
+        );
+        let config: Config = toml::from_str(&text).unwrap();
+        assert_eq!(config.command, ["sh"]);
+        assert_eq!(config.no_gpu, Some(true));
+        let mut entries =
+            load_env_files(&config.env_from_file, &fixture.project()).unwrap();
+        assert_eq!(entries, ["TOKEN=trusted"]);
+        entries.extend(config.env_pass);
+        let mut env = Vec::new();
+        apply_env_pass(&mut env, &entries, &[]);
+        assert_eq!(env, [("TOKEN".to_string(), "cli".to_string())]);
+    }
+
+    #[test]
+    fn env_from_file_reads_the_validated_fd_after_leaf_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for symlink in [false, true] {
+            let fixture =
+                EnvFileFixture::new(&format!("pinned-leaf-{symlink}"));
+            let directory =
+                open_env_parent(&fixture.file, &fixture.project()).unwrap();
+            let file = open_env_file_at(&directory, &fixture.file).unwrap();
+            std::fs::rename(&fixture.file, fixture.root.join("moved")).unwrap();
+            let replacement = if symlink {
+                fixture.project().join("untrusted")
+            } else {
+                fixture.file.clone()
+            };
+            std::fs::write(&replacement, "TOKEN=replacement\n").unwrap();
+            std::fs::set_permissions(
+                &replacement,
+                PermissionsExt::from_mode(0o644),
+            )
+            .unwrap();
+            if symlink {
+                std::os::unix::fs::symlink(&replacement, &fixture.file)
+                    .unwrap();
+            }
+            let mut entries = Vec::new();
+            read_env_file(file, &fixture.file, &mut entries).unwrap();
+            assert_eq!(entries, ["TOKEN=trusted"]);
+            assert_eq!(
+                std::fs::read_to_string(&replacement).unwrap(),
+                "TOKEN=replacement\n"
+            );
+            assert_eq!(
+                std::fs::metadata(&replacement)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+        }
+    }
+
+    #[test]
+    fn env_from_file_reads_from_the_pinned_parent_after_replacement() {
+        let fixture = EnvFileFixture::new("pinned-parent");
+        let parent = fixture.root.join("credentials");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("keys");
+        std::fs::rename(&fixture.file, &path).unwrap();
+        let directory = open_env_parent(&path, &fixture.project()).unwrap();
+        std::fs::rename(&parent, fixture.root.join("moved-parent")).unwrap();
+        let replacement = fixture.project().join("keys");
+        std::fs::write(&replacement, "TOKEN=replacement\n").unwrap();
+        std::fs::set_permissions(
+            &replacement,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(fixture.project(), &parent).unwrap();
+        let file = open_env_file_at(&directory, &path).unwrap();
+        let mut entries = Vec::new();
+        read_env_file(file, &path, &mut entries).unwrap();
+        assert_eq!(entries, ["TOKEN=trusted"]);
+        // A new open of the alias must still enforce outside-project.
+        let error = load_env_files(&[path], &fixture.project()).unwrap_err();
+        assert!(error.contains("outside the project"));
+        assert_eq!(
+            std::fs::read_to_string(replacement).unwrap(),
+            "TOKEN=replacement\n"
+        );
+    }
+
+    #[test]
+    fn env_from_file_checks_permissions_on_the_replacement_fd() {
+        let fixture = EnvFileFixture::new("replacement-mode");
+        let directory =
+            open_env_parent(&fixture.file, &fixture.project()).unwrap();
+        std::fs::rename(&fixture.file, fixture.root.join("moved")).unwrap();
+        std::fs::write(&fixture.file, "TOKEN=replacement\n").unwrap();
+        std::fs::set_permissions(
+            &fixture.file,
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
+        let error = open_env_file_at(&directory, &fixture.file).unwrap_err();
+        assert!(error.contains("0600 or stricter"));
+    }
+
+    #[test]
+    fn env_from_file_preserves_directory_aliases_and_read_only_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = EnvFileFixture::new("directory-alias");
+        let alias = fixture.root.join("alias");
+        std::os::unix::fs::symlink(&fixture.root, &alias).unwrap();
+        std::fs::set_permissions(
+            &fixture.file,
+            PermissionsExt::from_mode(0o400),
+        )
+        .unwrap();
+        let path = alias.join(fixture.file.file_name().unwrap());
+        let entries = load_env_files(&[path], &fixture.project()).unwrap();
+        assert_eq!(entries, ["TOKEN=trusted"]);
+        assert_eq!(
+            std::fs::metadata(&fixture.file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400
+        );
+        let result = load_env_files(
+            std::slice::from_ref(&fixture.file),
+            &alias.join("project"),
+        );
+        assert!(result.is_ok(), "project aliases remain supported");
+    }
+
+    #[test]
+    fn env_from_file_preserves_search_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestoreModes(Vec<PathBuf>);
+        impl Drop for RestoreModes {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::set_permissions(
+                        path,
+                        PermissionsExt::from_mode(0o700),
+                    );
+                }
+            }
+        }
+
+        let fixture = EnvFileFixture::new("search-only");
+        let parent = fixture.root.join("credentials");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("keys");
+        std::fs::rename(&fixture.file, &path).unwrap();
+        let restore =
+            RestoreModes(vec![fixture.root.clone(), fixture.project(), parent]);
+        for directory in &restore.0 {
+            std::fs::set_permissions(
+                directory,
+                PermissionsExt::from_mode(0o111),
+            )
+            .unwrap();
+        }
+        let entries = load_env_files(&[path], &fixture.project()).unwrap();
+        assert_eq!(entries, ["TOKEN=trusted"]);
+        for directory in &restore.0 {
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().permissions().mode()
+                    & 0o777,
+                0o111
+            );
+        }
+    }
+
+    #[test]
+    fn env_from_file_refuses_nested_project_directory_aliases() {
+        let fixture = EnvFileFixture::new("inside-alias");
+        let nested = fixture.project().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::rename(&fixture.file, nested.join("keys")).unwrap();
+        let alias = fixture.root.join("alias");
+        std::os::unix::fs::symlink(&nested, &alias).unwrap();
+        let error = load_env_files(&[alias.join("keys")], &fixture.project())
+            .unwrap_err();
+        assert!(error.contains("outside the project"));
+    }
+
+    #[test]
+    fn env_from_file_read_errors_do_not_produce_entries() {
+        let fixture = EnvFileFixture::new("read-error");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.file)
+            .unwrap();
+        let mut entries = vec!["EXISTING=1".to_string()];
+        assert!(read_env_file(file, &fixture.file, &mut entries).is_err());
+        assert_eq!(entries, ["EXISTING=1"]);
+        std::fs::write(&fixture.file, b"TOKEN=trusted\n\xff").unwrap();
+        assert!(
+            load_env_files(
+                std::slice::from_ref(&fixture.file),
+                &fixture.project()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires root to read a file owned by another UID"]
+    fn env_from_file_refuses_foreign_owner_with_readable_fd() {
+        use std::os::unix::fs::{MetadataExt, chown};
+
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(unsafe { nix::libc::geteuid() }, 0, "run as root");
+        let fixture = EnvFileFixture::new("foreign-owner-fd");
+        chown(&fixture.file, Some(1), None).unwrap();
+        assert_eq!(std::fs::metadata(&fixture.file).unwrap().uid(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&fixture.file).unwrap(),
+            "TOKEN=trusted\n"
+        );
+        let error = load_env_files(
+            std::slice::from_ref(&fixture.file),
+            &fixture.project(),
+        )
+        .unwrap_err();
+        assert!(error.contains("owned by the current user"));
+        assert_eq!(
+            std::fs::metadata(&fixture.file).unwrap().mode() & 0o777,
+            0o600
+        );
+        chown(&fixture.file, Some(0), None).unwrap();
+        let entries = load_env_files(
+            std::slice::from_ref(&fixture.file),
+            &fixture.project(),
+        )
+        .unwrap();
+        assert_eq!(entries, ["TOKEN=trusted"]);
     }
 
     #[test]
@@ -4467,7 +4853,9 @@ env_from_file = ["/run/secrets/anthropic"]
 
         // Not owned by the current user (root-owned system file; skip
         // when absent or when running as root).
-        let system = PathBuf::from("/etc/shadow");
+        // It must be readable so refusal exercises our fd ownership
+        // policy, rather than failing earlier on an OS permission error.
+        let system = PathBuf::from("/etc/passwd");
         let euid = unsafe { nix::libc::geteuid() };
         if euid != 0
             && let Ok(metadata) = std::fs::symlink_metadata(&system)
