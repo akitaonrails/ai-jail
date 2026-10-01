@@ -73,6 +73,7 @@ fn apply_browser_profile(config: &mut config::Config, command_trusted: bool) {
     config.no_worktree = Some(true);
     config.no_mise = Some(true);
     config.no_toolchains = Some(true);
+    config.agent_state = Some(false);
     config.no_save_config = Some(true);
     config.ssh = Some(false);
     config.pictures = Some(false);
@@ -724,6 +725,28 @@ fn run() -> Result<i32, String> {
             let spec = path.to_string_lossy().into_owned();
             if !toolchain_dest_already_mapped(&config, &spec) {
                 config.ro_maps.push(path);
+            }
+        }
+    }
+
+    // Pre-authenticate API-key harnesses: when agent state is on (the default,
+    // off under --lockdown), copy the invoked harness's well-known API-key env
+    // var from the host into the sandbox if it is set, so a harness that
+    // authenticates via a key (not an OAuth file) also starts authenticated.
+    // Injected after the save/--init/bootstrap returns so it is never persisted;
+    // an explicit --env for the same name already present wins.
+    if config.agent_state_enabled() {
+        let harness =
+            command::effective_name(&config.command).map(str::to_string);
+        if let Some(name) = harness {
+            for var in command::harness_api_key_env(&name) {
+                let already = config
+                    .env_pass
+                    .iter()
+                    .any(|e| e == var || e.starts_with(&format!("{var}=")));
+                if !already && std::env::var_os(var).is_some() {
+                    config.env_pass.push((*var).to_string());
+                }
             }
         }
     }

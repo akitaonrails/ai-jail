@@ -1951,9 +1951,12 @@ fn command_state_paths(config: &Config) -> &'static [&'static str] {
         Some("claude") => &[".claude"],
         Some("codex") => &[".codex"],
         Some("opencode") => &[".config/opencode", ".local/share/opencode"],
-        Some("crush") => &[".crush"],
+        Some("crush") => &[".crush", ".config/crush", ".local/share/crush"],
         Some(name) if name.starts_with("kimi") => &[".kimi-code"],
         Some("gemini") => &[".gemini"],
+        // Antigravity stores its OAuth under ~/.gemini/antigravity-cli and
+        // shares ~/.gemini's Google OAuth, so its credential home is ~/.gemini.
+        Some("antigravity") => &[".gemini"],
         Some("grok") => &[".grok"],
         Some("jcode") => &[".jcode", ".config/jcode"],
         Some("pi") => &[".pi", ".pi-lens"],
@@ -5941,10 +5944,31 @@ mod tests {
 
         let _home = EnvVarGuard::set("HOME", &home);
 
-        // Project command without opt-in: no ~/.claude or
-        // ~/.claude.json mounts.
+        // Default (agent-state on): ~/.claude and ~/.claude.json are mounted rw
+        // so the harness starts pre-authenticated.
         let mut config = minimal_test_config();
         config.command = vec!["claude".into()];
+        let mounts =
+            discover_home_dotfiles_full(&config, true, &[], false, false);
+        assert!(
+            mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { src, dest }
+                    if src == &claude_dir && dest == &claude_dir
+            )),
+            "~/.claude is mounted by default (agent_state on)"
+        );
+        assert!(
+            mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { src, dest }
+                    if src == &claude_json && dest == &claude_json
+            )),
+            "~/.claude.json is mounted by default (agent_state on)"
+        );
+
+        // Opt out with --no-agent-state: state dir and file stay hidden.
+        config.agent_state = Some(false);
         let mounts =
             discover_home_dotfiles_full(&config, true, &[], false, false);
         assert!(
@@ -5953,7 +5977,7 @@ mod tests {
                 Mount::Bind { src, dest }
                     if src == &claude_dir && dest == &claude_dir
             )),
-            "~/.claude must stay hidden without agent_state opt-in"
+            "~/.claude hidden with --no-agent-state"
         );
         assert!(
             !mounts.iter().any(|m| matches!(
@@ -5961,21 +5985,8 @@ mod tests {
                 Mount::Bind { src, dest }
                     if src == &claude_json && dest == &claude_json
             )),
-            "~/.claude.json must stay hidden without agent_state opt-in"
+            "~/.claude.json hidden with --no-agent-state"
         );
-
-        // With opt-in: state dir and state file are mounted rw.
-        config.agent_state = Some(true);
-        let mounts =
-            discover_home_dotfiles_full(&config, true, &[], false, false);
-        assert!(mounts.iter().any(|m| matches!(
-            m,
-            Mount::Bind { src, dest } if src == &claude_dir && dest == &claude_dir
-        )));
-        assert!(mounts.iter().any(|m| matches!(
-            m,
-            Mount::Bind { src, dest } if src == &claude_json && dest == &claude_json
-        )));
 
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -6063,9 +6074,10 @@ mod tests {
             ("claude", &[".claude"]),
             ("codex", &[".codex"]),
             ("opencode", &[".config/opencode", ".local/share/opencode"]),
-            ("crush", &[".crush"]),
+            ("crush", &[".crush", ".config/crush", ".local/share/crush"]),
             ("kimi", &[".kimi-code"]),
             ("gemini", &[".gemini"]),
+            ("antigravity", &[".gemini"]),
             ("grok", &[".grok"]),
             // jcode keeps credentials in ~/.jcode/auth.json and reads
             // provider env files from ~/.config/jcode on Linux, so both

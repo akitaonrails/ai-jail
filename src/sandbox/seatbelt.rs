@@ -936,9 +936,14 @@ fn agent_state_paths(config: &Config) -> Vec<PathBuf> {
             push(".config/opencode");
             push(".local/share/opencode");
         }
-        Some("crush") => push(".crush"),
+        Some("crush") => {
+            push(".crush");
+            push(".config/crush");
+            push(".local/share/crush");
+        }
         Some(name) if name.starts_with("kimi") => push(".kimi-code"),
         Some("gemini") => push(".gemini"),
+        Some("antigravity") => push(".gemini"),
         Some("grok") => push(".grok"),
         Some("jcode") => {
             push(".jcode");

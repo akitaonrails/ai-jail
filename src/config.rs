@@ -492,10 +492,23 @@ impl Config {
         }
     }
     /// Command-specific agent state mounts (`~/.claude`, `~/.codex`,
-    /// `~/.claude.json`, ...) are a trusted capability: disabled
-    /// unless explicitly enabled via CLI or global config.
+    /// `~/.claude.json`, ...) so the invoked harness starts pre-authenticated.
+    /// ON by default (reverses the former opt-in #84 stance): a plain
+    /// `ai-jail <harness>` mounts that harness's own credential/state dir
+    /// read-write, so OAuth/login persist and it does not re-authenticate each
+    /// session. `--no-agent-state` (or `agent_state = false`) opts out for an
+    /// isolated, logged-out run. Monotonic (an untrusted project `.ai-jail`
+    /// may only disable it, never force it on past a trusted opt-out) and
+    /// disabled under `--lockdown`.
+    ///
+    /// The `--lockdown` gate is folded in here (unlike the opt-in capability
+    /// accessors, which gate at the mount site) precisely because this one is
+    /// on by default: folding it in guarantees every call site — the bwrap and
+    /// seatbelt mounts, the Landlock wrapper forward, and the audit record —
+    /// keeps a lockdown launch fully isolated without a separate `!lockdown`
+    /// check each place.
     pub fn agent_state_enabled(&self) -> bool {
-        self.agent_state == Some(true)
+        self.agent_state != Some(false) && !self.lockdown_enabled()
     }
     /// Full host-environment inheritance is a trusted capability:
     /// disabled unless explicitly enabled. Default keeps only the
@@ -2047,7 +2060,7 @@ pub fn display_status(config: &Config) {
     print_opt_in_enabled("  X11", config.x11);
     print_opt_in_enabled("  Host shared memory", config.host_shm);
     print_opt_in_enabled("  Terminal passthrough", config.terminal_passthrough);
-    print_opt_in_enabled("  Agent state", config.agent_state);
+    print_default_on_enabled("  Agent state", config.agent_state);
     print_opt_in_enabled("  Full env inherit", config.inherit_env);
     print_string_list("  Env passthrough", &config.env_pass);
     print_path_list("  Env from file", &config.env_from_file);
@@ -2155,6 +2168,17 @@ fn print_opt_in_enabled(label: &str, val: Option<bool>) {
         "enabled"
     } else {
         "disabled"
+    };
+    output::status_header(label, v);
+}
+
+/// Render a capability that is enabled by default: disabled only on an
+/// explicit `Some(false)`.
+fn print_default_on_enabled(label: &str, val: Option<bool>) {
+    let v = if val == Some(false) {
+        "disabled"
+    } else {
+        "enabled"
     };
     output::status_header(label, v);
 }
@@ -2585,7 +2609,9 @@ lockdown = false
 "#;
         let cfg = parse_toml(toml).unwrap();
         assert_eq!(cfg.agent_state, None);
-        assert!(!cfg.agent_state_enabled());
+        // agent-state is ON by default now (pre-authentication); the rest of
+        // the trusted capabilities stay opt-in/off.
+        assert!(cfg.agent_state_enabled());
         assert_eq!(cfg.inherit_env, None);
         assert!(!cfg.inherit_env_enabled());
         assert!(cfg.env_pass().is_empty());
@@ -2594,16 +2620,25 @@ lockdown = false
     }
 
     #[test]
-    fn trusted_capability_accessors_default_off() {
+    fn trusted_capability_accessors() {
         let config = Config::default();
-        assert!(!config.agent_state_enabled());
+        // agent-state is now ON by default (pre-authentication); inherit_env
+        // and update_check stay opt-in/off.
+        assert!(config.agent_state_enabled());
         assert!(!config.inherit_env_enabled());
         assert!(!config.update_check_enabled());
+        // Explicit false disables it...
         assert!(
             !Config {
                 agent_state: Some(false),
-                inherit_env: Some(false),
-                update_check: Some(false),
+                ..Config::default()
+            }
+            .agent_state_enabled()
+        );
+        // ...and --lockdown disables it (folded into the accessor).
+        assert!(
+            !Config {
+                lockdown: Some(true),
                 ..Config::default()
             }
             .agent_state_enabled()
@@ -2647,10 +2682,13 @@ lockdown = false
             project,
             Path::new("/project"),
         );
-        assert!(!merged.agent_state_enabled());
+        // agent-state is ON by default, so a project asserting it is a no-op
+        // (nothing to escalate, no warning) — it stays on. inherit_env and
+        // update_check remain off and warn when a project tries to enable them.
+        assert!(merged.agent_state_enabled());
         assert!(!merged.inherit_env_enabled());
         assert!(!merged.update_check_enabled());
-        for field in ["agent_state", "inherit_env", "update_check"] {
+        for field in ["inherit_env", "update_check"] {
             assert!(
                 warnings.iter().any(|warning| warning.contains(field)),
                 "missing warning for {field}"

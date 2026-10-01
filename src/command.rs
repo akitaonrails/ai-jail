@@ -169,6 +169,23 @@ fn api_host(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The well-known API-key environment variable(s) a harness reads, so that a
+/// harness authenticated via an API key (rather than an OAuth file) also starts
+/// pre-authenticated. Only unambiguous, single-purpose variables are listed;
+/// the value is copied from the host environment only when actually set, and
+/// only alongside agent-state (on by default, off under `--lockdown`). Harnesses
+/// not listed rely on their OAuth/credential file mount instead.
+pub(crate) fn harness_api_key_env(name: &str) -> &'static [&'static str] {
+    match name {
+        "claude" => &["ANTHROPIC_API_KEY"],
+        "codex" => &["OPENAI_API_KEY"],
+        "gemini" | "antigravity" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "grok" => &["XAI_API_KEY"],
+        _ if name.starts_with("kimi") => &["MOONSHOT_API_KEY"],
+        _ => &[],
+    }
+}
+
 /// Launch-time warnings for a known API-client agent whose effective
 /// config denies a capability it needs (issue #131): `network` to reach
 /// the model API and `agent_state` for its login/session data. Warning
@@ -207,13 +224,10 @@ pub(crate) fn capability_gap_warnings(
              --allow-host {host}; see `ai-jail status`"
         ));
     }
-    if !config.agent_state_enabled() {
-        warnings.push(format!(
-            "ai-jail: `{name}` keeps its login/session data under agent \
-             state but agent_state is off — set `agent_state = true` or \
-             pass --agent-state; see `ai-jail status`"
-        ));
-    }
+    // Agent state is ON by default now, so no gap warning is needed: a plain
+    // `ai-jail <harness>` already mounts the harness's login/session data.
+    // `--no-agent-state` and `--lockdown` disable it deliberately, so nudging
+    // toward `--agent-state` there would just contradict the user's choice.
     if name == "opencode"
         && !config.command.iter().any(|arg| arg == "--standalone")
     {
@@ -371,12 +385,32 @@ mod tests {
     }
 
     #[test]
-    fn capability_gap_warns_for_claude_with_agent_state_off() {
+    fn harness_api_key_env_maps_known_harnesses() {
+        assert_eq!(harness_api_key_env("claude"), &["ANTHROPIC_API_KEY"]);
+        assert_eq!(harness_api_key_env("codex"), &["OPENAI_API_KEY"]);
+        assert_eq!(
+            harness_api_key_env("gemini"),
+            &["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+        );
+        assert_eq!(
+            harness_api_key_env("antigravity"),
+            &["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+        );
+        assert_eq!(harness_api_key_env("grok"), &["XAI_API_KEY"]);
+        assert_eq!(harness_api_key_env("kimi-code"), &["MOONSHOT_API_KEY"]);
+        assert!(harness_api_key_env("bash").is_empty());
+    }
+
+    #[test]
+    fn capability_gap_no_agent_state_warning_now_default_on() {
+        // agent_state is ON by default (pre-authentication), so there is no
+        // capability-gap warning even when it is left unset.
         let warnings =
             capability_gap_warnings(&gap_config("claude", Some(true), None));
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("agent_state is off"));
-        assert!(warnings[0].contains("--agent-state"));
+        assert!(
+            warnings.is_empty(),
+            "no agent_state gap warning expected: {warnings:?}"
+        );
     }
 
     #[test]
@@ -411,30 +445,36 @@ mod tests {
 
     #[test]
     fn capability_gap_covers_kimi_prefix_and_managed_harness() {
+        // kimi-code is recognized via the kimi prefix: with network off it
+        // gets the network-off warning.
         let warnings =
             capability_gap_warnings(&gap_config("kimi-code", None, None));
-        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("network is off"));
 
-        let mut config = gap_config("ai-memory", Some(true), None);
+        // A managed `ai-memory run ... codex` is detected as codex.
+        let mut config = gap_config("ai-memory", None, None);
         config.command =
             args(&["ai-memory", "run", "--project", "demo", "codex"]);
         let warnings = capability_gap_warnings(&config);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("`codex`"));
-        assert!(warnings[0].contains("agent_state is off"));
+        assert!(warnings[0].contains("network is off"));
     }
 
     #[test]
     fn capability_gap_suppresses_network_warning_under_lockdown() {
         // Lockdown blocks network regardless of config, and it is an
-        // explicit hardening choice -- pointing at `network = true`
-        // would mislead. The agent_state warning still applies.
+        // explicit hardening choice -- pointing at `network = true` would
+        // mislead. Agent state is also off under lockdown (by design), and its
+        // gap warning was removed, so lockdown yields no gap warnings at all.
         let mut config = gap_config("claude", None, None);
         config.lockdown = Some(true);
         let warnings = capability_gap_warnings(&config);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("agent_state is off"));
-        assert!(!warnings.iter().any(|warning| warning.contains("network")));
+        assert!(
+            warnings.is_empty(),
+            "lockdown should emit no capability-gap warnings: {warnings:?}"
+        );
     }
 
     #[test]
