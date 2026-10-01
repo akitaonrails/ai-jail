@@ -1,11 +1,36 @@
 # Security model
 
+**Read this first: ai-jail is an accident guard, not a security boundary.**
+It exists to stop a trusted-but-fallible AI agent from making a mistake —
+a mistyped command that deletes files outside the project, a script that
+walks up past the project root, a `git` or package-manager command that
+touches something it shouldn't — not to contain a motivated adversary or
+malicious code. The threat model is accidental damage and scope-creep from
+a tool you already chose to run, not a hostile party actively trying to
+break out of the sandbox.
+
+Consequently, ai-jail's defaults are tuned for developer convenience, not
+lockdown security: your project directory is writable, the invoked agent's
+own credentials and dev toolchains are available out of the box, and
+capabilities tighten only as you opt in (see the table below). This is a
+deliberate trade: it is what makes it reasonable to run an AI harness in an
+auto-accept / "YOLO" mode with confidence that the worst case stays inside
+the project, not a claim that nothing inside the sandbox can be abused by
+something that is actually trying to.
+
 ai-jail is a process sandbox for AI tools, not a malware-analysis boundary.
-It limits ordinary filesystem, namespace, and IPC exposure; a kernel, driver,
-or sandbox escape is outside its boundary. Use a disposable VM for truly
-hostile workloads.
+It limits ordinary filesystem, namespace, and IPC exposure; a kernel,
+driver, or sandbox escape is outside its boundary, and it makes no attempt
+to resist a determined attacker who controls what runs inside it. **Use a
+disposable VM for hostile code or untrusted workloads** — ai-jail is not a
+substitute for one.
 
 ## Defaults and explicit capabilities
+
+The table below is not a list of things ai-jail blocks by default so much as
+a map of what is exposed for developer convenience and what still requires
+an explicit opt-in. Everything marked "on" is a deliberate dev-friendly
+default, not an oversight.
 
 | Capability                  | Linux default                                                                                       | macOS default     | Explicit opt-in and risk                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | --------------------------- | --------------------------------------------------------------------------------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -18,7 +43,7 @@ hostile workloads.
 | Audio                       | off                                                                                                 | n/a               | `--audio` (Linux) binds the validated PipeWire/PulseAudio sockets in `XDG_RUNTIME_DIR` and `/dev/snd`; a sandboxed process can record and play audio while enabled.                                                                                                                                                                                                                                                                                                       |
 | Host shared memory          | off                                                                                                 | n/a               | `--host-shm` enables host cross-process IPC.                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | Raw terminal protocol       | filtered                                                                                            | filtered          | `--terminal-passthrough` restores clipboard/query/parser surface; agent output passes through a filtering VT parser by default.                                                                                                                                                                                                                                                                                                                                           |
-| Agent credential state      | off                                                                                                 | off               | `--agent-state` mounts the invoked agent's credential state (for example Claude's `~/.claude`) on Linux and macOS; anything in the sandbox can then use those credentials.                                                                                                                                                                                                                                                                                                |
+| Agent credential state      | on                                                                                                  | on                | On by default: mounts the invoked harness's own credential/state dir (for example Claude's `~/.claude`) read-write on Linux and macOS, and copies its known API-key env var from the host when set, so it starts pre-authenticated. `--no-agent-state` opts out for an isolated, logged-out run; disabled under `--lockdown`. Anything in the sandbox can use those credentials while mounted, which is the trade-off for not having to re-authenticate every launch.     |
 | Environment variables       | minimal allowlist                                                                                   | minimal allowlist | `--env NAME[=VALUE]` adds named variables; `--inherit-env` passes the entire parent environment, secrets included.                                                                                                                                                                                                                                                                                                                                                        |
 | Update check                | off                                                                                                 | off               | `--update-check` enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active; all other launches make no network requests.                                                                                                                                                                                                                                                                              |
 | macOS host IPC              | n/a                                                                                                 | off               | `--macos-host-ipc` permits Mach, IOKit, and host IPC exposure.                                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -50,8 +75,11 @@ modification, not the credential from use: anything in the sandbox can act as
 you on that service for as long as the credential is valid. That is why each
 stays opt-in, monotonic (an untrusted project `.ai-jail` may only disable one,
 never enable it), and disabled under `--lockdown`. The same monotonic rule
-applies to dev-toolchain support: `--no-toolchains` may only be set tighter by
-a project file, never relaxed.
+applies to dev-toolchain support (`--no-toolchains` may only be set tighter
+by a project file, never relaxed) and to agent-state, which is on by default
+rather than opt-in but is monotonic in the other direction: a project file
+may only disable it (`agent_state = false`), never force it back on past a
+trusted `--no-agent-state`.
 
 ## Configuration trust boundary
 
@@ -84,10 +112,12 @@ when the resolved target is a regular file this user owns, carries no group or
 other write bits, and lies outside the project directory — a target inside the
 project could be rewritten by the very agent the policy constrains.
 
-Private home is on by default. ai-jail exposes only state needed by the invoked
-agent, and agent credential state itself is opt-in (`--agent-state`, also
-settable per command in `~/.ai-jail`). Use
-`--no-private-home` only as an explicit broad host-home exception.
+Private home is on by default. ai-jail exposes only state needed by the
+invoked agent, and agent credential state is itself on by default
+(`--agent-state`, also settable per command in `~/.ai-jail`) so the harness
+starts pre-authenticated; `--no-agent-state` opts back out to an isolated,
+logged-out run. Use `--no-private-home` only as an explicit broad host-home
+exception.
 
 ## Platform notes and residual risks
 

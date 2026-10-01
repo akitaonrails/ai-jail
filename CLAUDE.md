@@ -4,6 +4,8 @@
 
 A Rust CLI tool that wraps bubblewrap (`bwrap`) to sandbox AI coding agents (Claude Code, GPT Codex, OpenCode, Crush). It replaces a bash script with config persistence (`.ai-jail` TOML), proper signal handling, and a developer-friendly CLI.
 
+ai-jail is a developer-friendly accident guard, not a hard-security or malware/invasion boundary. It defends against a trusted-but-fallible agent's mistakes (a mistyped command that deletes files outside the project, a wayward script) so the project directory is a confident blast radius for "YOLO mode" auto-accept harnesses — it does not defend against a motivated attacker trying to escape the sandbox. That is why dev tools and the invoked agent's own credentials are on by default, with flags to progressively tighten; for genuinely hostile code or untrusted workloads, the answer is a disposable VM, not a stricter ai-jail flag. Keep this framing in mind when weighing a new default: tightening security at the cost of developer convenience is not automatically the right call here.
+
 ## Project Structure
 
 ```
