@@ -486,6 +486,11 @@ impl Config {
         if self.network_enabled() {
             NetworkMode::Full
         } else if !self.allow_hosts.is_empty() {
+            // `--no-network` (network == Some(false)) with allow_hosts is NOT
+            // a contradiction: it composes to filtered egress, and the
+            // landlock wrapper itself re-execs with `--no-network` +
+            // `--allow-host` to express exactly this (see bwrap.rs). Strict
+            // offline is `--no-network` with no allow_hosts.
             NetworkMode::Filtered
         } else {
             NetworkMode::Off
@@ -4606,6 +4611,28 @@ allow_tcp_ports = []
             }
             .network_mode(),
             NetworkMode::Full
+        );
+        // Explicit --no-network WITH allow_hosts composes to filtered egress
+        // (not strict offline): the landlock wrapper itself re-execs with
+        // `--no-network --allow-host` to express this. Strict offline is
+        // `--no-network` with NO allow_hosts (the branch below).
+        assert_eq!(
+            Config {
+                network: Some(false),
+                allow_hosts: vec!["api.anthropic.com".into()],
+                ..Config::default()
+            }
+            .network_mode(),
+            NetworkMode::Filtered
+        );
+        // --no-network with no allow_hosts is strict offline.
+        assert_eq!(
+            Config {
+                network: Some(false),
+                ..Config::default()
+            }
+            .network_mode(),
+            NetworkMode::Off
         );
     }
 

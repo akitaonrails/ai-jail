@@ -284,7 +284,12 @@ impl MountSet {
             args.push("--new-session".into());
         }
 
-        if !network_enabled {
+        // Lockdown always isolates the network namespace, even if --network
+        // was also passed: lockdown is the maximum-isolation posture and must
+        // not fail open on kernels without Landlock V4 net enforcement.
+        // Filtered egress is unaffected — it runs with --no-network
+        // (network_enabled == false), so this branch already applied.
+        if !network_enabled || lockdown {
             args.push("--unshare-net".into());
         }
 
@@ -5715,6 +5720,33 @@ mod tests {
         assert!(
             args.contains(&"--unshare-net".to_string()),
             "lockdown without allowed ports must keep --unshare-net"
+        );
+    }
+
+    #[test]
+    fn lockdown_with_network_still_unshares_net() {
+        // C2 regression: lockdown is the maximum-isolation posture, so even a
+        // contradictory --network must not leave the net namespace shared.
+        let mut config = minimal_test_config();
+        config.lockdown = Some(true);
+        config.network = Some(true);
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let project = PathBuf::from("/home/user/project");
+
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            args.contains(&"--unshare-net".to_string()),
+            "lockdown must isolate the net namespace even with --network"
         );
     }
 

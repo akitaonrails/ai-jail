@@ -1494,6 +1494,11 @@ mod tests {
         assert_eq!(config.pictures, Some(false));
         assert_eq!(config.lockdown, Some(false));
         assert_eq!(config.no_status_bar, Some(true));
+        // C3: browser collateral — toolchain cache off and agent-state off,
+        // so a browser profile never mounts dev caches or the harness's own
+        // credential/state dirs.
+        assert_eq!(config.no_toolchains, Some(true));
+        assert_eq!(config.agent_state, Some(false));
     }
 
     #[test]
