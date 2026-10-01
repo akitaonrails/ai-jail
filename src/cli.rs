@@ -46,6 +46,22 @@ OPTIONS:
     --audio / --no-audio           Enable/disable host audio passthrough
                                    (PulseAudio/PipeWire sockets + /dev/snd;
                                    Linux only; default: off)
+    --github / --no-github         Enable/disable read-only ~/.config/gh mount
+                                   (read-only; opt-in; the agent can use these
+                                   credentials; default: off)
+    --aws / --no-aws               Enable/disable read-only ~/.aws mount
+                                   (read-only; opt-in; the agent can use these
+                                   credentials; default: off)
+    --kube / --no-kube             Enable/disable read-only ~/.kube mount
+                                   (read-only; opt-in; the agent can use these
+                                   credentials; default: off)
+    --gcloud / --no-gcloud         Enable/disable read-only ~/.config/gcloud
+                                   mount (read-only; opt-in; the agent can use
+                                   these credentials; default: off)
+    --docker-config / --no-docker-config
+                                   Enable/disable read-only ~/.docker/config.json
+                                   mount (read-only; opt-in; the agent can use
+                                   these credentials; default: off)
     --network / --no-network       Enable/disable unrestricted network access (default: off)
     --macos-host-ipc / --no-macos-host-ipc
                                     Enable/disable broad macOS host IPC compatibility (default: off)
@@ -131,6 +147,11 @@ pub struct CliArgs {
     pub tailscale: Option<bool>,
     pub display: Option<bool>,
     pub audio: Option<bool>,
+    pub github: Option<bool>,
+    pub aws: Option<bool>,
+    pub kube: Option<bool>,
+    pub gcloud: Option<bool>,
+    pub docker_config: Option<bool>,
     pub network: Option<bool>,
     pub macos_host_ipc: Option<bool>,
     pub x11: Option<bool>,
@@ -348,6 +369,21 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("audio" | "no-audio")) => {
                 args.audio = Some(s == "audio");
+            }
+            Long(s @ ("github" | "no-github")) => {
+                args.github = Some(s == "github");
+            }
+            Long(s @ ("aws" | "no-aws")) => {
+                args.aws = Some(s == "aws");
+            }
+            Long(s @ ("kube" | "no-kube")) => {
+                args.kube = Some(s == "kube");
+            }
+            Long(s @ ("gcloud" | "no-gcloud")) => {
+                args.gcloud = Some(s == "gcloud");
+            }
+            Long(s @ ("docker-config" | "no-docker-config")) => {
+                args.docker_config = Some(s == "docker-config");
             }
             Long(s @ ("network" | "no-network")) => {
                 args.network = Some(s == "network");
@@ -595,6 +631,16 @@ fn is_sandbox_long_flag(arg: &str) -> bool {
             | "--display"
             | "--audio"
             | "--no-audio"
+            | "--github"
+            | "--no-github"
+            | "--aws"
+            | "--no-aws"
+            | "--kube"
+            | "--no-kube"
+            | "--gcloud"
+            | "--no-gcloud"
+            | "--docker-config"
+            | "--no-docker-config"
             | "--network"
             | "--no-network"
             | "--macos-host-ipc"
@@ -890,6 +936,30 @@ mod tests {
         assert_eq!(args.audio, Some(false));
         let args = parse_test(&["--no-audio", "--audio", "bash"]).unwrap();
         assert_eq!(args.audio, Some(true));
+    }
+
+    #[test]
+    fn parse_github() {
+        let args = parse_test(&["--github", "bash"]).unwrap();
+        assert_eq!(args.github, Some(true));
+    }
+
+    #[test]
+    fn parse_no_github() {
+        let args = parse_test(&["--no-github", "bash"]).unwrap();
+        assert_eq!(args.github, Some(false));
+    }
+
+    #[test]
+    fn parse_docker_config() {
+        let args = parse_test(&["--docker-config", "bash"]).unwrap();
+        assert_eq!(args.docker_config, Some(true));
+    }
+
+    #[test]
+    fn parse_no_docker_config() {
+        let args = parse_test(&["--no-docker-config", "bash"]).unwrap();
+        assert_eq!(args.docker_config, Some(false));
     }
 
     #[test]

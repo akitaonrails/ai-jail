@@ -683,6 +683,21 @@ fn run() -> Result<i32, String> {
         }
     }
 
+    // Opt-in, read-only credential passthrough (github/aws/kube/gcloud/
+    // docker_config): off by default, disabled under --lockdown. Injected
+    // here, after the status/--init/bootstrap early returns and the save
+    // paths, so these derived, host-specific paths are never written into
+    // a saved `.ai-jail` nor shown as user maps in `ai-jail status`. A
+    // user's own explicit map for the same destination always wins.
+    if !config.lockdown_enabled() {
+        for path in sandbox::credential_ro_paths(&config) {
+            let spec = path.to_string_lossy().into_owned();
+            if !toolchain_dest_already_mapped(&config, &spec) {
+                config.ro_maps.push(path);
+            }
+        }
+    }
+
     // --env-from-file (phase 6 of docs/connect-proxy-plan.md): validated
     // credential files. Entries apply exactly like --env, and on a
     // conflict the --env entry wins (closest to the user), so the file

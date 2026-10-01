@@ -182,6 +182,32 @@ pub struct Config {
     /// only disable it, never enable it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<bool>,
+    /// Trusted capability: read-only mount `~/.config/gh` (GitHub CLI
+    /// credentials) into the sandbox. Opt-in; the untrusted project
+    /// `.ai-jail` may only disable it, never enable it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<bool>,
+    /// Trusted capability: read-only mount `~/.aws` (AWS CLI
+    /// credentials) into the sandbox. Opt-in; the untrusted project
+    /// `.ai-jail` may only disable it, never enable it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws: Option<bool>,
+    /// Trusted capability: read-only mount `~/.kube` (kubectl
+    /// credentials) into the sandbox. Opt-in; the untrusted project
+    /// `.ai-jail` may only disable it, never enable it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kube: Option<bool>,
+    /// Trusted capability: read-only mount `~/.config/gcloud` (gcloud
+    /// CLI credentials) into the sandbox. Opt-in; the untrusted project
+    /// `.ai-jail` may only disable it, never enable it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gcloud: Option<bool>,
+    /// Trusted capability: read-only mount `~/.docker/config.json`
+    /// (Docker registry credentials) into the sandbox. Opt-in; the
+    /// untrusted project `.ai-jail` may only disable it, never enable
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_config: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<bool>,
     /// Permit macOS Seatbelt's broad host IPC compatibility rules. This is
@@ -339,6 +365,21 @@ impl Config {
     }
     pub fn audio_enabled(&self) -> bool {
         self.audio == Some(true)
+    }
+    pub fn github_enabled(&self) -> bool {
+        self.github == Some(true)
+    }
+    pub fn aws_enabled(&self) -> bool {
+        self.aws == Some(true)
+    }
+    pub fn kube_enabled(&self) -> bool {
+        self.kube == Some(true)
+    }
+    pub fn gcloud_enabled(&self) -> bool {
+        self.gcloud == Some(true)
+    }
+    pub fn docker_config_enabled(&self) -> bool {
+        self.docker_config == Some(true)
     }
     pub fn x11_enabled(&self) -> bool {
         self.x11 == Some(true)
@@ -994,6 +1035,11 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(tailscale);
     take!(no_display);
     take!(audio);
+    take!(github);
+    take!(aws);
+    take!(kube);
+    take!(gcloud);
+    take!(docker_config);
     take!(network);
     take!(macos_host_ipc);
     take!(x11);
@@ -1335,6 +1381,12 @@ pub fn merge_with_global_report(
     monotonic!(tailscale, |config: &Config| config.tailscale_enabled());
     monotonic!(no_display, |config: &Config| config.display_enabled());
     monotonic!(audio, |config: &Config| config.audio_enabled());
+    monotonic!(github, |config: &Config| config.github_enabled());
+    monotonic!(aws, |config: &Config| config.aws_enabled());
+    monotonic!(kube, |config: &Config| config.kube_enabled());
+    monotonic!(gcloud, |config: &Config| config.gcloud_enabled());
+    monotonic!(docker_config, |config: &Config| config
+        .docker_config_enabled());
     monotonic!(network, |config: &Config| config.network_enabled());
     monotonic!(macos_host_ipc, |config: &Config| config
         .macos_host_ipc_enabled());
@@ -1822,6 +1874,11 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     direct!(tailscale);
     invert!(display, no_display);
     direct!(audio);
+    direct!(github);
+    direct!(aws);
+    direct!(kube);
+    direct!(gcloud);
+    direct!(docker_config);
     direct!(network);
     direct!(macos_host_ipc);
     direct!(x11);
@@ -1967,6 +2024,11 @@ pub fn display_status(config: &Config) {
     print_shared_or_hidden("  Tailscale", config.tailscale);
     print_opt_in_tristate("  Display", config.no_display);
     print_opt_in_enabled("  Audio", config.audio);
+    print_opt_in_enabled("  GitHub creds", config.github);
+    print_opt_in_enabled("  AWS creds", config.aws);
+    print_opt_in_enabled("  Kube creds", config.kube);
+    print_opt_in_enabled("  gcloud creds", config.gcloud);
+    print_opt_in_enabled("  Docker config", config.docker_config);
     print_network_mode(config);
     print_opt_in_enabled("  macOS host IPC", config.macos_host_ipc);
     print_opt_in_enabled("  X11", config.x11);
@@ -2306,6 +2368,122 @@ mod tests {
         };
         assert!(enabled.audio_enabled());
         assert!(serialize_config(&enabled).unwrap().contains("audio = true"));
+    }
+
+    #[test]
+    fn github_is_opt_in_and_project_cannot_enable_it() {
+        let baseline = Config::default();
+        let project = Config {
+            github: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert!(!merged.github_enabled());
+        assert!(warnings.iter().any(|warning| warning.contains("github")));
+
+        let enabled = Config {
+            github: Some(true),
+            ..Config::default()
+        };
+        assert!(enabled.github_enabled());
+        assert!(
+            serialize_config(&enabled)
+                .unwrap()
+                .contains("github = true")
+        );
+    }
+
+    #[test]
+    fn aws_is_opt_in_and_project_cannot_enable_it() {
+        let baseline = Config::default();
+        let project = Config {
+            aws: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert!(!merged.aws_enabled());
+        assert!(warnings.iter().any(|warning| warning.contains("aws")));
+
+        let enabled = Config {
+            aws: Some(true),
+            ..Config::default()
+        };
+        assert!(enabled.aws_enabled());
+        assert!(serialize_config(&enabled).unwrap().contains("aws = true"));
+    }
+
+    #[test]
+    fn kube_is_opt_in_and_project_cannot_enable_it() {
+        let baseline = Config::default();
+        let project = Config {
+            kube: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert!(!merged.kube_enabled());
+        assert!(warnings.iter().any(|warning| warning.contains("kube")));
+
+        let enabled = Config {
+            kube: Some(true),
+            ..Config::default()
+        };
+        assert!(enabled.kube_enabled());
+        assert!(serialize_config(&enabled).unwrap().contains("kube = true"));
+    }
+
+    #[test]
+    fn gcloud_is_opt_in_and_project_cannot_enable_it() {
+        let baseline = Config::default();
+        let project = Config {
+            gcloud: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert!(!merged.gcloud_enabled());
+        assert!(warnings.iter().any(|warning| warning.contains("gcloud")));
+
+        let enabled = Config {
+            gcloud: Some(true),
+            ..Config::default()
+        };
+        assert!(enabled.gcloud_enabled());
+        assert!(
+            serialize_config(&enabled)
+                .unwrap()
+                .contains("gcloud = true")
+        );
+    }
+
+    #[test]
+    fn docker_config_is_opt_in_and_project_cannot_enable_it() {
+        let baseline = Config::default();
+        let project = Config {
+            docker_config: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert!(!merged.docker_config_enabled());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("docker_config"))
+        );
+
+        let enabled = Config {
+            docker_config: Some(true),
+            ..Config::default()
+        };
+        assert!(enabled.docker_config_enabled());
+        assert!(
+            serialize_config(&enabled)
+                .unwrap()
+                .contains("docker_config = true")
+        );
     }
 
     // ── Trusted capabilities: agent_state / env / update_check ──
@@ -3276,6 +3454,11 @@ no_gpu = true
             tailscale: Some(true),
             no_display: Some(false),
             audio: Some(true),
+            github: None,
+            aws: None,
+            kube: None,
+            gcloud: None,
+            docker_config: None,
             network: None,
             macos_host_ipc: None,
             x11: Some(true),
@@ -6013,6 +6196,11 @@ hide_dotdirs = [".my_secrets"]
             tailscale: Some(true),
             no_display: None,
             audio: None,
+            github: None,
+            aws: None,
+            kube: None,
+            gcloud: None,
+            docker_config: None,
             network: None,
             macos_host_ipc: None,
             x11: None,

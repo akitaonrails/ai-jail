@@ -19,6 +19,11 @@ fn project_config_dangerous_opt_ins(
         (config.pictures_enabled(), "Pictures directory"),
         (config.systemd_user_enabled(), "systemd user bus"),
         (config.audio_enabled(), "Host audio"),
+        (config.github_enabled(), "GitHub credentials"),
+        (config.aws_enabled(), "AWS credentials"),
+        (config.kube_enabled(), "Kube credentials"),
+        (config.gcloud_enabled(), "gcloud credentials"),
+        (config.docker_config_enabled(), "Docker config"),
     ] {
         if enabled {
             items.push(name.into());
@@ -502,6 +507,37 @@ pub fn dotdir_exemptions(config: &Config) -> Vec<&'static str> {
 
 fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+}
+
+/// Read-only credential passthrough paths (opt-in, off by default): for
+/// each enabled capability whose host path exists, the path to mount
+/// read-only into the sandbox. Never used for `rw_maps`, and skipped
+/// entirely under `--lockdown`.
+pub(crate) fn credential_ro_paths(config: &Config) -> Vec<PathBuf> {
+    credential_ro_paths_from(config, &home_dir(), |p| p.exists())
+}
+
+fn credential_ro_paths_from(
+    config: &Config,
+    home: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for (enabled, path) in [
+        (config.github_enabled(), home.join(".config").join("gh")),
+        (config.aws_enabled(), home.join(".aws")),
+        (config.kube_enabled(), home.join(".kube")),
+        (config.gcloud_enabled(), home.join(".config").join("gcloud")),
+        (
+            config.docker_config_enabled(),
+            home.join(".docker").join("config.json"),
+        ),
+    ] {
+        if enabled && exists(&path) {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 /// Paths below `root` that must stay visible for the sandboxed command
@@ -1449,6 +1485,48 @@ mod tests {
         assert!(items.iter().any(|i| i.contains("SSH")));
         assert!(items.iter().any(|i| i.contains("Pictures")));
         assert!(items.iter().any(|i| i.contains("systemd")));
+    }
+
+    #[test]
+    fn credential_ro_paths_returns_enabled_existing_paths() {
+        let home = PathBuf::from("/home/u");
+        let config = Config {
+            github: Some(true),
+            aws: Some(true),
+            kube: Some(true),
+            gcloud: Some(true),
+            docker_config: Some(true),
+            ..Config::default()
+        };
+        let paths = credential_ro_paths_from(&config, &home, |_| true);
+        assert_eq!(
+            paths,
+            vec![
+                home.join(".config").join("gh"),
+                home.join(".aws"),
+                home.join(".kube"),
+                home.join(".config").join("gcloud"),
+                home.join(".docker").join("config.json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn credential_ro_paths_empty_when_all_disabled() {
+        let home = PathBuf::from("/home/u");
+        let config = Config::default();
+        assert!(credential_ro_paths_from(&config, &home, |_| true).is_empty());
+    }
+
+    #[test]
+    fn credential_ro_paths_skips_nonexistent_paths() {
+        let home = PathBuf::from("/home/u");
+        let config = Config {
+            github: Some(true),
+            aws: Some(true),
+            ..Config::default()
+        };
+        assert!(credential_ro_paths_from(&config, &home, |_| false).is_empty());
     }
 
     #[test]
