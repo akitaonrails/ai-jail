@@ -364,20 +364,21 @@ its installs inside the sandbox, it is skipped and your command still starts.
 sandbox, so entries describing the host's layout no longer make tools look
 installed when nothing is mounted behind them.
 
-**Under the default private home, mise has neither.** `$HOME` is a fresh
-tmpfs, so `~/.config/mise` and `~/.local/share/mise` are not mounted, and the
-inherited `PATH` still names the host's `~/.local/share/mise/installs/...`
-directories even though nothing is there. Activation is therefore skipped
-rather than left to fail slowly against the network. To give an agent a real
-mise toolchain, map it in explicitly from trusted global config:
+**Under the default private home, those paths are not dotdirs, so earlier
+releases did not mount them** — `$HOME` is a fresh tmpfs, activation found
+nothing, and every mise-managed tool (the agent executable included) vanished
+from `PATH`. As of v2.4.1, when mise is enabled ai-jail maps the mise data
+dir (`~/.local/share/mise`, honoring `MISE_DATA_DIR`), the mise config dir
+(`~/.config/mise`, honoring `MISE_CONFIG_DIR`), and the `mise` binary's
+directory **read-only automatically**, so an agent gets the project's real
+toolchain out of the box. Only existing directories are mapped, so a host
+without mise is unchanged, and the derived paths are never written into a
+saved `.ai-jail`.
 
-```toml
-# ~/.ai-jail
-[commands.claude]
-ro_maps = ["~/.config/mise", "~/.local/share/mise"]
-```
-
-or use `--no-private-home` when you deliberately want the whole host home.
+`--no-mise` (or `no_mise = true`) and `--lockdown` opt out — both already
+disable mise activation, so neither maps these paths. You can still add extra
+`ro_maps` from trusted global config if a tool lives elsewhere, or use
+`--no-private-home` when you deliberately want the whole host home.
 
 ## Herdr
 

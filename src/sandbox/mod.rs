@@ -871,6 +871,66 @@ fn mise_bin() -> Option<PathBuf> {
     })
 }
 
+/// Read-only host paths that mise's own in-sandbox activation needs.
+///
+/// mise is a developer-tool manager that ai-jail enables by default (and
+/// activates via `mise trust`/`activate`/`env` before the command). But the
+/// default private home mounts only dotdirs, so mise's data dir
+/// (`~/.local/share/mise`, which holds every installed tool's binary), its
+/// config dir, and the `mise` binary under `~/.local/bin` were never visible
+/// inside the sandbox. Activation then found nothing, and `PATH` pruning
+/// dropped the host's now-missing `installs/...` entries, so every
+/// mise-managed tool — the agent executable included — vanished (issue #113).
+///
+/// Mapping these read-only when mise is enabled makes the existing activation
+/// actually resolve tools. `--no-mise` and `--lockdown` opt out (they already
+/// disable mise activation), and only existing directories are returned, so a
+/// host without mise contributes nothing and the launch is unchanged.
+pub(crate) fn mise_auto_map_dirs() -> Vec<PathBuf> {
+    mise_auto_map_dirs_from(
+        &home_dir(),
+        std::env::var_os("MISE_DATA_DIR").map(PathBuf::from),
+        std::env::var_os("MISE_CONFIG_DIR").map(PathBuf::from),
+        mise_bin(),
+        |p| p.is_dir(),
+    )
+}
+
+/// Inner, injectable implementation of [`mise_auto_map_dirs`] so the path
+/// logic is unit-testable without mutating process env or touching a real
+/// home directory.
+fn mise_auto_map_dirs_from(
+    home: &Path,
+    data_override: Option<PathBuf>,
+    config_override: Option<PathBuf>,
+    mise_bin: Option<PathBuf>,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if is_dir(&p) && !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
+
+    push(data_override.unwrap_or_else(|| home.join(".local/share/mise")));
+    push(config_override.unwrap_or_else(|| home.join(".config/mise")));
+
+    // The mise binary must be executable inside the sandbox for activation to
+    // run at all. Map its directory only when it lives under the home tree
+    // (e.g. `~/.local/bin`); a system location like `/usr/bin` is already
+    // mounted, so adding it would be a redundant (and potentially conflicting)
+    // map.
+    if let Some(bin) = mise_bin
+        && let Some(parent) = bin.parent()
+        && parent.starts_with(home)
+    {
+        push(parent.to_path_buf());
+    }
+
+    dirs
+}
+
 fn default_launch_command(config: &Config) -> LaunchCommand {
     if config.command.is_empty() {
         return LaunchCommand {
@@ -1688,6 +1748,68 @@ mod tests {
         let cmd = build_launch_command(&cfg);
         assert_eq!(cmd.program, "claude");
         assert!(cmd.args.is_empty());
+    }
+
+    #[test]
+    fn mise_auto_map_dirs_returns_existing_data_and_config_dirs() {
+        let home = Path::new("/home/dev");
+        let present =
+            [home.join(".local/share/mise"), home.join(".config/mise")];
+        let dirs = mise_auto_map_dirs_from(home, None, None, None, |p| {
+            present.iter().any(|e| e == p)
+        });
+        assert_eq!(
+            dirs,
+            vec![home.join(".local/share/mise"), home.join(".config/mise")]
+        );
+    }
+
+    #[test]
+    fn mise_auto_map_dirs_skips_missing_dirs() {
+        let home = Path::new("/home/dev");
+        let dirs = mise_auto_map_dirs_from(home, None, None, None, |_| false);
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn mise_auto_map_dirs_adds_mise_binary_dir_only_under_home() {
+        let home = Path::new("/home/dev");
+        let data = home.join(".local/share/mise");
+        let local_bin = home.join(".local/bin");
+
+        let under_home = mise_auto_map_dirs_from(
+            home,
+            None,
+            None,
+            Some(local_bin.join("mise")),
+            |p| p == data || p == local_bin,
+        );
+        assert!(under_home.contains(&local_bin));
+
+        // A system mise binary is already mounted; its dir is not added.
+        let system = mise_auto_map_dirs_from(
+            home,
+            None,
+            None,
+            Some(PathBuf::from("/usr/bin/mise")),
+            |p| p == data || p == Path::new("/usr/bin"),
+        );
+        assert!(!system.contains(&PathBuf::from("/usr/bin")));
+    }
+
+    #[test]
+    fn mise_auto_map_dirs_honors_xdg_overrides() {
+        let home = Path::new("/home/dev");
+        let data = PathBuf::from("/opt/mise-data");
+        let conf = PathBuf::from("/opt/mise-config");
+        let dirs = mise_auto_map_dirs_from(
+            home,
+            Some(data.clone()),
+            Some(conf.clone()),
+            None,
+            |p| p == data || p == conf,
+        );
+        assert_eq!(dirs, vec![data, conf]);
     }
 
     #[test]

@@ -623,6 +623,25 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
 
+    // mise passthrough (issue #113): mise is enabled by default and already
+    // activated inside the sandbox, but the default private home maps only
+    // dotdirs, so mise's data/config dirs and the `mise` binary were never
+    // visible — activation found nothing and every mise-managed tool, the
+    // agent executable included, vanished from PATH. Map those paths
+    // read-only whenever mise is enabled; `--no-mise` and `--lockdown` opt out
+    // (they already disable mise activation). Added after the status/init/
+    // bootstrap early returns and the save paths so these derived,
+    // host-specific paths are never persisted into a saved `.ai-jail` nor
+    // shown as user maps in `ai-jail status`.
+    if config.mise_enabled() && !config.lockdown_enabled() {
+        for dir in sandbox::mise_auto_map_dirs() {
+            if !config.ro_maps.contains(&dir) && !config.rw_maps.contains(&dir)
+            {
+                config.ro_maps.push(dir);
+            }
+        }
+    }
+
     // --env-from-file (phase 6 of docs/connect-proxy-plan.md): validated
     // credential files. Entries apply exactly like --env, and on a
     // conflict the --env entry wins (closest to the user), so the file
