@@ -120,7 +120,9 @@ OPTIONS:
                                    Pastel picks a random pastel palette per session
     --no-status-bar                Disable persistent status line
     --exec                         Direct execution mode (no PTY proxy, no status bar)
-    --allow-tcp-port <PORT>        Allow outbound TCP to PORT in lockdown (repeatable)
+    --allow-tcp-port <PORT>        Deprecated and rejected at launch (UDP cannot be
+                                   isolated); use --allow-host for filtered egress
+                                   instead (still parsed for back-compat)
     --allow-host <HOST>            Allow CONNECT egress to HOST and its subdomains via the
                                    built-in filtered proxy (repeatable; implies filtered
                                    network mode; cannot combine with --network)
