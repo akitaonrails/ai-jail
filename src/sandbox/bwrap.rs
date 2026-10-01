@@ -3,6 +3,7 @@ use crate::output;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1301,11 +1302,16 @@ pub fn build(
     // sandbox so it can apply Landlock after bwrap namespace setup.
     let wrapper = resolve_landlock_wrapper(config)?;
 
-    let mut cmd = Command::new(bwrap);
+    // #147: bwrap OPTIONS (which include every `--setenv NAME VALUE` pair,
+    // and therefore all `--env`/`--env-from-file` values) go into a memfd
+    // handed to bwrap via `--args FD`, so they never land on bwrap's argv
+    // where same-user processes could read them from /proc/<pid>/cmdline.
+    // bwrap's `--args` is options-only: the `--` separator and the command
+    // must stay on the real argv, which they do below. Secrets are options,
+    // so this split keeps them off argv; the command itself is not secret.
+    let mut opt_args: Vec<String> = Vec::new();
 
-    for arg in mount_set.all_mount_args() {
-        cmd.arg(arg);
-    }
+    opt_args.extend(mount_set.all_mount_args());
 
     // Self binary mount for Landlock wrapper (after all other
     // mounts so /tmp tmpfs already exists)
@@ -1314,45 +1320,115 @@ pub fn build(
             src: wrapper_path.clone(),
             dest: PathBuf::from(LANDLOCK_WRAPPER_DEST),
         };
-        for arg in m.to_args() {
-            cmd.arg(arg);
-        }
+        opt_args.extend(m.to_args());
     }
 
-    for arg in proxy_socket_mount_args(config, proxy_socket)? {
-        cmd.arg(arg);
-    }
+    opt_args.extend(proxy_socket_mount_args(config, proxy_socket)?);
 
-    for arg in mount_set.isolation_args(
+    opt_args.extend(mount_set.isolation_args(
         project_dir,
         lockdown,
         config.network_enabled(),
         config.inherit_env_enabled(),
         config.env_pass(),
-    ) {
-        cmd.arg(arg);
-    }
+    ));
 
     // Propagate quiet mode into the sandbox so the inner
     // landlock-exec process suppresses its output too.
     if crate::output::is_quiet() {
-        cmd.arg("--setenv").arg("AI_JAIL_QUIET").arg("1");
+        opt_args.push("--setenv".into());
+        opt_args.push("AI_JAIL_QUIET".into());
+        opt_args.push("1".into());
     }
 
-    cmd.arg("--");
+    let mut cmd = Command::new(bwrap);
+    let args_fd = write_bwrap_args_fd(&opt_args)?;
+    cmd.arg("--args").arg(args_fd.to_string());
 
+    // The separator and command stay on the real argv (bwrap --args does not
+    // accept the command from the fd).
+    cmd.arg("--");
     if wrapper.is_some() {
         for arg in landlock_wrapper_args(config, &map_args, verbose) {
             cmd.arg(arg);
         }
     }
-
     cmd.arg(&launch.program);
     for arg in &launch.args {
         cmd.arg(arg);
     }
 
+    // The memfd shares its single open-file description (and read offset)
+    // with this parent across the fork, so just before exec reopen it via
+    // /proc to give bwrap an independent description positioned at the start.
+    // Registering pre_exec also forces std onto the fork+exec path, since
+    // posix_spawn does not reliably pass a non-stdio fd through. (#147)
+    let proc_path = std::ffi::CString::new(format!("/proc/self/fd/{args_fd}"))
+        .map_err(|e| format!("building bwrap args fd path: {e}"))?;
+    // SAFETY: the closure calls only async-signal-safe libc functions.
+    unsafe {
+        cmd.pre_exec(move || {
+            let fresh = nix::libc::open(
+                proc_path.as_ptr(),
+                nix::libc::O_RDONLY | nix::libc::O_CLOEXEC,
+            );
+            if fresh < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // dup2 onto args_fd gives bwrap the fresh description at offset 0
+            // and clears CLOEXEC on the target so it survives exec.
+            if nix::libc::dup2(fresh, args_fd) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if fresh != args_fd {
+                nix::libc::close(fresh);
+            }
+            Ok(())
+        });
+    }
+
     Ok(cmd)
+}
+
+/// Serialize bwrap arguments as a NUL-separated blob for `bwrap --args FD`.
+fn bwrap_args_blob(args: &[String]) -> Vec<u8> {
+    let mut blob = Vec::new();
+    for arg in args {
+        blob.extend_from_slice(arg.as_bytes());
+        blob.push(0);
+    }
+    blob
+}
+
+/// Write the bwrap arguments into an anonymous in-memory file and return a
+/// raw fd positioned at the start, for `bwrap --args <fd>`. The owning handle
+/// is deliberately leaked so the fd stays open (and fork-inheritable) until
+/// this short-lived process exits; the build() pre_exec hook reopens it per
+/// child. This keeps `--setenv` values off bwrap's argv (#147).
+fn write_bwrap_args_fd(args: &[String]) -> Result<std::os::fd::RawFd, String> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::fd::FromRawFd;
+
+    let name = c"ai-jail-bwrap-args";
+    // SAFETY: `name` is a valid NUL-terminated C string; memfd_create
+    // returns a fresh owned fd or -1 with errno set.
+    let raw = unsafe { nix::libc::memfd_create(name.as_ptr(), 0) };
+    if raw < 0 {
+        return Err(format!(
+            "memfd_create for bwrap args failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `raw` is a fresh fd owned solely by this File.
+    let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+    file.write_all(&bwrap_args_blob(args))
+        .map_err(|e| format!("writing bwrap args to memfd: {e}"))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("rewinding bwrap args memfd: {e}"))?;
+    // Keep the fd open (and fork-inheritable) so the pre_exec hook can reopen
+    // it via /proc; reclaimed when this short-lived process exits.
+    std::mem::forget(file);
+    Ok(raw)
 }
 
 /// Filtered egress: bind the outer proxy's Unix socket into the sandbox
@@ -5748,6 +5824,71 @@ mod tests {
             args.contains(&"--unshare-net".to_string()),
             "lockdown must isolate the net namespace even with --network"
         );
+    }
+
+    #[test]
+    fn bwrap_args_blob_is_nul_separated() {
+        let blob = bwrap_args_blob(&[
+            "--setenv".into(),
+            "TOKEN".into(),
+            "s3cr3t".into(),
+            "--".into(),
+            "bash".into(),
+        ]);
+        assert_eq!(blob, b"--setenv\0TOKEN\0s3cr3t\0--\0bash\0");
+        // Round-trips back to the original argument vector.
+        let parsed: Vec<&str> = blob
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| std::str::from_utf8(s).unwrap())
+            .collect();
+        assert_eq!(parsed, ["--setenv", "TOKEN", "s3cr3t", "--", "bash"]);
+    }
+
+    #[test]
+    fn build_keeps_env_values_off_bwrap_argv() {
+        // #147 regression: the only args on bwrap's real argv are
+        // `--args <fd>`; every --setenv pair (incl. secret --env values)
+        // travels through the inherited memfd, never /proc/<pid>/cmdline.
+        if bwrap_binary_path().is_err() {
+            return; // needs a real bwrap binary (CI/host, not inside the jail)
+        }
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-argsfd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let _h = EnvVarGuard::set("HOME", &home);
+
+        let mut config = minimal_test_config();
+        config.command = vec!["bash".into()];
+        config.env_pass = vec!["SECRET_TOKEN=hunter2".into()];
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let project = PathBuf::from("/home/user/project");
+
+        let cmd = build(&guard, &config, &project, false, None).unwrap();
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        // bwrap options (incl. every --setenv) travel through the fd; only
+        // `--args <fd>` and the `--`-separated command are on the real argv.
+        assert_eq!(argv.first().map(String::as_str), Some("--args"));
+        assert!(
+            argv.iter().any(|a| a == "--"),
+            "command separator must be on argv: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--setenv"),
+            "no --setenv on bwrap argv: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("hunter2")),
+            "secret value must not appear on bwrap argv: {argv:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
