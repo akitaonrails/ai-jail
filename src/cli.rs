@@ -635,103 +635,111 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
     Ok(args)
 }
 
+/// Long flags that configure the sandbox itself (as opposed to the wrapped
+/// command). Used to reject a sandbox flag that appears after the command
+/// with no `--` separator. Every entry MUST have a matching parse arm in
+/// `parse_from`, or it errors inconsistently (the `--ro-map` bug: "unknown
+/// option" before the command, "would be passed to the child" after it).
+/// The conformance test `every_guarded_sandbox_flag_is_parseable` enforces
+/// that invariant.
+const SANDBOX_LONG_FLAGS: &[&str] = &[
+    "--private-home",
+    "--no-private-home",
+    "--lockdown",
+    "--no-lockdown",
+    "--no-display",
+    "--display",
+    "--audio",
+    "--no-audio",
+    "--github",
+    "--no-github",
+    "--aws",
+    "--no-aws",
+    "--kube",
+    "--no-kube",
+    "--gcloud",
+    "--no-gcloud",
+    "--docker-config",
+    "--no-docker-config",
+    "--kvm",
+    "--no-kvm",
+    "--network",
+    "--no-network",
+    "--macos-host-ipc",
+    "--no-macos-host-ipc",
+    "--no-gpu",
+    "--gpu",
+    "--no-docker",
+    "--docker",
+    "--tailscale",
+    "--no-tailscale",
+    "--landlock",
+    "--no-landlock",
+    "--seccomp",
+    "--no-seccomp",
+    "--rlimits",
+    "--no-rlimits",
+    "--ssh",
+    "--no-ssh",
+    "--pictures",
+    "--no-pictures",
+    "--clean",
+    "--exec",
+    "--dry-run",
+    "--rw-map",
+    "--ro-map",
+    "--overlay-map",
+    "--map",
+    "--mask",
+    "--deny-path",
+    "--mask-except",
+    "--deny-path-except",
+    "--hide-dotdir",
+    "--allow-tcp-port",
+    "--allow-host",
+    "--systemd-user",
+    "--no-systemd-user",
+    "--worktree",
+    "--no-worktree",
+    "--browser",
+    "--no-browser",
+    "--claude-dir",
+    "--x11",
+    "--no-x11",
+    "--host-shm",
+    "--no-host-shm",
+    "--terminal-passthrough",
+    "--no-terminal-passthrough",
+    "--agent-state",
+    "--no-agent-state",
+    "--inherit-env",
+    "--no-inherit-env",
+    "--update-check",
+    "--no-update-check",
+    "--audit-log",
+    "--no-audit-log",
+    "--audit-verify",
+    "--env",
+    "--env-from-file",
+    "--secret",
+    "--mise",
+    "--no-mise",
+    "--toolchains",
+    "--no-toolchains",
+    "--save-config",
+    "--no-save-config",
+    "--hide-config",
+    "--no-hide-config",
+    "--status-bar",
+    "--no-status-bar",
+    "--init",
+    "--bootstrap",
+    "--verbose",
+];
+
 fn is_sandbox_long_flag(arg: &str) -> bool {
     let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
-    matches!(
-        flag,
-        "--private-home"
-            | "--no-private-home"
-            | "--lockdown"
-            | "--no-lockdown"
-            | "--no-display"
-            | "--display"
-            | "--audio"
-            | "--no-audio"
-            | "--github"
-            | "--no-github"
-            | "--aws"
-            | "--no-aws"
-            | "--kube"
-            | "--no-kube"
-            | "--gcloud"
-            | "--no-gcloud"
-            | "--docker-config"
-            | "--no-docker-config"
-            | "--kvm"
-            | "--no-kvm"
-            | "--network"
-            | "--no-network"
-            | "--macos-host-ipc"
-            | "--no-macos-host-ipc"
-            | "--no-gpu"
-            | "--gpu"
-            | "--no-docker"
-            | "--docker"
-            | "--tailscale"
-            | "--no-tailscale"
-            | "--landlock"
-            | "--no-landlock"
-            | "--seccomp"
-            | "--no-seccomp"
-            | "--rlimits"
-            | "--no-rlimits"
-            | "--ssh"
-            | "--no-ssh"
-            | "--pictures"
-            | "--no-pictures"
-            | "--clean"
-            | "--exec"
-            | "--dry-run"
-            | "--rw-map"
-            | "--ro-map"
-            | "--overlay-map"
-            | "--map"
-            | "--mask"
-            | "--deny-path"
-            | "--mask-except"
-            | "--deny-path-except"
-            | "--hide-dotdir"
-            | "--allow-tcp-port"
-            | "--allow-host"
-            | "--systemd-user"
-            | "--no-systemd-user"
-            | "--worktree"
-            | "--no-worktree"
-            | "--browser"
-            | "--no-browser"
-            | "--claude-dir"
-            | "--x11"
-            | "--no-x11"
-            | "--host-shm"
-            | "--no-host-shm"
-            | "--terminal-passthrough"
-            | "--no-terminal-passthrough"
-            | "--agent-state"
-            | "--no-agent-state"
-            | "--inherit-env"
-            | "--no-inherit-env"
-            | "--update-check"
-            | "--no-update-check"
-            | "--audit-log"
-            | "--no-audit-log"
-            | "--audit-verify"
-            | "--env"
-            | "--env-from-file"
-            | "--secret"
-            | "--mise"
-            | "--no-mise"
-            | "--toolchains"
-            | "--no-toolchains"
-            | "--save-config"
-            | "--no-save-config"
-            | "--hide-config"
-            | "--no-hide-config"
-            | "--status-bar"
-            | "--no-status-bar"
-            | "--init"
-            | "--bootstrap"
-            | "--verbose"
-    )
+    SANDBOX_LONG_FLAGS.contains(&flag)
 }
 
 #[cfg(test)]
@@ -740,6 +748,85 @@ mod tests {
 
     fn parse_test(args: &[&str]) -> Result<CliArgs, String> {
         parse_argv(args.iter().map(std::ffi::OsString::from).collect())
+    }
+
+    #[test]
+    fn every_guarded_sandbox_flag_is_parseable() {
+        // Regression for the --ro-map bug: a flag listed in the sandbox-flag
+        // guard but missing its parse arm fails with "unknown option" before
+        // the command yet is caught by the guard after it — two contradictory
+        // errors. Every guarded long flag must be a recognized option, so no
+        // guarded flag may produce "unknown option".
+        for &flag in SANDBOX_LONG_FLAGS {
+            // Attach a probe value so value-taking flags are satisfied. A
+            // boolean/action flag ignores it (lexopt may then complain about
+            // an unexpected value, or validation may reject "probe" — but
+            // never with "unknown option", which only an unwired flag yields).
+            let argv = [format!("{flag}=probe"), "bash".to_string()];
+            if let Err(e) =
+                parse_argv(argv.iter().map(std::ffi::OsString::from).collect())
+            {
+                assert!(
+                    !e.contains("unknown option"),
+                    "guarded flag {flag} has no parse arm: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_boolean_flags_have_both_polarities() {
+        // A --X/--no-X sandbox toggle must have both sides guarded and
+        // parseable, or the missing side slips past the post-command guard
+        // inconsistently. Action/value flags (--dry-run, --map, --env, …) are
+        // intentionally one-sided and excluded.
+        let toggles = [
+            "private-home",
+            "lockdown",
+            "display",
+            "audio",
+            "github",
+            "aws",
+            "kube",
+            "gcloud",
+            "docker-config",
+            "kvm",
+            "network",
+            "macos-host-ipc",
+            "gpu",
+            "docker",
+            "tailscale",
+            "landlock",
+            "seccomp",
+            "rlimits",
+            "ssh",
+            "pictures",
+            "systemd-user",
+            "worktree",
+            "x11",
+            "host-shm",
+            "terminal-passthrough",
+            "agent-state",
+            "inherit-env",
+            "update-check",
+            "audit-log",
+            "mise",
+            "toolchains",
+            "save-config",
+            "hide-config",
+        ];
+        for base in toggles {
+            let on = format!("--{base}");
+            let off = format!("--no-{base}");
+            assert!(
+                SANDBOX_LONG_FLAGS.contains(&on.as_str()),
+                "toggle --{base} is not in the sandbox-flag guard"
+            );
+            assert!(
+                SANDBOX_LONG_FLAGS.contains(&off.as_str()),
+                "toggle --{base} is missing its --no-{base} sibling"
+            );
+        }
     }
 
     // ── Basic command parsing ──────────────────────────────────
