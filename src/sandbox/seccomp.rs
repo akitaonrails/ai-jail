@@ -321,13 +321,19 @@ fn compile_filter(
     }
     rules.insert(libc::SYS_socket, socket_rules);
 
-    // `TIOCSTI` is a `c_ulong` const on glibc but `c_int` on musl;
-    // `as _` coerces either to the `u64` the condition expects.
+    // Compare the ioctl request as a 32-bit value (advisory
+    // GHSA-w976-gw52-hvx2 #2). The kernel reads `cmd` as `unsigned int` and
+    // ignores the upper 32 bits of the register, so a 64-bit (`Qword`) compare
+    // let `TIOCSTI | (1 << 32)` slip past the filter and still reach the same
+    // ioctl — a terminal-injection bypass. `Dword` matches the low 32 bits
+    // exactly as the kernel does. `TIOCSTI` is `c_ulong` on glibc and `c_int`
+    // on musl; mask to u32 first so the widening to the condition's u64 never
+    // sign-extends.
     let tiocsti = SeccompCondition::new(
         1,
-        SeccompCmpArgLen::Qword,
+        SeccompCmpArgLen::Dword,
         SeccompCmpOp::Eq,
-        libc::TIOCSTI as _,
+        u64::from(libc::TIOCSTI as u32),
     )
     .and_then(|condition| SeccompRule::new(vec![condition]))
     .map_err(|e| format!("Seccomp: failed to build ioctl rules: {e}"))?;

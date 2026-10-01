@@ -21,6 +21,14 @@
 //  3. Restricts network (V4, kernel ≥ 6.7) — in lockdown mode,
 //     denies all TCP bind/connect as defense-in-depth alongside
 //     bwrap's --unshare-net.
+//  4. Scopes abstract Unix sockets and signals (V6, kernel ≥ 6.12,
+//     best-effort) — blocks connecting to abstract sockets created
+//     outside the sandbox (e.g. the host's abstract X11 socket) and
+//     signalling host processes. Below V6 this layer is absent, so the
+//     backstop for those two classes then relies on bwrap's namespaces
+//     (the private netns fences abstract sockets whenever network is
+//     off); the pathname user bus is always a mount-namespace concern,
+//     not a Landlock one.
 //
 // Path selection philosophy:
 //  - System dirs (/usr, /etc, /opt, …) are read-only: agents
@@ -48,7 +56,7 @@ use crate::config::MapSpec;
 use crate::output;
 use landlock::{
     ABI, Access, AccessFs, AccessNet, NetPort, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
+    RulesetCreatedAttr, RulesetStatus, Scope, path_beneath_rules,
 };
 use std::path::{Path, PathBuf};
 
@@ -132,7 +140,54 @@ pub fn apply(
     // V4 network rules are stacked as a separate ruleset so
     // filesystem enforcement is preserved on kernels without
     // V4 support.
-    apply_net_rules(config, verbose)
+    apply_net_rules(config, verbose)?;
+
+    // V6 scope rules (abstract Unix sockets + signals) are stacked as a
+    // third best-effort ruleset so the fs (V3) and net (V4) layers are
+    // preserved on kernels without V6.
+    apply_scope_rules(verbose)
+}
+
+/// Stack the Landlock V6 scope ruleset: restrict connecting to abstract Unix
+/// sockets created outside the sandbox, and sending signals to processes
+/// outside it (advisory GHSA-frgp-q3qc-g78p). This is the layer that makes the
+/// documented "backstop that survives mount-namespace escapes" claim true for
+/// the abstract-socket and signal classes — without it, `--x11`/`--network`
+/// left the host's abstract X11 socket reachable and `--systemd-user` left host
+/// signalling open.
+///
+/// Best-effort and non-fatal, unlike the fs ruleset: ABI V6 is very new
+/// (kernel ≥ 6.12), and `--lockdown` must keep working on the far more common
+/// older kernels where fs (V3) and net (V4) still enforce and the private
+/// netns already fences abstract sockets. So a kernel without V6 logs and
+/// continues even in lockdown. Intra-sandbox sockets and signals are
+/// unaffected; only crossing the sandbox boundary is scoped.
+fn apply_scope_rules(verbose: bool) -> Result<(), String> {
+    let result = Ruleset::default()
+        .scope(Scope::AbstractUnixSocket | Scope::Signal)
+        .and_then(landlock::Ruleset::create)
+        .and_then(|created| created.restrict_self());
+
+    match result {
+        Ok(status) => {
+            if verbose {
+                let enforced = match status.ruleset {
+                    RulesetStatus::FullyEnforced => "fully enforced",
+                    RulesetStatus::PartiallyEnforced => "partially enforced",
+                    RulesetStatus::NotEnforced => "not enforced (kernel < V6)",
+                };
+                output::verbose(&format!("Landlock V6 scope: {enforced}"));
+            }
+            Ok(())
+        }
+        // Never fatal, even in lockdown: see the function doc.
+        Err(e) => {
+            if verbose {
+                output::verbose(&format!("Landlock V6 scope: skipped ({e})"));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Collect paths that need read-only access and paths that
@@ -1478,6 +1533,14 @@ mod tests {
         let config = Config::default();
         assert!(!config.lockdown_enabled());
         assert!(apply_net_rules(&config, true).is_ok());
+    }
+
+    #[test]
+    fn apply_scope_rules_does_not_panic() {
+        // Kernel-independent smoke test: the V6 scope ruleset builds and
+        // applies (or degrades) without panicking on any kernel, and is
+        // non-fatal by contract. (advisory GHSA-frgp-q3qc-g78p)
+        let _ = apply_scope_rules(false);
     }
 
     #[test]

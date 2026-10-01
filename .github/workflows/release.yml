@@ -118,7 +118,7 @@ jobs:
           echo "apt failed after 3 attempts" >&2
           exit 1
       - name: Test and build unsigned Linux binary
-        run: cargo test --locked && cargo build --locked --release --target x86_64-unknown-linux-gnu
+        run: cargo test --locked --features test-hooks && cargo build --locked --release --target x86_64-unknown-linux-gnu
       - name: Archive and checksum
         run: |
           tar czf ai-jail-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-gnu/release ai-jail
@@ -150,7 +150,7 @@ jobs:
       # until ci.yml gained a macos job. CI covers every push to master, so
       # this is the backstop for a tag placed on an untested commit.
       - name: Test and build unsigned macOS binary
-        run: cargo test --locked && cargo build --locked --release --target aarch64-apple-darwin
+        run: cargo test --locked --features test-hooks && cargo build --locked --release --target aarch64-apple-darwin
       - name: Archive and checksum unsigned binary
         run: |
           tar czf ai-jail-macos-aarch64-unsigned.tar.gz -C target/aarch64-apple-darwin/release ai-jail

@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <sys/ioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,6 +98,21 @@ static void test_io_uring(void)
  * returns EFAULT. EPERM means seccomp blocked it. eBPF can
  * load programs into the kernel to read arbitrary memory.
  */
+static void test_tiocsti_highbits(void)
+{
+    /* Advisory GHSA-w976-gw52-hvx2 #2: the kernel reads the ioctl request as
+     * 32 bits, so TIOCSTI with any upper-32 bits set is the same request. A
+     * 64-bit seccomp compare missed it. Use an invalid fd: EPERM means the
+     * seccomp rule fired (blocked); EBADF means the call reached the kernel
+     * (the filter was bypassed). */
+    errno = 0;
+    unsigned long req = (unsigned long)TIOCSTI | (1UL << 32);
+    long r = syscall(SYS_ioctl, -1, req, 0);
+    if (r == -1 && errno == EPERM)
+        BLOCKED();
+    ALLOWED("(ret=%ld, errno=%d)", r, errno);
+}
+
 static void test_bpf(void)
 {
 #ifdef SYS_bpf
@@ -298,6 +314,7 @@ int main(int argc, char *argv[])
     if (strcmp(t, "personality") == 0)   test_personality();
     if (strcmp(t, "io_uring") == 0)      test_io_uring();
     if (strcmp(t, "bpf") == 0)           test_bpf();
+    if (strcmp(t, "tiocsti_highbits") == 0) test_tiocsti_highbits();
     if (strcmp(t, "clone3") == 0)        test_clone3();
     if (strcmp(t, "unshare") == 0)       test_unshare();
     if (strcmp(t, "mount") == 0)         test_mount();

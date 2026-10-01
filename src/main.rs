@@ -59,7 +59,10 @@ fn resolve_browser_profile(
     })
 }
 
-fn apply_browser_profile(config: &mut config::Config) {
+fn apply_browser_profile(config: &mut config::Config, command_trusted: bool) {
+    // Capture before we set browser_profile below: an explicit profile comes
+    // from `--browser` on the CLI or from trusted global config, both trusted.
+    let explicit_profile = config.browser_profile().is_some();
     let Some(profile) = resolve_browser_profile(config) else {
         return;
     };
@@ -72,8 +75,25 @@ fn apply_browser_profile(config: &mut config::Config) {
     config.no_save_config = Some(true);
     config.ssh = Some(false);
     config.pictures = Some(false);
-    config.lockdown = Some(false);
     config.no_status_bar = Some(true);
+
+    // The browser profile clears lockdown so a browser window can actually
+    // reach the display and network. That is fine when the browser was chosen
+    // by trusted input — an explicit `--browser`/global profile, or a command
+    // the user or a trusted layer supplied. It is NOT fine when a browser
+    // command was adopted from an untrusted project `.ai-jail`: that would let
+    // a cloned repo downgrade a trusted `--lockdown`/global `lockdown = true`
+    // (advisory GHSA-w976-gw52-hvx2 #3). In that case keep lockdown; the rest
+    // of the profile still applies (it only tightens), so the browser simply
+    // will not have display/network — run it from the CLI to open it.
+    if explicit_profile || command_trusted || !config.lockdown_enabled() {
+        config.lockdown = Some(false);
+    } else {
+        output::security_warn(
+            "project .ai-jail browser command does not clear --lockdown; \
+             name the browser on the CLI to open a window",
+        );
+    }
 }
 
 /// Phantom credentials (issue #135): validate every `secret_hosts`
@@ -112,17 +132,25 @@ fn prepare_secrets(
                 "--secret {key}: {host} is not in allow_hosts (pass --allow-host {host})"
             ));
         }
-        let Some(at) = config
-            .env_pass
-            .iter()
-            .position(|entry| entry.split('=').next() == Some(key.as_str()))
-        else {
+        // Resolve the value the child would actually receive. apply_env_pass
+        // applies entries in order and the last one wins, so the effective
+        // value is the LAST matching entry, not the first. Rewriting only the
+        // first (the previous behaviour) left a later `KEY=real` entry intact,
+        // and the child received the real value despite phantomization
+        // (advisory-class duplicate-entry bypass). Match by parsed key so a
+        // value containing '=' cannot be mistaken for the name.
+        let last = config.env_pass.iter().rev().find_map(|entry| {
+            config::parse_env_entry(entry)
+                .ok()
+                .filter(|(name, _)| *name == key.as_str())
+        });
+        let Some((_, explicit)) = last else {
             return Err(format!(
                 "--secret {key}: {key} is not in the sandbox env; pass it via --env or --env-from-file"
             ));
         };
-        let real = match config.env_pass[at].split_once('=') {
-            Some((_, value)) => value.to_string(),
+        let real = match explicit {
+            Some(value) => value.to_string(),
             None => std::env::var(&key).map_err(|_| {
                 format!(
                     "--secret {key}: {key} is named in --env but not set in the host environment"
@@ -130,17 +158,27 @@ fn prepare_secrets(
             })?,
         };
         let binding = secret::SecretBinding::new(&key, &real, &host);
-        config.env_pass[at] = format!("{key}={}", binding.placeholder);
+        // Remove EVERY entry for this key, then insert exactly one placeholder,
+        // so no later duplicate can reintroduce the real value.
+        config.env_pass.retain(|entry| {
+            config::parse_env_entry(entry)
+                .map(|(name, _)| name != key.as_str())
+                .unwrap_or(true)
+        });
+        config
+            .env_pass
+            .push(format!("{key}={}", binding.placeholder));
         bindings.push(binding);
     }
     Ok(bindings)
 }
 
-/// Test-only TLS trust roots for the phantom-secret integration fixture
-/// (tests/phantom_secrets.rs): a PEM file of extra roots. Same rule as
-/// AI_JAIL_TEST_PROXY_ALLOW_PRIVATE -- never documented, never set in
-/// normal operation.
-#[cfg(target_os = "linux")]
+/// Test-only escape hatches, compiled in ONLY under the `test-hooks` feature.
+/// A default build (release, `cargo install`, CI without the feature) gets the
+/// inert fallbacks below, so neither the env-var reads nor their strings exist
+/// in the shipped binary — the environment is not a control channel over the
+/// SSRF guard or the proxy's TLS trust roots (audit B finding).
+#[cfg(all(target_os = "linux", feature = "test-hooks"))]
 fn test_extra_roots() -> Vec<rustls::pki_types::CertificateDer<'static>> {
     use rustls::pki_types::pem::PemObject;
     let Some(path) = std::env::var_os("AI_JAIL_TEST_PROXY_EXTRA_ROOTS") else {
@@ -153,6 +191,23 @@ fn test_extra_roots() -> Vec<rustls::pki_types::CertificateDer<'static>> {
         Ok(der) => vec![der],
         Err(_) => Vec::new(),
     }
+}
+
+#[cfg(all(target_os = "linux", not(feature = "test-hooks")))]
+fn test_extra_roots() -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    Vec::new()
+}
+
+/// Whether the SSRF address-range guard is disabled for loopback fixtures.
+/// Compiled to `false` outside the `test-hooks` feature, with no env read.
+#[cfg(all(target_os = "linux", feature = "test-hooks"))]
+fn test_allow_private() -> bool {
+    std::env::var_os("AI_JAIL_TEST_PROXY_ALLOW_PRIVATE").is_some()
+}
+
+#[cfg(all(target_os = "linux", not(feature = "test-hooks")))]
+fn test_allow_private() -> bool {
+    false
 }
 
 /// Network-mode contradiction checks, all fail-closed at launch.
@@ -504,6 +559,14 @@ fn run() -> Result<i32, String> {
             &invocation_cwd,
         )
     };
+    // Whether the effective command is trusted for the browser-profile
+    // lockdown decision below. It is adopted from the project file only when
+    // the CLI gave none and the project supplied one; that command is trusted
+    // only if the project directory is itself trusted (#3, browser lockdown
+    // downgrade).
+    let command_from_untrusted_project = cli.command.is_empty()
+        && !project_config.command.is_empty()
+        && !project_trusted;
     if cli.command.is_empty() && !project_config.command.is_empty() {
         config.command = project_config.command.clone();
     }
@@ -522,7 +585,7 @@ fn run() -> Result<i32, String> {
     // #54). Done here so display_status and the --init save path see
     // the same canonical paths the sandbox will use.
     config::absolutize_user_paths(&mut config, &invocation_cwd);
-    apply_browser_profile(&mut config);
+    apply_browser_profile(&mut config, !command_from_untrusted_project);
     validate_network_flags(&config)?;
 
     // Handle status command
@@ -622,12 +685,13 @@ fn run() -> Result<i32, String> {
     {
         let mut proxy_config =
             proxy::ProxyConfig::new(config.allow_hosts().to_vec());
-        // Test-only escape hatch (tests/filtered_egress.rs): lets the
-        // end-to-end tests CONNECT to loopback fixtures, which the SSRF
-        // guard would otherwise refuse. Never documented; never set in
-        // normal operation.
-        proxy_config.danger_allow_private =
-            std::env::var_os("AI_JAIL_TEST_PROXY_ALLOW_PRIVATE").is_some();
+        // Test-only escape hatches (tests/filtered_egress.rs,
+        // tests/phantom_secrets.rs): let the end-to-end tests CONNECT to
+        // loopback fixtures and trust a self-signed root. These are compiled
+        // in ONLY under the `test-hooks` feature; a release build
+        // (`cargo build --release`, `cargo install`) has neither the env-var
+        // read nor the string, so they cannot be reached at runtime.
+        proxy_config.danger_allow_private = test_allow_private();
         proxy_config.danger_extra_roots = test_extra_roots();
         // The audit handle is supervisor-side; the sandbox never sees
         // the file it appends to.
@@ -1196,12 +1260,45 @@ mod tests {
     }
 
     #[test]
+    fn browser_profile_keeps_lockdown_for_untrusted_command() {
+        // Advisory GHSA-w976-gw52-hvx2 #3: a browser command adopted from an
+        // untrusted project must not clear a trusted lockdown.
+        let mut config = Config {
+            command: vec!["chromium".into()],
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        apply_browser_profile(&mut config, /* command_trusted */ false);
+        assert_eq!(
+            config.lockdown,
+            Some(true),
+            "untrusted project browser command must not clear lockdown"
+        );
+        // The profile still applies its tightening bits.
+        assert_eq!(config.browser_profile.as_deref(), Some("hard"));
+        assert_eq!(config.no_docker, Some(true));
+    }
+
+    #[test]
+    fn browser_profile_clears_lockdown_for_trusted_command() {
+        // A user- or trusted-layer command still opens the browser.
+        let mut config = Config {
+            command: vec!["chromium".into()],
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        apply_browser_profile(&mut config, /* command_trusted */ true);
+        assert_eq!(config.lockdown, Some(false));
+        assert_eq!(config.browser_profile.as_deref(), Some("hard"));
+    }
+
+    #[test]
     fn browser_profile_applies_hardened_defaults() {
         let mut config = Config {
             command: vec!["chromium".into()],
             ..Config::default()
         };
-        apply_browser_profile(&mut config);
+        apply_browser_profile(&mut config, true);
 
         assert_eq!(config.browser_profile.as_deref(), Some("hard"));
         assert_eq!(config.no_gpu, Some(true));

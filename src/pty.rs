@@ -763,6 +763,25 @@ impl TerminalFilter {
                 }
                 continue;
             }
+            // A fresh ESC outside a string aborts any partial sequence and
+            // starts a new one, and the abandoned bytes are never forwarded.
+            // Terminals collapse `ESC ESC` and `ESC [ ESC` into a single
+            // introducer, so forwarding the partial (the previous behaviour)
+            // let `ESC ESC ]52;…BEL` and `ESC [ ESC ]…` smuggle an OSC past
+            // the filter (advisory-class terminal-injection). Inside a string
+            // ESC may be part of the ST terminator, so String/StringEsc keep
+            // their own handling below.
+            if b == 0x1b
+                && !matches!(
+                    self.state,
+                    FilterState::String | FilterState::StringEsc
+                )
+            {
+                self.pending.clear();
+                self.pending.push(b);
+                self.state = FilterState::Esc;
+                continue;
+            }
             match self.state {
                 FilterState::Ground => {
                     if b == 0x1b {
@@ -1658,6 +1677,28 @@ mod tests {
         let mut filter = super::TerminalFilter::new();
         let out = filter.feed(b"\x9d0;t\x1b\x9cok");
         assert_eq!(out, b"ok");
+    }
+
+    #[test]
+    fn primary_filter_doubled_esc_does_not_leak_osc() {
+        // Advisory-class terminal injection: terminals collapse ESC ESC and
+        // ESC [ ESC into one introducer, so a following OSC would reach the
+        // terminal. The filter must not forward the OSC introducer.
+        for prefix in [&b"\x1b"[..], &b"\x1b["[..]] {
+            let mut f = super::TerminalFilter::new();
+            let mut input = prefix.to_vec();
+            input.extend_from_slice(b"\x1b]52;c;QUJD\x07");
+            let out = f.feed(&input);
+            assert!(
+                !out.windows(3).any(|w| w == b"\x1b]5"),
+                "OSC introducer leaked after {prefix:?}: {out:?}"
+            );
+            // And no raw ] 5 2 payload leaks as text either.
+            assert!(
+                !out.windows(4).any(|w| w == b"]52;"),
+                "OSC payload leaked as text after {prefix:?}: {out:?}"
+            );
+        }
     }
 
     #[test]
