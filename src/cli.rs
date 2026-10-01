@@ -75,7 +75,8 @@ OPTIONS:
     --agent-state / --no-agent-state
                                     Enable/disable mounting the agent's own state
                                     dirs (~/.claude, ~/.codex, ~/.claude.json, ...;
-                                    default: off; project .ai-jail cannot enable)
+                                    default: on; off under --lockdown; project
+                                    .ai-jail can only disable)
     --env <NAME[=VALUE]>            Pass environment variable NAME (value copied from
                                     the host) or NAME=VALUE into the sandbox
                                     (repeatable; not persisted to .ai-jail).
@@ -260,7 +261,10 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     parser.value().map_err(|e| e.to_string())?.into();
                 args.rw_maps.push(val);
             }
-            Long("map") => {
+            // --ro-map is a back-compat alias for --map (read-only mount).
+            // It is listed in is_sandbox_long_flag, so it must parse here
+            // too, or it errors inconsistently depending on position.
+            Long("map" | "ro-map") => {
                 let val: PathBuf =
                     parser.value().map_err(|e| e.to_string())?.into();
                 args.ro_maps.push(val);
@@ -1321,6 +1325,14 @@ mod tests {
     #[test]
     fn parse_ro_map() {
         let args = parse_test(&["--map", "/opt/data", "bash"]).unwrap();
+        assert_eq!(args.ro_maps, vec![PathBuf::from("/opt/data")]);
+    }
+
+    #[test]
+    fn parse_ro_map_alias_matches_map() {
+        // --ro-map is a back-compat alias for --map; it is in the sandbox
+        // flag guard, so it must parse into ro_maps instead of erroring.
+        let args = parse_test(&["--ro-map", "/opt/data", "bash"]).unwrap();
         assert_eq!(args.ro_maps, vec![PathBuf::from("/opt/data")]);
     }
 
