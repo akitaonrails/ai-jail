@@ -477,6 +477,12 @@ fn lockdown_blocks_write_to_usr() {
 // rustup, and atomic saves for all Rust work in the jail. The fix grants
 // Refer on the writable paths in every stacked layer (fs, net, scope), never
 // on read-only paths.
+//
+// These probes run OUTSIDE any jail (the test binary is not sandboxed), so
+// they are only meaningful when the outer domain lets a fs-handling ruleset
+// reparent at all. Under an outer scope-only layer — nix ≥ 2.31.4 builder
+// hardening on kernels ≥ 6.12 — that is not the case, and all three tests
+// skip instead of reporting false failures/vacuous passes.
 
 fn assert_refer_ok(output: &Output, name: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -489,8 +495,67 @@ fn assert_refer_ok(output: &Output, name: &str) {
     );
 }
 
+/// Does the *outer* Landlock domain (this test process is outside any
+/// jail) permit cross-directory reparenting once a fs-handling ruleset is
+/// stacked on top of it? `None` = inconclusive (probe could not set up its
+/// own ruleset); `Some(false)` = an outer layer denies reparenting.
+///
+/// Stacked-layer semantics: reparenting is denied with EXDEV whenever the
+/// restricted domain is fs-applicable and ANY layer fails to grant REFER
+/// on the parent directories. A scope-only outer layer (no fs rights, no
+/// rules) qualifies: e.g. nix ≥ 2.31.4 hardens every sandboxed Linux
+/// build with a LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET layer on kernels
+/// ≥ 6.12 (nix commit 23c7a64, GHSA-g3g9-5vj6-r3gj backports). Ordinary
+/// nix builds are unaffected (no fs-handling layer → never applicable),
+/// but ai-jail inside the checkPhase sandbox cannot reparent, so here:
+///  - the two `landlock_allows_cross_dir_rename_*` tests would fail with
+///    EXDEV before ai-jail's layers are even consulted, and
+///  - `landlock_denies_rename_out_of_readonly_map` would pass vacuously
+///    (EXDEV from the outer layer, not a deny from the inner one).
+fn outer_refer_allows() -> Option<bool> {
+    static RESULT: OnceLock<Option<bool>> = OnceLock::new();
+    *RESULT.get_or_init(|| {
+        if !compile_helper() {
+            return None;
+        }
+        let out = Command::new(helper_bin())
+            .arg("refer_outer_probe")
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stdout.contains("REFER_OK") {
+            Some(true)
+        } else if out.status.code() == Some(3) {
+            None // PROBE_ERR: inconclusive, do not skip
+        } else {
+            Some(false) // REFER_FAIL: outer layer denies reparenting
+        }
+    })
+}
+
+/// Skips (returns true) when an outer Landlock domain denies
+/// cross-directory rename to any nested fs-handling ruleset: ai-jail's
+/// inner REFER grants are then unmeasurable in this environment.
+fn skip_if_outer_refer_denied(test_name: &str) -> bool {
+    match outer_refer_allows() {
+        Some(true) | None => false,
+        Some(false) => {
+            eprintln!(
+                "SKIPPED: {test_name} — outer Landlock domain (e.g. nix \
+                 builder hardening on kernels ≥ 6.12) denies cross-dir \
+                 rename to any nested fs-handling ruleset (EXDEV), so \
+                 ai-jail's inner REFER grants are unmeasurable here"
+            );
+            true
+        }
+    }
+}
+
 #[test]
 fn landlock_allows_cross_dir_rename_normal() {
+    if skip_if_outer_refer_denied("cross-dir rename (normal)") {
+        return;
+    }
     require_bwrap!();
     require_helper!();
     let out = helper_normal("refer_rename");
@@ -499,6 +564,9 @@ fn landlock_allows_cross_dir_rename_normal() {
 
 #[test]
 fn landlock_allows_cross_dir_rename_lockdown() {
+    if skip_if_outer_refer_denied("cross-dir rename (lockdown)") {
+        return;
+    }
     require_bwrap_net!();
     require_helper!();
     // The lockdown net ruleset is another stacked layer: it must also grant
@@ -509,6 +577,9 @@ fn landlock_allows_cross_dir_rename_lockdown() {
 
 #[test]
 fn landlock_denies_rename_out_of_readonly_map() {
+    if skip_if_outer_refer_denied("reparent out of read-only map") {
+        return;
+    }
     require_bwrap!();
     require_helper!();
     // Refer is granted only on read-write paths. Reparenting a file OUT of a
