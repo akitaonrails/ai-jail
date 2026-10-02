@@ -26,6 +26,7 @@
 #include <sched.h>
 #include <sys/mount.h>
 #include <sys/personality.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -337,6 +338,128 @@ static void test_refer_escape(void)
     BLOCKED();
 }
 
+/*
+ * OUTSIDE-the-jail probe: is the *outer* Landlock domain (if any) willing
+ * to let a nested fs-handling ruleset reparent across directories?
+ *
+ * Stacked-layer semantics: a rename/link across directories is allowed
+ * only if EVERY layer of the restricted domain grants REFER on both
+ * parents, and only once some layer handles filesystem rights at all
+ * ("fs-applicable"). Two consequences:
+ *
+ *  - A domain consisting solely of a scope-only layer (no fs rights —
+ *    e.g. nix ≥ 2.31.4 builder hardening on kernels ≥ 6.12) does NOT deny
+ *    renames by itself: ordinary builds are unaffected.
+ *  - Stacking any fs-handling ruleset (ai-jail's) on top of it makes the
+ *    domain fs-applicable, and the scope-only layer — having no rules —
+ *    denies every reparent with EXDEV, silently overriding the inner
+ *    layer's own REFER grants.
+ *
+ * This probe reproduces the second condition in miniature: it stacks its
+ * own minimal fs-handling layer (handle+grant REFER on the probe tree)
+ * and attempts the rename OUTSIDE any jail. Run as `refer_outer_probe`:
+ *   REFER_OK   (exit 0)  outer domain permits reparenting → refer tests
+ *                        are meaningful here, run them.
+ *   REFER_FAIL (exit 1)  outer layer denies reparenting → the inner
+ *                        REFER grants are unmeasurable; refer tests must
+ *                        skip instead of reporting wrong results.
+ *   PROBE_ERR  (exit 3)  inner ruleset could not be established (no
+ *                        Landlock, ABI < 2, ...) — inconclusive; callers
+ *                        must NOT skip.
+ */
+static void test_refer_outer_probe(void)
+{
+    /* Self-contained Landlock ABI bits: <linux/landlock.h> is missing on
+     * older toolchains. Only REFER (bit 13) is used; the ruleset attr is
+     * the ABI-7 layout {fs, net, scoped}; older kernels ignore trailing
+     * zero fields, so the same struct works on every ABI ≥ 1. */
+    #define LL_REFER (1ULL << 13)          /* LANDLOCK_ACCESS_FS_REFER */
+    #define LL_RULE_PATH_BENEATH 1         /* LANDLOCK_RULE_PATH_BENEATH */
+    #define LL_CREATE_RULESET_VERSION (1U << 0)
+    #ifndef SYS_landlock_create_ruleset
+    #define SYS_landlock_create_ruleset 444
+    #endif
+    #ifndef SYS_landlock_add_rule
+    #define SYS_landlock_add_rule 445
+    #endif
+    #ifndef SYS_landlock_restrict_self
+    #define SYS_landlock_restrict_self 446
+    #endif
+    struct ll_ruleset_attr {              /* landlock_ruleset_attr */
+        unsigned long long handled_access_fs;
+        unsigned long long handled_access_net;
+        unsigned long long scoped;
+    };
+    struct ll_path_beneath_attr {         /* landlock_path_beneath_attr */
+        unsigned long long allowed_access; /* allowed_access comes first */
+        int parent_fd;
+    } __attribute__((packed));            /* packed, 12 bytes */
+
+    long abi = syscall(SYS_landlock_create_ruleset, NULL, 0,
+                       LL_CREATE_RULESET_VERSION);
+    if (abi < 2) {
+        puts("PROBE_ERR");
+        exit(3);
+    }
+    struct ll_ruleset_attr attr = { .handled_access_fs = LL_REFER };
+    int fd = syscall(SYS_landlock_create_ruleset, &attr, sizeof(attr), 0);
+    if (fd < 0) {
+        printf("PROBE_ERR (create errno=%d)\n", errno);
+        exit(3);
+    }
+
+    /* Unique tree per run: parallel test binaries must not race on a
+     * shared path (a lost race would fake an EXDEV). */
+    char tmpl[] = "/tmp/.aijail_outer.XXXXXX";
+    char *base = mkdtemp(tmpl);
+    if (!base) {
+        printf("PROBE_ERR (mkdtemp errno=%d)\n", errno);
+        exit(3);
+    }
+    char pa[256], pb[256], pf[256], f2[256];
+    snprintf(pa, sizeof(pa), "%s/a", base);
+    snprintf(pb, sizeof(pb), "%s/b", base);
+    snprintf(pf, sizeof(pf), "%s/a/f", base);
+    snprintf(f2, sizeof(f2), "%s/b/f", base);
+    mkdir(pa, 0700);
+    mkdir(pb, 0700);
+    int ffd = open(pf, O_CREAT | O_WRONLY, 0600);
+    if (ffd >= 0)
+        close(ffd);
+    int dirfd = open(base, O_PATH | O_CLOEXEC);
+    struct ll_path_beneath_attr rule = {
+        .allowed_access = LL_REFER,
+        .parent_fd = dirfd,
+    };
+    if (dirfd < 0) {
+        printf("PROBE_ERR (open errno=%d)\n", errno);
+        exit(3);
+    }
+    if (syscall(SYS_landlock_add_rule, fd, LL_RULE_PATH_BENEATH, &rule,
+                0) < 0) {
+        printf("PROBE_ERR (add_rule errno=%d)\n", errno);
+        exit(3);
+    }
+    close(dirfd);
+
+    /* Landlock restricts unprivileged callers only under
+     * PR_SET_NO_NEW_PRIVS (no CAP_SYS_ADMIN here). */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 ||
+        syscall(SYS_landlock_restrict_self, fd, 0) < 0) {
+        printf("PROBE_ERR (restrict errno=%d)\n", errno);
+        exit(3);
+    }
+    close(fd);
+
+    errno = 0;
+    if (rename(pf, f2) == 0) {
+        puts("REFER_OK");
+        exit(0);
+    }
+    printf("REFER_FAIL (errno=%d)\n", errno);
+    exit(1);
+}
+
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
@@ -365,6 +488,7 @@ int main(int argc, char *argv[])
     if (strcmp(t, "write_sys") == 0)     test_write_sys();
     if (strcmp(t, "refer_rename") == 0)  test_refer_rename();
     if (strcmp(t, "refer_escape") == 0)  test_refer_escape();
+    if (strcmp(t, "refer_outer_probe") == 0) test_refer_outer_probe();
 
     fprintf(stderr, "Unknown test: %s\n", t);
     return 2;
