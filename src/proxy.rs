@@ -892,22 +892,31 @@ pub(crate) const BRIDGE_READY_ENV: &str = "AI_JAIL_BRIDGE_READY";
 /// bind-mounted Unix socket. Connecting to a Unix socket is a
 /// filesystem operation, so it does not cross network namespaces.
 ///
+/// Test-only hatch (tests/port_forward.rs), compiled in ONLY under the
+/// `test-hooks` feature: hold the bind back so a spawner that does not wait
+/// for readiness loses the race every time. Called only for bridges whose
+/// spawner waits for them (a `--forward-port` bridge), so it can only delay
+/// the launch, never leave the proxy bridge unbound while the agent runs.
+#[cfg(feature = "test-hooks")]
+fn test_bridge_delay() {
+    if let Some(ms) = std::env::var("AI_JAIL_TEST_BRIDGE_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        thread::sleep(Duration::from_millis(ms.min(5_000)));
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn test_bridge_delay() {}
+
 /// Runs unrestricted by design: the landlock wrapper spawns this mode
 /// before apply_landlock/apply_seccomp, and those only restrict the
 /// caller and its future children.
 pub(crate) fn run_bridge(port: u16, socket: &Path) -> Result<(), String> {
-    // Test-only (tests/port_forward.rs): hold the bind back so a spawner
-    // that does not wait for readiness loses the race every time. Never
-    // documented, and honoured only by bridges whose spawner waits for
-    // them (a `--forward-port` bridge): it can only delay the launch, never
-    // leave the proxy bridge unbound while the agent runs.
     let wait_ready = std::env::var_os(BRIDGE_READY_ENV).is_some();
-    if let Some(ms) = std::env::var("AI_JAIL_TEST_BRIDGE_DELAY_MS")
-        .ok()
-        .filter(|_| wait_ready)
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        thread::sleep(Duration::from_millis(ms.min(5_000)));
+    if wait_ready {
+        test_bridge_delay();
     }
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
         .map_err(|e| format!("bridge cannot bind 127.0.0.1:{port}: {e}"))?;

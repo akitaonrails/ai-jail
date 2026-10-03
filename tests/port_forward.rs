@@ -308,6 +308,9 @@ fn simultaneous_relays_are_capped_on_the_host() {
     assert!(reached >= 200, "only {reached} relays reached the host");
 }
 
+// Needs the AI_JAIL_TEST_BRIDGE_DELAY_MS hatch, which only exists under
+// `cargo test --features test-hooks`.
+#[cfg(feature = "test-hooks")]
 #[test]
 fn agent_starts_only_after_the_forward_is_listening() {
     require_sandbox!();
