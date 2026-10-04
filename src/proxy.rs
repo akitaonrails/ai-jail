@@ -36,6 +36,28 @@ use std::time::Duration;
 const REQUEST_CAP: usize = 8 * 1024;
 
 const REPLY_OK: &str = "HTTP/1.1 200 Connection Established\r\n\r\n";
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+fn accept_next<S>(
+    label: &str,
+    accept: &mut impl FnMut() -> io::Result<S>,
+) -> S {
+    let mut warned = false;
+    loop {
+        match accept() {
+            Ok(stream) => return stream,
+            Err(error) => {
+                if !warned {
+                    crate::output::warn(&format!(
+                        "{label} accept failed: {error}; retrying"
+                    ));
+                    warned = true;
+                }
+                thread::sleep(ACCEPT_RETRY_DELAY);
+            }
+        }
+    }
+}
 
 /// Proxy configuration. Phase 2 builds this from the effective config.
 pub(crate) struct ProxyConfig {
@@ -109,7 +131,10 @@ impl Proxy {
 
         let tcp_shared = Arc::clone(&shared);
         thread::spawn(move || {
-            for stream in listener.incoming().map_while(Result::ok) {
+            loop {
+                let stream = accept_next("proxy TCP listener", &mut || {
+                    listener.accept().map(|(stream, _)| stream)
+                });
                 let shared = Arc::clone(&tcp_shared);
                 thread::spawn(move || handle_conn(stream, shared));
             }
@@ -125,7 +150,11 @@ impl Proxy {
             )?;
             let unix_shared = Arc::clone(&shared);
             thread::spawn(move || {
-                for stream in unix_listener.incoming().map_while(Result::ok) {
+                loop {
+                    let stream =
+                        accept_next("proxy Unix listener", &mut || {
+                            unix_listener.accept().map(|(stream, _)| stream)
+                        });
                     let shared = Arc::clone(&unix_shared);
                     thread::spawn(move || handle_conn(stream, shared));
                 }
@@ -868,7 +897,10 @@ pub(crate) fn run_bridge(port: u16, socket: &Path) -> Result<(), String> {
         TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(|e| {
             format!("proxy bridge cannot bind 127.0.0.1:{port}: {e}")
         })?;
-    for client in listener.incoming().map_while(Result::ok) {
+    loop {
+        let client = accept_next("proxy bridge listener", &mut || {
+            listener.accept().map(|(stream, _)| stream)
+        });
         let socket = socket.to_path_buf();
         thread::spawn(move || {
             if let Ok(upstream) = UnixStream::connect(&socket) {
@@ -876,7 +908,6 @@ pub(crate) fn run_bridge(port: u16, socket: &Path) -> Result<(), String> {
             }
         });
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -885,6 +916,21 @@ mod tests {
 
     fn entries(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    #[test]
+    fn accept_retries_after_transient_errors() {
+        let mut attempts = [
+            Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
+            Err(io::Error::from(io::ErrorKind::Other)),
+            Ok(42_u8),
+        ]
+        .into_iter();
+
+        let accepted =
+            accept_next("test listener", &mut || attempts.next().unwrap());
+
+        assert_eq!(accepted, 42);
     }
 
     #[test]

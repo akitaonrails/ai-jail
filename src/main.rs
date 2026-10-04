@@ -520,6 +520,14 @@ fn should_auto_save_project_config(
     !cli.dry_run && !config.lockdown_enabled() && config.save_config_enabled()
 }
 
+fn internal_mode_inherits_quiet(
+    landlock_exec: bool,
+    proxy_bridge: bool,
+    inherited_quiet: bool,
+) -> bool {
+    inherited_quiet && (landlock_exec || proxy_bridge)
+}
+
 fn run() -> Result<i32, String> {
     let cli = cli::parse()?;
     validate_write_flags(&cli)?;
@@ -529,19 +537,23 @@ fn run() -> Result<i32, String> {
         output::set_quiet(true);
     }
 
+    let internal_quiet = internal_mode_inherits_quiet(
+        cli.landlock_exec,
+        cli.proxy_bridge.is_some(),
+        std::env::var_os("AI_JAIL_QUIET").is_some(),
+    );
+    if internal_quiet {
+        output::set_quiet(true);
+    }
+
     // Internal: apply Landlock and exec (used inside bwrap sandbox)
     if cli.landlock_exec {
-        // Inherit quiet mode from outer ai-jail via env var
-        if std::env::var("AI_JAIL_QUIET").is_ok() {
-            output::set_quiet(true);
-        }
         return run_landlock_exec(&cli);
     }
 
     // Internal: the in-sandbox filtered-egress bridge (spawned by the
     // landlock wrapper, which sets the marker env var; top-level
-    // invocation is refused). Prints nothing; quiet mode needs no
-    // handling.
+    // invocation is refused).
     if cli.proxy_bridge.is_some()
         && std::env::var_os("AI_JAIL_PROXY_BRIDGE").is_none()
     {
@@ -1120,15 +1132,23 @@ mod tests {
     use super::{
         apply_browser_profile, command_is_browser, command_needs_direct_tty,
         default_registry_egress_applies, default_resize_redraw_key,
-        exec_requires_terminal_passthrough, prune_missing_path_entries,
-        pty_proxy_active, resolve_browser_profile, running_inside_multiplexer,
-        should_auto_save_project_config, should_check_update,
-        should_save_global_preferences, validate_network_flags,
-        validate_write_flags,
+        exec_requires_terminal_passthrough, internal_mode_inherits_quiet,
+        prune_missing_path_entries, pty_proxy_active, resolve_browser_profile,
+        running_inside_multiplexer, should_auto_save_project_config,
+        should_check_update, should_save_global_preferences,
+        validate_network_flags, validate_write_flags,
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
     use crate::test_utils::{ENV_LOCK, EnvVarGuard};
+
+    #[test]
+    fn internal_modes_inherit_quiet_output() {
+        assert!(internal_mode_inherits_quiet(true, false, true));
+        assert!(internal_mode_inherits_quiet(false, true, true));
+        assert!(!internal_mode_inherits_quiet(false, false, true));
+        assert!(!internal_mode_inherits_quiet(true, true, false));
+    }
 
     #[test]
     fn default_registry_egress_only_when_posture_unset() {
