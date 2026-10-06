@@ -2058,6 +2058,12 @@ fn command_state_paths(config: &Config) -> &'static [&'static str] {
         Some("aider") => &[".aider"],
         Some("soulforge") => &[".soulforge"],
         Some("omp") => &[".omp"],
+        // prime-agent keeps auth, sessions, and the Continual
+        // Harness state under ~/.prime/agent (CONFIG_DIR_NAME in
+        // packages/coding-agent/src/config.ts). Deliberately not the
+        // whole ~/.prime: sibling config.json holds the prime CLI's
+        // compute/sandbox API key.
+        Some("prime-agent") => &[".prime/agent"],
         _ => &[],
     }
 }
@@ -2487,21 +2493,61 @@ fn discover_command_binary(
     // dangling symlink until its versions dir is mounted (#138).
     let all = paths.clone();
     paths.retain(|p| !all.iter().any(|a| a != p && p.starts_with(a)));
-    paths
-        .into_iter()
-        .map(|path| {
+    // Process each path in the symlink chain. Paths collected by
+    // command_paths_under_impl come in order: symlink hops within root,
+    // then the terminal directory's parent. Symlinks must preserve their
+    // target text so bun's app-root heuristic (dirname of invoked exe)
+    // can find package.json in adjacent directories.
+    let mut mounts = Vec::new();
+    for path in paths {
+        // Check if this path is a symlink on the host.
+        let is_symlink = path
+            .symlink_metadata()
+            .map(|m| m.is_symlink())
+            .unwrap_or(false);
+        if is_symlink {
+            // Read the symlink target text verbatim. The target may be
+            // relative (e.g., "../share/prime-agent/bin/prime-agent")
+            // or absolute (/home/user/.local/share/prime-agent/bin/prime-agent).
+            // Both work inside the sandbox because the HOME tmpfs is mounted at
+            // the same destination.
+            match std::fs::read_link(&path) {
+                Ok(target) => {
+                    if verbose {
+                        output::verbose(&format!(
+                            "Command binary: {} -> {} (symlink)",
+                            path.display(),
+                            target.display()
+                        ));
+                    }
+                    mounts.push(Mount::Symlink {
+                        src: target.to_string_lossy().into_owned(),
+                        dest: path,
+                    });
+                }
+                Err(e) => {
+                    output::warn(&format!(
+                        "Command binary: cannot read symlink {}: {e}; \
+                         skipping.",
+                        path.display()
+                    ));
+                }
+            }
+        } else {
+            // Terminal directory: emit as read-only bind mount.
             if verbose {
                 output::verbose(&format!(
                     "Command binary: {} ro",
                     path.display()
                 ));
             }
-            Mount::RoBind {
+            mounts.push(Mount::RoBind {
                 src: path.clone(),
                 dest: path,
-            }
-        })
-        .collect()
+            });
+        }
+    }
+    mounts
 }
 
 fn command_mount_path(path: &Path) -> PathBuf {
@@ -4868,6 +4914,13 @@ mod tests {
             .any(|w| w[0] == "--ro-bind" && w[1] == p && w[2] == p)
     }
 
+    fn has_symlink(args: &[String], src: &Path, dest: &Path) -> bool {
+        let src = src.display().to_string();
+        let dest = dest.display().to_string();
+        args.windows(3)
+            .any(|w| w[0] == "--symlink" && w[1] == src && w[2] == dest)
+    }
+
     fn prepend_path(dir: &Path) -> std::ffi::OsString {
         std::env::var_os("PATH").map_or_else(
             || dir.as_os_str().to_os_string(),
@@ -4906,7 +4959,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(has_ro_bind(&args, &home.join(".local/bin/agent")));
+        assert!(has_symlink(
+            &args,
+            &home.join(".local/share/agent/versions/1.0"),
+            &home.join(".local/bin/agent")
+        ));
         assert!(has_ro_bind(
             &args,
             &home.join(".local/share/agent/versions")
@@ -4964,6 +5021,78 @@ mod tests {
         assert!(has_ro_bind(&args, &bin));
         assert!(has_ro_bind(&args, &versions));
         assert!(!has_ro_bind(&args, &bin.join("claude")));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn private_home_preserves_command_symlink_chain() {
+        // Regression (prime-agent): --ro-bind flattened the symlink hops,
+        // so bun's app-root heuristic (dirname of the invoked exe) resolved
+        // next to the launcher and crashed with ENOENT package.json.
+        // The chain launcher -> mid -> release must keep its symlinks, with
+        // only the terminal release dir as a read-only bind.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-bwrap-cmd-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let release = home.join(".local/share/prime-agent/releases/0.9.8");
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(home.join(".local/share/prime-agent/bin"))
+            .unwrap();
+        std::fs::create_dir_all(&release).unwrap();
+        std::fs::write(release.join("prime-agent"), "#!/bin/sh\n").unwrap();
+        std::fs::write(release.join("package.json"), "{}\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            release.join("prime-agent"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "../share/prime-agent/bin/prime-agent",
+            home.join(".local/bin/prime-agent"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "../releases/0.9.8/prime-agent",
+            home.join(".local/share/prime-agent/bin/prime-agent"),
+        )
+        .unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path =
+            EnvVarGuard::set("PATH", prepend_path(&home.join(".local/bin")));
+
+        let config = Config {
+            command: vec!["prime-agent".into()],
+            private_home: Some(true),
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &home.join("project"),
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        // Both hops keep their relative target text verbatim.
+        assert!(has_symlink(
+            &args,
+            Path::new("../share/prime-agent/bin/prime-agent"),
+            &home.join(".local/bin/prime-agent")
+        ));
+        assert!(has_symlink(
+            &args,
+            Path::new("../releases/0.9.8/prime-agent"),
+            &home.join(".local/share/prime-agent/bin/prime-agent")
+        ));
+        // Only the terminal release dir is a read-only bind.
+        assert!(has_ro_bind(&args, &release));
 
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -6317,6 +6446,9 @@ mod tests {
             ("aider", &[".aider"]),
             ("soulforge", &[".soulforge"]),
             ("omp", &[".omp"]),
+            // Only .prime/agent, never the whole ~/.prime: sibling
+            // config.json holds the prime CLI's API key.
+            ("prime-agent", &[".prime/agent"]),
         ];
         for (command, expected) in cases {
             let mut config = minimal_test_config();

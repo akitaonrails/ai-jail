@@ -151,6 +151,13 @@ only when deliberately granting broad host-home access; `--map` and
 | `--gcloud` / `--no-gcloud`                             | Enables/disables read-only `~/.config/gcloud`. Off by default; anything in the sandbox can then act as you on GCP.                                                                                                                                                                                                                                                      |
 | `--docker-config` / `--no-docker-config`               | Enables/disables read-only `~/.docker/config.json`. Off by default; anything in the sandbox can then push/pull as you against your registries.                                                                                                                                                                                                                          |
 
+When the invoked command itself lives under `$HOME`, its path is exempted
+from the private home, and symlink chains along it are preserved as symlinks
+inside the sandbox (regression: prime-agent/bun crashed with ENOENT
+`package.json` when the exemption flattened the launcher symlink), so
+symlink-following launchers keep resolving their app root. Only the terminal
+real path is bind-mounted read-only.
+
 ### Turning it down
 
 The default posture is developer-friendly: your tools and the invoked
