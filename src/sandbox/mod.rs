@@ -526,7 +526,6 @@ fn credential_ro_paths_from(
 ) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for (enabled, path) in [
-        (config.github_enabled(), home.join(".config").join("gh")),
         (config.aws_enabled(), home.join(".aws")),
         (config.kube_enabled(), home.join(".kube")),
         (config.gcloud_enabled(), home.join(".config").join("gcloud")),
@@ -1607,13 +1606,22 @@ mod tests {
         assert_eq!(
             paths,
             vec![
-                home.join(".config").join("gh"),
                 home.join(".aws"),
                 home.join(".kube"),
                 home.join(".config").join("gcloud"),
                 home.join(".docker").join("config.json"),
             ]
         );
+    }
+
+    #[test]
+    fn generic_credential_mounts_do_not_add_a_second_github_config_path() {
+        let home = PathBuf::from("/home/u");
+        let config = Config {
+            github: Some(true),
+            ..Config::default()
+        };
+        assert!(credential_ro_paths_from(&config, &home, |_| true).is_empty());
     }
 
     #[test]

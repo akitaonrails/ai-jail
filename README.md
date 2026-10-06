@@ -145,7 +145,7 @@ only when deliberately granting broad host-home access; `--map` and
 | `--worktree` / `--no-worktree`                         | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only.                                                                                                                                                                          |
 | `--private-home` / `--no-private-home`                 | Enables/disables the default private home. Disabling it is broad host-home access.                                                                                                                                                                                                                                                                                      |
 | `--toolchains` / `--no-toolchains`                     | On by default (Linux only; issue #148). Persists dependency caches (cargo/npm/go/maven/...) in a jail-owned store and maps Rust's toolchain binaries read-only; when the network posture is otherwise unset, also default-allows filtered egress to package registries. `--no-toolchains` disables both; disabled under `--lockdown`; no effect on macOS.               |
-| `--github` / `--no-github`                             | Enables/disables read-only `~/.config/gh` (GitHub CLI credentials). Off by default; anything in the sandbox can then act as you on GitHub.                                                                                                                                                                                                                              |
+| `--github` / `--no-github`                             | Shares gh configuration read-only and the active github.com token from the host. Off by default; sandboxed programs can act with that token.                                                                                                                                                                                                                              |
 | `--aws` / `--no-aws`                                   | Enables/disables read-only `~/.aws`. Off by default; anything in the sandbox can then act as you on AWS.                                                                                                                                                                                                                                                                |
 | `--kube` / `--no-kube`                                 | Enables/disables read-only `~/.kube`. Off by default; anything in the sandbox can then act as you against your clusters.                                                                                                                                                                                                                                                |
 | `--gcloud` / `--no-gcloud`                             | Enables/disables read-only `~/.config/gcloud`. Off by default; anything in the sandbox can then act as you on GCP.                                                                                                                                                                                                                                                      |
@@ -255,12 +255,27 @@ disable it, never enable it, and `--lockdown` disables it outright.
 
 ### Tool credentials
 
-Five flags mount one external tool's host credentials **read-only** into the
-sandbox, each off by default: `--github` (`~/.config/gh`), `--aws`
+Five flags share one external tool's host credentials with the sandbox, each
+off by default: `--github` (GitHub CLI configuration and active token), `--aws`
 (`~/.aws`), `--kube` (`~/.kube`), `--gcloud` (`~/.config/gcloud`), and
 `--docker-config` (`~/.docker/config.json`). Each is monotonic — the
 untrusted project `.ai-jail` may only disable one, never enable it — and all
 five are disabled under `--lockdown`.
+
+`--github` mounts the effective GitHub CLI configuration directory read-only:
+`GH_CONFIG_DIR` if set, otherwise `$XDG_CONFIG_HOME/gh` if set, otherwise
+`~/.config/gh`. It also forwards the active `github.com` account's token from
+the host `gh` command, including tokens kept in the system keyring. Existing
+`GH_TOKEN` and `GITHUB_TOKEN` values follow the CLI's precedence, and an
+explicit `--env` or `--env-from-file` token skips the host lookup. Under
+`--inherit-env` an inherited `GH_TOKEN` still outranks an explicit
+`GITHUB_TOKEN`; pass `--env GH_TOKEN=...` to replace it. The token is
+available to programs inside the sandbox as `GH_TOKEN`. Only `github.com` and
+its active account are resolved automatically; Enterprise hosts and other
+accounts need explicit configuration. If the host token cannot be retrieved,
+ai-jail warns and continues with the read-only configuration mount, which may
+still contain usable credentials. Dry-run does not retrieve a token. Network
+access is controlled separately by the network flags.
 
 Read-only protects the file from modification, not the credential from use:
 anything running inside the sandbox can authenticate to that service as you
@@ -282,15 +297,14 @@ ai-jail --env CI --env API_BASE=https://internal.example claude
 - `--inherit-env` passes the entire parent environment instead. This exports
   every secret currently in your shell into the sandbox; avoid it.
 
-Both `--env` and `--env-from-file` place the value on the sandbox launcher's
-argv (`bwrap --setenv NAME VALUE`), so another process of the **same user** can
-read it via `/proc/<pid>/cmdline` while the jail runs (issue #147). On a
-single-user desktop this is usually fine; in a shared or multi-process
-environment (a container running other tasks) it is a real exposure. For a
-genuine secret bound to one host, prefer `--secret KEY=host` (filtered egress):
-the real value never reaches the sandbox argv or env — the child sees a
-placeholder and the egress proxy substitutes it. (A descriptor-based fix to keep
-all `--env`/`--env-from-file` values off argv is tracked as a follow-up.)
+On Linux, ai-jail passes bwrap options, including environment values, through
+an anonymous file descriptor; on macOS it sets the child environment directly.
+These values do not appear on the sandbox launcher's argv. A literal
+`--env NAME=VALUE` is still visible on **ai-jail's own** command line before
+launch. Use `--env NAME` or `--env-from-file` to avoid putting a literal secret
+there. Programs inside the sandbox can read forwarded environment values. For
+a secret bound to one HTTP host, `--secret KEY=host` (filtered egress) keeps the
+real value outside the sandbox and substitutes it through the egress proxy.
 
 The same thing is available from trusted config as `env_pass`, so you do not
 have to repeat `--env` on every launch:
