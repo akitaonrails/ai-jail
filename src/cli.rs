@@ -46,9 +46,9 @@ OPTIONS:
     --audio / --no-audio           Enable/disable host audio passthrough
                                    (PulseAudio/PipeWire sockets + /dev/snd;
                                    Linux only; default: off)
-    --github / --no-github         Enable/disable read-only ~/.config/gh mount
-                                   (read-only; opt-in; the agent can use these
-                                   credentials; default: off)
+    --github / --no-github         Share gh config read-only and the active
+                                   github.com token from host gh (including
+                                   keyring storage); default: off
     --aws / --no-aws               Enable/disable read-only ~/.aws mount
                                    (read-only; opt-in; the agent can use these
                                    credentials; default: off)
@@ -80,11 +80,11 @@ OPTIONS:
     --env <NAME[=VALUE]>            Pass environment variable NAME (value copied from
                                     the host) or NAME=VALUE into the sandbox
                                     (repeatable; not persisted to .ai-jail).
-                                    NOTE: the value is placed on the sandbox
-                                    launcher's argv, so another process of the
-                                    same user can read it via /proc/<pid>/cmdline
-                                    (#147). For a real secret prefer --secret
-                                    (value kept off argv), not --env.
+                                    A literal NAME=VALUE is visible on ai-jail's
+                                    own argv before launch. Use --env NAME or
+                                    --env-from-file to avoid that exposure;
+                                    --secret keeps a bound HTTP value outside
+                                    the sandbox entirely.
     --env-from-file <PATH>          Read KEY=VALUE lines from PATH (repeatable; file
                                     must be user-owned, mode 0600, outside the project;
                                     applies like --env, which wins on conflicts)

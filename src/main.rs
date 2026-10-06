@@ -7,6 +7,7 @@ mod cli;
 mod command;
 mod config;
 mod fsutil;
+mod github_auth;
 mod output;
 mod proxy;
 mod pty;
@@ -744,7 +745,7 @@ fn run() -> Result<i32, String> {
         }
     }
 
-    // Opt-in, read-only credential passthrough (github/aws/kube/gcloud/
+    // Opt-in, read-only credential passthrough (aws/kube/gcloud/
     // docker_config): off by default, disabled under --lockdown. Injected
     // here, after the status/--init/bootstrap early returns and the save
     // paths, so these derived, host-specific paths are never written into
@@ -795,6 +796,22 @@ fn run() -> Result<i32, String> {
         let mut env_pass = file_entries;
         env_pass.extend(config.env_pass.iter().cloned());
         config.env_pass = env_pass;
+    }
+
+    // The GitHub config directory may live under GH_CONFIG_DIR or
+    // XDG_CONFIG_HOME, and its active token may live in the host keyring.
+    // Resolve both after --env-from-file is applied, but never fetch a token
+    // for dry-run. These derived values are used for this launch only.
+    let github =
+        github_auth::prepare(&mut config, &invocation_cwd, cli.dry_run);
+    if let Some(path) = github.config_dir.filter(|path| path.is_dir()) {
+        let spec = path.to_string_lossy().into_owned();
+        if !toolchain_dest_already_mapped(&config, &spec) {
+            config.ro_maps.push(path);
+        }
+    }
+    if let Some(warning) = github.warning {
+        output::warn(warning);
     }
 
     // Phantom credentials (issue #135): each bound key's env_pass entry
