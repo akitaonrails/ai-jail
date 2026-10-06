@@ -155,6 +155,17 @@ fn filtered_run_locked(
     lockdown: bool,
 ) -> Output {
     let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
+    filtered_run_holding_lock(allow_hosts, extra_env, script, lockdown)
+}
+
+/// The body of [`filtered_run_locked`], for a caller that already holds
+/// `SANDBOX_RUN_LOCK` and must keep holding it after the sandbox exits.
+fn filtered_run_holding_lock(
+    allow_hosts: &[&str],
+    extra_env: &[(&str, &str)],
+    script: &str,
+    lockdown: bool,
+) -> Output {
     let mut command = Command::new(ai_jail());
     command.args(["--clean", "--no-status-bar", "--exec"]);
     if lockdown {
@@ -366,7 +377,11 @@ fn filtered_egress_lockdown_still_tunnels() {
 #[test]
 fn filtered_egress_bridge_does_not_outlive_sandbox() {
     require_bwrap_net!();
-    let output = filtered_run(&["127.0.0.1"], &[], "true");
+    // Hold the run lock through the /proc scan below, not just the run:
+    // released early, another test's sandbox (and its bridge) can start
+    // inside the scan window and be counted as this one's survivor.
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
+    let output = filtered_run_holding_lock(&["127.0.0.1"], &[], "true", false);
     assert!(output.status.success());
 
     // The bridge is a process inside the sandbox's private pid
@@ -392,4 +407,35 @@ fn filtered_egress_bridge_does_not_outlive_sandbox() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn filtered_egress_bridge_survives_descriptor_exhaustion() {
+    require_bwrap_net!();
+    require_lockdown_tools!("bash", "python3");
+    // Under --lockdown NOFILE is 4096: flood the in-sandbox bridge until
+    // accepts start failing, release everything, and connect again. A
+    // failed accept used to end the bridge's accept loop for good, so
+    // every later connection was refused for the rest of the launch.
+    let script = "python3 -c '
+import socket, time
+held = []
+try:
+    while len(held) < 20000:
+        held.append(socket.create_connection((\"127.0.0.1\", 15919), timeout=2))
+except OSError:
+    pass
+for s in held:
+    s.close()
+time.sleep(1)
+socket.create_connection((\"127.0.0.1\", 15919), timeout=5).close()
+print(\"ALIVE after\", len(held))
+'";
+    let output = filtered_run_locked(&["example.invalid"], &[], script, true);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("ALIVE"),
+        "bridge did not survive: stdout={stdout:?} stderr={stderr:?}"
+    );
 }
