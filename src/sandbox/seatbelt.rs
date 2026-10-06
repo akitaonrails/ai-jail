@@ -930,10 +930,18 @@ fn agent_state_paths(config: &Config) -> Vec<PathBuf> {
         Some("aider") => push(".aider"),
         Some("soulforge") => push(".soulforge"),
         Some("omp") => push(".omp"),
+        // Mirrors the bwrap-side list: only ~/.prime/agent, never the
+        // whole ~/.prime (the prime compute CLI's API key lives in
+        // the sibling config.json).
+        Some("prime-agent") => push(".prime/agent"),
         _ => {}
     }
     paths
 }
+
+// macOS needs no symlink-preservation equivalent of the bwrap command
+// exemption: seatbelt profiles operate on the host filesystem (no bind
+// flattening), so command symlink chains resolve naturally.
 
 fn macos_writable_paths(
     project_dir: &Path,
@@ -2546,6 +2554,7 @@ mod tests {
             ".aider",
             ".soulforge",
             ".omp",
+            ".prime/agent",
         ] {
             std::fs::create_dir_all(home.join(dir)).unwrap();
         }
@@ -2616,6 +2625,9 @@ mod tests {
             (vec!["aider"], vec![".aider"]),
             (vec!["soulforge"], vec![".soulforge"]),
             (vec!["omp"], vec![".omp"]),
+            // Only .prime/agent, never the whole ~/.prime: sibling
+            // config.json holds the prime CLI's API key.
+            (vec!["prime-agent"], vec![".prime/agent"]),
         ] {
             let config = Config {
                 command: command

@@ -84,6 +84,13 @@ running in the sandbox, so it stays opt-in. Use `--no-private-home` only when
 deliberately granting broad host-home access; `--map` and `--rw-map` remain
 explicit, narrow alternatives.
 
+When the invoked command itself lives under `$HOME`, its path is exempted
+from the private home, and symlink chains along it are preserved as symlinks
+inside the sandbox (regression: prime-agent/bun crashed with ENOENT
+`package.json` when the exemption flattened the launcher symlink), so
+symlink-following launchers keep resolving their app root. Only the terminal
+real path is bind-mounted read-only.
+
 The following capabilities default **off**: network, GPU, display, linked Git
 worktree metadata, X11, host shared memory, terminal passthrough, update
 check, and macOS host IPC. Docker, SSH, Pictures, Tailscale, and the systemd

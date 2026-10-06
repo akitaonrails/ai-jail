@@ -592,6 +592,11 @@ fn command_paths_under_impl(
                         None => break,
                     }
                 };
+                // A relative target may traverse with `..`; keep each
+                // hop lexically normalized so collected paths (mount
+                // destinations, containment checks, seatbelt rules)
+                // never carry `..` components.
+                cur = crate::config::normalize_path(&cur);
             }
             Err(_) => {
                 // Terminal: a regular file (or a broken link target —
