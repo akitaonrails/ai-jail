@@ -335,6 +335,7 @@ fn generate_sbpl_profile_for_tty(
         sandbox_tty,
     );
     push_network_section(&mut profile, config, proxy_port);
+    push_codex_control_socket_section(&mut profile, config);
     let is_claude =
         crate::command::effective_name(&config.command) == Some("claude");
     push_file_read_section(
@@ -613,6 +614,33 @@ fn push_network_section(
         }
         _ => {}
     }
+}
+
+/// Codex 0.16x moved the interactive client onto a persistent app-server
+/// daemon. Its control plane is a Unix socket, so Seatbelt classifies the
+/// connection as `network-outbound` even though no network access is wanted.
+/// Allow only Codex's own control socket when its trusted agent state is
+/// mounted; do not widen the sandbox to arbitrary Unix sockets or TCP.
+fn push_codex_control_socket_section(profile: &mut String, config: &Config) {
+    if config.lockdown_enabled()
+        || !config.agent_state_enabled()
+        || crate::command::effective_name(&config.command) != Some("codex")
+    {
+        return;
+    }
+
+    let socket = super::home_dir()
+        .join(".codex/app-server-control/app-server-control.sock");
+    // The daemon exposes this as a symlink into its per-user runtime
+    // directory. Seatbelt evaluates the resolved Unix-socket endpoint, so
+    // matching only the symlink path still produces EPERM on connect().
+    let socket = canonicalize_or_keep(&socket);
+    let escaped = sbpl_escape(socket.to_string_lossy().as_ref());
+    profile.push_str("; Codex app-server daemon control socket\n");
+    profile.push_str("(allow system-socket (socket-domain AF_UNIX))\n");
+    profile.push_str(&format!(
+        "(allow network-outbound (remote unix-socket (path-literal \"{escaped}\")))\n\n"
+    ));
 }
 
 fn push_file_read_section(
@@ -1440,6 +1468,48 @@ mod tests {
         assert!(profile.contains("(allow ipc-posix-shm-write-create)"));
         assert!(profile.contains("(allow ipc-posix-sem)"));
         assert!(!profile.contains("mach-register"));
+    }
+
+    #[test]
+    fn codex_agent_state_allows_only_its_control_unix_socket() {
+        let fixture = agent_state_fixture_home("codex-daemon-socket");
+        let project = PathBuf::from("/tmp/test-project");
+        let config = Config {
+            command: vec!["codex".into()],
+            no_mise: Some(true),
+            agent_state: Some(true),
+            ..Config::default()
+        };
+        let socket = fixture
+            .home
+            .join(".codex/app-server-control/app-server-control.sock");
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        // Keep the resolved target short enough for Darwin's SUN_LEN limit;
+        // the real daemon likewise uses a short hash under /private/tmp.
+        let daemon_socket = std::env::temp_dir().join(format!(
+            "aj-codex-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&daemon_socket);
+        let _listener = std::os::unix::net::UnixListener::bind(&daemon_socket)
+            .unwrap();
+        std::os::unix::fs::symlink(&daemon_socket, &socket).unwrap();
+
+        let profile = generate_sbpl_profile(&config, &project);
+        let escaped = sbpl_escape(
+            canonicalize_or_keep(&socket).to_string_lossy().as_ref(),
+        );
+        assert!(profile.contains(&format!(
+            "(allow network-outbound (remote unix-socket \
+             (path-literal \"{escaped}\")))"
+        )));
+        assert!(profile.contains(
+            "(allow system-socket (socket-domain AF_UNIX))"
+        ));
+        assert!(!profile.contains("(allow network-outbound)\n"));
+
+        let _ = std::fs::remove_dir_all(&fixture.home);
+        let _ = std::fs::remove_file(&daemon_socket);
     }
 
     #[test]
