@@ -95,7 +95,7 @@ host is either hidden or exposed deliberately, capability by capability.
   home.
 - **Agent/harness auth (`agent_state`)** — the invoked harness's own
   credential/state dir (for example `~/.claude`, `~/.codex`,
-  `~/.kimi`, `~/.gemini`) is mounted **read-write** so it starts
+  `~/.kimi`, `~/.gemini`, `~/.kiro`) is mounted **read-write** so it starts
   pre-authenticated instead of asking you to log in every session; its
   known API-key env var (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
   `GEMINI_API_KEY`/`GOOGLE_API_KEY`, `XAI_API_KEY`, `MOONSHOT_API_KEY`) is

@@ -961,6 +961,12 @@ fn agent_state_paths(config: &Config) -> Vec<PathBuf> {
         Some("aider") => push(".aider"),
         Some("soulforge") => push(".soulforge"),
         Some("omp") => push(".omp"),
+        // kiro-cli's login lives in its data dir, which on macOS is
+        // Application Support (bwrap mounts ~/.local/share/kiro-cli).
+        Some("kiro-cli") => {
+            push(".kiro");
+            push("Library/Application Support/kiro-cli");
+        }
         // Mirrors the bwrap-side list: only ~/.prime/agent, never the
         // whole ~/.prime (the prime compute CLI's API key lives in
         // the sibling config.json).
@@ -2646,6 +2652,8 @@ mod tests {
             ".aider",
             ".soulforge",
             ".omp",
+            ".kiro",
+            "Library/Application Support/kiro-cli",
             ".prime/agent",
         ] {
             std::fs::create_dir_all(home.join(dir)).unwrap();
@@ -2742,6 +2750,10 @@ mod tests {
             (vec!["aider"], vec![".aider"]),
             (vec!["soulforge"], vec![".soulforge"]),
             (vec!["omp"], vec![".omp"]),
+            (
+                vec!["kiro-cli"],
+                vec![".kiro", "Library/Application Support/kiro-cli"],
+            ),
             // Only .prime/agent, never the whole ~/.prime: sibling
             // config.json holds the prime CLI's API key.
             (vec!["prime-agent"], vec![".prime/agent"]),
