@@ -141,6 +141,23 @@ fn apply_child_env(
         cmd.env(key, value);
     }
 
+    // Claude Code looks up its macOS Keychain item using the login name as
+    // the item account. Keep USER filtered for other tools, but preserve it
+    // for Claude's explicit agent-state passthrough when the caller did not
+    // already choose a value through --env.
+    let claude_agent_state = !config.lockdown_enabled()
+        && config.agent_state_enabled()
+        && crate::command::effective_name(&config.command) == Some("claude");
+    if claude_agent_state
+        && !config.env_pass().iter().any(|entry| {
+            crate::config::parse_env_entry(entry)
+                .is_ok_and(|(name, _)| name == "USER")
+        })
+        && let Some((_, value)) = host_env.iter().find(|(name, _)| name == "USER")
+    {
+        cmd.env("USER", value);
+    }
+
     if config.lockdown_enabled() {
         cmd.env("PATH", super::LOCKDOWN_PATH);
     }
@@ -334,6 +351,7 @@ fn generate_sbpl_profile_for_tty(
         config.macos_host_ipc_enabled(),
         sandbox_tty,
     );
+    push_claude_keychain_section(&mut profile, config);
     push_network_section(&mut profile, config, proxy_port);
     push_codex_control_socket_section(&mut profile, config);
     let is_claude =
@@ -356,6 +374,25 @@ fn generate_sbpl_profile_for_tty(
     push_docker_section(&mut profile, docker_active(config, lockdown));
 
     profile
+}
+
+/// Let Claude use the macOS Keychain services for its OAuth credential.
+/// Claude Code keeps that credential outside `~/.claude`; exposing only the
+/// state directory leaves it looking logged out. These services are limited
+/// to normal Claude agent-state launches.
+fn push_claude_keychain_section(profile: &mut String, config: &Config) {
+    if config.lockdown_enabled()
+        || !config.agent_state_enabled()
+        || crate::command::effective_name(&config.command) != Some("claude")
+    {
+        return;
+    }
+
+    profile.push_str(
+        "; Claude Code OAuth credential lookup through macOS Keychain\n\
+         (allow mach-lookup (global-name \"com.apple.securityd.xpc\"))\n\
+         (allow mach-lookup (global-name \"com.apple.SecurityServer\"))\n",
+    );
 }
 
 /// Emit an allow/deny rule for a single host path. Uses `subpath` if
@@ -1189,6 +1226,20 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
         push_unique(canonicalize_or_keep(&path));
     }
 
+    // Claude Code's macOS OAuth credential lives in the login Keychain,
+    // outside ~/.claude. Expose only the login database read-only; the
+    // Keychain daemon performs item access and writes through its XPC API.
+    if !config.lockdown_enabled()
+        && config.agent_state_enabled()
+        && crate::command::effective_name(&config.command) == Some("claude")
+    {
+        let keychain_db =
+            super::home_dir().join("Library/Keychains/login.keychain-db");
+        if keychain_db.is_file() {
+            push_unique(canonicalize_or_keep(&keychain_db));
+        }
+    }
+
     if !private_home {
         for filename in [".gitconfig", ".gitignore"] {
             let git_file = super::home_dir().join(filename);
@@ -1451,6 +1502,75 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn claude_agent_state_can_use_macos_keychain_xpc() {
+        // Claude Code keeps macOS OAuth credentials in Keychain rather than
+        // ~/.claude. Agent-state passthrough must therefore include its
+        // specific Keychain XPC service and read-only login database.
+        let fixture = agent_state_fixture_home("claude-keychain");
+        let keychain_dir = fixture.home.join("Library/Keychains");
+        std::fs::create_dir_all(&keychain_dir).unwrap();
+        std::fs::write(keychain_dir.join("login.keychain-db"), b"fixture")
+            .unwrap();
+        let claude = Config {
+            command: vec!["claude".into()],
+            agent_state: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile(&claude, Path::new("/tmp/test-project"));
+        let keychain_db = canonicalize_or_keep(
+            &keychain_dir.join("login.keychain-db"),
+        );
+        let keychain_dir = canonicalize_or_keep(&keychain_dir);
+        assert!(
+            profile.contains(
+                "(allow mach-lookup (global-name \"com.apple.securityd.xpc\"))"
+            ),
+            "Claude agent-state must be able to access its macOS Keychain credential"
+        );
+        assert!(profile.contains(
+            "(allow mach-lookup (global-name \"com.apple.SecurityServer\"))"
+        ));
+        assert!(profile.contains(&format!(
+            "(allow file-read* (literal \"{}\"))",
+            sbpl_escape(keychain_db.to_string_lossy().as_ref())
+        )));
+        assert!(!profile.contains(&format!(
+            "(allow file-read* (subpath \"{}\"))",
+            sbpl_escape(keychain_dir.to_string_lossy().as_ref())
+        )));
+
+        let no_agent_state = Config {
+            agent_state: Some(false),
+            ..claude.clone()
+        };
+        let no_agent_state_profile =
+            generate_sbpl_profile(&no_agent_state, Path::new("/tmp/test-project"));
+        assert!(!no_agent_state_profile.contains("com.apple.securityd.xpc"));
+        assert!(!no_agent_state_profile.contains("com.apple.SecurityServer"));
+        assert!(!no_agent_state_profile.contains("login.keychain-db"));
+
+        let other_agent = Config {
+            command: vec!["codex".into()],
+            ..claude.clone()
+        };
+        let other_agent_profile =
+            generate_sbpl_profile(&other_agent, Path::new("/tmp/test-project"));
+        assert!(!other_agent_profile.contains("com.apple.securityd.xpc"));
+        assert!(!other_agent_profile.contains("com.apple.SecurityServer"));
+        assert!(!other_agent_profile.contains("login.keychain-db"));
+
+        let lockdown = Config {
+            lockdown: Some(true),
+            ..claude
+        };
+        let lockdown_profile =
+            generate_sbpl_profile(&lockdown, Path::new("/tmp/test-project"));
+        assert!(!lockdown_profile.contains("com.apple.securityd.xpc"));
+        assert!(!lockdown_profile.contains("com.apple.SecurityServer"));
+        assert!(!lockdown_profile.contains("login.keychain-db"));
     }
 
     #[test]
@@ -2966,6 +3086,39 @@ mod tests {
             get("PS1"),
             Some(std::ffi::OsStr::new(crate::sandbox::JAIL_PS1))
         );
+    }
+
+    #[test]
+    fn claude_agent_state_passes_user_for_keychain_lookup() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _user = EnvVarGuard::set("USER", "ai-jail-test-user");
+        let config = Config {
+            command: vec!["claude".into()],
+            agent_state: Some(true),
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let cmd =
+            build(&config, Path::new("/tmp/test-project"), false, None, None);
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(
+            env.get(&std::ffi::OsStr::new("USER")).copied().flatten(),
+            Some(std::ffi::OsStr::new("ai-jail-test-user"))
+        );
+
+        let other_agent = Config {
+            command: vec!["codex".into()],
+            ..config.clone()
+        };
+        let cmd = build(
+            &other_agent,
+            Path::new("/tmp/test-project"),
+            false,
+            None,
+            None,
+        );
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert!(env.get(&std::ffi::OsStr::new("USER")).is_none());
     }
 
     #[test]
