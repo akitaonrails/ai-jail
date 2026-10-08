@@ -326,6 +326,18 @@ fn default_registry_egress_applies(config: &config::Config) -> bool {
         && config.browser_profile.is_none()
 }
 
+/// Give Claude Code the documented API/telemetry endpoints when the user has
+/// not selected a network posture or supplied an explicit host allowlist.
+/// The sandbox still defaults to filtered egress; explicit offline/full
+/// network, browser, and lockdown choices keep their existing semantics.
+fn default_claude_egress_applies(config: &config::Config) -> bool {
+    command::effective_name(&config.command) == Some("claude")
+        && config.network.is_none()
+        && config.allow_hosts().is_empty()
+        && !config.lockdown_enabled()
+        && config.browser_profile.is_none()
+}
+
 fn toolchain_dest_already_mapped(config: &config::Config, spec: &str) -> bool {
     let dest = |p: &std::path::Path| {
         config::MapSpec::parse(p)
@@ -623,13 +635,6 @@ fn run() -> Result<i32, String> {
     for warning in security_warnings {
         output::security_warn(&warning);
     }
-    // Capability gaps for known API-client agents (issue #131): warn at
-    // launch so an upgrade that flips a default does not fail silently.
-    // `output::warn` respects --exec quiet mode like other non-security
-    // warnings; the launch itself is never blocked.
-    for warning in command::capability_gap_warnings(&config) {
-        output::warn(&warning);
-    }
     // Resolve any relative paths in rw_maps/ro_maps against the user's
     // invocation cwd before they reach bwrap/landlock/seatbelt (issue
     // #54). Done here so display_status and the --init save path see
@@ -728,6 +733,19 @@ fn run() -> Result<i32, String> {
         }
     }
 
+    // Claude Code default egress (filtered): allow only the endpoints
+    // documented by Anthropic when no explicit network posture or host list
+    // was supplied. The capability remains opt-in for other commands.
+    if default_claude_egress_applies(&config)
+        && sandbox::unprivileged_netns_available()
+    {
+        for host in command::CLAUDE_CODE_DEFAULT_EGRESS_HOSTS {
+            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
+                config.allow_hosts.push((*host).to_string());
+            }
+        }
+    }
+
     // Default-allow the package registries (filtered egress) so dependency
     // fetches work without the user passing --allow-host. Deny-by-default still
     // holds: only these hosts become reachable. An explicit --allow-host set is
@@ -743,6 +761,15 @@ fn run() -> Result<i32, String> {
                 config.allow_hosts.push((*host).to_string());
             }
         }
+    }
+
+    // Capability gaps for known API-client agents (issue #131): warn at
+    // launch after default egress policy is resolved, so Claude's automatic
+    // filtered allowlist does not produce a stale "network is off" warning.
+    // `output::warn` respects --exec quiet mode like other non-security
+    // warnings; the launch itself is never blocked.
+    for warning in command::capability_gap_warnings(&config) {
+        output::warn(&warning);
     }
 
     // Opt-in, read-only credential passthrough (aws/kube/gcloud/

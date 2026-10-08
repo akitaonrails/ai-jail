@@ -252,9 +252,21 @@ an explicit `--allow-host` set is unioned with this list. The default is
 gated on an unprivileged network-namespace probe: where netns is unavailable
 (hardened kernels, some nested containers, restricted CI) it silently stays
 offline instead of breaking the launch — an explicit `--allow-host` keeps its
-fail-closed guarantee regardless. `--no-network` always keeps the sandbox
-fully offline; `--network` gives unrestricted access instead of filtered
-egress.
+fail-closed guarantee regardless. `--no-network` without an explicit
+`--allow-host` list keeps the sandbox fully offline; combined with
+`--allow-host`, it permits only that filtered host list. `--network` gives
+unrestricted access instead of filtered egress.
+
+When Claude Code is the invoked command and no network posture or explicit
+`--allow-host` list is configured, ai-jail also enables filtered egress to
+`api.anthropic.com`, `statsig.anthropic.com`, and `sentry.io`, the endpoints
+listed in Anthropic's [Claude Code proxy documentation](https://docs.anthropic.com/en/docs/claude-code/corporate-proxy).
+This applies on macOS and Linux; on Linux it is gated on the same network
+namespace probe as registry egress. Explicit `--no-network`, `--network`,
+`--allow-host`, browser, and lockdown choices keep their existing behavior.
+On Linux, the package-registry hosts above are also added when toolchains are
+enabled; pass `--no-toolchains` to omit those registry hosts while retaining
+Claude's documented endpoints.
 
 `--no-toolchains` (or `no_toolchains = true`) disables both the cache maps
 and the registry default together. The untrusted project `.ai-jail` may only
