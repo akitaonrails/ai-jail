@@ -188,6 +188,7 @@ const KNOWN_API_AGENTS: &[&str] = &[
     "aider",
     "soulforge",
     "omp",
+    "kiro-cli",
 ];
 
 fn is_known_api_agent(name: &str) -> bool {

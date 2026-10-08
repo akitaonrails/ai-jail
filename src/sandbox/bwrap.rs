@@ -2058,6 +2058,11 @@ fn command_state_paths(config: &Config) -> &'static [&'static str] {
         Some("aider") => &[".aider"],
         Some("soulforge") => &[".soulforge"],
         Some("omp") => &[".omp"],
+        // kiro-cli keeps agents, settings and sessions in ~/.kiro and its
+        // login (data.sqlite3) in the XDG data dir. The DOTDIR_RW and
+        // LOCAL_SHARE_RW entries from #73 only apply without private home,
+        // so under the default private home it started logged out.
+        Some("kiro-cli") => &[".kiro", ".local/share/kiro-cli"],
         // prime-agent keeps auth, sessions, and the Continual
         // Harness state under ~/.prime/agent (CONFIG_DIR_NAME in
         // packages/coding-agent/src/config.ts). Deliberately not the
@@ -6288,6 +6293,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[test]
+    fn kiro_cli_state_is_mounted_under_private_home() {
+        // Regression: #73 put .kiro in DOTDIR_RW and kiro-cli in
+        // LOCAL_SHARE_RW, but both only apply without private home, so
+        // once private home became the default `ai-jail kiro-cli` started
+        // logged out (its login is ~/.local/share/kiro-cli/data.sqlite3).
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-kiro-state-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let kiro_dir = home.join(".kiro");
+        let kiro_data = home.join(".local/share/kiro-cli");
+        std::fs::create_dir_all(kiro_dir.join("sessions")).unwrap();
+        std::fs::create_dir_all(&kiro_data).unwrap();
+        let mounted = |mounts: &[Mount], path: &Path| {
+            mounts.iter().any(|m| {
+                matches!(m, Mount::Bind { src, dest } if src == path && dest == path)
+            })
+        };
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let mut kiro = minimal_test_config();
+        kiro.command = vec!["kiro-cli".into()];
+        kiro.agent_state = Some(true);
+        let mounts =
+            discover_home_dotfiles_full(&kiro, true, &[], false, false);
+        assert!(
+            mounted(&mounts, &kiro_dir),
+            "~/.kiro must be mounted read-write under private home"
+        );
+        assert!(
+            mounted(&mounts, &kiro_data),
+            "kiro-cli's login lives in ~/.local/share/kiro-cli; without it the agent starts logged out"
+        );
+
+        // With agent state off (--no-agent-state), or for another agent,
+        // both stay hidden.
+        let mut gated = minimal_test_config();
+        gated.command = vec!["kiro-cli".into()];
+        gated.agent_state = Some(false);
+        let mounts =
+            discover_home_dotfiles_full(&gated, true, &[], false, false);
+        assert!(!mounted(&mounts, &kiro_dir) && !mounted(&mounts, &kiro_data));
+
+        let mut other = minimal_test_config();
+        other.command = vec!["claude".into()];
+        other.agent_state = Some(true);
+        let mounts =
+            discover_home_dotfiles_full(&other, true, &[], false, false);
+        assert!(!mounted(&mounts, &kiro_dir) && !mounted(&mounts, &kiro_data));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     // ── Agent-state capability gating ───────────────────────────
 
     #[test]
@@ -6446,6 +6505,7 @@ mod tests {
             ("aider", &[".aider"]),
             ("soulforge", &[".soulforge"]),
             ("omp", &[".omp"]),
+            ("kiro-cli", &[".kiro", ".local/share/kiro-cli"]),
             // Only .prime/agent, never the whole ~/.prime: sibling
             // config.json holds the prime CLI's API key.
             ("prime-agent", &[".prime/agent"]),
