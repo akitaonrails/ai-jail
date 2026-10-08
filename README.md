@@ -259,8 +259,8 @@ unrestricted access instead of filtered egress.
 
 When Claude Code is the invoked command and no network posture or explicit
 `--allow-host` list is configured, ai-jail also enables filtered egress to
-`api.anthropic.com`, `statsig.anthropic.com`, and `sentry.io`, the endpoints
-listed in Anthropic's [Claude Code proxy documentation](https://docs.anthropic.com/en/docs/claude-code/corporate-proxy).
+  `api.anthropic.com` and `statsig.anthropic.com`, the Anthropic-operated
+  endpoints listed in Anthropic's [Claude Code proxy documentation](https://docs.anthropic.com/en/docs/claude-code/corporate-proxy).
 This applies on macOS and Linux; on Linux it is gated on the same network
 namespace probe as registry egress. Explicit `--no-network`, `--network`,
 `--allow-host`, browser, and lockdown choices keep their existing behavior.

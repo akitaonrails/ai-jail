@@ -192,11 +192,10 @@ const KNOWN_API_AGENTS: &[&str] = &[
 
 /// Hosts required by Claude Code's documented network configuration:
 /// https://docs.anthropic.com/en/docs/claude-code/corporate-proxy
-/// Anthropic lists API access, Statsig telemetry, and Sentry error reporting.
+/// The Anthropic-operated API and Statsig telemetry endpoints.
 pub(crate) const CLAUDE_CODE_DEFAULT_EGRESS_HOSTS: &[&str] = &[
     "api.anthropic.com",
     "statsig.anthropic.com",
-    "sentry.io",
 ];
 
 fn is_known_api_agent(name: &str) -> bool {
