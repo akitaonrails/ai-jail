@@ -2046,6 +2046,18 @@ mod tests {
     }
 
     #[test]
+    fn child_pty_receives_the_cursor_report() {
+        let (read, write) = nix::unistd::pipe().unwrap();
+        let mut io =
+            super::IoLoop::new(write.as_raw_fd(), 24, 80, None, false, false);
+        let _ = io.handle_master_read(b"\x1b[4;2H\x1b[6n");
+        drop(write);
+        let mut buf = [0u8; 32];
+        let n = nix::unistd::read(read.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"\x1b[4;2R");
+    }
+
+    #[test]
     fn host_answers_cursor_only_on_primary_passthrough() {
         assert!(super::host_answers_cursor_request(true, false, false));
         assert!(!super::host_answers_cursor_request(false, false, false));
