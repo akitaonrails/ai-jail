@@ -554,10 +554,13 @@ printf 'ghp_synthetic_token\n'
         )
         .unwrap();
 
+        // Generous timeout: this test exercises argv/env selection, not the
+        // timeout path, and a 1s budget flaked under heavy nix-build
+        // parallelism (the fake gh spawn missed the deadline -> Err).
         let result = gh_auth_token_from(
             &script,
             Path::new("/tmp/gh-config"),
-            Duration::from_secs(1),
+            Duration::from_secs(10),
         );
 
         std::fs::remove_file(&script).unwrap();
