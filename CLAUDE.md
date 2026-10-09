@@ -57,14 +57,28 @@ This is the single most important invariant of the project. Users generate `.ai-
   global config; broad home exposure requires explicit `--no-private-home`.
 - Network, GPU, display, X11, host shared memory, terminal passthrough, macOS
   host IPC, and worktree metadata are opt-in. Do not weaken these defaults.
-- Network is the one default with a built-in exception: when dev-toolchain
-  support is enabled (the default) and neither `--network` nor
-  `--no-network` is set, ai-jail default-allows filtered egress to a fixed
-  list of package-registry hosts (`TOOLCHAIN_REGISTRY_HOSTS` in
-  `sandbox/mod.rs`) so dependency fetches work out of the box. This is gated
-  on an unprivileged network-namespace probe (`unprivileged_netns_available`)
-  that falls back to fully offline when unavailable, never to unrestricted
-  access. `--no-network` always forces strict offline regardless.
+- Network is the one default with two built-in filtered-egress exceptions,
+  both of which only ever _add named hosts to a deny-by-default allowlist_,
+  never open unrestricted access:
+  - Registry egress: when dev-toolchain support is enabled (the default) and
+    neither `--network` nor `--no-network` is set, ai-jail default-allows a
+    fixed list of package-registry hosts (`TOOLCHAIN_REGISTRY_HOSTS` in
+    `sandbox/mod.rs`) so dependency fetches work out of the box. Linux-only.
+  - Agent API egress (issue #156): when the invoked command is a known API
+    agent with a canonical host in `command::api_host`
+    (`command::default_egress_host` exposes it — claude/codex/gemini/grok) and
+    the posture is otherwise unset (no `--network`/`--no-network`, empty
+    `allow_hosts`, not `--lockdown`, not a browser launch), ai-jail
+    default-allows that one host so a bare `ai-jail claude` reaches its model
+    API. Only the functional API host is added, never a telemetry host, and it
+    stays in lockstep with the capability-gap warning's `api_host` table (the
+    injection is exactly what silences that warning). Not Linux-only: macOS
+    filtered egress is a seatbelt loopback rule, so it applies there too.
+    Both are gated on an unprivileged network-namespace probe
+    (`unprivileged_netns_available`) that falls back to fully offline when
+    unavailable, never to unrestricted access. An explicit `--allow-host` list
+    is used verbatim and suppresses both automatic defaults; `--no-network`
+    always forces strict offline regardless.
 - Dev-toolchain cache persistence (`--toolchains`/`no_toolchains`, on by
   default) and the opt-in read-only credential flags (`--github`, `--aws`,
   `--kube`, `--gcloud`, `--docker-config`) are monotonic capabilities: a

@@ -326,6 +326,22 @@ fn default_registry_egress_applies(config: &config::Config) -> bool {
         && config.browser_profile.is_none()
 }
 
+/// Give a bare launch of a known API agent (one with a canonical API host in
+/// `command::default_egress_host`) filtered egress to that host when the user
+/// has selected no network posture and supplied no explicit host allowlist
+/// (issue #156). The sandbox still defaults to filtered egress — only the one
+/// documented API host becomes reachable; explicit offline/full network,
+/// browser, and lockdown choices keep their existing semantics. Unlike the
+/// package-registry default this is not Linux-only: macOS filtered egress is a
+/// seatbelt loopback rule, so the same default applies there.
+fn default_agent_api_egress_applies(config: &config::Config) -> bool {
+    command::default_egress_host(&config.command).is_some()
+        && config.network.is_none()
+        && config.allow_hosts().is_empty()
+        && !config.lockdown_enabled()
+        && config.browser_profile.is_none()
+}
+
 fn toolchain_dest_already_mapped(config: &config::Config, spec: &str) -> bool {
     let dest = |p: &std::path::Path| {
         config::MapSpec::parse(p)
@@ -623,13 +639,6 @@ fn run() -> Result<i32, String> {
     for warning in security_warnings {
         output::security_warn(&warning);
     }
-    // Capability gaps for known API-client agents (issue #131): warn at
-    // launch so an upgrade that flips a default does not fail silently.
-    // `output::warn` respects --exec quiet mode like other non-security
-    // warnings; the launch itself is never blocked.
-    for warning in command::capability_gap_warnings(&config) {
-        output::warn(&warning);
-    }
     // Resolve any relative paths in rw_maps/ro_maps against the user's
     // invocation cwd before they reach bwrap/landlock/seatbelt (issue
     // #54). Done here so display_status and the --init save path see
@@ -728,6 +737,22 @@ fn run() -> Result<i32, String> {
         }
     }
 
+    // Default-allow a known API agent's own documented API host (filtered
+    // egress) when the user selected no network posture and no explicit host
+    // list (issue #156), so a bare `ai-jail claude` / `ai-jail codex` reaches
+    // its model API out of the box without opening the whole network. Only the
+    // agent's single canonical host is added; the sandbox stays deny-by-default
+    // and an explicit --allow-host set is used verbatim instead. Gated on the
+    // same netns probe as registry egress (always available on macOS, where
+    // filtered egress is a seatbelt loopback rule).
+    if default_agent_api_egress_applies(&config)
+        && sandbox::unprivileged_netns_available()
+        && let Some(host) = command::default_egress_host(&config.command)
+        && !config.allow_hosts.iter().any(|allowed| allowed == host)
+    {
+        config.allow_hosts.push(host.to_string());
+    }
+
     // Default-allow the package registries (filtered egress) so dependency
     // fetches work without the user passing --allow-host. Deny-by-default still
     // holds: only these hosts become reachable. An explicit --allow-host set is
@@ -743,6 +768,17 @@ fn run() -> Result<i32, String> {
                 config.allow_hosts.push((*host).to_string());
             }
         }
+    }
+
+    // Capability gaps for known API-client agents (issue #131): warn at
+    // launch so an upgrade that flips a default does not fail silently. Done
+    // after the default egress policy above so an agent that just received its
+    // documented API host by default does not also draw a stale "network is
+    // off" / "API host not in allow_hosts" warning. `output::warn` respects
+    // --exec quiet mode like other non-security warnings; the launch itself is
+    // never blocked.
+    for warning in command::capability_gap_warnings(&config) {
+        output::warn(&warning);
     }
 
     // Opt-in, read-only credential passthrough (aws/kube/gcloud/
@@ -1148,12 +1184,13 @@ fn main() {
 mod tests {
     use super::{
         apply_browser_profile, command_is_browser, command_needs_direct_tty,
-        default_registry_egress_applies, default_resize_redraw_key,
-        exec_requires_terminal_passthrough, internal_mode_inherits_quiet,
-        prune_missing_path_entries, pty_proxy_active, resolve_browser_profile,
-        running_inside_multiplexer, should_auto_save_project_config,
-        should_check_update, should_save_global_preferences,
-        validate_network_flags, validate_write_flags,
+        default_agent_api_egress_applies, default_registry_egress_applies,
+        default_resize_redraw_key, exec_requires_terminal_passthrough,
+        internal_mode_inherits_quiet, prune_missing_path_entries,
+        pty_proxy_active, resolve_browser_profile, running_inside_multiplexer,
+        should_auto_save_project_config, should_check_update,
+        should_save_global_preferences, validate_network_flags,
+        validate_write_flags,
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
@@ -1200,6 +1237,65 @@ mod tests {
             browser_profile: Some("hard".into()),
             ..Config::default()
         }));
+    }
+
+    #[test]
+    fn default_agent_api_egress_follows_the_api_host_table() {
+        // A bare launch of a known API agent with a canonical host applies,
+        // on both platforms (macOS filtered egress is a seatbelt loopback).
+        for agent in ["claude", "codex", "gemini", "grok"] {
+            assert!(
+                default_agent_api_egress_applies(&Config {
+                    command: vec![agent.into()],
+                    ..Config::default()
+                }),
+                "{agent} should receive its default API host"
+            );
+        }
+        // An agent with no canonical API host (opencode) gets nothing.
+        assert!(!default_agent_api_egress_applies(&Config {
+            command: vec!["opencode".into()],
+            ..Config::default()
+        }));
+        // A non-agent command gets nothing.
+        assert!(!default_agent_api_egress_applies(&Config {
+            command: vec!["bash".into()],
+            ..Config::default()
+        }));
+    }
+
+    #[test]
+    fn default_agent_api_egress_only_when_posture_unset() {
+        let claude = |f: fn(&mut Config)| {
+            let mut c = Config {
+                command: vec!["claude".into()],
+                ..Config::default()
+            };
+            f(&mut c);
+            c
+        };
+        // Baseline bare claude applies.
+        assert!(default_agent_api_egress_applies(&claude(|_| {})));
+        // --no-network keeps the sandbox fully offline.
+        assert!(!default_agent_api_egress_applies(&claude(|c| {
+            c.network = Some(false);
+        })));
+        // --network is unrestricted; no filtered-egress injection.
+        assert!(!default_agent_api_egress_applies(&claude(|c| {
+            c.network = Some(true);
+        })));
+        // An explicit host list is used verbatim, not extended by default.
+        assert!(!default_agent_api_egress_applies(&claude(|c| {
+            c.allow_hosts = vec!["example.com".into()];
+        })));
+        // Lockdown stays offline.
+        assert!(!default_agent_api_egress_applies(&claude(|c| {
+            c.lockdown = Some(true);
+        })));
+        // Browser launches need real DNS, not filtered egress.
+        assert!(!default_agent_api_egress_applies(&claude(|c| {
+            c.browser_profile = Some("hard".into());
+        })));
     }
 
     #[test]
