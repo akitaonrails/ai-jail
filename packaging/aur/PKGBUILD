@@ -1,7 +1,7 @@
 # Maintainer: AkitaOnRails <boss@akitaonrails.com>
 
 pkgname=ai-jail
-pkgver=2.7.0
+pkgver=2.8.0
 pkgrel=1
 pkgdesc="Sandbox wrapper for AI coding agents"
 arch=('x86_64' 'aarch64')
@@ -19,7 +19,7 @@ optdepends=(
 options=('!debug' '!lto')
 conflicts=('ai-jail-bin')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('a5115330c8f52ad0fc6ba01fe5cd244a51d0543bed629a70899b540618c1af42')
+sha256sums=('94e9f504681f6bc473dd019c142ac80e5ed992027085b286087e431733a19887')
 
 prepare() {
     cd "$pkgname-$pkgver"
