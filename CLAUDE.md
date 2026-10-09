@@ -66,7 +66,7 @@ This is the single most important invariant of the project. Users generate `.ai-
     `sandbox/mod.rs`) so dependency fetches work out of the box. Linux-only.
   - Agent API egress (issue #156): when the invoked command is a known API
     agent with a canonical host in `command::api_host`
-    (`command::default_egress_host` exposes it — claude/codex/gemini/grok) and
+    (`command::default_egress_host` exposes it — claude/codex/gemini/grok/devin) and
     the posture is unset (no `--network`/`--no-network`, not `--lockdown`, not
     a browser launch), ai-jail default-allows that one host so `ai-jail claude`
     reaches its model API. Only the functional API host is added, never a
@@ -128,7 +128,7 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 7. Display mounts (validated Wayland socket and optional X11; never the whole runtime directory)
 8. Audio mounts (`--audio`: validated PipeWire/PulseAudio sockets in the runtime dir, plus `/dev/snd`)
 9. systemd user bus mounts (`--systemd-user`, narrow explicit runtime sockets)
-10. Home directory (tmpfs `$HOME` first, then command-specific state/dotfiles)
+10. Home directory (tmpfs `$HOME` first, then command-specific state/dotfiles; Devin's existing XDG data/config roots are writable, followed by a self-bind of `cli` to prevent rename and a read-only bind of `cli/_versions`; a present but invalid/incomplete CLI tree falls back to a read-only data root, while an absent `cli` keeps externally installed Devin state writable)
 11. Config hide (tmpfs over sensitive `~/.config/*` subdirs)
 12. Cache hide (tmpfs over sensitive `~/.cache/*` subdirs)
 13. Local overrides (`~/.local/state`, `~/.local/share/*` rw subdirs)
@@ -140,7 +140,7 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 19. Extra user mounts (`--map`, `--rw-map`)
 20. Overlay maps (`--overlay-map` — copy-on-write `--overlay-src`/`--overlay`)
 21. Project directory (pwd, rw or ro depending on mode)
-22. In-project user mounts (after the project bind)
+22. In-project agent-state mounts, then in-project user mounts (after the project bind; masks and deny overlays still follow both)
 23. In-project overlay maps (after the project bind)
 24. Mask overlays (`--mask` and hidden project `.ai-jail`)
 25. Deny overlays (`--deny-path`, mode-000 file/dir placeholders)

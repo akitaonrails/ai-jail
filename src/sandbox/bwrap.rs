@@ -172,6 +172,10 @@ struct MountSet {
     base: Vec<Mount>,
     sys_masks: Vec<Mount>,
     home_dotfiles: Vec<Mount>,
+    devin_env: Vec<(String, String)>,
+    /// Devin state roots are read-write; the installation below its data
+    /// root is remounted read-only afterward.
+    devin_state: Vec<Mount>,
     config_hide: Vec<Mount>,
     cache_hide: Vec<Mount>,
     local_overrides: Vec<Mount>,
@@ -206,6 +210,7 @@ struct MountSet {
     /// project directory. Applied after the project bind — bwrap gives
     /// the later mount precedence, so emitting these earlier would let
     /// the read-write project bind silently shadow them (#83).
+    devin_state_inside: Vec<Mount>,
     extra_inside: Vec<Mount>,
     /// `--overlay-map` mounts inside the project directory; same
     /// shadowing rule as `extra_inside` (#83). Without this, writes
@@ -220,7 +225,14 @@ struct MountSet {
 }
 
 impl MountSet {
-    fn ordered_mounts(&self) -> [&[Mount]; 27] {
+    fn landlock_map_mounts(&self) -> impl Iterator<Item = &Mount> {
+        self.devin_state
+            .iter()
+            .chain(self.devin_state_inside.iter())
+            .chain(self.extra.iter())
+            .chain(self.extra_inside.iter())
+    }
+    fn ordered_mounts(&self) -> [&[Mount]; 29] {
         [
             &self.base,
             &self.sys_masks,
@@ -233,6 +245,7 @@ impl MountSet {
             &self.audio,
             &self.systemd_user,
             &self.home_dotfiles,
+            &self.devin_state,
             &self.config_hide,
             &self.cache_hide,
             &self.local_overrides,
@@ -244,6 +257,7 @@ impl MountSet {
             &self.extra,
             &self.overlay,
             &self.project,
+            &self.devin_state_inside,
             &self.extra_inside,
             &self.overlay_inside,
             &self.mask,
@@ -374,6 +388,11 @@ impl MountSet {
             args.push("--setenv".into());
             args.push(key.clone());
             args.push(val.clone());
+        }
+        if !lockdown {
+            for (key, val) in &self.devin_env {
+                args.extend(["--setenv".into(), key.clone(), val.clone()]);
+            }
         }
 
         // Filtered egress proxy env (always, even in lockdown). Must
@@ -1291,9 +1310,7 @@ pub fn build(
     let sources = MountSources::from_guard(guard);
     let mount_set =
         discover_mounts_full(config, project_dir, &sources, verbose)?;
-    let map_args = mounted_map_args(
-        mount_set.extra.iter().chain(mount_set.extra_inside.iter()),
-    );
+    let map_args = mounted_map_args(mount_set.landlock_map_mounts());
     let lockdown = config.lockdown_enabled();
     let bwrap = bwrap_binary_path()?;
     let launch = super::build_launch_command(config);
@@ -1498,9 +1515,7 @@ fn build_dry_run_args_full(
 ) -> Result<Vec<String>, String> {
     let mount_set =
         discover_mounts_full(config, project_dir, sources, verbose)?;
-    let map_args = mounted_map_args(
-        mount_set.extra.iter().chain(mount_set.extra_inside.iter()),
-    );
+    let map_args = mounted_map_args(mount_set.landlock_map_mounts());
     let lockdown = config.lockdown_enabled();
     let launch = super::build_launch_command(config);
     let mut args: Vec<String> =
@@ -1682,6 +1697,15 @@ fn discover_mounts_full(
         lockdown,
         verbose,
     );
+    let (devin_state, devin_state_inside) = split_by_project(
+        discover_devin_state_mounts(
+            config,
+            &home_dotfiles,
+            project_dir,
+            verbose,
+        ),
+        project_dir,
+    );
     // Overlay maps are opt-in and only meaningful when the sandbox
     // can write: disabled under lockdown (read-only) and browser mode.
     let (overlay_mounts_v, overlay_hide_v) = if lockdown || browser_mode {
@@ -1725,6 +1749,8 @@ fn discover_mounts_full(
             masks
         },
         home_dotfiles,
+        devin_env: super::devin_child_env(config),
+        devin_state,
         config_hide: if private_home {
             vec![]
         } else {
@@ -1792,6 +1818,7 @@ fn discover_mounts_full(
         extra: extra_outside,
         overlay: overlay_outside,
         project: project_mount(project_dir, lockdown || browser_mode),
+        devin_state_inside,
         extra_inside,
         overlay_inside,
         mask: mask_mounts,
@@ -2034,6 +2061,114 @@ fn discover_home_dotfiles_full(
             src: dir.clone(),
             dest: dir.clone(),
         });
+    }
+    mounts
+}
+
+/// Share existing state, pin the launcher ancestor, and protect its versions.
+/// Never create placeholders inside a writable host bind during discovery.
+fn discover_devin_state_mounts(
+    config: &Config,
+    home_mounts: &[Mount],
+    project_dir: &Path,
+    verbose: bool,
+) -> Vec<Mount> {
+    if crate::command::effective_name(&config.command) != Some("devin")
+        || config.lockdown_enabled()
+        || config.browser_profile().is_some()
+    {
+        return Vec::new();
+    }
+    let Some(installation) = super::devin_installation_dir(config) else {
+        return super::devin_state_paths(config)
+            .into_iter()
+            .filter(|path| safe_state_dir(path))
+            .map(|path| Mount::Bind {
+                src: path.clone(),
+                dest: path,
+            })
+            .collect();
+    };
+    let cli = installation.parent().expect("Devin cli path");
+    let data = cli.parent().expect("Devin data path");
+    let candidates = super::devin_candidate_paths(config);
+    let visible = |path: &Path| {
+        path.starts_with(project_dir)
+            || home_mounts.iter().any(|mount| {
+                matches!(mount, Mount::Bind { .. } | Mount::RoBind { .. })
+                    && path.starts_with(mount.dest())
+            })
+    };
+    let data_selected = candidates.iter().any(|path| path == data);
+    let share_data = config.agent_state_enabled() && data_selected;
+    let protect_visible = data_selected && visible(cli);
+    let installation_kind = super::devin_installation(data);
+    let safe_installation =
+        installation_kind == super::DevinInstallation::Managed;
+    let mut mounts = Vec::new();
+    if data_selected
+        && safe_state_dir(data)
+        && (share_data || visible(data))
+        && installation_kind == super::DevinInstallation::Invalid
+    {
+        output::warn(&format!(
+            "Devin: cli/_versions is missing, unreadable, or a symlink under {}; sharing data read-only",
+            data.display()
+        ));
+        mounts.push(Mount::RoBind {
+            src: data.into(),
+            dest: data.into(),
+        });
+    } else if share_data && safe_state_dir(data) {
+        mounts.push(Mount::Bind {
+            src: data.into(),
+            dest: data.into(),
+        });
+    }
+    if config.agent_state_enabled() {
+        for path in candidates.iter().filter(|path| path.as_path() != data) {
+            if safe_state_dir(path) {
+                mounts.push(Mount::Bind {
+                    src: path.clone(),
+                    dest: path.clone(),
+                });
+            }
+        }
+    }
+    if safe_state_dir(data)
+        && safe_installation
+        && (share_data || protect_visible)
+    {
+        // A mountpoint cannot be renamed. Keep CLI metadata writable when
+        // sharing state, without making an existing read-only home writable.
+        mounts.push(if share_data {
+            Mount::Bind {
+                src: cli.into(),
+                dest: cli.into(),
+            }
+        } else {
+            Mount::RoBind {
+                src: cli.into(),
+                dest: cli.into(),
+            }
+        });
+        mounts.push(Mount::RoBind {
+            src: installation.clone(),
+            dest: installation,
+        });
+    }
+    if verbose {
+        for mount in &mounts {
+            output::verbose(&format!(
+                "Devin: {} {}",
+                mount.dest().display(),
+                if matches!(mount, Mount::Bind { .. }) {
+                    "rw"
+                } else {
+                    "ro"
+                }
+            ));
+        }
     }
     mounts
 }
@@ -6519,6 +6654,319 @@ mod tests {
                 "state mapping mismatch for {command}"
             );
         }
+    }
+
+    #[test]
+    fn devin_state_mounts_rw_and_installation_ro_are_forwarded() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-devin-state-mounts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let data_home = root.join("xdg-data");
+        let config_home = root.join("xdg-config");
+        let data_state = data_home.join("devin");
+        let config_state = config_home.join("devin");
+        let installation = data_state.join("cli/_versions");
+        std::fs::create_dir_all(installation.join("3000.11.3")).unwrap();
+        std::fs::create_dir_all(&config_state).unwrap();
+        std::os::unix::fs::symlink("3000.11.3", installation.join("current"))
+            .unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &data_home);
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
+        let mut config = minimal_test_config();
+        config.command = vec!["devin".into()];
+
+        let mounts = discover_devin_state_mounts(
+            &config,
+            &[],
+            Path::new("/unrelated"),
+            false,
+        );
+        assert_eq!(mounts.len(), 4);
+        assert!(matches!(
+            &mounts[0],
+            Mount::Bind { src, dest }
+                if src == &data_state && dest == &data_state
+        ));
+        assert!(matches!(
+            &mounts[1],
+            Mount::Bind { src, dest }
+                if src == &config_state && dest == &config_state
+        ));
+        assert!(matches!(
+            &mounts[3],
+            Mount::RoBind { src, dest }
+                if src == &installation && dest == &installation
+        ));
+
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let guard = SandboxGuard::test_with_hosts(root.join("hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+        let data_rw = data_state.display().to_string();
+        let install_ro = installation.display().to_string();
+        let rw_index = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--bind" && w[1] == data_rw && w[2] == data_rw
+            })
+            .expect("Devin data root should be mounted read-write");
+        let ro_index = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--ro-bind" && w[1] == install_ro && w[2] == install_ro
+            })
+            .expect("Devin installation should be remounted read-only");
+        assert!(rw_index < ro_index, "installation RO bind must win");
+        assert!(
+            args.windows(2)
+                .any(|w| { w[0] == "--landlock-rw-path" && w[1] == data_rw })
+        );
+        assert!(
+            args.windows(2).any(|w| {
+                w[0] == "--landlock-ro-path" && w[1] == install_ro
+            })
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn devin_state_mounts_respect_opt_out_lockdown_and_browser_mode() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-devin-state-gates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let data_home = root.join("xdg-data");
+        let config_home = root.join("xdg-config");
+        let state = data_home.join("devin");
+        std::fs::create_dir_all(state.join("cli/_versions")).unwrap();
+        std::fs::create_dir_all(config_home.join("devin")).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &data_home);
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
+        let mut config = minimal_test_config();
+        config.command = vec!["devin".into()];
+
+        assert!(
+            !discover_devin_state_mounts(
+                &config,
+                &[],
+                Path::new("/unrelated"),
+                false
+            )
+            .is_empty()
+        );
+        config.agent_state = Some(false);
+        assert!(
+            discover_devin_state_mounts(
+                &config,
+                &[],
+                Path::new("/unrelated"),
+                false
+            )
+            .is_empty()
+        );
+        config.private_home = Some(false);
+        // An external XDG root is not exposed merely to protect it.
+        assert!(
+            discover_devin_state_mounts(
+                &config,
+                &[],
+                Path::new("/unrelated"),
+                false
+            )
+            .is_empty()
+        );
+        // Already-visible home state remains protected without RW grants.
+        let home_mounts = vec![Mount::RoBind {
+            src: data_home.clone(),
+            dest: data_home.clone(),
+        }];
+        let mounts = discover_devin_state_mounts(
+            &config,
+            &home_mounts,
+            Path::new("/unrelated"),
+            false,
+        );
+        assert_eq!(mounts.len(), 2);
+        assert!(
+            mounts
+                .iter()
+                .all(|mount| matches!(mount, Mount::RoBind { .. }))
+        );
+        config.private_home = None;
+        config.agent_state = None;
+        config.lockdown = Some(true);
+        assert!(
+            discover_devin_state_mounts(
+                &config,
+                &[],
+                Path::new("/unrelated"),
+                false
+            )
+            .is_empty()
+        );
+        config.lockdown = None;
+        config.browser_profile = Some("soft".into());
+        assert!(
+            discover_devin_state_mounts(
+                &config,
+                &[],
+                Path::new("/unrelated"),
+                false
+            )
+            .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        config.browser_profile = None;
+        assert!(
+            discover_devin_state_mounts(
+                &config,
+                &[],
+                Path::new("/unrelated"),
+                false
+            )
+            .is_empty()
+        );
+        assert!(!state.exists(), "missing state must not be created");
+        assert!(
+            !config_home.join("devin").exists(),
+            "missing config must not be created"
+        );
+    }
+
+    #[test]
+    fn devin_state_skips_writable_data_root_when_versions_is_symlink() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-devin-versions-symlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let data_home = root.join("xdg-data");
+        let config_home = root.join("xdg-config");
+        let data_state = data_home.join("devin");
+        let config_state = config_home.join("devin");
+        let cli = data_state.join("cli");
+        let installation = cli.join("_versions");
+        let external_versions = root.join("versions");
+        std::fs::create_dir_all(&cli).unwrap();
+        std::fs::create_dir_all(&config_state).unwrap();
+        std::fs::create_dir_all(external_versions.join("3000.11.3")).unwrap();
+        std::os::unix::fs::symlink(&external_versions, &installation).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &data_home);
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
+        let mut config = minimal_test_config();
+        config.command = vec!["devin".into()];
+        config.private_home = Some(false);
+
+        let mounts = discover_devin_state_mounts(
+            &config,
+            &[],
+            Path::new("/unrelated"),
+            false,
+        );
+        assert_eq!(mounts.len(), 2);
+        assert!(matches!(
+            &mounts[1],
+            Mount::Bind { src, dest }
+                if src == &config_state && dest == &config_state
+        ));
+        assert!(!mounts.iter().any(|mount| matches!(
+            mount,
+            Mount::Bind { src, .. } if src == &data_state
+        )));
+        assert!(!mounts.iter().any(|mount| matches!(
+            mount,
+            Mount::RoBind { src, .. } if src == &installation
+        )));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn devin_state_inside_project_stays_after_project_and_before_masks() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-devin-project-state-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let project = root.join("project");
+        let data_home = project.join("xdg-data");
+        let data_state = data_home.join("devin");
+        let installation = data_state.join("cli/_versions");
+        std::fs::create_dir_all(installation.join("3000.11.3")).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &data_home);
+        let missing_config = root.join("missing-config");
+        let _config_home =
+            EnvVarGuard::set("XDG_CONFIG_HOME", missing_config.as_os_str());
+        let mut config = minimal_test_config();
+        config.command = vec!["devin".into()];
+        config.mask = vec![data_state.clone()];
+
+        let guard = SandboxGuard::test_with_hosts(root.join("hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &project,
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+        let project_text = project.display().to_string();
+        let state_text = data_state.display().to_string();
+        let installation_text = installation.display().to_string();
+        let project_index = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--bind" && w[1] == project_text && w[2] == project_text
+            })
+            .expect("project should be bound");
+        let state_index = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--bind" && w[1] == state_text && w[2] == state_text
+            })
+            .expect("Devin state should be rebound after project");
+        let installation_index = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--ro-bind"
+                    && w[1] == installation_text
+                    && w[2] == installation_text
+            })
+            .expect("installation should remain read-only");
+        let mask_index = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == state_text)
+            .expect("mask should still cover the Devin state path");
+        assert!(project_index < state_index);
+        assert!(state_index < installation_index);
+        assert!(installation_index < mask_index);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── Sandbox environment filtering ───────────────────────────

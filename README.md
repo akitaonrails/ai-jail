@@ -89,6 +89,37 @@ tuned to stop attackers — see
 directory is where the agent is expected to work; everything else on the
 host is either hidden or exposed deliberately, capability by capability.
 
+Devin CLI is recognized as `devin`. Its existing state under
+`$XDG_DATA_HOME/devin` (default `~/.local/share/devin`) and configuration under
+`$XDG_CONFIG_HOME/devin` (default `~/.config/devin`) are shared read-write,
+including credentials and history. `--no-agent-state` disables this automatic
+sharing. The self-managed installation under `devin/cli/_versions` stays
+read-only, and its `cli` ancestor cannot be renamed from the jail; CLI metadata
+outside `_versions` remains writable. If `cli` is entirely absent (as with an
+external installation), credentials and history remain writable without a warning;
+installation protection is not applied. If `cli` is present but invalid, or its
+`_versions` is missing, unreadable, or a symlink, Linux shares the data root
+read-only and macOS skips sharing it. Discovery never creates host directories.
+Update Devin on the host and start a new jail session afterward. XDG base paths must exist:
+relative values use the HOME fallback, existing bases are resolved physically
+(including symlinks and `..`), and unresolved bases are skipped with one warning
+per XDG variable per launch. `--no-agent-state` suppresses these XDG-base warnings.
+On Linux, explicit writable maps or using the installation as the project
+can override the automatic read-only mount. `--no-private-home` keeps the
+existing broad home-sharing behavior; it is not equivalent to private-home
+isolation.
+When no network posture is selected, the existing agent API policy
+default-allows `server.codeium.com` through filtered egress, unioned with any
+explicit `--allow-host` list. To allow only explicitly named hosts, use
+`--no-network --allow-host HOST`; `--no-network` without allowed hosts stays
+fully offline. Lockdown and browser launches suppress these automatic defaults.
+A custom Devin `--config` file outside the visible paths requires an explicit
+`--map` or `--rw-map`.
+
+```bash
+ai-jail devin --permission-mode dangerous
+```
+
 ### On by default
 
 - **Private home** — the agent gets a fresh tmpfs `$HOME`, not your host
@@ -258,7 +289,8 @@ egress.
 
 When the invoked command is a known API agent whose canonical API host ai-jail
 knows — `claude` → `api.anthropic.com`, `codex` → `api.openai.com`, `gemini` →
-`generativelanguage.googleapis.com`, `grok` → `api.x.ai` — and the network
+`generativelanguage.googleapis.com`, `grok` → `api.x.ai`, `devin` →
+`server.codeium.com` — and the network
 posture is unset (no `--network`, no `--no-network`, not `--lockdown`, not a
 browser launch), ai-jail also default-allows filtered egress to that one host,
 so a bare `ai-jail claude` or `ai-jail codex` reaches its model API out of the
