@@ -10,7 +10,7 @@ USAGE:
 
 COMMANDS (positional):
     gemini, claude, codex, opencode, crush, soulforge, grok, pi, jcode,
-    kimi, kiro-cli, bash
+    kimi, kiro-cli, devin, bash
                                             Known AI tool presets
     status                                 Show current .ai-jail config
     Any other string                       Passed through as the command

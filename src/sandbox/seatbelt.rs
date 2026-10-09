@@ -170,6 +170,8 @@ fn apply_child_env(
         cmd.env("CLAUDE_CONFIG_DIR", dir);
     }
 
+    cmd.envs(super::devin_child_env(config));
+
     // Filtered egress: force the proxy env onto the child, pointing at
     // the outer proxy's loopback TCP port. Emitted after the env_pass
     // application above: Command::env replaces earlier values, so a
@@ -342,6 +344,7 @@ fn generate_sbpl_profile_for_tty(
             .filter(|p| super::path_exists(p))
             .cloned(),
     );
+    let devin_installation_paths = devin_installation_write_denies(config);
 
     let mut profile = String::new();
     profile.push_str("(version 1)\n");
@@ -373,6 +376,12 @@ fn generate_sbpl_profile_for_tty(
         is_claude,
     );
     push_docker_section(&mut profile, docker_active(config, lockdown));
+    // This must follow all write grants, including the optional Docker socket
+    // rule emitted above, because SBPL uses last-match-wins semantics.
+    push_devin_installation_write_denies(
+        &mut profile,
+        &devin_installation_paths,
+    );
 
     profile
 }
@@ -842,6 +851,75 @@ fn push_file_write_section(
     profile.push('\n');
 }
 
+/// Add a write denial for Devin's version tree and mutable `current`
+/// selector. The version tree lives inside the broadly writable Devin data
+/// directory, so an ancestor RW rule alone would permit in-jail upgrades.
+/// The selector is emitted as a raw final path component because resolving
+/// the symlink would only protect the selected version, not replacement of
+/// the selector itself.
+fn devin_installation_write_denies(config: &Config) -> Vec<PathBuf> {
+    if crate::command::effective_name(&config.command) != Some("devin") {
+        return Vec::new();
+    }
+    let Some(versions) = super::devin_installation_dir(config) else {
+        return Vec::new();
+    };
+    let data = versions
+        .parent()
+        .and_then(Path::parent)
+        .expect("Devin data path");
+    let installation = super::devin_installation(data);
+    if config.agent_state_enabled()
+        && data.is_dir()
+        && super::devin_state_paths(config).contains(&data.to_path_buf())
+        && installation == super::DevinInstallation::Invalid
+    {
+        output::warn(&format!(
+            "Devin: cli/_versions is missing, unreadable, or a symlink under {}; writable state sharing skipped",
+            data.display()
+        ));
+    }
+    if installation == super::DevinInstallation::Absent {
+        return Vec::new();
+    }
+    vec![versions.clone(), versions.join("current")]
+}
+
+fn push_write_deny_literal(profile: &mut String, path: &Path) {
+    let node = symlink_node_rule_path(path)
+        .unwrap_or_else(|| canonicalize_or_keep(path));
+    let escaped = sbpl_escape(node.to_string_lossy().as_ref());
+    profile.push_str(&format!("(deny file-write* (literal \"{escaped}\"))\n"));
+}
+
+fn push_devin_installation_write_denies(
+    profile: &mut String,
+    paths: &[PathBuf],
+) {
+    if paths.is_empty() {
+        return;
+    }
+    profile.push_str("; Devin installation stays read-only\n");
+    for path in paths {
+        push_path_rule(profile, "deny", "file-write*", path);
+    }
+    // Pin the launcher ancestor without denying writes to CLI metadata.
+    let cli = paths[0].parent().expect("Devin cli path");
+    push_write_deny_literal(profile, cli);
+    let data = cli.parent().expect("Devin data path");
+    if data.is_dir()
+        && super::devin_installation(data) == super::DevinInstallation::Invalid
+    {
+        push_path_rule(profile, "deny", "file-write*", data);
+    }
+    for node in paths {
+        // Preserve each final component here: canonicalizing a symlink would
+        // only deny writes to its target, leaving the node replaceable.
+        push_write_deny_literal(profile, node);
+    }
+    profile.push('\n');
+}
+
 fn docker_active(config: &Config, lockdown: bool) -> bool {
     config.docker_enabled() && config.browser_profile().is_none() && !lockdown
 }
@@ -1037,6 +1115,24 @@ fn agent_state_paths(config: &Config) -> Vec<PathBuf> {
         // whole ~/.prime (the prime compute CLI's API key lives in
         // the sibling config.json).
         Some("prime-agent") => push(".prime/agent"),
+        Some("devin") => {
+            let data_root =
+                super::devin_installation_dir(config).and_then(|versions| {
+                    versions.parent()?.parent().map(Path::to_path_buf)
+                });
+            for path in super::devin_state_paths(config) {
+                let is_data = data_root.as_ref() == Some(&path);
+                if is_data
+                    && super::devin_installation(&path)
+                        == super::DevinInstallation::Invalid
+                {
+                    continue;
+                }
+                if super::path_exists(&path) && !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
         _ => {}
     }
     paths
@@ -2998,6 +3094,423 @@ mod tests {
         )));
 
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    struct DevinStateFixture {
+        root: PathBuf,
+        home: PathBuf,
+        data_home: PathBuf,
+        config_home: PathBuf,
+        project_dir: PathBuf,
+        versions_dir: PathBuf,
+        current_selector: PathBuf,
+    }
+
+    impl Drop for DevinStateFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn devin_state_fixture(prefix: &str) -> DevinStateFixture {
+        use std::fs;
+
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-seatbelt-{prefix}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        let home = root.join("home");
+        let data_home = root.join("xdg-data");
+        let config_home = root.join("xdg-config");
+        let project_dir = root.join("project");
+        let cli_dir = data_home.join("devin/cli");
+        let versions_dir = cli_dir.join("_versions");
+        let version_bin = versions_dir.join("3000.11.3/bin");
+        let current_selector = versions_dir.join("current");
+
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::create_dir_all(&version_bin).unwrap();
+        fs::create_dir_all(config_home.join("devin")).unwrap();
+        fs::write(config_home.join("devin/config.json"), "{}\n").unwrap();
+        fs::write(version_bin.join("devin"), "fixture executable\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("3000.11.3", &current_selector).unwrap();
+
+        DevinStateFixture {
+            root,
+            home,
+            data_home,
+            config_home,
+            project_dir,
+            versions_dir,
+            current_selector,
+        }
+    }
+
+    #[test]
+    fn devin_state_is_rw_but_installation_tree_and_selector_are_write_denied() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = devin_state_fixture("state-profile");
+        let _home = EnvVarGuard::set("HOME", fixture.home.as_os_str());
+        let _data =
+            EnvVarGuard::set("XDG_DATA_HOME", fixture.data_home.as_os_str());
+        let _config = EnvVarGuard::set(
+            "XDG_CONFIG_HOME",
+            fixture.config_home.as_os_str(),
+        );
+        let docker_socket = fixture.root.join("docker.sock");
+        let _docker_listener =
+            std::os::unix::net::UnixListener::bind(&docker_socket).unwrap();
+        let _docker_host = EnvVarGuard::set(
+            "DOCKER_HOST",
+            format!("unix://{}", docker_socket.display()),
+        );
+
+        let data_state = fixture.data_home.join("devin");
+        let config_state = fixture.config_home.join("devin");
+        let config = Config {
+            command: vec!["devin".into()],
+            no_mise: Some(true),
+            no_docker: Some(false),
+            ..Config::default()
+        };
+        let expected = vec![data_state.clone(), config_state.clone()];
+        assert_eq!(agent_state_paths(&config), expected);
+
+        let writable =
+            macos_writable_paths(&fixture.project_dir, &config, false);
+        assert!(writable.contains(&data_state));
+        assert!(writable.contains(&config_state));
+
+        let profile = generate_sbpl_profile(&config, &fixture.project_dir);
+        let data_state = sbpl_path(&data_state);
+        let config_state = sbpl_path(&config_state);
+        let versions = sbpl_path(&fixture.versions_dir);
+        let cli = sbpl_path(fixture.versions_dir.parent().unwrap());
+        assert!(
+            profile
+                .contains(&format!("(deny file-write* (literal \"{cli}\"))"))
+        );
+        assert!(profile.contains(&format!(
+            "(allow file-read* (subpath \"{data_state}\"))"
+        )));
+        assert!(profile.contains(&format!(
+            "(allow file-write* (subpath \"{data_state}\"))"
+        )));
+        assert!(profile.contains(&format!(
+            "(allow file-read* (subpath \"{config_state}\"))"
+        )));
+        assert!(profile.contains(&format!(
+            "(allow file-write* (subpath \"{config_state}\"))"
+        )));
+        assert!(
+            profile.contains(&format!(
+                "(deny file-write* (subpath \"{versions}\"))"
+            ))
+        );
+
+        let current_node =
+            symlink_node_rule_path(&fixture.current_selector).unwrap();
+        let current_node = sbpl_escape(current_node.to_string_lossy().as_ref());
+        assert!(profile.contains(&format!(
+            "(deny file-write* (literal \"{current_node}\"))"
+        )));
+        let state_write = profile
+            .find(&format!("(allow file-write* (subpath \"{data_state}\"))"))
+            .unwrap();
+        let versions_deny = profile
+            .find(&format!("(deny file-write* (subpath \"{versions}\"))"))
+            .unwrap();
+        let docker_allow = profile
+            .find(&format!(
+                "(allow file-write* (literal \"{}\"))",
+                sbpl_path(&docker_socket)
+            ))
+            .unwrap();
+        let current_deny = profile
+            .find(&format!("(deny file-write* (literal \"{current_node}\"))"))
+            .unwrap();
+        assert!(state_write < versions_deny);
+        assert!(docker_allow < versions_deny);
+        assert!(versions_deny < current_deny);
+        assert!(
+            !profile.contains(&format!(
+                "(deny file-read* (subpath \"{versions}\"))"
+            )),
+            "the version tree stays readable for execution"
+        );
+
+        let _ = std::fs::remove_dir_all(&fixture.root);
+    }
+
+    #[test]
+    fn devin_incomplete_and_symlink_installations_skip_writable_data() {
+        let _env = ENV_LOCK.lock().unwrap();
+        for layout in ["missing-versions", "symlink-cli"] {
+            let fixture = devin_state_fixture(layout);
+            let _home = EnvVarGuard::set("HOME", &fixture.home);
+            let _data = EnvVarGuard::set("XDG_DATA_HOME", &fixture.data_home);
+            let _config =
+                EnvVarGuard::set("XDG_CONFIG_HOME", &fixture.config_home);
+            let cli = fixture.versions_dir.parent().unwrap();
+            match layout {
+                "missing-versions" => {
+                    std::fs::remove_dir_all(&fixture.versions_dir).unwrap()
+                }
+                _ => {
+                    let target = fixture.root.join("external-cli");
+                    std::fs::rename(cli, &target).unwrap();
+                    std::os::unix::fs::symlink(target, cli).unwrap();
+                }
+            }
+            let config = Config {
+                command: vec!["devin".into()],
+                no_mise: Some(true),
+                ..Config::default()
+            };
+            assert_eq!(
+                agent_state_paths(&config),
+                vec![fixture.config_home.join("devin")]
+            );
+            let profile = generate_sbpl_profile(&config, &fixture.project_dir);
+            assert!(profile.contains(&format!(
+                "(deny file-write* (subpath \"{}\"))",
+                sbpl_path(&fixture.data_home.join("devin"))
+            )));
+        }
+    }
+
+    #[test]
+    fn devin_external_installation_shares_state_without_installation_denies() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = devin_state_fixture("external-installation");
+        let _home = EnvVarGuard::set("HOME", &fixture.home);
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &fixture.data_home);
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &fixture.config_home);
+        std::fs::remove_dir_all(fixture.versions_dir.parent().unwrap())
+            .unwrap();
+        let data = fixture.data_home.join("devin");
+        let config = Config {
+            command: vec!["devin".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        assert_eq!(
+            agent_state_paths(&config),
+            vec![data.clone(), fixture.config_home.join("devin")]
+        );
+        let profile = generate_sbpl_profile(&config, &fixture.project_dir);
+        let data_rule = sbpl_path(&data);
+        assert!(profile.contains(&format!(
+            "(allow file-write* (subpath \"{data_rule}\"))"
+        )));
+        assert!(!profile.contains(&format!(
+            "(deny file-write* (subpath \"{data_rule}\"))"
+        )));
+        assert!(devin_installation_write_denies(&config).is_empty());
+        assert!(!data.join("cli").exists());
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            eprintln!(
+                "SKIPPED: sandbox-exec unavailable for external installation runtime probe"
+            );
+            return;
+        }
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "--", "/bin/sh", "-c",
+                "set -eu; printf rotated > \"$1/credentials.tmp\"; /bin/mv \"$1/credentials.tmp\" \"$1/credentials.toml\"; /bin/mkdir -p \"$1/history\"; printf session > \"$1/history/session.log\"",
+                "probe"])
+            .arg(&data).output().expect("sandbox-exec should run");
+        assert!(
+            output.status.success(),
+            "status={:?}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(data.join("credentials.toml")).unwrap(),
+            "rotated"
+        );
+        assert_eq!(
+            std::fs::read_to_string(data.join("history/session.log")).unwrap(),
+            "session"
+        );
+        assert!(!data.join("cli").exists());
+    }
+
+    #[test]
+    fn devin_current_target_outside_versions_remains_write_denied() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = devin_state_fixture("external-current");
+        let _home = EnvVarGuard::set("HOME", &fixture.home);
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &fixture.data_home);
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &fixture.config_home);
+        let target = fixture.project_dir.join("external-version");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::remove_file(&fixture.current_selector).unwrap();
+        std::os::unix::fs::symlink(&target, &fixture.current_selector).unwrap();
+        let config = Config {
+            command: vec!["devin".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile(&config, &fixture.project_dir);
+        assert!(profile.contains(&format!(
+            "(deny file-write* (subpath \"{}\"))",
+            sbpl_path(&target)
+        )));
+        let current =
+            symlink_node_rule_path(&fixture.current_selector).unwrap();
+        assert!(profile.contains(&format!(
+            "(deny file-write* (literal \"{}\"))",
+            sbpl_escape(current.to_string_lossy().as_ref())
+        )));
+    }
+
+    #[test]
+    fn devin_runtime_blocks_cli_rename_and_preserves_metadata_writes() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = devin_state_fixture("runtime-installation");
+        let _home = EnvVarGuard::set("HOME", &fixture.home);
+        let _data = EnvVarGuard::set("XDG_DATA_HOME", &fixture.data_home);
+        let _config = EnvVarGuard::set("XDG_CONFIG_HOME", &fixture.config_home);
+        let config = Config {
+            command: vec!["devin".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile(&config, &fixture.project_dir);
+        let data = fixture.data_home.join("devin");
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "--", "/bin/sh", "-c",
+                "set -eu; if /bin/mv \"$1/cli\" \"$1/cli.moved\" 2>/dev/null; then exit 10; fi; printf metadata > \"$1/cli/installation_id\"; if printf tampered > \"$1/cli/_versions/3000.11.3/bin/devin\" 2>/dev/null; then exit 11; fi; printf credential > \"$1/credentials.tmp\"; /bin/mv \"$1/credentials.tmp\" \"$1/credentials.toml\"",
+                "probe"])
+            .arg(&data).output().expect("sandbox-exec should run");
+        assert!(
+            output.status.success(),
+            "status={:?}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!data.join("cli.moved").exists());
+        assert_eq!(
+            std::fs::read_to_string(data.join("cli/installation_id")).unwrap(),
+            "metadata"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                fixture.versions_dir.join("3000.11.3/bin/devin")
+            )
+            .unwrap(),
+            "fixture executable\n"
+        );
+    }
+
+    #[test]
+    fn devin_state_keeps_masks_hides_and_optouts_in_force() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = devin_state_fixture("state-policy");
+        let _home = EnvVarGuard::set("HOME", fixture.home.as_os_str());
+        let _data =
+            EnvVarGuard::set("XDG_DATA_HOME", fixture.data_home.as_os_str());
+        let _config = EnvVarGuard::set(
+            "XDG_CONFIG_HOME",
+            fixture.config_home.as_os_str(),
+        );
+
+        let data_state = fixture.data_home.join("devin");
+        let config_state = fixture.config_home.join("devin");
+        let project = &fixture.project_dir;
+        let base = Config {
+            command: vec!["devin".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+
+        let explicitly_denied = Config {
+            mask: vec![data_state.clone()],
+            deny_paths: vec![config_state.clone()],
+            ..base.clone()
+        };
+        let profile = generate_sbpl_profile(&explicitly_denied, project);
+        for state in [&data_state, &config_state] {
+            let state = sbpl_path(state);
+            assert!(
+                profile.contains(&format!(
+                    "(deny file-read* (subpath \"{state}\"))"
+                ))
+            );
+            assert!(profile.contains(&format!(
+                "(deny file-write* (subpath \"{state}\"))"
+            )));
+        }
+
+        // The logical defaults remain hideable even when Devin's selected
+        // XDG roots are custom paths outside HOME.
+        let hidden_data = Config {
+            hide_dotdirs: vec![".local".into()],
+            ..base.clone()
+        };
+        assert_eq!(agent_state_paths(&hidden_data), vec![config_state.clone()]);
+        let hidden_config = Config {
+            hide_dotdirs: vec![".config".into()],
+            ..base.clone()
+        };
+        assert_eq!(agent_state_paths(&hidden_config), vec![data_state.clone()]);
+
+        let opted_out = Config {
+            agent_state: Some(false),
+            ..base.clone()
+        };
+        assert!(agent_state_paths(&opted_out).is_empty());
+        let browser = Config {
+            browser_profile: Some("soft".into()),
+            ..base.clone()
+        };
+        assert!(agent_state_paths(&browser).is_empty());
+        let locked = Config {
+            lockdown: Some(true),
+            ..base.clone()
+        };
+        assert!(agent_state_paths(&locked).is_empty());
+
+        // A broad --no-private-home grant includes the default Devin data
+        // root. The specific install deny must still follow that broad RW
+        // rule, including when XDG overrides are absent.
+        let default_data = fixture.home.join(".local/share/devin");
+        let default_config = fixture.home.join(".config/devin");
+        let default_versions = default_data.join("cli/_versions");
+        std::fs::create_dir_all(default_versions.join("3000.11.3/bin"))
+            .unwrap();
+        std::fs::create_dir_all(&default_config).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            "3000.11.3",
+            default_versions.join("current"),
+        )
+        .unwrap();
+        let _unset_data = EnvVarGuard::remove("XDG_DATA_HOME");
+        let _unset_config = EnvVarGuard::remove("XDG_CONFIG_HOME");
+        let broad_home = Config {
+            private_home: Some(false),
+            ..base
+        };
+        let profile = generate_sbpl_profile(&broad_home, project);
+        let local = sbpl_path(&fixture.home.join(".local"));
+        let versions = sbpl_path(&default_versions);
+        let broad_write = profile
+            .find(&format!("(allow file-write* (subpath \"{local}\"))"))
+            .unwrap();
+        let versions_deny = profile
+            .find(&format!("(deny file-write* (subpath \"{versions}\"))"))
+            .unwrap();
+        assert!(broad_write < versions_deny);
+
+        let _ = std::fs::remove_dir_all(&fixture.root);
     }
 
     #[test]

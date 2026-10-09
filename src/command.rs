@@ -174,8 +174,8 @@ pub(crate) fn effective_name(command: &[String]) -> Option<&str> {
 
 /// Agents known to be network API clients. Kept in sync with the
 /// per-agent state-path tables in the sandbox backends
-/// (`bwrap::command_state_paths`, `seatbelt::agent_state_paths`); kimi
-/// binaries are matched by prefix like those tables do.
+/// (`bwrap::command_state_paths`, `seatbelt::agent_state_paths`) and Devin's
+/// XDG state helper; kimi binaries are matched by prefix like those tables do.
 const KNOWN_API_AGENTS: &[&str] = &[
     "claude",
     "codex",
@@ -184,6 +184,7 @@ const KNOWN_API_AGENTS: &[&str] = &[
     "crush",
     "grok",
     "jcode",
+    "devin",
     "pi",
     "aider",
     "soulforge",
@@ -204,6 +205,7 @@ fn api_host(name: &str) -> Option<&'static str> {
         "codex" => Some("api.openai.com"),
         "gemini" => Some("generativelanguage.googleapis.com"),
         "grok" => Some("api.x.ai"),
+        "devin" => Some("server.codeium.com"),
         _ => None,
     }
 }
@@ -614,6 +616,20 @@ mod tests {
     }
 
     #[test]
+    fn devin_uses_existing_api_warning_policy() {
+        let mut config = gap_config("devin", None, None);
+        assert!(capability_gap_warnings(&config)[0].contains("network is off"));
+        config.allow_hosts = vec!["github.com".into()];
+        let warnings = capability_gap_warnings(&config);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("server.codeium.com"));
+        config.allow_hosts = vec!["server.codeium.com".into()];
+        assert!(capability_gap_warnings(&config).is_empty());
+        assert!(!config.network_enabled());
+        assert!(harness_api_key_env("devin").is_empty());
+    }
+
+    #[test]
     fn capability_gap_filtered_mode_silent_without_known_api_host() {
         // Agents with no canonical API host in the table get no
         // host-coverage warning in filtered mode.
@@ -624,6 +640,10 @@ mod tests {
 
     #[test]
     fn default_egress_host_matches_api_host_table() {
+        assert_eq!(
+            default_egress_host(&["devin".into()]),
+            Some("server.codeium.com")
+        );
         // Each agent's default egress host is exactly its api_host entry, so
         // injecting it (issue #156) silences the filtered-mode gap warning.
         assert_eq!(
