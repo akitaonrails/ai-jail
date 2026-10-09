@@ -259,18 +259,24 @@ egress.
 When the invoked command is a known API agent whose canonical API host ai-jail
 knows — `claude` → `api.anthropic.com`, `codex` → `api.openai.com`, `gemini` →
 `generativelanguage.googleapis.com`, `grok` → `api.x.ai` — and the network
-posture is otherwise unset (no `--network`, no `--no-network`, no explicit
-`--allow-host` list, not `--lockdown`, not a browser launch), ai-jail also
-default-allows filtered egress to that one host, so a bare `ai-jail claude` or
-`ai-jail codex` reaches its model API out of the box without opening the whole
-network. Only the agent's own functional API host is added — telemetry
-endpoints are not — and the sandbox stays deny-by-default. Unlike the
-package-registry default this is not Linux-only: on macOS filtered egress is a
-seatbelt loopback rule, so the same default applies there (issue #156). An
-explicit `--allow-host` set is used verbatim instead; if an agent needs more
-than its API host (an auth endpoint, a region host), pass those with
-`--allow-host`. `--no-network`, `--network`, browser, and `--lockdown` choices
-keep their existing behavior.
+posture is unset (no `--network`, no `--no-network`, not `--lockdown`, not a
+browser launch), ai-jail also default-allows filtered egress to that one host,
+so a bare `ai-jail claude` or `ai-jail codex` reaches its model API out of the
+box without opening the whole network. Only the agent's own functional API host
+is added — telemetry endpoints are not — and the sandbox stays deny-by-default.
+Unlike the package-registry default this is not Linux-only: on macOS filtered
+egress is a seatbelt loopback rule, so the same default applies there
+(issue #156).
+
+Like the registry hosts, this is **unioned** with any explicit `--allow-host`
+list rather than suppressed by it: `ai-jail --allow-host github.com claude`
+reaches `github.com` _and_ `api.anthropic.com`, because adding a host is almost
+always meant to extend what the agent can reach, not to cut off its own API. If
+you instead want _exactly_ your list and none of the automatic defaults, assert
+a posture: `ai-jail --no-network --allow-host github.com claude` composes to
+filtered egress with `github.com` only (`--no-network` disables both the agent
+and registry defaults while a non-empty allow-list keeps egress filtered rather
+than fully offline). `--network` and `--lockdown` keep their existing behavior.
 
 `--no-toolchains` (or `no_toolchains = true`) disables both the cache maps
 and the registry default together. The untrusted project `.ai-jail` may only

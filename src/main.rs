@@ -326,18 +326,22 @@ fn default_registry_egress_applies(config: &config::Config) -> bool {
         && config.browser_profile.is_none()
 }
 
-/// Give a bare launch of a known API agent (one with a canonical API host in
-/// `command::default_egress_host`) filtered egress to that host when the user
-/// has selected no network posture and supplied no explicit host allowlist
-/// (issue #156). The sandbox still defaults to filtered egress — only the one
-/// documented API host becomes reachable; explicit offline/full network,
-/// browser, and lockdown choices keep their existing semantics. Unlike the
-/// package-registry default this is not Linux-only: macOS filtered egress is a
-/// seatbelt loopback rule, so the same default applies there.
+/// Give a launch of a known API agent (one with a canonical API host in
+/// `command::default_egress_host`) filtered egress to that host whenever the
+/// user has not asserted a network posture (issue #156). Like the
+/// package-registry default, this is _unioned_ with any explicit `--allow-host`
+/// list rather than suppressed by it: adding a host (`--allow-host github.com
+/// claude`) keeps the agent's own API reachable, which is almost always what
+/// the user meant. The verbatim "exactly this list, nothing automatic" mode is
+/// `--no-network --allow-host …`, which sets `network` and so disables both
+/// this and the registry default while still composing to filtered egress. The
+/// sandbox stays deny-by-default; `--network`, `--lockdown`, and browser
+/// launches keep their existing semantics. Unlike the registry default this is
+/// not Linux-only: macOS filtered egress is a seatbelt loopback rule, so it
+/// applies there too.
 fn default_agent_api_egress_applies(config: &config::Config) -> bool {
     command::default_egress_host(&config.command).is_some()
         && config.network.is_none()
-        && config.allow_hosts().is_empty()
         && !config.lockdown_enabled()
         && config.browser_profile.is_none()
 }
@@ -738,13 +742,14 @@ fn run() -> Result<i32, String> {
     }
 
     // Default-allow a known API agent's own documented API host (filtered
-    // egress) when the user selected no network posture and no explicit host
-    // list (issue #156), so a bare `ai-jail claude` / `ai-jail codex` reaches
-    // its model API out of the box without opening the whole network. Only the
-    // agent's single canonical host is added; the sandbox stays deny-by-default
-    // and an explicit --allow-host set is used verbatim instead. Gated on the
-    // same netns probe as registry egress (always available on macOS, where
-    // filtered egress is a seatbelt loopback rule).
+    // egress) when the user asserted no network posture (issue #156), so
+    // `ai-jail claude` / `ai-jail codex` reaches its model API out of the box
+    // without opening the whole network. Only the agent's single canonical host
+    // is added, and it is UNIONED with any explicit --allow-host list (like the
+    // registry hosts below) rather than suppressed by it — `--no-network
+    // --allow-host …` is the verbatim escape hatch. The sandbox stays
+    // deny-by-default. Gated on the same netns probe as registry egress (always
+    // available on macOS, where filtered egress is a seatbelt loopback rule).
     if default_agent_api_egress_applies(&config)
         && sandbox::unprivileged_netns_available()
         && let Some(host) = command::default_egress_host(&config.command)
@@ -1280,12 +1285,22 @@ mod tests {
         assert!(!default_agent_api_egress_applies(&claude(|c| {
             c.network = Some(false);
         })));
+        // Verbatim escape hatch: --no-network with an explicit --allow-host
+        // list composes to filtered egress but suppresses the automatic API
+        // host, so the launch reaches only the named hosts.
+        assert!(!default_agent_api_egress_applies(&claude(|c| {
+            c.network = Some(false);
+            c.allow_hosts = vec!["github.com".into()];
+        })));
         // --network is unrestricted; no filtered-egress injection.
         assert!(!default_agent_api_egress_applies(&claude(|c| {
             c.network = Some(true);
         })));
-        // An explicit host list is used verbatim, not extended by default.
-        assert!(!default_agent_api_egress_applies(&claude(|c| {
+        // An explicit --allow-host list is UNIONED with the agent's own API
+        // host (like registry egress), not suppressed by it, so long as no
+        // network posture is set. `--no-network --allow-host …` is the verbatim
+        // escape hatch, and sets `network` (covered by the --no-network case).
+        assert!(default_agent_api_egress_applies(&claude(|c| {
             c.allow_hosts = vec!["example.com".into()];
         })));
         // Lockdown stays offline.
