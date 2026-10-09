@@ -153,7 +153,8 @@ fn apply_child_env(
             crate::config::parse_env_entry(entry)
                 .is_ok_and(|(name, _)| name == "USER")
         })
-        && let Some((_, value)) = host_env.iter().find(|(name, _)| name == "USER")
+        && let Some((_, value)) =
+            host_env.iter().find(|(name, _)| name == "USER")
     {
         cmd.env("USER", value);
     }
@@ -1519,10 +1520,10 @@ mod tests {
             agent_state: Some(true),
             ..Config::default()
         };
-        let profile = generate_sbpl_profile(&claude, Path::new("/tmp/test-project"));
-        let keychain_db = canonicalize_or_keep(
-            &keychain_dir.join("login.keychain-db"),
-        );
+        let profile =
+            generate_sbpl_profile(&claude, Path::new("/tmp/test-project"));
+        let keychain_db =
+            canonicalize_or_keep(&keychain_dir.join("login.keychain-db"));
         let keychain_dir = canonicalize_or_keep(&keychain_dir);
         assert!(
             profile.contains(
@@ -1546,8 +1547,10 @@ mod tests {
             agent_state: Some(false),
             ..claude.clone()
         };
-        let no_agent_state_profile =
-            generate_sbpl_profile(&no_agent_state, Path::new("/tmp/test-project"));
+        let no_agent_state_profile = generate_sbpl_profile(
+            &no_agent_state,
+            Path::new("/tmp/test-project"),
+        );
         assert!(!no_agent_state_profile.contains("com.apple.securityd.xpc"));
         assert!(!no_agent_state_profile.contains("com.apple.SecurityServer"));
         assert!(!no_agent_state_profile.contains("login.keychain-db"));
@@ -1612,13 +1615,11 @@ mod tests {
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         // Keep the resolved target short enough for Darwin's SUN_LEN limit;
         // the real daemon likewise uses a short hash under /private/tmp.
-        let daemon_socket = std::env::temp_dir().join(format!(
-            "aj-codex-{}.sock",
-            std::process::id()
-        ));
+        let daemon_socket = std::env::temp_dir()
+            .join(format!("aj-codex-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&daemon_socket);
-        let _listener = std::os::unix::net::UnixListener::bind(&daemon_socket)
-            .unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&daemon_socket).unwrap();
         std::os::unix::fs::symlink(&daemon_socket, &socket).unwrap();
 
         let profile = generate_sbpl_profile(&config, &project);
@@ -1629,9 +1630,9 @@ mod tests {
             "(allow network-outbound (remote unix-socket \
              (path-literal \"{escaped}\")))"
         )));
-        assert!(profile.contains(
-            "(allow system-socket (socket-domain AF_UNIX))"
-        ));
+        assert!(
+            profile.contains("(allow system-socket (socket-domain AF_UNIX))")
+        );
         assert!(!profile.contains("(allow network-outbound)\n"));
 
         let _ = std::fs::remove_dir_all(&fixture.home);
