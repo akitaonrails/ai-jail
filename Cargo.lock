@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "ai-jail"
-version = "2.8.0"
+version = "2.8.1"
 dependencies = [
  "landlock",
  "lexopt",
