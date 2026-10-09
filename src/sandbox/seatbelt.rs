@@ -3119,7 +3119,7 @@ mod tests {
             None,
         );
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
-        assert!(env.get(&std::ffi::OsStr::new("USER")).is_none());
+        assert!(!env.contains_key(&std::ffi::OsStr::new("USER")));
     }
 
     #[test]
