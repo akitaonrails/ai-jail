@@ -208,6 +208,17 @@ fn api_host(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The hosted-API host to default-allow (filtered egress) for a bare launch
+/// of a known API agent, or `None` when the agent has no canonical host we
+/// can name (issue #156). Reuses the same `api_host` table as the
+/// capability-gap warning, so the default allowlist and the warning always
+/// agree on the agent's host — injecting it here is exactly what silences
+/// the warning. Only the functional API host is returned; telemetry hosts
+/// are deliberately not default-allowed.
+pub(crate) fn default_egress_host(command: &[String]) -> Option<&'static str> {
+    api_host(effective_name(command)?)
+}
+
 /// The well-known API-key environment variable(s) a harness reads, so that a
 /// harness authenticated via an API key (rather than an OAuth file) also starts
 /// pre-authenticated. Only unambiguous, single-purpose variables are listed;
@@ -609,5 +620,30 @@ mod tests {
         let mut config = gap_config("kimi", None, Some(true));
         config.allow_hosts = vec!["example.com".into()];
         assert!(capability_gap_warnings(&config).is_empty());
+    }
+
+    #[test]
+    fn default_egress_host_matches_api_host_table() {
+        // Each agent's default egress host is exactly its api_host entry, so
+        // injecting it (issue #156) silences the filtered-mode gap warning.
+        assert_eq!(
+            default_egress_host(&["claude".into()]),
+            Some("api.anthropic.com")
+        );
+        assert_eq!(
+            default_egress_host(&["codex".into()]),
+            Some("api.openai.com")
+        );
+        assert_eq!(default_egress_host(&["grok".into()]), Some("api.x.ai"));
+        // Resolved through the same harness/basename logic as warnings.
+        assert_eq!(
+            default_egress_host(&["/usr/bin/claude".into()]),
+            Some("api.anthropic.com")
+        );
+        // Agents without a canonical host, and non-agents, get nothing — no
+        // half-working default allowlist is injected.
+        assert_eq!(default_egress_host(&["opencode".into()]), None);
+        assert_eq!(default_egress_host(&["kimi".into()]), None);
+        assert_eq!(default_egress_host(&["bash".into()]), None);
     }
 }
