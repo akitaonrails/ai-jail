@@ -67,18 +67,25 @@ This is the single most important invariant of the project. Users generate `.ai-
   - Agent API egress (issue #156): when the invoked command is a known API
     agent with a canonical host in `command::api_host`
     (`command::default_egress_host` exposes it — claude/codex/gemini/grok) and
-    the posture is otherwise unset (no `--network`/`--no-network`, empty
-    `allow_hosts`, not `--lockdown`, not a browser launch), ai-jail
-    default-allows that one host so a bare `ai-jail claude` reaches its model
-    API. Only the functional API host is added, never a telemetry host, and it
-    stays in lockstep with the capability-gap warning's `api_host` table (the
-    injection is exactly what silences that warning). Not Linux-only: macOS
-    filtered egress is a seatbelt loopback rule, so it applies there too.
-    Both are gated on an unprivileged network-namespace probe
+    the posture is unset (no `--network`/`--no-network`, not `--lockdown`, not
+    a browser launch), ai-jail default-allows that one host so `ai-jail claude`
+    reaches its model API. Only the functional API host is added, never a
+    telemetry host, and it stays in lockstep with the capability-gap warning's
+    `api_host` table (the injection is exactly what silences that warning). Not
+    Linux-only: macOS filtered egress is a seatbelt loopback rule, so it
+    applies there too.
+
+    Both defaults are gated on an unprivileged network-namespace probe
     (`unprivileged_netns_available`) that falls back to fully offline when
-    unavailable, never to unrestricted access. An explicit `--allow-host` list
-    is used verbatim and suppresses both automatic defaults; `--no-network`
-    always forces strict offline regardless.
+    unavailable, never to unrestricted access. Both are **unioned with** any
+    explicit `--allow-host` list, not suppressed by it — neither predicate
+    checks `allow_hosts`, only the asserted posture — so `--allow-host X claude`
+    keeps `api.anthropic.com` reachable alongside `X`. The verbatim "only this
+    list" mode is `--no-network --allow-host …`: `--no-network` sets `network`,
+    which disables both automatic defaults, while a non-empty `allow_hosts`
+    keeps `network_mode` filtered rather than fully offline. `--no-network`
+    with no `--allow-host` forces strict offline regardless.
+
 - Dev-toolchain cache persistence (`--toolchains`/`no_toolchains`, on by
   default) and the opt-in read-only credential flags (`--github`, `--aws`,
   `--kube`, `--gcloud`, `--docker-config`) are monotonic capabilities: a
