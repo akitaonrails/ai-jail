@@ -224,6 +224,8 @@ struct IoLoop<'a> {
     terminal_passthrough: bool,
     primary_filter: TerminalFilter,
     status_bar: bool,
+    /// `CSI 6 n` split across reads of the child PTY.
+    cursor_requests: CursorRequestParser,
 }
 
 impl<'a> IoLoop<'a> {
@@ -256,6 +258,7 @@ impl<'a> IoLoop<'a> {
             terminal_passthrough,
             primary_filter: TerminalFilter::new(),
             status_bar,
+            cursor_requests: CursorRequestParser::default(),
         }
     }
 
@@ -348,9 +351,24 @@ impl<'a> IoLoop<'a> {
     /// `ControlFlow::Break(())` when the loop should exit (child
     /// closed the PTY).
     fn handle_master_read(&mut self, buf: &[u8]) -> std::ops::ControlFlow<()> {
-        self.parser.process(buf);
+        let replies = cursor_replies(
+            &mut self.parser,
+            &mut self.cursor_requests,
+            buf,
+            true,
+        );
         let screen = self.parser.screen();
         let now_alt = screen.alternate_screen();
+        // Answer from the vt100 cursor unless this chunk is delivered
+        // raw to the host, which then answers the query itself.
+        if !host_answers_cursor_request(
+            self.terminal_passthrough,
+            self.was_alt_screen,
+            now_alt,
+        ) && !replies.is_empty()
+        {
+            write_all_raw(self.master_raw, &replies);
+        }
 
         // Forward CSI control/query sequences that vt100 silently
         // drops (kitty keyboard protocol, Device Attributes, XTVERSION
@@ -604,6 +622,172 @@ fn csi_final_forwardable(final_b: u8, prefix: Option<u8>) -> bool {
         b'q' => prefix == Some(b'>'),
         _ => false,
     }
+}
+
+/// Parser state for a `CSI 6 n` cursor-position request in child output.
+///
+/// Drawing commands stay inside vt100. This only notices the request so
+/// the proxy can answer it. Forwarding it to the real terminal would
+/// race the cursor the proxy itself draws (status bar, scroll region).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CursorReqState {
+    #[default]
+    Ground,
+    Esc,
+    /// Saw `ESC [` or an 8-bit CSI, waiting for the first parameter byte.
+    Csi,
+    /// Saw a parameter that is exactly `6`, with no other bytes yet.
+    Param6,
+    /// Some other CSI. Wait for its final byte.
+    Skip,
+    /// OSC, DCS, APC, or PM. A `CSI 6 n` in a string is not a query.
+    String,
+    /// Saw `ESC` inside a string, waiting for ST (`\`) or another byte.
+    StringEsc,
+}
+
+/// Incomplete `CSI 6 n` carried across reads of the child PTY.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CursorRequestParser {
+    state: CursorReqState,
+}
+
+impl CursorRequestParser {
+    /// End offsets (exclusive) of each completed `CSI 6 n` in `data`.
+    fn observe(&mut self, data: &[u8]) -> Vec<usize> {
+        let mut ends = Vec::new();
+        for (i, &b) in data.iter().enumerate() {
+            self.step(b, i, &mut ends);
+        }
+        ends
+    }
+
+    fn step(&mut self, b: u8, index: usize, ends: &mut Vec<usize>) {
+        self.state = match self.state {
+            CursorReqState::Ground => self.ground(b),
+            CursorReqState::Esc => self.after_esc(b),
+            CursorReqState::Csi => self.csi(b),
+            CursorReqState::Param6 => self.param6(b, index, ends),
+            CursorReqState::Skip => self.skip(b),
+            CursorReqState::String => self.string(b),
+            CursorReqState::StringEsc => self.string_esc(b),
+        };
+    }
+
+    fn ground(&self, b: u8) -> CursorReqState {
+        match b {
+            0x1b => CursorReqState::Esc,
+            0x9b => CursorReqState::Csi,
+            0x90 | 0x9d | 0x9e | 0x9f => CursorReqState::String,
+            _ => CursorReqState::Ground,
+        }
+    }
+
+    fn after_esc(&self, b: u8) -> CursorReqState {
+        match b {
+            b'[' => CursorReqState::Csi,
+            b']' | b'P' | b'X' | b'^' | b'_' => CursorReqState::String,
+            0x1b => CursorReqState::Esc,
+            _ => CursorReqState::Ground,
+        }
+    }
+
+    fn csi(&self, b: u8) -> CursorReqState {
+        match b {
+            b'6' => CursorReqState::Param6,
+            0x1b => CursorReqState::Esc,
+            0x40..=0x7e => CursorReqState::Ground,
+            _ => CursorReqState::Skip,
+        }
+    }
+
+    fn param6(
+        &self,
+        b: u8,
+        index: usize,
+        ends: &mut Vec<usize>,
+    ) -> CursorReqState {
+        match b {
+            b'n' => {
+                ends.push(index + 1);
+                CursorReqState::Ground
+            }
+            0x1b => CursorReqState::Esc,
+            0x40..=0x7e => CursorReqState::Ground,
+            _ => CursorReqState::Skip,
+        }
+    }
+
+    fn skip(&self, b: u8) -> CursorReqState {
+        match b {
+            0x1b => CursorReqState::Esc,
+            0x40..=0x7e => CursorReqState::Ground,
+            _ => CursorReqState::Skip,
+        }
+    }
+
+    fn string(&self, b: u8) -> CursorReqState {
+        match b {
+            0x07 | 0x9c => CursorReqState::Ground,
+            0x1b => CursorReqState::StringEsc,
+            _ => CursorReqState::String,
+        }
+    }
+
+    fn string_esc(&self, b: u8) -> CursorReqState {
+        match b {
+            b'\\' | 0x9c => CursorReqState::Ground,
+            0x1b => CursorReqState::StringEsc,
+            _ => CursorReqState::String,
+        }
+    }
+}
+
+/// CPR for a 0-based vt100 cursor. The terminal report is 1-based.
+fn cursor_position_report(row: u16, col: u16) -> Vec<u8> {
+    format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
+}
+
+/// Feed `data` to `parser` and build one CPR per completed `CSI 6 n`.
+///
+/// The cursor is read when the request completes, so later bytes in the
+/// same chunk do not change that report. `synthesize` is false when the
+/// real terminal will answer (primary screen with passthrough): the
+/// screen and the scanner still advance, and no local report is built.
+fn cursor_replies(
+    parser: &mut vt100::Parser,
+    requests: &mut CursorRequestParser,
+    data: &[u8],
+    synthesize: bool,
+) -> Vec<u8> {
+    let ends = requests.observe(data);
+    if !synthesize || ends.is_empty() {
+        parser.process(data);
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    for end in ends {
+        parser.process(&data[start..end]);
+        start = end;
+        let (row, col) = parser.screen().cursor_position();
+        out.extend(cursor_position_report(row, col));
+    }
+    if start < data.len() {
+        parser.process(&data[start..]);
+    }
+    out
+}
+
+/// The real terminal sees child bytes raw only while we stay on the
+/// primary screen with passthrough on. That is the one case where it
+/// answers `CSI 6 n` itself.
+fn host_answers_cursor_request(
+    passthrough: bool,
+    was_alt: bool,
+    now_alt: bool,
+) -> bool {
+    passthrough && !was_alt && !now_alt
 }
 
 /// Scan child output for CSI control/query sequences that vt100 does
@@ -1476,9 +1660,10 @@ mod tests {
 
     #[test]
     fn unrelated_csi_finals_not_forwarded() {
-        // SGR (m), cursor home (H), erase (J), DSR (n) stay swallowed —
-        // vt100 reconstructs the screen for those, and forwarding a DSR
-        // cursor-position request would race the real terminal's cursor.
+        // SGR (m), cursor home (H), erase (J), DSR (n) stay swallowed.
+        // vt100 reconstructs drawing commands. Forwarding CSI 6 n would
+        // race the cursor the proxy draws on the real terminal. The
+        // child is answered from the vt100 cursor in `cursor_replies`.
         assert!(capture_kbd_forward(b"\x1b[31m").is_empty());
         assert!(capture_kbd_forward(b"\x1b[6n").is_empty());
         assert!(capture_kbd_forward(b"\x1b[2J").is_empty());
@@ -1779,6 +1964,100 @@ mod tests {
     fn terminal_reply_detection_is_conservative() {
         assert!(super::looks_like_terminal_reply(b"\x1b[12;4R"));
         assert!(!super::looks_like_terminal_reply(b"\x1b[A"));
+    }
+
+    fn cursor_replies(chunks: &[&[u8]], synthesize: bool) -> Vec<u8> {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        let mut requests = super::CursorRequestParser::default();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend(super::cursor_replies(
+                &mut parser,
+                &mut requests,
+                chunk,
+                synthesize,
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn cursor_request_is_answered_from_vt100_origin() {
+        // CSI 6 n at the home position. The report is 1-based.
+        assert_eq!(cursor_replies(&[b"\x1b[6n"], true), b"\x1b[1;1R");
+    }
+
+    #[test]
+    fn cursor_request_uses_position_at_the_request() {
+        // CUP is 1-based. Bytes after the request must not move the
+        // reported position. "ab" leaves the cursor in column 3.
+        assert_eq!(cursor_replies(&[b"\x1b[8;3H\x1b[6n"], true), b"\x1b[8;3R");
+        assert_eq!(cursor_replies(&[b"ab\x1b[6ncd"], true), b"\x1b[1;3R");
+        assert_eq!(
+            cursor_replies(&[b"\x1b[6n\x1b[4;5H\x1b[6n"], true),
+            b"\x1b[1;1R\x1b[4;5R"
+        );
+    }
+
+    #[test]
+    fn cursor_request_ignores_other_status_reports() {
+        // CSI 5 n is device status, not the cursor. Extra digits,
+        // a private prefix, or another parameter are not CSI 6 n.
+        assert!(cursor_replies(&[b"\x1b[5n"], true).is_empty());
+        assert!(cursor_replies(&[b"\x1b[16n"], true).is_empty());
+        assert!(cursor_replies(&[b"\x1b[?6n"], true).is_empty());
+        assert!(cursor_replies(&[b"\x1b[6;1n"], true).is_empty());
+    }
+
+    #[test]
+    fn cursor_request_split_across_reads_is_answered_once() {
+        assert_eq!(
+            cursor_replies(&[b"\x1b[2;4H\x1b[6", b"n"], true),
+            b"\x1b[2;4R"
+        );
+    }
+
+    #[test]
+    fn cursor_request_inside_osc_is_not_a_query() {
+        assert!(cursor_replies(&[b"\x1b]0;\x1b[6n\x07"], true).is_empty());
+        assert_eq!(
+            cursor_replies(&[b"\x1b]0;title\x07\x1b[6n"], true),
+            b"\x1b[1;1R"
+        );
+    }
+
+    #[test]
+    fn cursor_request_stays_silent_when_the_host_answers() {
+        // Primary screen + passthrough forwards the query raw. A second
+        // report from the vt100 model would race that reply. The cursor
+        // still moves, so a later local answer uses that position.
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        let mut requests = super::CursorRequestParser::default();
+        let silent = super::cursor_replies(
+            &mut parser,
+            &mut requests,
+            b"\x1b[3;3H\x1b[6n",
+            false,
+        );
+        assert!(silent.is_empty());
+        let answered =
+            super::cursor_replies(&mut parser, &mut requests, b"\x1b[6n", true);
+        assert_eq!(answered, b"\x1b[3;3R");
+    }
+
+    #[test]
+    fn host_answers_cursor_only_on_primary_passthrough() {
+        assert!(super::host_answers_cursor_request(true, false, false));
+        assert!(!super::host_answers_cursor_request(false, false, false));
+        assert!(!super::host_answers_cursor_request(true, true, true));
+        assert!(!super::host_answers_cursor_request(true, false, true));
+        assert!(!super::host_answers_cursor_request(true, true, false));
+    }
+
+    #[test]
+    fn primary_filter_drops_cursor_position_request() {
+        let mut filter = super::TerminalFilter::new();
+        assert_eq!(filter.feed(b"\x1b[6nvisible"), b"visible");
     }
 
     #[test]
