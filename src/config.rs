@@ -1528,8 +1528,25 @@ pub fn save(config: &Config) {
 /// a plain first run in a clean directory no longer leaves a comment-only
 /// `.ai-jail` behind (issue #103). `--init` still writes that file, because
 /// there the user explicitly asked for one to edit.
-pub fn save_auto(config: &Config) {
-    save_project(config, false);
+///
+/// An untrusted project file keeps only what its next load would accept,
+/// so a capability passed once on the CLI is not saved into a file that
+/// then ignores it, with a warning, on every later run. A project listed
+/// in the global `trust_project_config` is saved as is.
+pub fn save_auto(config: &Config, project_trusted: bool, project_dir: &Path) {
+    if project_trusted {
+        save_project(config, false);
+    } else {
+        save_project(&untrusted_project_view(config, project_dir), false);
+    }
+}
+
+/// What an untrusted project `.ai-jail` keeps once loaded: the project
+/// layer of [`merge_with_global_report`] over a default baseline. Using the
+/// merge itself keeps auto-save and loading from drifting apart when a
+/// capability is added.
+fn untrusted_project_view(config: &Config, project_dir: &Path) -> Config {
+    merge_with_global_report(Config::default(), config.clone(), project_dir).0
 }
 
 fn save_project(config: &Config, write_when_empty: bool) {
@@ -4211,6 +4228,78 @@ tailscale = true
     }
 
     #[test]
+    fn untrusted_auto_save_drops_what_the_project_merge_refuses() {
+        // Everything one CLI run can put into the project file that the
+        // untrusted merge refuses on the next load, beside values it keeps.
+        let to_save = Config {
+            command: vec!["claude".into()],
+            network: Some(false),
+            mask: vec![PathBuf::from("/project/.env")],
+            ro_maps: vec![
+                PathBuf::from("/project/docs"),
+                PathBuf::from("/etc/hostname"),
+            ],
+            no_gpu: Some(false),
+            no_display: Some(false),
+            x11: Some(true),
+            ssh: Some(true),
+            pictures: Some(true),
+            github: Some(true),
+            private_home: Some(false),
+            inherit_env: Some(true),
+            claude_dir: Some(PathBuf::from("/tmp/cd")),
+            mask_exceptions: vec![PathBuf::from("/project/.env")],
+            ..Config::default()
+        };
+        let saved = untrusted_project_view(&to_save, Path::new("/project"));
+
+        assert_eq!(saved.command, vec!["claude"]);
+        assert_eq!(saved.network, Some(false));
+        assert_eq!(saved.mask, vec![PathBuf::from("/project/.env")]);
+        assert_eq!(saved.ro_maps, vec![PathBuf::from("/project/docs")]);
+        assert_eq!(saved.no_gpu, None);
+        assert_eq!(saved.no_display, None);
+        assert_eq!(saved.x11, None);
+        assert_eq!(saved.ssh, None);
+        assert_eq!(saved.pictures, None);
+        assert_eq!(saved.github, None);
+        assert_eq!(saved.private_home, None);
+        assert_eq!(saved.inherit_env, None);
+        assert_eq!(saved.claude_dir, None);
+        assert!(saved.mask_exceptions.is_empty());
+
+        // The file auto-save writes loads again without a single warning.
+        let (_, warnings) = merge_with_global_report(
+            Config::default(),
+            saved,
+            Path::new("/project"),
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn untrusted_auto_save_keeps_tightening_values() {
+        let to_save = Config {
+            no_gpu: Some(true),
+            lockdown: Some(true),
+            no_toolchains: Some(true),
+            no_save_config: Some(true),
+            hide_dotdirs: vec![".aws".into()],
+            deny_paths: vec![PathBuf::from("/project/secrets")],
+            rw_maps: vec![PathBuf::from("/project/out")],
+            ..Config::default()
+        };
+        let saved = untrusted_project_view(&to_save, Path::new("/project"));
+        assert_eq!(saved.no_gpu, Some(true));
+        assert_eq!(saved.lockdown, Some(true));
+        assert_eq!(saved.no_toolchains, Some(true));
+        assert_eq!(saved.no_save_config, Some(true));
+        assert_eq!(saved.hide_dotdirs, vec![".aws"]);
+        assert_eq!(saved.deny_paths, vec![PathBuf::from("/project/secrets")]);
+        assert_eq!(saved.rw_maps, vec![PathBuf::from("/project/out")]);
+    }
+
+    #[test]
     fn command_scoped_global_applies_for_cli_command() {
         let global = parse_global_toml(
             r#"
@@ -5234,6 +5323,42 @@ env_from_file = ["/run/secrets/anthropic"]
 "#;
         let cfg = parse_toml(toml).unwrap();
         assert!(cfg.secret_hosts.is_empty());
+    }
+
+    #[test]
+    fn regression_v2_8_1_auto_saved_capability_opt_ins_parse() {
+        // 2.8.1 auto-save wrote CLI capability opt-ins into the project
+        // file (`--pictures`, `--display`, `--claude-dir`, a map outside the
+        // project). Those files must keep parsing, and the untrusted merge
+        // keeps ignoring the opt-ins with a warning.
+        let toml = r#"
+command = ["true"]
+network = false
+pictures = true
+no_display = false
+claude_dir = "/tmp/cd"
+ro_maps = ["/etc/hostname"]
+mask = ["/project/.env"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.pictures, Some(true));
+        assert_eq!(cfg.no_display, Some(false));
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            cfg,
+            Path::new("/project"),
+        );
+        assert!(!merged.pictures_enabled());
+        assert!(!merged.display_enabled());
+        assert_eq!(merged.claude_dir, None);
+        assert!(merged.ro_maps.is_empty());
+        assert_eq!(merged.mask, vec![PathBuf::from("/project/.env")]);
+        for field in ["pictures", "no_display", "claude_dir", "/etc/hostname"] {
+            assert!(
+                warnings.iter().any(|w| w.contains(field)),
+                "no warning for {field}: {warnings:?}"
+            );
+        }
     }
 
     #[test]
