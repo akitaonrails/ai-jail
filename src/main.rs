@@ -946,7 +946,7 @@ fn run() -> Result<i32, String> {
             project_config,
             &invocation_cwd,
         );
-        config::save_auto(&to_save);
+        config::save_auto(&to_save, project_trusted, &invocation_cwd);
     }
 
     // Handle dry run
