@@ -1612,13 +1612,11 @@ fn discover_mounts_full(
     let enable_docker = !lockdown && config.docker_enabled();
     let enable_tailscale = !lockdown && config.tailscale_enabled();
     let enable_display = !lockdown && config.display_enabled();
+    let enable_x11 = !lockdown && config.x11_enabled();
     let exempt = super::dotdir_exemptions(config);
 
-    let (display_mounts, display_env) = if enable_display {
-        discover_display(config, verbose)
-    } else {
-        (vec![], vec![])
-    };
+    let (display_mounts, display_env) =
+        discover_display(enable_display, enable_x11, verbose);
     let (audio_mounts, audio_env) = if !lockdown && config.audio_enabled() {
         discover_audio(verbose)
     } else {
@@ -2751,30 +2749,29 @@ fn discover_shm(host_shared: bool) -> Vec<Mount> {
     }
 }
 
+/// Display passthrough. Wayland (`--display`) and X11 (`--x11`) are
+/// separate opt-ins: either can be enabled without the other.
 fn discover_display(
-    config: &Config,
+    display: bool,
+    x11: bool,
     verbose: bool,
 ) -> (Vec<Mount>, Vec<(String, String)>) {
     let mut mounts = Vec::new();
     let mut env = Vec::new();
 
-    let x11 = PathBuf::from("/tmp/.X11-unix");
-    if config.x11_enabled() && x11.is_dir() {
+    let x11_dir = PathBuf::from("/tmp/.X11-unix");
+    if x11 && x11_dir.is_dir() {
         mounts.push(Mount::Bind {
-            src: x11.clone(),
-            dest: x11,
+            src: x11_dir.clone(),
+            dest: x11_dir,
         });
     }
 
-    if config.x11_enabled()
-        && let Ok(display) = std::env::var("DISPLAY")
-    {
+    if x11 && let Ok(display) = std::env::var("DISPLAY") {
         env.push(("DISPLAY".into(), display));
     }
 
-    if config.x11_enabled()
-        && let Ok(xauth) = std::env::var("XAUTHORITY")
-    {
+    if x11 && let Ok(xauth) = std::env::var("XAUTHORITY") {
         let xauth_path = PathBuf::from(&xauth);
         if safe_xauthority(&xauth_path) {
             mounts.push(Mount::RoBind {
@@ -2789,10 +2786,12 @@ fn discover_display(
         }
     }
 
-    if let (Ok(xdg_dir), Ok(wayland)) = (
-        std::env::var("XDG_RUNTIME_DIR"),
-        std::env::var("WAYLAND_DISPLAY"),
-    ) {
+    if display
+        && let (Ok(xdg_dir), Ok(wayland)) = (
+            std::env::var("XDG_RUNTIME_DIR"),
+            std::env::var("WAYLAND_DISPLAY"),
+        )
+    {
         let xdg_path = PathBuf::from(&xdg_dir);
         if is_safe_xdg_runtime(&xdg_path) {
             if let Ok(runtime) = xdg_path.canonicalize()
@@ -3915,6 +3914,72 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == &private.display().to_string()));
 
         let _ = std::fs::remove_dir_all(&runtime);
+    }
+
+    fn x11_dry_run_args(config: &Config) -> Vec<String> {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let sources = MountSources::from_guard(&guard);
+        build_dry_run_args_full(
+            config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn sets_env(args: &[String], name: &str, value: &str) -> bool {
+        args.windows(3)
+            .any(|w| w[0] == "--setenv" && w[1] == name && w[2] == value)
+    }
+
+    #[test]
+    fn x11_is_passed_through_without_display() {
+        // `--x11` is its own capability: X11-only apps and browsers use it
+        // instead of `--display` (README "Browsers").
+        let _env = ENV_LOCK.lock().unwrap();
+        let _display = EnvVarGuard::set("DISPLAY", ":42");
+        let _xauth = EnvVarGuard::remove("XAUTHORITY");
+        let _wayland = EnvVarGuard::remove("WAYLAND_DISPLAY");
+        let config = Config {
+            no_display: Some(true),
+            x11: Some(true),
+            ..minimal_test_config()
+        };
+        let args = x11_dry_run_args(&config);
+        assert!(sets_env(&args, "DISPLAY", ":42"), "{args:?}");
+    }
+
+    #[test]
+    fn display_without_x11_passes_no_x11() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _display = EnvVarGuard::set("DISPLAY", ":42");
+        let _xauth = EnvVarGuard::remove("XAUTHORITY");
+        let config = Config {
+            no_display: Some(false),
+            x11: None,
+            ..minimal_test_config()
+        };
+        let args = x11_dry_run_args(&config);
+        assert!(!args.iter().any(|arg| arg == "DISPLAY"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "/tmp/.X11-unix"), "{args:?}");
+    }
+
+    #[test]
+    fn x11_stays_off_under_lockdown() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _display = EnvVarGuard::set("DISPLAY", ":42");
+        let _xauth = EnvVarGuard::remove("XAUTHORITY");
+        let config = Config {
+            lockdown: Some(true),
+            x11: Some(true),
+            ..minimal_test_config()
+        };
+        let args = x11_dry_run_args(&config);
+        assert!(!args.iter().any(|arg| arg == "DISPLAY"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "/tmp/.X11-unix"), "{args:?}");
     }
 
     #[test]
