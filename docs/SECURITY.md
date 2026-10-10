@@ -220,6 +220,28 @@ granted access to. On both platforms, kernel and driver bugs, terminal emulator
 bugs (especially after terminal passthrough), and sandbox backend defects remain
 residual risk.
 
+The writable project directory includes `.git/`, and host-side git trusts what
+it finds there. A program named in `.git/config`, such as `core.fsmonitor` or
+`core.pager`, or an executable in `.git/hooks/`, runs as you, outside the
+sandbox, when the matching git operation next runs on the host. For
+`core.fsmonitor` that is a plain `git status`, including one another tool runs
+in the background. Unlike an edited `Makefile` or `package.json`, such a change
+needs no project code to be run and does not show in `git diff`. `--lockdown`
+closes it by mounting the project read-only, and `--map .git` keeps the
+repository read-only in a normal run at the cost of committing from inside the
+sandbox. On Linux, mapping only `.git/config` and `.git/hooks` read-only stops
+an accidental write but not a process that renames `.git` and builds a new one.
+If a session did something you did not expect, read `.git/config` and list
+`.git/hooks` with plain file tools before running git on the host —
+`git config --list` itself starts the configured pager.
+
+`--mask` and `--deny-path` change what the sandbox sees, not the host files:
+on Linux they are placeholder mounts in the sandbox's mount namespace, on
+macOS seatbelt deny rules. Anything outside the sandbox that acts for the agent
+still reads the real files — for example the Docker daemon under `--docker`,
+or an MCP server or broker reached through a mapped socket. A tool that serves
+a sandboxed agent from the host has to apply the same masks itself.
+
 ## Reporting vulnerabilities
 
 Do not open a public issue for a suspected vulnerability. Use GitHub's private
