@@ -329,7 +329,7 @@ fn default_registry_egress_applies(config: &config::Config) -> bool {
 }
 
 /// Give a launch of a known API agent (one with a canonical API host in
-/// `command::default_egress_host`) filtered egress to that host whenever the
+/// `command::default_egress_hosts`) filtered egress to those hosts whenever the
 /// user has not asserted a network posture (issue #156). Like the
 /// package-registry default, this is _unioned_ with any explicit `--allow-host`
 /// list rather than suppressed by it: adding a host (`--allow-host github.com
@@ -342,7 +342,7 @@ fn default_registry_egress_applies(config: &config::Config) -> bool {
 /// not Linux-only: macOS filtered egress is a seatbelt loopback rule, so it
 /// applies there too.
 fn default_agent_api_egress_applies(config: &config::Config) -> bool {
-    command::default_egress_host(&config.command).is_some()
+    !command::default_egress_hosts(&config.command).is_empty()
         && config.network.is_none()
         && !config.lockdown_enabled()
         && config.browser_profile.is_none()
@@ -743,21 +743,23 @@ fn run() -> Result<i32, String> {
         }
     }
 
-    // Default-allow a known API agent's own documented API host (filtered
+    // Default-allow a known API agent's own functional hosts (filtered
     // egress) when the user asserted no network posture (issue #156), so
     // `ai-jail claude` / `ai-jail codex` reaches its model API out of the box
-    // without opening the whole network. Only the agent's single canonical host
-    // is added, and it is UNIONED with any explicit --allow-host list (like the
+    // without opening the whole network. Only the agent's canonical API hosts
+    // are added, and they are UNIONED with any explicit --allow-host list (like the
     // registry hosts below) rather than suppressed by it — `--no-network
     // --allow-host …` is the verbatim escape hatch. The sandbox stays
     // deny-by-default. Gated on the same netns probe as registry egress (always
     // available on macOS, where filtered egress is a seatbelt loopback rule).
     if default_agent_api_egress_applies(&config)
         && sandbox::unprivileged_netns_available()
-        && let Some(host) = command::default_egress_host(&config.command)
-        && !config.allow_hosts.iter().any(|allowed| allowed == host)
     {
-        config.allow_hosts.push(host.to_string());
+        for host in command::default_egress_hosts(&config.command) {
+            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
+                config.allow_hosts.push(host.to_string());
+            }
+        }
     }
 
     // Default-allow the package registries (filtered egress) so dependency

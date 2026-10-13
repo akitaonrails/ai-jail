@@ -132,6 +132,12 @@ fn prepare_codex_ps_shim() -> Result<PathBuf, String> {
     let executable = std::env::current_exe().map_err(|e| {
         format!("Cannot resolve ai-jail for Codex ps helper: {e}")
     })?;
+    let executable = std::fs::canonicalize(&executable).map_err(|e| {
+        format!(
+            "Cannot canonicalize ai-jail for Codex ps helper {}: {e}",
+            executable.display()
+        )
+    })?;
     let bin_dir = tmpdir.join("codex-bin");
     std::fs::create_dir_all(&bin_dir).map_err(|e| {
         format!(
@@ -763,6 +769,7 @@ fn push_codex_control_socket_section(profile: &mut String, config: &Config) {
 /// limited to Codex launches; neither service is granted to arbitrary tools.
 fn push_codex_mach_section(profile: &mut String, config: &Config) {
     if config.lockdown_enabled()
+        || !config.agent_state_enabled()
         || crate::command::effective_name(&config.command) != Some("codex")
     {
         return;
@@ -770,12 +777,31 @@ fn push_codex_mach_section(profile: &mut String, config: &Config) {
 
     profile.push_str("; Codex app-server system services\n");
     for service in [
+        "com.apple.cfprefsd.agent",
+        "com.apple.SecurityServer",
+        "com.apple.trustd.agent",
         "com.apple.SystemConfiguration.configd",
         "com.apple.system.notification_center",
         "com.apple.system.opendirectoryd.libinfo",
     ] {
         profile.push_str(&format!(
             "(allow mach-lookup (global-name \"{service}\"))\n"
+        ));
+    }
+    profile.push('\n');
+
+    // CFPreferences uses shared memory for managed and per-user defaults.
+    // Codex 0.162.1 fails account/read when Seatbelt denies these two names.
+    let uid = unsafe { nix::libc::getuid() };
+    for name in [
+        format!("apple.cfprefs.{uid}v1"),
+        "apple.cfprefs.daemonv1".into(),
+    ] {
+        profile.push_str(&format!(
+            "(allow ipc-posix-shm-read-data (ipc-posix-name \"{name}\"))\n"
+        ));
+        profile.push_str(&format!(
+            "(allow ipc-posix-shm-write-data (ipc-posix-name \"{name}\"))\n"
         ));
     }
     profile.push('\n');
@@ -1672,7 +1698,6 @@ mod tests {
         let other_agent_profile =
             generate_sbpl_profile(&other_agent, Path::new("/tmp/test-project"));
         assert!(!other_agent_profile.contains("com.apple.securityd.xpc"));
-        assert!(!other_agent_profile.contains("com.apple.SecurityServer"));
         assert!(!other_agent_profile.contains("login.keychain-db"));
 
         let lockdown = Config {
@@ -1743,6 +1768,13 @@ mod tests {
         assert!(
             profile.contains("(allow system-socket (socket-domain AF_UNIX))")
         );
+        for service in [
+            "com.apple.cfprefsd.agent",
+            "com.apple.SecurityServer",
+            "com.apple.trustd.agent",
+        ] {
+            assert!(profile.contains(service), "missing {service}");
+        }
         assert!(profile.contains(
             "(allow mach-lookup (global-name \
              \"com.apple.SystemConfiguration.configd\"))"
@@ -1756,12 +1788,34 @@ mod tests {
              \"com.apple.system.opendirectoryd.libinfo\"))"
         ));
         let uid = unsafe { nix::libc::getuid() };
+        for name in [
+            format!("apple.cfprefs.{uid}v1"),
+            "apple.cfprefs.daemonv1".into(),
+        ] {
+            for operation in
+                ["ipc-posix-shm-read-data", "ipc-posix-shm-write-data"]
+            {
+                assert!(profile.contains(&format!(
+                    "(allow {operation} (ipc-posix-name \"{name}\"))"
+                )));
+            }
+        }
         assert!(profile.contains(&format!(
             "(path-regex #\"^/private/tmp/codex-daemon-{uid}/[0-9a-f]+$\")"
         )));
         assert!(profile.contains("(allow network-bind (local unix-socket"));
         assert!(!profile.contains("(allow network-outbound)\n"));
         assert!(!profile.contains("(allow network-bind)\n"));
+
+        let no_agent_state = Config {
+            agent_state: Some(false),
+            ..config.clone()
+        };
+        let no_agent_state_profile =
+            generate_sbpl_profile(&no_agent_state, &project);
+        assert!(!no_agent_state_profile.contains("com.apple.cfprefsd.agent"));
+        assert!(!no_agent_state_profile.contains("com.apple.trustd.agent"));
+        assert!(!no_agent_state_profile.contains("ipc-posix-shm-read-data"));
 
         let other_tool = Config {
             command: vec!["bash".into()],
@@ -1781,6 +1835,11 @@ mod tests {
         assert!(
             !other_profile.contains("com.apple.SystemConfiguration.configd")
         );
+        assert!(!other_profile.contains("com.apple.cfprefsd.agent"));
+        assert!(!other_profile.contains("com.apple.SecurityServer"));
+        assert!(!other_profile.contains("com.apple.trustd.agent"));
+        assert!(!other_profile.contains("ipc-posix-shm-read-data"));
+        assert!(!other_profile.contains("ipc-posix-shm-write-data"));
 
         let _ = std::fs::remove_dir_all(&fixture.home);
         let _ = std::fs::remove_file(&daemon_socket);
@@ -1944,7 +2003,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_link(helper_dir.join("ps")).unwrap(),
-            std::env::current_exe().unwrap()
+            std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
         );
     }
 
