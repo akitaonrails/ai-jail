@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::output;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -85,8 +86,15 @@ pub fn build(
     verbose: bool,
     sandbox_tty: Option<&Path>,
     proxy_port: Option<u16>,
-) -> Command {
+) -> Result<Command, String> {
     let lockdown = config.lockdown_enabled();
+    let codex_ps_shim = if !lockdown
+        && crate::command::effective_name(&config.command) == Some("codex")
+    {
+        Some(prepare_codex_ps_shim()?)
+    } else {
+        None
+    };
     let profile =
         build_profile(config, project_dir, verbose, sandbox_tty, proxy_port);
     let launch = super::build_launch_command(config);
@@ -98,7 +106,7 @@ pub fn build(
     cmd.args(&launch.args);
     cmd.current_dir(project_dir);
 
-    apply_child_env(&mut cmd, config, proxy_port);
+    apply_child_env(&mut cmd, config, proxy_port, codex_ps_shim.as_deref());
 
     // The profile only grants RW inside the dedicated session scratch
     // dir; TMPDIR must point there or every temp operation in the
@@ -107,7 +115,52 @@ pub fn build(
         cmd.env("TMPDIR", tmpdir);
     }
 
-    cmd
+    Ok(cmd)
+}
+
+/// Install an unprivileged `ps` entry point in this session's private temp
+/// directory. macOS's `/bin/ps` is setuid and Seatbelt rejects its exec; the
+/// ai-jail binary handles only Codex's narrow PID-validation query.
+fn prepare_codex_ps_shim() -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(tmpdir) = macos_session_tmpdir() else {
+        return Err(
+            "Cannot prepare Codex ps helper without a session temp dir".into(),
+        );
+    };
+    let executable = std::env::current_exe().map_err(|e| {
+        format!("Cannot resolve ai-jail for Codex ps helper: {e}")
+    })?;
+    let bin_dir = tmpdir.join("codex-bin");
+    std::fs::create_dir_all(&bin_dir).map_err(|e| {
+        format!(
+            "Cannot create Codex helper directory {}: {e}",
+            bin_dir.display()
+        )
+    })?;
+    std::fs::set_permissions(&bin_dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| {
+            format!(
+                "Cannot secure Codex helper directory {}: {e}",
+                bin_dir.display()
+            )
+        })?;
+    let ps = bin_dir.join("ps");
+    match std::fs::remove_file(&ps) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Cannot replace Codex ps helper {}: {error}",
+                ps.display()
+            ));
+        }
+    }
+    std::os::unix::fs::symlink(&executable, &ps).map_err(|e| {
+        format!("Cannot install Codex ps helper {}: {e}", ps.display())
+    })?;
+    Ok(bin_dir)
 }
 
 /// Build the child environment from the shared allowlist in
@@ -121,11 +174,12 @@ fn apply_child_env(
     cmd: &mut Command,
     config: &Config,
     proxy_port: Option<u16>,
+    codex_ps_shim: Option<&Path>,
 ) {
     cmd.env_clear();
 
     let host_env: Vec<(String, String)> = std::env::vars().collect();
-    let env = if config.inherit_env_enabled() {
+    let mut env = if config.inherit_env_enabled() {
         // The whole parent environment, secrets included — that is what
         // the opt-in means. Starting from an empty vector here handed the
         // child nothing at all (not even PATH), because `env_clear` above
@@ -137,6 +191,16 @@ fn apply_child_env(
     } else {
         crate::config::filtered_child_env(config.env_pass(), &host_env)
     };
+
+    if let Some(shim_dir) = codex_ps_shim
+        && let Some((_, path)) = env.iter_mut().find(|(key, _)| key == "PATH")
+    {
+        let mut paths = vec![shim_dir.to_path_buf()];
+        paths.extend(std::env::split_paths(OsStr::new(path)));
+        if let Ok(joined_path) = std::env::join_paths(paths) {
+            *path = joined_path.to_string_lossy().into_owned();
+        }
+    }
     for (key, value) in env {
         cmd.env(key, value);
     }
@@ -353,6 +417,7 @@ fn generate_sbpl_profile_for_tty(
         sandbox_tty,
     );
     push_claude_keychain_section(&mut profile, config);
+    push_codex_mach_section(&mut profile, config);
     push_network_section(&mut profile, config, proxy_port);
     push_codex_control_socket_section(&mut profile, config);
     let is_claude =
@@ -658,7 +723,10 @@ fn push_network_section(
 /// daemon. Its control plane is a Unix socket, so Seatbelt classifies the
 /// connection as `network-outbound` even though no network access is wanted.
 /// Allow only Codex's own control socket when its trusted agent state is
-/// mounted; do not widen the sandbox to arbitrary Unix sockets or TCP.
+/// mounted; do not widen the sandbox to arbitrary Unix sockets or TCP. The
+/// daemon creates its socket after the profile is built, so the canonical
+/// target is not always available yet. Its per-user runtime path is stable
+/// even though the socket's hash changes between starts.
 fn push_codex_control_socket_section(profile: &mut String, config: &Config) {
     if config.lockdown_enabled()
         || !config.agent_state_enabled()
@@ -679,6 +747,38 @@ fn push_codex_control_socket_section(profile: &mut String, config: &Config) {
     profile.push_str(&format!(
         "(allow network-outbound (remote unix-socket (path-literal \"{escaped}\")))\n\n"
     ));
+    let uid = unsafe { nix::libc::getuid() };
+    profile.push_str(&format!(
+        "(allow network-outbound (remote unix-socket \
+         (path-regex #\"^/private/tmp/codex-daemon-{uid}/[0-9a-f]+$\")))\n\n"
+    ));
+    profile.push_str(&format!(
+        "(allow network-bind (local unix-socket \
+         (path-regex #\"^/private/tmp/codex-daemon-{uid}/[0-9a-f]+$\")))\n\n"
+    ));
+}
+
+/// Codex's managed app-server initializes macOS account and notification
+/// services before it publishes its control socket. Keep these lookups
+/// limited to Codex launches; neither service is granted to arbitrary tools.
+fn push_codex_mach_section(profile: &mut String, config: &Config) {
+    if config.lockdown_enabled()
+        || crate::command::effective_name(&config.command) != Some("codex")
+    {
+        return;
+    }
+
+    profile.push_str("; Codex app-server system services\n");
+    for service in [
+        "com.apple.SystemConfiguration.configd",
+        "com.apple.system.notification_center",
+        "com.apple.system.opendirectoryd.libinfo",
+    ] {
+        profile.push_str(&format!(
+            "(allow mach-lookup (global-name \"{service}\"))\n"
+        ));
+    }
+    profile.push('\n');
 }
 
 fn push_file_read_section(
@@ -1183,6 +1283,16 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
     // receive write access through macos_writable_paths.
     push_unique(canonicalize_or_keep(project_dir));
 
+    // Codex's ps helper is this executable, reached through a private temp
+    // symlink. Name its canonical target explicitly so Seatbelt can resolve
+    // that symlink without exposing the rest of the installation directory.
+    if !config.lockdown_enabled()
+        && crate::command::effective_name(&config.command) == Some("codex")
+        && let Ok(executable) = std::env::current_exe()
+    {
+        push_unique(canonicalize_or_keep(&executable));
+    }
+
     if let Some(worktree) =
         super::discover_git_worktree_paths(config, project_dir, false)
     {
@@ -1633,7 +1743,44 @@ mod tests {
         assert!(
             profile.contains("(allow system-socket (socket-domain AF_UNIX))")
         );
+        assert!(profile.contains(
+            "(allow mach-lookup (global-name \
+             \"com.apple.SystemConfiguration.configd\"))"
+        ));
+        assert!(profile.contains(
+            "(allow mach-lookup (global-name \
+             \"com.apple.system.notification_center\"))"
+        ));
+        assert!(profile.contains(
+            "(allow mach-lookup (global-name \
+             \"com.apple.system.opendirectoryd.libinfo\"))"
+        ));
+        let uid = unsafe { nix::libc::getuid() };
+        assert!(profile.contains(&format!(
+            "(path-regex #\"^/private/tmp/codex-daemon-{uid}/[0-9a-f]+$\")"
+        )));
+        assert!(profile.contains("(allow network-bind (local unix-socket"));
         assert!(!profile.contains("(allow network-outbound)\n"));
+        assert!(!profile.contains("(allow network-bind)\n"));
+
+        let other_tool = Config {
+            command: vec!["bash".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let other_profile = generate_sbpl_profile(
+            &other_tool,
+            &PathBuf::from("/tmp/test-project"),
+        );
+        assert!(
+            !other_profile.contains("com.apple.system.notification_center")
+        );
+        assert!(
+            !other_profile.contains("com.apple.system.opendirectoryd.libinfo")
+        );
+        assert!(
+            !other_profile.contains("com.apple.SystemConfiguration.configd")
+        );
 
         let _ = std::fs::remove_dir_all(&fixture.home);
         let _ = std::fs::remove_file(&daemon_socket);
@@ -1735,7 +1882,8 @@ mod tests {
             false,
             None,
             Some(15919),
-        );
+        )
+        .unwrap();
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         let get = |name: &str| {
             env.get(&std::ffi::OsStr::new(name)).copied().flatten()
@@ -1765,10 +1913,39 @@ mod tests {
             ..Config::default()
         };
         let cmd =
-            build(&config, Path::new("/tmp/test-project"), false, None, None);
+            build(&config, Path::new("/tmp/test-project"), false, None, None)
+                .unwrap();
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert!(!env.contains_key(std::ffi::OsStr::new("http_proxy")));
         assert!(!env.contains_key(std::ffi::OsStr::new("ALL_PROXY")));
+    }
+
+    #[test]
+    fn codex_build_prepends_private_ps_helper_to_path() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let config = Config {
+            command: vec!["codex".into()],
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let cmd =
+            build(&config, Path::new("/tmp/test-project"), false, None, None)
+                .unwrap();
+        let path = cmd
+            .get_envs()
+            .find(|(key, _)| key == &std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, value)| value)
+            .unwrap();
+        let mut paths = std::env::split_paths(path);
+        let helper_dir = paths.next().unwrap();
+        assert_eq!(
+            helper_dir.file_name(),
+            Some(std::ffi::OsStr::new("codex-bin"))
+        );
+        assert_eq!(
+            std::fs::read_link(helper_dir.join("ps")).unwrap(),
+            std::env::current_exe().unwrap()
+        );
     }
 
     #[test]
@@ -3033,7 +3210,8 @@ mod tests {
             ..Config::default()
         };
         let cmd =
-            build(&config, Path::new("/tmp/test-project"), false, None, None);
+            build(&config, Path::new("/tmp/test-project"), false, None, None)
+                .unwrap();
         let session = root.join(format!("ai-jail-{}", std::process::id()));
         let tmpdir = cmd
             .get_envs()
@@ -3060,7 +3238,8 @@ mod tests {
             ..Config::default()
         };
         let cmd =
-            build(&config, Path::new("/tmp/test-project"), false, None, None);
+            build(&config, Path::new("/tmp/test-project"), false, None, None)
+                .unwrap();
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
 
         let get = |name: &str| {
@@ -3100,7 +3279,8 @@ mod tests {
             ..Config::default()
         };
         let cmd =
-            build(&config, Path::new("/tmp/test-project"), false, None, None);
+            build(&config, Path::new("/tmp/test-project"), false, None, None)
+                .unwrap();
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert_eq!(
             env.get(&std::ffi::OsStr::new("USER")).copied().flatten(),
@@ -3117,7 +3297,8 @@ mod tests {
             false,
             None,
             None,
-        );
+        )
+        .unwrap();
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert!(!env.contains_key(&std::ffi::OsStr::new("USER")));
     }
@@ -3134,7 +3315,8 @@ mod tests {
             ..Config::default()
         };
         let cmd =
-            build(&config, Path::new("/tmp/test-project"), false, None, None);
+            build(&config, Path::new("/tmp/test-project"), false, None, None)
+                .unwrap();
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert_eq!(
             env.get(&std::ffi::OsStr::new("AI_JAIL_HOST_STATE"))

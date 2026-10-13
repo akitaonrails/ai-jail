@@ -1513,13 +1513,13 @@ pub fn build(
     {
         let _ = guard;
         let prepared = prepare_seatbelt_config(config)?;
-        Ok(seatbelt::build(
+        seatbelt::build(
             &prepared,
             project_dir,
             verbose,
             sandbox_tty,
             proxy.map(|p| p.port()),
-        ))
+        )
     }
 }
 

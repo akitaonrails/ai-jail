@@ -4,6 +4,8 @@ compile_error!("ai-jail only supports Linux and macOS");
 mod audit;
 mod bootstrap;
 mod cli;
+#[cfg(target_os = "macos")]
+mod codex_ps;
 mod command;
 mod config;
 mod fsutil;
@@ -1176,6 +1178,11 @@ fn run() -> Result<i32, String> {
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    if codex_ps::is_compat_invocation() {
+        std::process::exit(codex_ps::run());
+    }
+
     match run() {
         Ok(code) => std::process::exit(code),
         Err(msg) => {
