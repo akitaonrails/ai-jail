@@ -153,6 +153,32 @@ fn forward_port_composes_with_filtered_egress_and_lockdown() {
 }
 
 #[test]
+fn forward_port_under_filtered_egress_bypasses_the_proxy() {
+    require_sandbox!();
+    let forwarded = http_fixture();
+    let other = http_fixture();
+    let forwarded_text = forwarded.to_string();
+    // No `--noproxy '*'`; `-f` turns the proxy's refusal into a failure.
+    let script = format!(
+        "curl -fsS {CURL_OPTS} http://127.0.0.1:{forwarded}/ && echo && \
+         curl -fsS --max-time 3 http://127.0.0.1:{other}/ \
+         && echo LEAK || echo BLOCKED"
+    );
+    let output = run_in(
+        None,
+        &[
+            "--lockdown",
+            "--allow-host",
+            "example.invalid",
+            "--forward-port",
+            &forwarded_text,
+        ],
+        &script,
+    );
+    assert_eq!(assert_ok(&output), "ok\nBLOCKED\n");
+}
+
+#[test]
 fn unforwarded_host_port_stays_unreachable() {
     require_sandbox!();
     let forwarded = http_fixture();

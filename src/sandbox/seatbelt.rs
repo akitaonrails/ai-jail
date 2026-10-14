@@ -250,7 +250,8 @@ fn apply_child_env(
     if config.network_mode() == crate::config::NetworkMode::Filtered
         && let Some(port) = proxy_port
     {
-        for (key, value) in crate::proxy::env_vars(port) {
+        for (key, value) in crate::proxy::env_vars(port, config.forward_ports())
+        {
             cmd.env(key, value);
         }
     }
@@ -2057,6 +2058,38 @@ mod tests {
         }
         assert_eq!(get("no_proxy"), Some(std::ffi::OsStr::new("")));
         assert_eq!(get("NO_PROXY"), Some(std::ffi::OsStr::new("")));
+    }
+
+    #[test]
+    fn build_child_env_forward_port_exempts_loopback_from_proxy() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let config = Config {
+            command: vec!["bash".into()],
+            no_mise: Some(true),
+            allow_hosts: vec!["api.anthropic.com".into()],
+            forward_ports: vec![49374],
+            ..Config::default()
+        };
+        let cmd = build(
+            &config,
+            Path::new("/tmp/test-project"),
+            false,
+            None,
+            Some(15919),
+        )
+        .unwrap();
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        let get = |name: &str| {
+            env.get(&std::ffi::OsStr::new(name)).copied().flatten()
+        };
+
+        let loopback = std::ffi::OsStr::new("127.0.0.1,localhost,::1");
+        assert_eq!(get("no_proxy"), Some(loopback));
+        assert_eq!(get("NO_PROXY"), Some(loopback));
+        assert_eq!(
+            get("http_proxy"),
+            Some(std::ffi::OsStr::new("http://127.0.0.1:15919"))
+        );
     }
 
     #[test]

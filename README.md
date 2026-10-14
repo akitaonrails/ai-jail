@@ -254,6 +254,12 @@ unreachable. It combines with filtered egress and `--lockdown` (the port
 joins the Landlock V4 connect allow set), and is Linux-only. Ports below
 1024 are refused: the sandbox cannot bind them.
 
+Under filtered egress the forced proxy env would send
+`http://127.0.0.1:PORT` to the CONNECT proxy, which refuses loopback
+targets, so a forward also sets `no_proxy`/`NO_PROXY` to
+`127.0.0.1,localhost,::1`. That exempts nothing else: loopback ports that
+are not forwarded stay closed.
+
 It cannot combine with `--network`, where the host loopback is already
 reachable, and it is refused outside Linux — so a `forward_ports` entry in
 the global config fails every launch that enables `--network` (including

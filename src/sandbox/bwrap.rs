@@ -198,8 +198,8 @@ struct MountSet {
     ssh_env: Vec<(String, String)>,
     claude_env: Vec<(String, String)>,
     /// Forced proxy environment in filtered-egress mode
-    /// (http_proxy/https_proxy/all_proxy + an emptied no_proxy), empty
-    /// otherwise.
+    /// (http_proxy/https_proxy/all_proxy + a no_proxy that names only
+    /// loopback, and only when a port is forwarded), empty otherwise.
     proxy_env: Vec<(String, String)>,
     pictures: Vec<Mount>,
     browser_state: Vec<Mount>,
@@ -400,7 +400,7 @@ impl MountSet {
         // applies --setenv in order, so these forced values also win
         // over a user-supplied `--env http_proxy=...` -- in filtered
         // mode the child must not be told to use a different proxy,
-        // and the emptied no_proxy must not exempt anything.
+        // and no_proxy must not exempt anything beyond loopback.
         for (key, val) in &self.proxy_env {
             args.push("--setenv".into());
             args.push(key.clone());
@@ -1718,7 +1718,10 @@ fn discover_mounts_full(
     let proxy_env = if config.network_mode()
         == crate::config::NetworkMode::Filtered
     {
-        let mut vars = crate::proxy::env_vars(crate::proxy::BRIDGE_PORT);
+        let mut vars = crate::proxy::env_vars(
+            crate::proxy::BRIDGE_PORT,
+            config.forward_ports(),
+        );
         if lockdown {
             for key in config.secret_hosts.keys() {
                 if let Some(value) = config.env_pass.iter().find_map(|entry| {
@@ -4530,6 +4533,42 @@ mod tests {
         // Forwarding is not filtered egress: no proxy env, no bridge port.
         assert!(!args.iter().any(|arg| arg == "--proxy-bridge-port"));
         assert!(!args.iter().any(|arg| arg == "http_proxy"));
+    }
+
+    #[test]
+    fn forward_port_under_filtered_egress_exempts_loopback_from_proxy() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            forward_ports: vec![49374],
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let args = build_dry_run_args_forwarded(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            Some(Path::new("/tmp/ai-jail-proxy-test.sock")),
+            &[(49374, PathBuf::from("/tmp/ai-jail-forward-test.49374.sock"))],
+        )
+        .unwrap();
+
+        for key in ["no_proxy", "NO_PROXY"] {
+            assert!(
+                args.windows(3).any(|w| {
+                    w[0] == "--setenv"
+                        && w[1] == key
+                        && w[2] == "127.0.0.1,localhost,::1"
+                }),
+                "{key}"
+            );
+        }
+        let url = format!("http://127.0.0.1:{}", crate::proxy::BRIDGE_PORT);
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--setenv" && w[1] == "http_proxy" && w[2] == url
+        }));
     }
 
     #[test]
