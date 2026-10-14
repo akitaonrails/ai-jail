@@ -3351,11 +3351,28 @@ mod tests {
     fn devin_state_fixture(prefix: &str) -> DevinStateFixture {
         use std::fs;
 
-        let root = std::env::temp_dir()
-            .join(format!("ai-jail-seatbelt-{prefix}-{}", std::process::id()));
+        // macOS runners put the temp dir deep under /private/var/folders/…,
+        // and canonicalizing this fixture's root plus the deepest path it
+        // builds (`devin/cli/_versions/…`) can exceed a Unix socket name
+        // (SUN_LEN), which a test below needs for its Docker socket bind.
+        // Pick a short base when the canonical temp root is too long for
+        // the fixture tree.
+        const MAX_ROOT: usize = 60;
+        let make_root = |base: &Path| {
+            base.join(format!("ai-jail-sb-{prefix}-{}", std::process::id()))
+        };
+        let mut root = make_root(&std::env::temp_dir());
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let root = fs::canonicalize(&root).unwrap();
+        root = fs::canonicalize(&root).unwrap();
+        if root.to_string_lossy().len() > MAX_ROOT {
+            let _ = fs::remove_dir_all(&root);
+            let short = make_root(Path::new("/tmp"));
+            let _ = fs::remove_dir_all(&short);
+            fs::create_dir_all(&short).unwrap();
+            root = fs::canonicalize(&short)
+                .expect("short fixture base must stay within SUN_LEN");
+        }
         let home = root.join("home");
         let data_home = root.join("xdg-data");
         let config_home = root.join("xdg-config");
