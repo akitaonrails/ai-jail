@@ -397,12 +397,15 @@ fn apply_net_rules(
 
 /// TCP ports the lockdown net ruleset allows ConnectTcp to: the user's
 /// `--allow-tcp-port` entries plus, in filtered-egress mode, the
-/// in-sandbox proxy bridge port (see apply_net_rules).
+/// in-sandbox proxy bridge port (see apply_net_rules), plus every
+/// `--forward-port` -- each has a bridge on in-sandbox loopback, and
+/// like the proxy bridge port it names nothing else inside the netns.
 fn allowed_connect_ports(config: &Config) -> Vec<u16> {
     let mut ports = config.allow_tcp_ports().to_vec();
     if config.network_mode() == crate::config::NetworkMode::Filtered {
         ports.push(crate::proxy::BRIDGE_PORT);
     }
+    ports.extend_from_slice(config.forward_ports());
     ports
 }
 
@@ -1676,6 +1679,26 @@ mod tests {
         // Empty ports → same as no ports → best-effort V4 or
         // fallback to --unshare-net only.
         let _ = apply_net_rules(&config, &[], true);
+    }
+
+    #[test]
+    fn lockdown_allows_forwarded_ports() {
+        // Each forward has a bridge on in-sandbox loopback; lockdown's
+        // net ruleset must let the child connect to it.
+        let config = Config {
+            lockdown: Some(true),
+            forward_ports: vec![49374],
+            ..Config::default()
+        };
+        assert_eq!(allowed_connect_ports(&config), vec![49374]);
+        let config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..config
+        };
+        assert_eq!(
+            allowed_connect_ports(&config),
+            vec![crate::proxy::BRIDGE_PORT, 49374]
+        );
     }
 
     #[test]

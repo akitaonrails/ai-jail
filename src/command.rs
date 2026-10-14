@@ -210,15 +210,22 @@ fn api_host(name: &str) -> Option<&'static str> {
     }
 }
 
-/// The hosted-API host to default-allow (filtered egress) for a bare launch
-/// of a known API agent, or `None` when the agent has no canonical host we
-/// can name (issue #156). Reuses the same `api_host` table as the
-/// capability-gap warning, so the default allowlist and the warning always
-/// agree on the agent's host — injecting it here is exactly what silences
-/// the warning. Only the functional API host is returned; telemetry hosts
-/// are deliberately not default-allowed.
-pub(crate) fn default_egress_host(command: &[String]) -> Option<&'static str> {
-    api_host(effective_name(command)?)
+/// The functional hosts to default-allow (filtered egress) for a bare launch
+/// of a known API agent. Codex also needs chatgpt.com for ChatGPT OAuth
+/// workspace routing; api.openai.com alone only covers API-key traffic.
+/// Telemetry hosts are deliberately not default-allowed.
+pub(crate) fn default_egress_hosts(command: &[String]) -> Vec<&'static str> {
+    let Some(name) = effective_name(command) else {
+        return Vec::new();
+    };
+    let Some(host) = api_host(name) else {
+        return Vec::new();
+    };
+    let mut hosts = vec![host];
+    if name == "codex" {
+        hosts.push("chatgpt.com");
+    }
+    hosts
 }
 
 /// The well-known API-key environment variable(s) a harness reads, so that a
@@ -641,29 +648,29 @@ mod tests {
     #[test]
     fn default_egress_host_matches_api_host_table() {
         assert_eq!(
-            default_egress_host(&["devin".into()]),
-            Some("server.codeium.com")
+            default_egress_hosts(&["devin".into()]),
+            vec!["server.codeium.com"]
         );
         // Each agent's default egress host is exactly its api_host entry, so
         // injecting it (issue #156) silences the filtered-mode gap warning.
         assert_eq!(
-            default_egress_host(&["claude".into()]),
-            Some("api.anthropic.com")
+            default_egress_hosts(&["claude".into()]),
+            vec!["api.anthropic.com"]
         );
         assert_eq!(
-            default_egress_host(&["codex".into()]),
-            Some("api.openai.com")
+            default_egress_hosts(&["codex".into()]),
+            vec!["api.openai.com", "chatgpt.com"]
         );
-        assert_eq!(default_egress_host(&["grok".into()]), Some("api.x.ai"));
+        assert_eq!(default_egress_hosts(&["grok".into()]), vec!["api.x.ai"]);
         // Resolved through the same harness/basename logic as warnings.
         assert_eq!(
-            default_egress_host(&["/usr/bin/claude".into()]),
-            Some("api.anthropic.com")
+            default_egress_hosts(&["/usr/bin/claude".into()]),
+            vec!["api.anthropic.com"]
         );
         // Agents without a canonical host, and non-agents, get nothing — no
         // half-working default allowlist is injected.
-        assert_eq!(default_egress_host(&["opencode".into()]), None);
-        assert_eq!(default_egress_host(&["kimi".into()]), None);
-        assert_eq!(default_egress_host(&["bash".into()]), None);
+        assert!(default_egress_hosts(&["opencode".into()]).is_empty());
+        assert!(default_egress_hosts(&["kimi".into()]).is_empty());
+        assert!(default_egress_hosts(&["bash".into()]).is_empty());
     }
 }
