@@ -733,6 +733,23 @@ fn push_network_section(
         }
         _ => {}
     }
+    push_forward_ports_section(profile, config);
+}
+
+/// `--forward-port`: Seatbelt shares the host's network stack, so each
+/// forward is one outbound rule naming the port, not a relay.
+fn push_forward_ports_section(profile: &mut String, config: &Config) {
+    let ports = config.forward_ports();
+    if ports.is_empty() {
+        return;
+    }
+    profile.push_str("; Forwarded host loopback ports (--forward-port)\n");
+    for port in ports {
+        profile.push_str(&format!(
+            "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+        ));
+    }
+    profile.push('\n');
 }
 
 /// Codex 0.16x moved the interactive client onto a persistent app-server
@@ -2013,6 +2030,53 @@ mod tests {
         );
         assert!(!off_profile.contains("network-outbound"));
         assert!(!off_profile.contains("remote ip"));
+    }
+
+    #[test]
+    fn sbpl_profile_forward_port_allows_only_that_loopback_port() {
+        let config = Config {
+            forward_ports: vec![49374],
+            ..Config::default()
+        };
+        let profile =
+            generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
+        assert!(profile.contains(
+            "(allow network-outbound (remote ip \"localhost:49374\"))"
+        ));
+        // No blanket rule: every other port stays refused.
+        assert!(!profile.contains("(allow network-outbound)\n"));
+        assert!(!profile.contains("network-inbound"));
+        assert!(!profile.contains("network-bind"));
+
+        let without = generate_sbpl_profile(
+            &Config::default(),
+            Path::new("/tmp/test-project"),
+        );
+        assert!(!without.contains("49374"));
+    }
+
+    #[test]
+    fn sbpl_profile_forward_port_composes_with_filtered_egress_and_lockdown() {
+        let config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            forward_ports: vec![49374, 5432],
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile_filtered(
+            &config,
+            Path::new("/tmp/test-project"),
+            15919,
+        );
+        for port in [15919, 49374, 5432] {
+            assert!(
+                profile.contains(&format!(
+                    "(allow network-outbound (remote ip \"localhost:{port}\"))"
+                )),
+                "port {port}"
+            );
+        }
+        assert!(!profile.contains("(allow network-outbound)\n"));
     }
 
     #[test]

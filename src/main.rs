@@ -233,14 +233,17 @@ fn validate_network_flags(config: &config::Config) -> Result<(), String> {
 }
 
 /// `--forward-port` contradiction checks, fail-closed at launch. A
-/// forward only means something across a private netns; the in-sandbox
-/// bridge port is taken; port 0 names no service.
+/// forward only means something while the host loopback is otherwise
+/// unreachable; the in-sandbox bridge port is taken; port 0 names no
+/// service.
 fn validate_forward_ports(config: &config::Config) -> Result<(), String> {
     if config.forward_ports().is_empty() {
         return Ok(());
     }
-    if cfg!(not(target_os = "linux")) {
-        return Err("--forward-port is Linux-only: it relays across the sandbox's private network namespace".into());
+    if cfg!(not(any(target_os = "linux", target_os = "macos"))) {
+        return Err(
+            "--forward-port is supported on Linux and macOS only".into()
+        );
     }
     if config.network_enabled() {
         return Err("--network and --forward-port are mutually exclusive: with unrestricted network the host's loopback is already reachable".into());
@@ -249,17 +252,16 @@ fn validate_forward_ports(config: &config::Config) -> Result<(), String> {
         if port == 0 {
             return Err("--forward-port 0 is not a port".into());
         }
-        // The sandbox's own network namespace keeps the kernel default
-        // ip_unprivileged_port_start (1024), and the bridge holds no
-        // capability to bind below it.
+        // The Linux netns keeps ip_unprivileged_port_start (1024) and the
+        // bridge port; macOS refuses the same ports so one entry fits both.
         if port < 1024 {
             return Err(format!(
-                "--forward-port {port}: ports below 1024 cannot be bound inside the sandbox"
+                "--forward-port {port}: ports below 1024 are not supported"
             ));
         }
         if port == proxy::BRIDGE_PORT {
             return Err(format!(
-                "--forward-port {port} collides with the in-sandbox proxy bridge port"
+                "--forward-port {port} is reserved for the proxy bridge"
             ));
         }
     }
@@ -1444,10 +1446,10 @@ mod tests {
             ..Config::default()
         };
         let error = validate_network_flags(&with_network).unwrap_err();
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             assert!(error.contains("mutually exclusive"), "{error}");
         } else {
-            assert!(error.contains("Linux-only"), "{error}");
+            assert!(error.contains("Linux and macOS only"), "{error}");
         }
         for port in [0, 80, 443, 1023, crate::proxy::BRIDGE_PORT] {
             let config = Config {
@@ -1464,7 +1466,7 @@ mod tests {
         };
         assert_eq!(
             validate_network_flags(&ok).is_ok(),
-            cfg!(target_os = "linux")
+            cfg!(any(target_os = "linux", target_os = "macos"))
         );
     }
 
