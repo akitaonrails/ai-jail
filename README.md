@@ -225,8 +225,11 @@ joins the Landlock V4 connect allow set), and is Linux-only. Ports below
 
 It cannot combine with `--network`, where the host loopback is already
 reachable, and it is refused outside Linux — so a `forward_ports` entry in
-the global config fails every `--network` or `--browser` launch, and every
-launch on macOS; put it under a command-specific table instead.
+the global config fails every launch that enables `--network` (including
+`--browser` launches, which normally pass it) and every launch on macOS;
+put it under a command-specific table instead. A Linux `--browser` launch
+without `--network` keeps the private netns and can forward a port like any
+other launch.
 
 A forwarded port is trusted in full: there is no allowlist, inspection or
 audit record on it, so the agent can do whatever the service behind it
