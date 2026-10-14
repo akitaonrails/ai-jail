@@ -274,6 +274,12 @@ pub struct Config {
     /// this list, never grow it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_hosts: Vec<String>,
+    /// Host loopback ports exposed on the sandbox's own loopback (Linux).
+    /// Each is relayed through a Unix socket, so the private netns stays
+    /// in place and only the named port crosses it. Trusted capability:
+    /// the untrusted project `.ai-jail` may only shrink this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward_ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_dir: Option<PathBuf>,
     /// Trusted capability: mount the invoked agent's own state
@@ -476,6 +482,9 @@ impl Config {
     }
     pub fn allow_hosts(&self) -> &[String] {
         &self.allow_hosts
+    }
+    pub fn forward_ports(&self) -> &[u16] {
+        &self.forward_ports
     }
     /// Effective network posture: `network = true` wins as unrestricted,
     /// a non-empty `allow_hosts` selects filtered egress through the
@@ -1102,6 +1111,9 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     // Trusted layers union the filtered-egress allowlist.
     c.allow_hosts.extend(local.allow_hosts);
     dedup_strings(&mut c.allow_hosts);
+    c.forward_ports.extend(local.forward_ports);
+    c.forward_ports.sort_unstable();
+    c.forward_ports.dedup();
     take!(claude_dir);
     // Status bar + resize redraw key stay from global — local should
     // not override user-level preferences.
@@ -1500,6 +1512,23 @@ pub fn merge_with_global_report(
         warnings.push(format!(
             "project .ai-jail allow_hosts ignored: {}",
             dropped_hosts.join(", ")
+        ));
+    }
+    // Port forwarding is shrink-only from an untrusted project, like
+    // allow_hosts: a project cannot open a path to a host service.
+    let dropped_forwards: Vec<_> = local
+        .forward_ports
+        .into_iter()
+        .filter(|port| !c.forward_ports.contains(port))
+        .collect();
+    if !dropped_forwards.is_empty() {
+        warnings.push(format!(
+            "project .ai-jail forward_ports ignored: {}",
+            dropped_forwards
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     if local.claude_dir.is_some() {
@@ -1944,6 +1973,12 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     config.allow_hosts.extend(cli.allow_hosts.iter().cloned());
     dedup_strings(&mut config.allow_hosts);
 
+    config
+        .forward_ports
+        .extend(cli.forward_ports.iter().copied());
+    config.forward_ports.sort_unstable();
+    config.forward_ports.dedup();
+
     config.env_pass.extend(cli.env.iter().cloned());
     dedup_strings(&mut config.env_pass);
 
@@ -2008,8 +2043,18 @@ pub fn project_config_for_init(
     invocation_cwd: &Path,
 ) -> Config {
     let mut to_save = merge(cli, project);
+    drop_launch_only_fields(&mut to_save);
     absolutize_user_paths(&mut to_save, invocation_cwd);
     to_save
+}
+
+/// Fields a project file must not carry even when the CLI set them.
+/// `forward_ports` is trusted-only -- written into the untrusted project
+/// file it could never take effect and would only warn on every launch --
+/// and the ports it names (an editor's IDE socket, a dev server) usually
+/// change from one launch to the next.
+fn drop_launch_only_fields(to_save: &mut Config) {
+    to_save.forward_ports.clear();
 }
 
 pub fn project_config_for_auto_save(
@@ -2027,6 +2072,7 @@ pub fn project_config_for_auto_save(
         to_save.command = stored_project_command;
     }
 
+    drop_launch_only_fields(&mut to_save);
     absolutize_user_paths(&mut to_save, invocation_cwd);
     to_save
 }
@@ -2234,6 +2280,15 @@ fn print_network_mode(config: &Config) {
     output::status_header("  Network", &v);
     if config.network_mode() == NetworkMode::Filtered {
         print_string_list("  Allow hosts", &config.allow_hosts);
+    }
+    if !config.forward_ports.is_empty() {
+        let joined = config
+            .forward_ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        output::status_header("  Forward ports", &joined);
     }
 }
 
@@ -3598,6 +3653,7 @@ no_gpu = true
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000, 8080],
             allow_hosts: vec!["api.anthropic.com".into()],
+            forward_ports: vec![49374],
             claude_dir: None,
             agent_state: Some(true),
             inherit_env: None,
@@ -3643,6 +3699,7 @@ no_gpu = true
         assert_eq!(deserialized.systemd_user, config.systemd_user);
         assert_eq!(deserialized.allow_tcp_ports, config.allow_tcp_ports);
         assert_eq!(deserialized.allow_hosts, config.allow_hosts);
+        assert_eq!(deserialized.forward_ports, config.forward_ports);
         assert_eq!(deserialized.claude_dir, config.claude_dir);
         assert_eq!(deserialized.agent_state, config.agent_state);
         assert_eq!(deserialized.inherit_env, config.inherit_env);
@@ -4707,6 +4764,102 @@ allow_tcp_ports = []
             warnings
                 .iter()
                 .any(|w| w.contains("allow_hosts") && w.contains("evil.com"))
+        );
+    }
+
+    #[test]
+    fn regression_v2_2_0_config_without_forward_ports() {
+        // Configs written before forward_ports existed must still parse,
+        // with no port forwarded.
+        let toml = r#"
+command = ["claude"]
+allow_hosts = ["api.anthropic.com"]
+rw_maps = []
+ro_maps = []
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.forward_ports().is_empty());
+        // And an empty list is never written back.
+        assert!(!toml::to_string(&config).unwrap().contains("forward_ports"));
+    }
+
+    #[test]
+    fn project_forward_ports_cannot_extend_baseline() {
+        let baseline = Config {
+            forward_ports: vec![49374],
+            ..Config::default()
+        };
+        let project = Config {
+            forward_ports: vec![49374, 5432],
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert_eq!(merged.forward_ports, vec![49374]);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("forward_ports") && w.contains("5432"))
+        );
+    }
+
+    #[test]
+    fn forward_ports_are_never_saved_into_the_project() {
+        let cli = CliArgs {
+            forward_ports: vec![49374],
+            ..CliArgs::default()
+        };
+        let project = Config {
+            forward_ports: vec![5432],
+            ..Config::default()
+        };
+        let auto = project_config_for_auto_save(
+            &cli,
+            project.clone(),
+            Path::new("/project"),
+        );
+        assert!(auto.forward_ports.is_empty());
+        let init =
+            project_config_for_init(&cli, project, Path::new("/project"));
+        assert!(init.forward_ports.is_empty());
+    }
+
+    #[test]
+    fn project_forward_ports_alone_grant_nothing() {
+        let project = Config {
+            forward_ports: vec![49374],
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(merged.forward_ports.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("forward_ports")));
+    }
+
+    #[test]
+    fn trusted_layers_and_cli_union_forward_ports() {
+        let global = Config {
+            forward_ports: vec![64342, 49374],
+            ..Config::default()
+        };
+        let trusted = merge_with_global(
+            global,
+            Config {
+                forward_ports: vec![49374, 8080],
+                ..Config::default()
+            },
+        );
+        assert_eq!(trusted.forward_ports, vec![8080, 49374, 64342]);
+        let cli = CliArgs {
+            forward_ports: vec![5173, 8080],
+            ..CliArgs::default()
+        };
+        assert_eq!(
+            merge(&cli, trusted).forward_ports,
+            vec![5173, 8080, 49374, 64342]
         );
     }
 
@@ -6364,6 +6517,7 @@ hide_dotdirs = [".my_secrets"]
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000],
             allow_hosts: vec![],
+            forward_ports: vec![],
             claude_dir: None,
             agent_state: None,
             inherit_env: None,

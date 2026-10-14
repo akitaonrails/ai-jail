@@ -1497,6 +1497,7 @@ pub fn build(
     verbose: bool,
     sandbox_tty: Option<&Path>,
     proxy: Option<&crate::proxy::Proxy>,
+    forward_sockets: &[(u16, PathBuf)],
 ) -> Result<Command, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1507,11 +1508,12 @@ pub fn build(
             project_dir,
             verbose,
             proxy.and_then(|p| p.unix_path()),
+            forward_sockets,
         )
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = guard;
+        let _ = (guard, forward_sockets);
         let prepared = prepare_seatbelt_config(config)?;
         Ok(seatbelt::build(
             &prepared,
@@ -1529,6 +1531,7 @@ pub fn dry_run(
     project_dir: &Path,
     verbose: bool,
     proxy: Option<&crate::proxy::Proxy>,
+    forward_sockets: &[(u16, PathBuf)],
 ) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1538,11 +1541,12 @@ pub fn dry_run(
             project_dir,
             verbose,
             proxy.and_then(|p| p.unix_path()),
+            forward_sockets,
         )
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = guard;
+        let _ = (guard, forward_sockets);
         let prepared = prepare_seatbelt_config(config)?;
         Ok(seatbelt::dry_run(
             &prepared,

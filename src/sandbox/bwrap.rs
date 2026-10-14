@@ -1129,6 +1129,8 @@ fn resolve_landlock_wrapper(
         // restriction control off: spawning the in-sandbox proxy bridge
         // before the agent execs.
         && config.network_mode() != crate::config::NetworkMode::Filtered
+        // Port forwards need it for the same reason: their bridges.
+        && config.forward_ports().is_empty()
     {
         return Ok(None);
     }
@@ -1256,6 +1258,13 @@ fn landlock_wrapper_args(
         args.push("--proxy-bridge-port".into());
         args.push(crate::proxy::BRIDGE_PORT.to_string());
     }
+    // Port forwards: the inner config must see them too -- the wrapper
+    // spawns one in-sandbox bridge per port, and lockdown's Landlock V4
+    // net ruleset adds each to its ConnectTcp allow set.
+    for port in config.forward_ports() {
+        args.push("--forward-port".into());
+        args.push(port.to_string());
+    }
 
     if config.browser_profile().is_none() {
         args.extend_from_slice(map_args);
@@ -1287,6 +1296,7 @@ pub fn build(
     project_dir: &Path,
     verbose: bool,
     proxy_socket: Option<&Path>,
+    forward_sockets: &[(u16, PathBuf)],
 ) -> Result<Command, String> {
     let sources = MountSources::from_guard(guard);
     let mount_set =
@@ -1324,6 +1334,7 @@ pub fn build(
     }
 
     opt_args.extend(proxy_socket_mount_args(config, proxy_socket)?);
+    opt_args.extend(forward_socket_mount_args(config, forward_sockets)?);
 
     opt_args.extend(mount_set.isolation_args(
         project_dir,
@@ -1458,20 +1469,49 @@ fn proxy_socket_mount_args(
     }
 }
 
+/// Port forwards: bind each host-side forward socket into the sandbox
+/// at its fixed per-port path. Same placement and reasoning as the proxy
+/// socket above. Fails closed when a configured port has no socket --
+/// the bridge would otherwise listen on a port that leads nowhere.
+fn forward_socket_mount_args(
+    config: &Config,
+    forward_sockets: &[(u16, PathBuf)],
+) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    for &port in config.forward_ports() {
+        let Some((_, sock)) = forward_sockets.iter().find(|(p, _)| *p == port)
+        else {
+            return Err(format!(
+                "--forward-port {port} requires its host-side Unix socket"
+            ));
+        };
+        args.extend(
+            Mount::Bind {
+                src: sock.clone(),
+                dest: crate::proxy::forward_in_sandbox_path(port),
+            }
+            .to_args(),
+        );
+    }
+    Ok(args)
+}
+
 pub fn dry_run(
     guard: &SandboxGuard,
     config: &Config,
     project_dir: &Path,
     verbose: bool,
     proxy_socket: Option<&Path>,
+    forward_sockets: &[(u16, PathBuf)],
 ) -> Result<String, String> {
     let sources = MountSources::from_guard(guard);
-    let args = build_dry_run_args_full(
+    let args = build_dry_run_args_forwarded(
         config,
         project_dir,
         &sources,
         verbose,
         proxy_socket,
+        forward_sockets,
     )?;
     Ok(format_dry_run_args(&args))
 }
@@ -1489,12 +1529,31 @@ fn build_dry_run_args(
     build_dry_run_args_full(config, project_dir, &sources, verbose, None)
 }
 
+#[cfg(test)]
 fn build_dry_run_args_full(
     config: &Config,
     project_dir: &Path,
     sources: &MountSources<'_>,
     verbose: bool,
     proxy_socket: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    build_dry_run_args_forwarded(
+        config,
+        project_dir,
+        sources,
+        verbose,
+        proxy_socket,
+        &[],
+    )
+}
+
+fn build_dry_run_args_forwarded(
+    config: &Config,
+    project_dir: &Path,
+    sources: &MountSources<'_>,
+    verbose: bool,
+    proxy_socket: Option<&Path>,
+    forward_sockets: &[(u16, PathBuf)],
 ) -> Result<Vec<String>, String> {
     let mount_set =
         discover_mounts_full(config, project_dir, sources, verbose)?;
@@ -1519,6 +1578,7 @@ fn build_dry_run_args_full(
     }
 
     args.extend(proxy_socket_mount_args(config, proxy_socket)?);
+    args.extend(forward_socket_mount_args(config, forward_sockets)?);
 
     args.extend(mount_set.isolation_args(
         project_dir,
@@ -4222,6 +4282,77 @@ mod tests {
     }
 
     #[test]
+    fn forward_port_dry_run_mounts_socket_and_forces_wrapper() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            forward_ports: vec![49374],
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let sock = PathBuf::from("/tmp/ai-jail-forward-test.49374.sock");
+        let args = build_dry_run_args_forwarded(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            None,
+            &[(49374, sock.clone())],
+        )
+        .unwrap();
+
+        // No network flag: the private netns stays and the forward
+        // crosses it through the socket only.
+        assert!(args.iter().any(|arg| arg == "--unshare-net"));
+        let tmpfs_tmp = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/tmp")
+            .expect("expected /tmp tmpfs mount");
+        let dest = crate::proxy::forward_in_sandbox_path(49374)
+            .display()
+            .to_string();
+        let socket_mount = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--bind"
+                    && w[1] == sock.display().to_string()
+                    && w[2] == dest
+            })
+            .expect("expected forward socket bind mount");
+        assert!(socket_mount > tmpfs_tmp);
+        // The wrapper is forced (it spawns the bridge) and sees the port.
+        assert!(args.iter().any(|arg| arg == "--landlock-exec"));
+        let pos = args
+            .iter()
+            .position(|arg| arg == "--forward-port")
+            .expect("expected --forward-port in wrapper args");
+        assert_eq!(args[pos + 1], "49374");
+        // Forwarding is not filtered egress: no proxy env, no bridge port.
+        assert!(!args.iter().any(|arg| arg == "--proxy-bridge-port"));
+        assert!(!args.iter().any(|arg| arg == "http_proxy"));
+    }
+
+    #[test]
+    fn forward_port_without_its_socket_fails_closed() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            forward_ports: vec![49374, 8080],
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let result = build_dry_run_args_forwarded(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            None,
+            &[(49374, PathBuf::from("/tmp/only-one.sock"))],
+        );
+        assert!(result.unwrap_err().contains("--forward-port 8080"));
+    }
+
+    #[test]
     fn filtered_lockdown_forces_placeholder_env() {
         // Under lockdown the env_pass path never runs, so phantom
         // secrets would otherwise never reach the child: the bound
@@ -6001,7 +6132,7 @@ mod tests {
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let project = PathBuf::from("/home/user/project");
 
-        let cmd = build(&guard, &config, &project, false, None).unwrap();
+        let cmd = build(&guard, &config, &project, false, None, &[]).unwrap();
         let argv: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())

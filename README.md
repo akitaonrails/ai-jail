@@ -207,6 +207,34 @@ re-originated over TLS by the supervisor, which therefore sees that plaintext
 for secret-bound hosts. HTTPS clients that only CONNECT keep working exactly
 as before, with no substitution.
 
+### Host loopback services: `--forward-port PORT`
+
+Without `--network` the sandbox has its own loopback, so services listening
+on the host's `127.0.0.1` — a local MCP server, an editor's IDE socket, a
+dev database — are unreachable. `--forward-port 49374` (repeatable, or
+`forward_ports = [...]` in the global config) relays exactly that port: the
+supervisor connects a per-launch Unix socket to the host's
+`127.0.0.1:49374` (falling back to `[::1]:49374`, for services bound to
+`localhost` over IPv6 only), and an in-sandbox bridge listens on the
+sandbox's own `127.0.0.1:49374` and pumps into it. The agent starts only
+once every bridge is listening, and a bridge that cannot bind fails the
+launch. The private network namespace stays up; every other host port stays
+unreachable. It combines with filtered egress and `--lockdown` (the port
+joins the Landlock V4 connect allow set), and is Linux-only. Ports below
+1024 are refused: the sandbox cannot bind them.
+
+It cannot combine with `--network`, where the host loopback is already
+reachable, and it is refused outside Linux — so a `forward_ports` entry in
+the global config fails every `--network` or `--browser` launch, and every
+launch on macOS; put it under a command-specific table instead.
+
+A forwarded port is trusted in full: there is no allowlist, inspection or
+audit record on it, so the agent can do whatever the service behind it
+accepts. At most 256 relays run at once. Only the CLI and global config can
+open a forward: a project `.ai-jail` cannot, unless the global config lists
+it under `trust_project_config`. Forwards are never written into a project
+file by auto-save or `--init`.
+
 `--allow-tcp-port` remains accepted for backward compatibility, but launch
 fails closed because UDP cannot be securely constrained through this option —
 use `--allow-host` for filtered egress instead.
@@ -512,6 +540,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --deny-path PATH|GLOB           deny project paths
 --agent-state / --no-agent-state  mount the command's credential state (default off)
 --env NAME[=VALUE]              forward or set an environment variable (repeatable)
+--forward-port PORT             relay host 127.0.0.1:PORT into the sandbox (Linux, repeatable)
 --inherit-env / --no-inherit-env  pass the full parent environment (default: allowlist)
 --update-check / --no-update-check  host-side version check (default off)
 --lockdown / --no-lockdown      strict read-only mode, no network by default
