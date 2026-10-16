@@ -633,10 +633,11 @@ fn self_binary_path() -> Option<PathBuf> {
 
 pub(crate) fn bwrap_binary_path() -> Result<PathBuf, String> {
     let mut override_error: Option<String> = None;
+    let mut rejected: Vec<(PathBuf, String)> = Vec::new();
 
     if let Some(raw) = std::env::var_os(BWRAP_ENV_VAR) {
         let p = PathBuf::from(raw);
-        if let Some(path) = trusted_bwrap_path(&p) {
+        if let Some(path) = trusted_bwrap_candidate(&p, &mut rejected) {
             return Ok(path);
         }
         output::security_warn(
@@ -650,7 +651,7 @@ pub(crate) fn bwrap_binary_path() -> Result<PathBuf, String> {
 
     for candidate in BWRAP_CANDIDATES {
         let p = PathBuf::from(candidate);
-        if let Some(path) = trusted_bwrap_path(&p) {
+        if let Some(path) = trusted_bwrap_candidate(&p, &mut rejected) {
             return Ok(path);
         }
     }
@@ -658,24 +659,47 @@ pub(crate) fn bwrap_binary_path() -> Result<PathBuf, String> {
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join("bwrap");
-            if let Some(path) = trusted_bwrap_path(&candidate) {
+            if let Some(path) =
+                trusted_bwrap_candidate(&candidate, &mut rejected)
+            {
                 return Ok(path);
             }
         }
     }
 
-    let mut msg = String::from(
-        "bwrap (bubblewrap) not found in trusted locations. Install it:\n  \
-         Arch: pacman -S bubblewrap\n  \
-         Debian/Ubuntu: apt install bubblewrap\n  \
-         Fedora: dnf install bubblewrap\n\
-         Or set BWRAP_BIN=/absolute/path/to/bwrap",
-    );
+    Err(bwrap_lookup_error(&rejected, override_error))
+}
+
+fn bwrap_lookup_error(
+    rejected: &[(PathBuf, String)],
+    override_error: Option<String>,
+) -> String {
+    let mut msg = if rejected.is_empty() {
+        String::from(
+            "bwrap (bubblewrap) not found in trusted locations. Install it:\n  \
+             Arch: pacman -S bubblewrap\n  \
+             Debian/Ubuntu: apt install bubblewrap\n  \
+             Fedora: dnf install bubblewrap\n\
+             Or set BWRAP_BIN=/absolute/path/to/bwrap",
+        )
+    } else {
+        let mut msg = String::from(
+            "bwrap (bubblewrap) was found but failed trusted binary \
+             validation. ai-jail only runs a bwrap that is an executable \
+             file owned by root (or in a protected Nix store) and not \
+             writable by group or others:",
+        );
+        for (_, line) in rejected {
+            msg.push_str("\n  ");
+            msg.push_str(line);
+        }
+        msg
+    };
     if let Some(err) = override_error {
         msg.push('\n');
         msg.push_str(&err);
     }
-    Err(msg)
+    msg
 }
 
 /// Use --new-session only when stdin is NOT a terminal.
@@ -700,18 +724,81 @@ fn should_use_new_session() -> bool {
     !crate::statusbar::is_active() && !std::io::stdin().is_terminal()
 }
 
-fn trusted_bwrap_path(path: &Path) -> Option<PathBuf> {
+/// Returns the canonical path when `path` is a trusted bwrap. A candidate
+/// that exists but is refused is recorded in `rejected` (once per canonical
+/// path) with the reason, so the final error can say it was found rather
+/// than "not found".
+fn trusted_bwrap_candidate(
+    path: &Path,
+    rejected: &mut Vec<(PathBuf, String)>,
+) -> Option<PathBuf> {
     let canonical = path.canonicalize().ok()?;
     let metadata = canonical.metadata().ok()?;
     let in_nix_store = canonical.starts_with(NIX_STORE)
         && nix_store_is_protected(Path::new(NIX_STORE));
-    trusted_binary_metadata(
+    let (is_file, uid, mode) = (
         metadata.file_type().is_file(),
         metadata.uid(),
         metadata.mode(),
-        in_nix_store,
-    )
-    .then_some(canonical)
+    );
+    if trusted_binary_metadata(is_file, uid, mode, in_nix_store) {
+        return Some(canonical);
+    }
+    if rejected.iter().any(|(seen, _)| *seen == canonical) {
+        return None;
+    }
+
+    let shown = if canonical == path {
+        path.display().to_string()
+    } else {
+        format!("{} -> {}", path.display(), canonical.display())
+    };
+    let line = format!(
+        "{shown}: {}",
+        untrusted_binary_reason(
+            is_file,
+            uid,
+            mode,
+            in_nix_store,
+            overflow_uid()
+        )
+    );
+    rejected.push((canonical, line));
+    None
+}
+
+/// The kernel's overflow uid: what `stat` reports, inside a user
+/// namespace, for an owner that namespace does not map (usually 65534).
+fn overflow_uid() -> Option<u32> {
+    std::fs::read_to_string("/proc/sys/kernel/overflowuid")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Why `trusted_binary_metadata` refused a binary, for the error message.
+fn untrusted_binary_reason(
+    is_file: bool,
+    uid: u32,
+    mode: u32,
+    in_nix_store: bool,
+    overflow_uid: Option<u32>,
+) -> String {
+    let perms = mode & 0o7777;
+    if !is_file {
+        "not a regular file".into()
+    } else if mode & 0o111 == 0 {
+        format!("not executable (mode {perms:04o})")
+    } else if uid == 0 || in_nix_store {
+        format!("writable by group or others (mode {perms:04o})")
+    } else if overflow_uid == Some(uid) {
+        format!(
+            "owned by uid {uid} (the overflow uid), not root. Inside a user \
+             namespace that does not map root, such as a rootless \
+             container, a root-owned file shows up as this uid"
+        )
+    } else {
+        format!("owned by uid {uid}, not root")
+    }
 }
 
 /// Whether the Nix store itself is beyond the reach of whoever runs
@@ -8051,6 +8138,72 @@ nameserver 8.8.8.8
 
         let _bwrap_bin = EnvVarGuard::set(BWRAP_ENV_VAR, bwrap.as_os_str());
         assert_ne!(bwrap_binary_path().ok().as_ref(), Some(&bwrap));
+        let _ = std::fs::remove_file(&bwrap);
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[test]
+    fn missing_bwrap_still_says_install_it() {
+        let msg = bwrap_lookup_error(&[], None);
+        assert!(msg.starts_with("bwrap (bubblewrap) not found"), "{msg}");
+        assert!(msg.contains("Install it"), "{msg}");
+    }
+
+    #[test]
+    fn untrusted_binary_reason_names_the_failed_rule() {
+        assert_eq!(
+            untrusted_binary_reason(false, 0, 0o755, false, Some(65534)),
+            "not a regular file"
+        );
+        assert_eq!(
+            untrusted_binary_reason(true, 0, 0o644, false, Some(65534)),
+            "not executable (mode 0644)"
+        );
+        assert_eq!(
+            untrusted_binary_reason(true, 0, 0o775, false, Some(65534)),
+            "writable by group or others (mode 0775)"
+        );
+        assert_eq!(
+            untrusted_binary_reason(true, 1000, 0o755, true, Some(65534)),
+            "writable by group or others (mode 0755)"
+        );
+        assert_eq!(
+            untrusted_binary_reason(true, 1000, 0o755, false, Some(65534)),
+            "owned by uid 1000, not root"
+        );
+        let overflow =
+            untrusted_binary_reason(true, 65534, 0o755, false, Some(65534));
+        assert!(overflow.starts_with("owned by uid 65534 (the overflow uid)"));
+        assert!(overflow.contains("user namespace"));
+    }
+
+    #[test]
+    fn rejected_bwrap_is_reported_as_found() {
+        let tmp = std::env::temp_dir()
+            .join(format!("ai-jail-bwrap-found.{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let bwrap = tmp.join("bwrap");
+        std::fs::write(&bwrap, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            &bwrap,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let mut rejected = Vec::new();
+        assert!(trusted_bwrap_candidate(&bwrap, &mut rejected).is_none());
+        // Seen twice (BWRAP_BIN and PATH), listed once.
+        assert!(trusted_bwrap_candidate(&bwrap, &mut rejected).is_none());
+        assert_eq!(rejected.len(), 1);
+        let line = &rejected[0].1;
+        assert!(
+            line.starts_with(&format!("{}: owned by uid", bwrap.display()))
+        );
+
+        let msg = bwrap_lookup_error(&rejected, None);
+        assert!(msg.contains("was found but failed"), "{msg}");
+        assert!(!msg.contains("Install it"), "{msg}");
+        assert!(msg.contains(line.as_str()), "{msg}");
         let _ = std::fs::remove_file(&bwrap);
         let _ = std::fs::remove_dir(&tmp);
     }
