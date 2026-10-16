@@ -449,8 +449,34 @@ fn env_args(inherit_env: bool, env_pass: &[String]) -> Vec<String> {
         {
             args.extend(["--setenv".into(), name, value]);
         }
+        for (name, value) in login_name_env(env_pass) {
+            args.extend(["--setenv".into(), name.into(), value]);
+        }
     }
     args
+}
+
+/// `USER` and `LOGNAME` for the filtered environment, from the passwd
+/// entry of the invoking uid: the same name `whoami`, `id -un` and the
+/// shell prompt already read from the jail's `/etc/passwd`, so this
+/// exposes nothing new. Without them, everything that reads `$USER`
+/// (`/tmp/$USER` paths, the `psql` default role, shell prompts and
+/// titles) sees an empty name. A name chosen with `--env` wins.
+fn login_name_env(env_pass: &[String]) -> Vec<(&'static str, String)> {
+    let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::getuid())
+    else {
+        return Vec::new();
+    };
+    ["USER", "LOGNAME"]
+        .into_iter()
+        .filter(|var| {
+            !env_pass.iter().any(|entry| {
+                crate::config::parse_env_entry(entry)
+                    .is_ok_and(|(name, _)| name == *var)
+            })
+        })
+        .map(|var| (var, user.name.clone()))
+        .collect()
 }
 
 struct MountSources<'a> {
@@ -7470,6 +7496,46 @@ mod tests {
         assert!(
             args.windows(3)
                 .any(|w| w[0] == "--setenv" && w[1] == "PATH")
+        );
+    }
+
+    #[test]
+    fn env_args_sets_login_name_from_passwd_by_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _user = EnvVarGuard::set("USER", "not-the-passwd-name");
+        let _logname = EnvVarGuard::remove("LOGNAME");
+        let name = nix::unistd::User::from_uid(nix::unistd::getuid())
+            .unwrap()
+            .unwrap()
+            .name;
+
+        let args = env_args(false, &[]);
+        assert!(sets_env(&args, "USER", &name), "{args:?}");
+        assert!(sets_env(&args, "LOGNAME", &name), "{args:?}");
+        assert!(!sets_env(&args, "USER", "not-the-passwd-name"));
+    }
+
+    #[test]
+    fn env_args_login_name_yields_to_env_pass_and_inherit() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let args = env_args(false, &["USER=chosen".to_string()]);
+        let users: Vec<&String> = args
+            .windows(3)
+            .filter(|w| w[0] == "--setenv" && w[1] == "USER")
+            .map(|w| &w[2])
+            .collect();
+        assert_eq!(users, ["chosen"]);
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--setenv" && w[1] == "LOGNAME")
+        );
+
+        // --inherit-env keeps the host's own values untouched.
+        let args = env_args(true, &[]);
+        assert!(
+            !args
+                .windows(3)
+                .any(|w| w[0] == "--setenv" && w[1] == "USER")
         );
     }
 
