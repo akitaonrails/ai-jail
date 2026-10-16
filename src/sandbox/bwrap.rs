@@ -1777,6 +1777,18 @@ fn discover_mounts_full(
     } else {
         overlay_mounts(&config.overlay_maps, project_dir, verbose)?
     };
+    // Lockdown clears the environment to paths already supplied by the
+    // sandbox, so it intentionally skips host command exemptions.
+    let command_binary = if !lockdown {
+        discover_command_binary(
+            config,
+            config.private_home_enabled(),
+            &[&home_dotfiles, &devin_state],
+            verbose,
+        )
+    } else {
+        vec![]
+    };
     let (extra_outside, extra_inside) = if lockdown || browser_mode {
         (vec![], vec![])
     } else {
@@ -1824,17 +1836,7 @@ fn discover_mounts_full(
         } else {
             discover_local_overrides()
         },
-        // Lockdown clears the environment to paths already supplied by the
-        // sandbox, so it intentionally skips host command exemptions.
-        command_binary: if !lockdown {
-            discover_command_binary(
-                config,
-                config.private_home_enabled(),
-                verbose,
-            )
-        } else {
-            vec![]
-        },
+        command_binary,
         git_worktree: git_worktree_mounts(config, project_dir, verbose),
         gpu: if enable_gpu {
             discover_gpu(verbose)
@@ -2673,6 +2675,7 @@ fn discover_subdir_hide(parent: &str, deny_list: &[&str]) -> Vec<Mount> {
 fn discover_command_binary(
     config: &Config,
     private_home: bool,
+    home_mounts: &[&[Mount]],
     verbose: bool,
 ) -> Vec<Mount> {
     let mut paths = if private_home {
@@ -2697,12 +2700,29 @@ fn discover_command_binary(
     // target text so bun's app-root heuristic (dirname of invoked exe)
     // can find package.json in adjacent directories.
     let mut mounts = Vec::new();
-    for path in paths {
+    for mut path in paths {
         // Check if this path is a symlink on the host.
         let is_symlink = path
             .symlink_metadata()
             .map(|m| m.is_symlink())
             .unwrap_or(false);
+        // A path an earlier home mount exposes as the host's own directory
+        // is already visible, symlinks included. Binding over it again can
+        // fail: the codex standalone installer's `~/.codex/.../current` is
+        // an absolute symlink, and bwrap cannot create a mount point
+        // through it. Only a terminal directory whose real path leaves
+        // that mount still needs a bind, made at the real path.
+        if exposed_by_self_bind(home_mounts, &path) {
+            match path.canonicalize() {
+                Ok(real)
+                    if !is_symlink
+                        && !exposed_by_self_bind(home_mounts, &real) =>
+                {
+                    path = real;
+                }
+                _ => continue,
+            }
+        }
         if is_symlink {
             // Read the symlink target text verbatim. The target may be
             // relative (e.g., "../share/prime-agent/bin/prime-agent")
@@ -2746,6 +2766,21 @@ fn discover_command_binary(
         }
     }
     mounts
+}
+
+/// Whether the most specific of `mounts` covering `path` binds the host
+/// directory onto itself, so `path` already appears as on the host.
+fn exposed_by_self_bind(mounts: &[&[Mount]], path: &Path) -> bool {
+    let covering = mounts
+        .iter()
+        .flat_map(|group| group.iter())
+        .filter(|m| path.starts_with(m.dest()))
+        .max_by_key(|m| m.dest().components().count());
+    matches!(
+        covering,
+        Some(Mount::Bind { src, dest } | Mount::RoBind { src, dest })
+            if src == dest
+    )
 }
 
 fn command_mount_path(path: &Path) -> PathBuf {
@@ -5303,6 +5338,78 @@ mod tests {
         assert!(has_ro_bind(
             &args,
             &home.join(".local/share/agent/versions")
+        ));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn command_binary_skips_paths_exposed_by_home_bind() {
+        // codex standalone installer: `~/.codex` is already bound, and its
+        // `current` symlink is absolute. A ro-bind through it made bwrap
+        // abort with "Can't mkdir .../current/bin".
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-bwrap-cmd-home-dirlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let codex_dir = home.join(".codex");
+        let standalone = codex_dir.join("packages/standalone");
+        let release_bin = standalone.join("releases/0.1/bin");
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&release_bin).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let target = release_bin.join("codex");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let current = standalone.join("current");
+        std::os::unix::fs::symlink(standalone.join("releases/0.1"), &current)
+            .unwrap();
+        let launcher = bin.join("codex");
+        std::os::unix::fs::symlink(current.join("bin/codex"), &launcher)
+            .unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path = EnvVarGuard::set("PATH", prepend_path(&bin));
+        let config = Config {
+            command: vec!["codex".into()],
+            private_home: Some(true),
+            ..minimal_test_config()
+        };
+        let home_mounts = vec![
+            Mount::Tmpfs { dest: home.clone() },
+            Mount::Bind {
+                src: codex_dir.clone(),
+                dest: codex_dir.clone(),
+            },
+        ];
+
+        let mounts =
+            discover_command_binary(&config, true, &[&home_mounts, &[]], false);
+
+        let dests: Vec<&Path> = mounts.iter().map(Mount::dest).collect();
+        assert_eq!(dests, vec![launcher.as_path()]);
+
+        // When `current` leaves the bound directory, the release is bound
+        // at its real path, which the exposed symlink then resolves to.
+        let outside = home.join("opt/codex-0.1");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::rename(release_bin.parent().unwrap(), &outside).unwrap();
+        std::fs::remove_file(&current).unwrap();
+        std::os::unix::fs::symlink(&outside, &current).unwrap();
+        let mounts =
+            discover_command_binary(&config, true, &[&home_mounts, &[]], false);
+        let real_bin = outside.join("bin");
+        let dests: Vec<&Path> = mounts.iter().map(Mount::dest).collect();
+        assert_eq!(dests, vec![launcher.as_path(), real_bin.as_path()]);
+        assert!(matches!(
+            &mounts[1],
+            Mount::RoBind { src, .. } if *src == real_bin
         ));
 
         let _ = std::fs::remove_dir_all(&home);
