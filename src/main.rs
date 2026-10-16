@@ -101,6 +101,34 @@ fn apply_browser_profile(config: &mut config::Config, command_trusted: bool) {
     }
 }
 
+/// A one-line hint for a browser profile that will not get a window: on
+/// Linux the display is an explicit opt-in, and without it the browser
+/// exits with only its own "failed to connect to display" error. Silent
+/// when there is no display on the host to pass, under lockdown (which
+/// has its own warning above), and on macOS, where the display is
+/// system-level.
+fn browser_display_hint(
+    config: &config::Config,
+    host_has_display: bool,
+) -> Option<&'static str> {
+    (cfg!(target_os = "linux")
+        && host_has_display
+        && config.browser_profile().is_some()
+        && !config.lockdown_enabled()
+        && !config.display_enabled()
+        && !config.x11_enabled())
+    .then_some(
+        "ai-jail: browser profile without --display: the browser cannot \
+         open a window — pass --display (or --x11 for an X11-only browser)",
+    )
+}
+
+fn host_has_display() -> bool {
+    ["WAYLAND_DISPLAY", "DISPLAY"]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()))
+}
+
 /// Phantom credentials (issue #135): validate every `secret_hosts`
 /// binding and rewrite the bound `env_pass` entries to placeholders,
 /// moving the real values into supervisor-side `SecretBinding`s for the
@@ -863,6 +891,9 @@ fn run() -> Result<i32, String> {
     for warning in command::capability_gap_warnings(&config) {
         output::warn(&warning);
     }
+    if let Some(hint) = browser_display_hint(&config, host_has_display()) {
+        output::warn(hint);
+    }
 
     // Opt-in, read-only credential passthrough (aws/kube/gcloud/
     // docker_config): off by default, disabled under --lockdown. Injected
@@ -1294,14 +1325,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_browser_profile, command_is_browser, command_needs_direct_tty,
-        default_agent_api_egress_applies, default_registry_egress_applies,
-        default_resize_redraw_key, exec_requires_terminal_passthrough,
-        internal_mode_inherits_quiet, prune_missing_path_entries,
-        pty_proxy_active, resolve_browser_profile, running_inside_multiplexer,
-        should_auto_save_project_config, should_check_update,
-        should_save_global_preferences, validate_network_flags,
-        validate_write_flags,
+        apply_browser_profile, browser_display_hint, command_is_browser,
+        command_needs_direct_tty, default_agent_api_egress_applies,
+        default_registry_egress_applies, default_resize_redraw_key,
+        exec_requires_terminal_passthrough, internal_mode_inherits_quiet,
+        prune_missing_path_entries, pty_proxy_active, resolve_browser_profile,
+        running_inside_multiplexer, should_auto_save_project_config,
+        should_check_update, should_save_global_preferences,
+        validate_network_flags, validate_write_flags,
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
@@ -1759,6 +1790,47 @@ mod tests {
         apply_browser_profile(&mut config, /* command_trusted */ true);
         assert_eq!(config.lockdown, Some(false));
         assert_eq!(config.browser_profile.as_deref(), Some("hard"));
+    }
+
+    #[test]
+    fn browser_display_hint_only_when_a_window_cannot_open() {
+        let browser = |extra: fn(&mut Config)| {
+            let mut config = Config {
+                command: vec!["chromium".into()],
+                ..Config::default()
+            };
+            apply_browser_profile(&mut config, true);
+            extra(&mut config);
+            config
+        };
+        let linux = cfg!(target_os = "linux");
+
+        // A browser profile with no --display on a host that has one.
+        assert_eq!(
+            browser_display_hint(&browser(|_| {}), true).is_some(),
+            linux
+        );
+        // Display or X11 passed: the browser can open a window.
+        assert!(
+            browser_display_hint(
+                &browser(|c| c.no_display = Some(false)),
+                true
+            )
+            .is_none()
+        );
+        assert!(
+            browser_display_hint(&browser(|c| c.x11 = Some(true)), true)
+                .is_none()
+        );
+        // No display on the host: nothing to pass.
+        assert!(browser_display_hint(&browser(|_| {}), false).is_none());
+        // Lockdown kept for an untrusted browser command warns on its own.
+        assert!(
+            browser_display_hint(&browser(|c| c.lockdown = Some(true)), true)
+                .is_none()
+        );
+        // Not a browser launch.
+        assert!(browser_display_hint(&Config::default(), true).is_none());
     }
 
     #[test]
