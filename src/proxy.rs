@@ -110,35 +110,40 @@ impl ProxyConfig {
 /// Running proxy handle. Reports where the listeners are; see the
 /// module docs for the (process-exit) lifecycle.
 pub(crate) struct Proxy {
-    port: u16,
+    port: Option<u16>,
     unix_path: Option<PathBuf>,
 }
 
 impl Proxy {
-    /// Bind a TCP listener on 127.0.0.1:0 (random port) and, when
-    /// `unix_socket_path` is given, a Unix listener at that path
-    /// (mode 0600), serving both on dedicated accept threads.
+    /// Bind exactly one listener: a Unix socket (mode 0600) when a path is
+    /// supplied, otherwise a TCP listener on 127.0.0.1:0. Linux uses the Unix
+    /// endpoint across its private network namespace; macOS uses loopback.
     pub(crate) fn start(
         config: ProxyConfig,
         unix_socket_path: Option<&Path>,
     ) -> io::Result<Proxy> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let port = listener.local_addr()?.port();
         let shared = Arc::new(Shared {
             config,
             active: AtomicUsize::new(0),
         });
 
-        let tcp_shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            loop {
-                let stream = accept_next("proxy TCP listener", &mut || {
-                    listener.accept().map(|(stream, _)| stream)
-                });
-                let shared = Arc::clone(&tcp_shared);
-                thread::spawn(move || handle_conn(stream, shared));
-            }
-        });
+        let port = if unix_socket_path.is_none() {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+            let port = listener.local_addr()?.port();
+            let tcp_shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                loop {
+                    let stream = accept_next("proxy TCP listener", &mut || {
+                        listener.accept().map(|(stream, _)| stream)
+                    });
+                    let shared = Arc::clone(&tcp_shared);
+                    thread::spawn(move || handle_conn(stream, shared));
+                }
+            });
+            Some(port)
+        } else {
+            None
+        };
 
         let unix_path = if let Some(path) = unix_socket_path {
             // A stale socket from a previous launch would fail the bind.
@@ -169,6 +174,11 @@ impl Proxy {
 
     /// Loopback TCP port the proxy listens on.
     pub(crate) fn port(&self) -> u16 {
+        self.port.expect("proxy does not have a TCP listener")
+    }
+
+    /// Loopback TCP port, when one was bound.
+    pub(crate) fn tcp_port(&self) -> Option<u16> {
         self.port
     }
 
@@ -1525,6 +1535,7 @@ mod tests {
         let proxy =
             Proxy::start(test_config(&["127.0.0.1"]), Some(&path)).unwrap();
         assert_eq!(proxy.unix_path(), Some(path.as_path()));
+        assert_eq!(proxy.tcp_port(), None);
         let mode =
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -1837,6 +1848,7 @@ mod tests {
             .join(format!("ai-jail-bridge-test-{}.sock", std::process::id()));
         let proxy =
             Proxy::start(test_config(&["127.0.0.1"]), Some(&path)).unwrap();
+        assert_eq!(proxy.tcp_port(), None);
 
         let bridge_listener =
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

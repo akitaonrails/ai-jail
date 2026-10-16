@@ -982,6 +982,10 @@ fn validate_linked_git_worktree(
     let common_dir_canon = std::fs::canonicalize(&common_dir).map_err(|e| {
         format!("cannot resolve commondir {}: {e}", common_dir.display())
     })?;
+    let project_dir_canon =
+        std::fs::canonicalize(project_dir).map_err(|e| {
+            format!("cannot resolve project dir {}: {e}", project_dir.display())
+        })?;
     let under_worktrees = git_dir_canon
         .parent()
         .filter(|worktrees| {
@@ -995,6 +999,24 @@ fn validate_linked_git_worktree(
              refusing to trust repository-authored worktree metadata",
             git_dir_canon.display(),
             common_dir_canon.display()
+        ));
+    }
+
+    // A real linked worktree stores its administrative directories outside
+    // the checkout. If either side contains the other, the repository can
+    // manufacture the entire circular layout itself and trick us into
+    // exposing a project ancestor (or more of the project) as host metadata.
+    // Refuse every overlap, not only the known `<project>/worktrees/...`
+    // spelling, so alternate nesting and symlink spellings fail closed.
+    let overlaps_project = |path: &Path| {
+        path.starts_with(&project_dir_canon)
+            || project_dir_canon.starts_with(path)
+    };
+    if overlaps_project(&git_dir_canon) || overlaps_project(&common_dir_canon) {
+        return Err(format!(
+            "worktree metadata overlaps project directory {}; refusing to \
+             trust repository-authored worktree metadata",
+            project_dir_canon.display()
         ));
     }
 
@@ -1168,7 +1190,10 @@ pub(crate) fn unprivileged_netns_available() -> bool {
     use std::sync::OnceLock;
     static OK: OnceLock<bool> = OnceLock::new();
     *OK.get_or_init(|| {
-        std::process::Command::new("bwrap")
+        let Ok(bwrap) = bwrap::bwrap_binary_path() else {
+            return false;
+        };
+        std::process::Command::new(bwrap)
             .args([
                 "--ro-bind",
                 "/",
@@ -2957,6 +2982,35 @@ mod tests {
         assert!(
             discover_git_worktree_paths(&config, &project, false).is_none()
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worktree_metadata_nested_in_project_is_rejected() {
+        // A project can satisfy the structural `<common>/worktrees/<name>`
+        // check with directories it owns. That circular proof must never turn
+        // a project ancestor into a host-side worktree metadata mount.
+        let root = temp_test_dir("nested-worktree-metadata");
+        let common = root.join("project");
+        let project = common.join("worktrees/checkout");
+        let git_dir = common.join("worktrees/admin");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            project.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            git_dir.join("gitdir"),
+            format!("{}\n", project.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+
+        let err = validate_linked_git_worktree(&project).unwrap_err();
+        assert!(err.contains("overlaps project"), "unexpected error: {err}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

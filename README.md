@@ -199,7 +199,8 @@ strictest mode:
 
 - **Selective opt-outs** — `--no-agent-state` (no harness credentials
   mounted), `--no-toolchains` (no caches, no registry egress),
-  `--no-network` (fully offline, overriding the toolchain default), `--mask`
+  `--no-network` (fully offline unless combined with trusted
+  `--allow-host`, overriding automatic egress defaults), `--mask`
   / `--deny-path` (hide or deny specific project paths), `--hide-dotdir`
   (never mount a named dotdir), `--map` / `--rw-map` (scope extra mounts
   narrowly instead of a broad grant).
@@ -327,9 +328,9 @@ an explicit `--allow-host` set is unioned with this list. The default is
 gated on an unprivileged network-namespace probe: where netns is unavailable
 (hardened kernels, some nested containers, restricted CI) it silently stays
 offline instead of breaking the launch — an explicit `--allow-host` keeps its
-fail-closed guarantee regardless. `--no-network` always keeps the sandbox
-fully offline; `--network` gives unrestricted access instead of filtered
-egress.
+fail-closed guarantee regardless. `--no-network` by itself keeps the sandbox
+fully offline; adding a trusted `--allow-host` composes it into filtered
+egress to exactly those hosts. `--network` gives unrestricted access instead.
 
 When the invoked command is a known API agent whose canonical API host ai-jail
 knows — `claude` → `api.anthropic.com`, `codex` → `api.openai.com`, `gemini` →
@@ -586,7 +587,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --overlay-map PATH              copy-on-write mount (Linux only; read-only map on macOS)
 --mask PATH|GLOB                replace project paths with empty placeholders
 --deny-path PATH|GLOB           deny project paths
---agent-state / --no-agent-state  mount the command's credential state (default off)
+--agent-state / --no-agent-state  mount the command's credential state (default on)
 --env NAME[=VALUE]              forward or set an environment variable (repeatable)
 --forward-port PORT             relay host 127.0.0.1:PORT into the sandbox (Linux and macOS, repeatable)
 --inherit-env / --no-inherit-env  pass the full parent environment (default: allowlist)

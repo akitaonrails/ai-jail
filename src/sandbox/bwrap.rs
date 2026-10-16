@@ -422,9 +422,11 @@ impl MountSet {
 
 /// bwrap environment arguments for normal (non-lockdown) mode.
 ///
-/// Full inheritance (`--inherit-env`) keeps the host environment as
-/// bwrap would by default, with env_pass entries forced verbatim via
-/// `--setenv` (winning over the `--unsetenv` hardening above). The
+/// Full inheritance (`--inherit-env`) recreates the host environment through
+/// explicit `--setenv` arguments, with env_pass entries forced verbatim
+/// (winning over the inherited values). The outer bwrap process itself is
+/// launched with an empty environment so host-only values are not readable
+/// through its `/proc/<pid>/environ`. The
 /// default filters to the safe allowlist: `--clearenv` followed by a
 /// `--setenv` per kept variable.
 ///
@@ -437,7 +439,7 @@ fn env_args(inherit_env: bool, env_pass: &[String]) -> Vec<String> {
     let host_env: Vec<(String, String)> = std::env::vars().collect();
     let mut args = Vec::new();
     if inherit_env {
-        let mut env = Vec::new();
+        let mut env = host_env.clone();
         crate::config::apply_env_pass(&mut env, env_pass, &host_env);
         for (name, value) in env {
             args.extend(["--setenv".into(), name, value]);
@@ -838,7 +840,8 @@ fn untrusted_binary_reason(
 /// safe — a member may create new store paths but cannot replace someone
 /// else's — so `nix_store_metadata_is_protected` explicitly requires it on
 /// group-writable stores. A store owned by a non-root user (e.g. a single-user
-/// install) must carry no write bits at all.
+/// install) is never protected: its owner can restore write permission even
+/// when the current mode has no write bits.
 fn nix_store_is_protected(store: &Path) -> bool {
     store.metadata().is_ok_and(|m| {
         m.is_dir() && nix_store_metadata_is_protected(m.uid(), m.mode())
@@ -852,11 +855,7 @@ fn nix_store_metadata_is_protected(uid: u32, mode: u32) -> bool {
         return false;
     }
 
-    if uid == 0 || uid == 65534 {
-        mode & 0o002 == 0
-    } else {
-        mode & 0o222 == 0
-    }
+    (uid == 0 || uid == 65534) && mode & 0o002 == 0
 }
 
 fn trusted_binary_metadata(
@@ -1483,6 +1482,9 @@ pub fn build(
     }
 
     let mut cmd = Command::new(bwrap);
+    // Environment filtering must cover the long-lived bwrap supervisor as
+    // well as its child. All intended child values are encoded in opt_args.
+    cmd.env_clear();
     let args_fd = write_bwrap_args_fd(&opt_args)?;
     cmd.arg("--args").arg(args_fd.to_string());
 
@@ -7569,13 +7571,11 @@ mod tests {
                 .any(|w| w[0] == "--setenv" && w[1] == "LOGNAME")
         );
 
-        // --inherit-env keeps the host's own values untouched.
+        // --inherit-env recreates the host's own values explicitly because
+        // the outer bwrap process is launched with an empty environment.
+        let _user = EnvVarGuard::set("USER", "host-user");
         let args = env_args(true, &[]);
-        assert!(
-            !args
-                .windows(3)
-                .any(|w| w[0] == "--setenv" && w[1] == "USER")
-        );
+        assert!(sets_env(&args, "USER", "host-user"), "{args:?}");
     }
 
     #[test]
@@ -7801,11 +7801,9 @@ mod tests {
         assert!(!nix_store_metadata_is_protected(0, 0o1777));
         assert!(!nix_store_metadata_is_protected(65534, 0o1777));
         assert!(!nix_store_metadata_is_protected(65534, 0o777));
-        // Read-only store owned by someone else is still fine.
-        assert!(nix_store_metadata_is_protected(1000, 0o555));
-        // Single-user store the invoking user can write: the
-        // non-root-owned relaxation must not apply, or anyone running
-        // as that user could drop in a fake bwrap.
+        // Non-root ownership is refused even when the current mode is
+        // read-only: the owner can chmod it and replace a trusted binary.
+        assert!(!nix_store_metadata_is_protected(1000, 0o555));
         assert!(!nix_store_metadata_is_protected(1000, 0o755));
         assert!(!nix_store_metadata_is_protected(1000, 0o775));
     }
