@@ -4104,13 +4104,13 @@ mod tests {
                         && w[1] == empty_str
                         && w[2] == masked_str
                 }),
-                "expected glob-expanded mask for {}; args: {args:?}",
+                "expected glob-expanded mask for {}",
                 masked.display()
             );
         }
         assert!(
             !args.iter().any(|arg| arg.ends_with("public.txt")),
-            "non-matching files must not be masked; args: {args:?}"
+            "non-matching files must not be masked"
         );
 
         let _ = std::fs::remove_dir_all(&project);
@@ -4297,7 +4297,7 @@ mod tests {
             ..minimal_test_config()
         };
         let args = x11_dry_run_args(&config);
-        assert!(sets_env(&args, "DISPLAY", ":42"), "{args:?}");
+        assert!(sets_env(&args, "DISPLAY", ":42"));
     }
 
     #[test]
@@ -4311,8 +4311,8 @@ mod tests {
             ..minimal_test_config()
         };
         let args = x11_dry_run_args(&config);
-        assert!(!args.iter().any(|arg| arg == "DISPLAY"), "{args:?}");
-        assert!(!args.iter().any(|arg| arg == "/tmp/.X11-unix"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "DISPLAY"));
+        assert!(!args.iter().any(|arg| arg == "/tmp/.X11-unix"));
     }
 
     #[test]
@@ -4326,8 +4326,8 @@ mod tests {
             ..minimal_test_config()
         };
         let args = x11_dry_run_args(&config);
-        assert!(!args.iter().any(|arg| arg == "DISPLAY"), "{args:?}");
-        assert!(!args.iter().any(|arg| arg == "/tmp/.X11-unix"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "DISPLAY"));
+        assert!(!args.iter().any(|arg| arg == "/tmp/.X11-unix"));
     }
 
     #[test]
@@ -4842,7 +4842,7 @@ mod tests {
         });
         assert!(
             found,
-            "default behavior must auto-mask .ai-jail with the empty tempfile; args: {args:?}"
+            "default behavior must auto-mask .ai-jail with the empty tempfile"
         );
 
         let _ = std::fs::remove_dir_all(&project);
@@ -4879,7 +4879,7 @@ mod tests {
         });
         assert!(
             !found,
-            "no_hide_config=true must skip the auto-mask of .ai-jail; args: {args:?}"
+            "no_hide_config=true must skip the auto-mask of .ai-jail"
         );
 
         let _ = std::fs::remove_dir_all(&project);
@@ -5001,7 +5001,7 @@ mod tests {
         assert_eq!(
             occurrences, 1,
             "Exactly one --ro-bind for .ai-jail expected, got {occurrences}.\n\
-             Auto-mask dedup is broken — full args: {args:?}"
+             Auto-mask dedup is broken"
         );
 
         let _ = std::fs::remove_dir_all(&project);
@@ -7551,8 +7551,8 @@ mod tests {
             .name;
 
         let args = env_args(false, &[]);
-        assert!(sets_env(&args, "USER", &name), "{args:?}");
-        assert!(sets_env(&args, "LOGNAME", &name), "{args:?}");
+        assert!(sets_env(&args, "USER", &name));
+        assert!(sets_env(&args, "LOGNAME", &name));
         assert!(!sets_env(&args, "USER", "not-the-passwd-name"));
     }
 
@@ -7575,7 +7575,7 @@ mod tests {
         // the outer bwrap process is launched with an empty environment.
         let _user = EnvVarGuard::set("USER", "host-user");
         let args = env_args(true, &[]);
-        assert!(sets_env(&args, "USER", "host-user"), "{args:?}");
+        assert!(sets_env(&args, "USER", "host-user"));
     }
 
     #[test]
@@ -8356,7 +8356,7 @@ nameserver 8.8.8.8
         });
         assert!(
             bind_pos.is_some(),
-            "--bind for claude_dir not found in argv: {args:?}"
+            "--bind for claude_dir not found in argv"
         );
 
         let setenv_pos = args.windows(3).position(|w| {
@@ -8366,8 +8366,7 @@ nameserver 8.8.8.8
         });
         assert!(
             setenv_pos.is_some(),
-            "--setenv CLAUDE_CONFIG_DIR not found in argv: \
-             {args:?}"
+            "--setenv CLAUDE_CONFIG_DIR not found in argv"
         );
 
         let _ = std::fs::remove_dir_all(&tmp_root);
