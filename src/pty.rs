@@ -17,7 +17,8 @@
 //! full control over screen recovery.
 //!
 //! By default output is rendered safely: terminal control queries and string
-//! commands are not passed from the sandbox to the host terminal. The
+//! commands are not passed from the sandbox to the host terminal, except a
+//! window title (OSC 0/1/2), which is rebuilt from printable text only. The
 //! `--terminal-passthrough` opt-in restores raw TUI terminal behavior.
 
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -386,8 +387,10 @@ impl<'a> IoLoop<'a> {
         // updates (OSC 0/1/2 — the tab keeps showing the launch command
         // instead of "opencode", #57), clipboard writes (OSC 52), and
         // color queries (OSC 10/11/12). The primary screen's raw
-        // pass-through carries these natively.
-        if now_alt {
+        // pass-through carries these natively; without passthrough the
+        // primary filter strips every OSC, so the forwarder runs there
+        // too and puts back the sanitized window title.
+        if now_alt || !self.terminal_passthrough {
             self.osc.feed(self.stdout, buf);
         }
 
@@ -1075,6 +1078,10 @@ const OSC_MAX_LEN: usize = 1 << 20;
 /// forwarded.
 const OSC_FORWARD_CMDS: &[&[u8]] = &[b"0", b"1", b"2", b"52"];
 
+/// Longest window title (in bytes) forwarded without
+/// `--terminal-passthrough`; longer ones are dropped.
+const OSC_TITLE_MAX_LEN: usize = 1024;
+
 /// Where the OSC scanner is within a (possibly read-spanning) sequence.
 enum OscState {
     /// Not inside a candidate sequence.
@@ -1100,18 +1107,22 @@ enum OscState {
 /// State persists across reads on purpose: a base64 OSC 52 selection
 /// can easily exceed a single 8 KiB read, so a stateless per-read scan
 /// (like [`forward_terminal_queries`]) would miss split sequences.
+///
+/// Without `--terminal-passthrough` only window titles get through, and
+/// only as rebuilt by [`OscForwarder::sanitized_title`]: clipboard
+/// access and color queries stay behind the opt-in.
 struct OscForwarder {
     state: OscState,
     buf: Vec<u8>,
-    enabled: bool,
+    passthrough: bool,
 }
 
 impl OscForwarder {
-    fn new(enabled: bool) -> Self {
+    fn new(passthrough: bool) -> Self {
         Self {
             state: OscState::Ground,
             buf: Vec::new(),
-            enabled,
+            passthrough,
         }
     }
 
@@ -1121,12 +1132,46 @@ impl OscForwarder {
     }
 
     /// Forward the captured sequence only if its OSC command number is
-    /// in the allowlist; always reset afterwards.
+    /// in the allowlist (with passthrough) or it is a safe window title
+    /// (without); always reset afterwards.
     fn flush(&mut self, fd: i32) {
-        if self.enabled && Self::is_forwardable(&self.buf) {
-            write_all_raw(fd, &self.buf);
+        if self.passthrough {
+            if Self::is_forwardable(&self.buf) {
+                write_all_raw(fd, &self.buf);
+            }
+        } else if let Some(title) = Self::sanitized_title(&self.buf) {
+            write_all_raw(fd, &title);
         }
         self.reset();
+    }
+
+    /// A complete OSC 0/1/2 (set icon name / window title) rebuilt as
+    /// `ESC ] <cmd> ; <text> BEL`, or `None` unless the text is valid
+    /// UTF-8 of at most [`OSC_TITLE_MAX_LEN`] bytes with no C0, DEL or
+    /// C1 control. Setting a title is display-only; reading one back
+    /// (`CSI 21 t`) is a query and stays filtered.
+    fn sanitized_title(buf: &[u8]) -> Option<Vec<u8>> {
+        let body = buf.strip_prefix(b"\x1b]")?;
+        let body = body
+            .strip_suffix(b"\x07")
+            .or_else(|| body.strip_suffix(b"\x1b\\"))?;
+        let sep = body.iter().position(|&b| b == b';')?;
+        let (cmd, text) = (&body[..sep], &body[sep + 1..]);
+        if !matches!(cmd, b"0" | b"1" | b"2") || text.len() > OSC_TITLE_MAX_LEN
+        {
+            return None;
+        }
+        let text = std::str::from_utf8(text).ok()?;
+        if text.chars().any(char::is_control) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(body.len() + 3);
+        out.extend_from_slice(b"\x1b]");
+        out.extend_from_slice(cmd);
+        out.push(b';');
+        out.extend_from_slice(text.as_bytes());
+        out.push(0x07);
+        Some(out)
     }
 
     /// Inspect a captured `ESC ] <cmd> (;|terminator) …` buffer and
@@ -1786,14 +1831,113 @@ mod tests {
         assert!(capture_osc52(&[&seq]).is_empty());
     }
 
-    #[test]
-    fn osc_title_and_clipboard_denied_without_passthrough() {
+    fn capture_filtered_osc(chunks: &[&[u8]]) -> Vec<u8> {
         let (r, w) = nix::unistd::pipe().unwrap();
         let mut fwd = super::OscForwarder::new(false);
-        fwd.feed(w.as_raw_fd(), b"\x1b]2;title\x07\x1b]52;c;data\x07");
+        for chunk in chunks {
+            fwd.feed(w.as_raw_fd(), chunk);
+        }
         drop(w);
-        let mut out = [0; 1];
-        assert_eq!(nix::unistd::read(r.as_raw_fd(), &mut out).unwrap_or(0), 0);
+        let mut out = vec![0u8; 8192];
+        let n = nix::unistd::read(r.as_raw_fd(), &mut out).unwrap_or(0);
+        out.truncate(n);
+        out
+    }
+
+    #[test]
+    fn osc_clipboard_denied_and_title_kept_without_passthrough() {
+        let out = capture_filtered_osc(&[
+            b"\x1b]2;title\x07\x1b]52;c;data\x07\x1b]52;c;?\x07",
+        ]);
+        assert_eq!(out, b"\x1b]2;title\x07");
+    }
+
+    #[test]
+    fn osc_color_query_denied_without_passthrough() {
+        assert!(capture_filtered_osc(&[b"\x1b]11;?\x07"]).is_empty());
+    }
+
+    #[test]
+    fn osc_title_without_passthrough_is_rebuilt_with_bel() {
+        assert_eq!(capture_filtered_osc(&[b"\x1b]0;a\x1b\\"]), b"\x1b]0;a\x07");
+        assert_eq!(
+            capture_filtered_osc(&[b"\x1b]1;", b"icon\x07"]),
+            b"\x1b]1;icon\x07"
+        );
+        let utf8 = "\x1b]0;\u{2733} Claude Code\x07";
+        assert_eq!(capture_filtered_osc(&[utf8.as_bytes()]), utf8.as_bytes());
+    }
+
+    #[test]
+    fn osc_title_without_passthrough_drops_unsafe_text() {
+        // C0 control, DEL, a C1 control encoded as UTF-8, invalid UTF-8.
+        for seq in [
+            &b"\x1b]0;a\x08b\x07"[..],
+            b"\x1b]0;a\x7fb\x07",
+            b"\x1b]0;a\xc2\x9bb\x07",
+            b"\x1b]0;a\xffb\x07",
+        ] {
+            assert!(capture_filtered_osc(&[seq]).is_empty(), "{seq:?}");
+        }
+        let mut long = b"\x1b]2;".to_vec();
+        long.extend(std::iter::repeat_n(b'x', super::OSC_TITLE_MAX_LEN + 1));
+        long.push(0x07);
+        assert!(capture_filtered_osc(&[&long]).is_empty());
+    }
+
+    /// Run one child-output chunk through the IO loop and return what
+    /// reaches the real terminal.
+    fn rendered_output(passthrough: bool, chunk: &[u8]) -> Vec<u8> {
+        let (master_r, master_w) = nix::unistd::pipe().unwrap();
+        let (out_r, out_w) = nix::unistd::pipe().unwrap();
+        let mut io = super::IoLoop::new(
+            master_w.as_raw_fd(),
+            24,
+            80,
+            None,
+            passthrough,
+            false,
+        );
+        io.stdout = out_w.as_raw_fd();
+        let _ = io.handle_master_read(chunk);
+        drop(out_w);
+        drop((master_r, master_w));
+        let mut out = vec![0u8; 8192];
+        let n = nix::unistd::read(out_r.as_raw_fd(), &mut out).unwrap_or(0);
+        out.truncate(n);
+        out
+    }
+
+    #[test]
+    fn primary_screen_forwards_title_but_not_clipboard_by_default() {
+        let out = rendered_output(
+            false,
+            b"before\x1b]0;my title\x07\x1b]52;c;ZGF0YQ==\x07after",
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("\x1b]0;my title\x07"), "{text:?}");
+        assert!(!text.contains("]52;"), "{text:?}");
+        assert!(
+            text.contains("before") && text.contains("after"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn alt_screen_forwards_title_but_not_clipboard_by_default() {
+        let out = rendered_output(
+            false,
+            b"\x1b[?1049h\x1b]2;tui\x07\x1b]52;c;ZGF0YQ==\x07",
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("\x1b]2;tui\x07"), "{text:?}");
+        assert!(!text.contains("]52;"), "{text:?}");
+    }
+
+    #[test]
+    fn primary_screen_title_passes_through_once_with_passthrough() {
+        let out = rendered_output(true, b"\x1b]0;raw\x07");
+        assert_eq!(out, b"\x1b]0;raw\x07");
     }
 
     #[test]
