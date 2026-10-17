@@ -160,9 +160,10 @@ fn prepare_secrets(
                 "--secret {key}: host must be a bare hostname, not {host:?}"
             ));
         }
-        if !proxy::allowlist_matches(config.allow_hosts(), &host) {
+        if !config.host_is_allowlisted(&host) {
             return Err(format!(
-                "--secret {key}: {host} is not in allow_hosts (pass --allow-host {host})"
+                "--secret {key}: {host} is not in allow_hosts or allow_private_hosts \
+                 (pass --allow-host {host} or --allow-private-host {host})"
             ));
         }
         // Resolve the value the child would actually receive. apply_env_pass
@@ -251,11 +252,11 @@ fn validate_network_flags(config: &config::Config) -> Result<(), String> {
     if !config.allow_tcp_ports().is_empty() {
         return Err("--allow-tcp-port is disabled (UDP cannot be isolated); use --allow-host for filtered egress instead".into());
     }
-    if config.network_enabled() && !config.allow_hosts().is_empty() {
-        return Err("--network and --allow-host are mutually exclusive: filtered egress and unrestricted network cannot be combined".into());
+    if config.network_enabled() && config.has_filtered_hosts() {
+        return Err("--network and --allow-host/--allow-private-host are mutually exclusive: filtered egress and unrestricted network cannot be combined".into());
     }
-    if config.browser_profile().is_some() && !config.allow_hosts().is_empty() {
-        return Err("--browser and --allow-host cannot be combined: browsers need real DNS and many domains".into());
+    if config.browser_profile().is_some() && config.has_filtered_hosts() {
+        return Err("--browser and --allow-host/--allow-private-host cannot be combined: browsers need real DNS and many domains".into());
     }
     validate_forward_ports(config)
 }
@@ -1010,8 +1011,11 @@ fn run() -> Result<i32, String> {
     #[cfg(target_os = "linux")]
     let egress_proxy = if config.network_mode() == config::NetworkMode::Filtered
     {
-        let mut proxy_config =
-            proxy::ProxyConfig::new(config.allow_hosts().to_vec());
+        let mut allowlist = config.allow_hosts().to_vec();
+        allowlist.extend(config.allow_private_hosts().iter().cloned());
+        let mut proxy_config = proxy::ProxyConfig::new(allowlist);
+        proxy_config.allow_private_hosts =
+            config.allow_private_hosts().to_vec();
         // Test-only escape hatches (tests/filtered_egress.rs,
         // tests/phantom_secrets.rs): let the end-to-end tests CONNECT to
         // loopback fixtures and trust a self-signed root. These are compiled
@@ -1034,8 +1038,11 @@ fn run() -> Result<i32, String> {
     #[cfg(target_os = "macos")]
     let egress_proxy = if config.network_mode() == config::NetworkMode::Filtered
     {
-        let mut proxy_config =
-            proxy::ProxyConfig::new(config.allow_hosts().to_vec());
+        let mut allowlist = config.allow_hosts().to_vec();
+        allowlist.extend(config.allow_private_hosts().iter().cloned());
+        let mut proxy_config = proxy::ProxyConfig::new(allowlist);
+        proxy_config.allow_private_hosts =
+            config.allow_private_hosts().to_vec();
         proxy_config.audit = audit_log.clone();
         proxy_config.secrets = secrets;
         let proxy = proxy::Proxy::start(proxy_config, None)
@@ -1277,10 +1284,12 @@ fn run() -> Result<i32, String> {
             config::NetworkMode::Filtered => "filtered",
             config::NetworkMode::Full => "full",
         };
+        let mut audit_allow_hosts = config.allow_hosts().to_vec();
+        audit_allow_hosts.extend(config.allow_private_hosts().iter().cloned());
         log.record(audit::launch_record(&audit::LaunchRecord {
             command: &config.command,
             network_mode: network,
-            allow_hosts: config.allow_hosts(),
+            allow_hosts: &audit_allow_hosts,
             lockdown: config.lockdown_enabled(),
             agent_state: config.agent_state_enabled(),
             gpu: config.gpu_enabled(),
@@ -1510,6 +1519,13 @@ mod tests {
         };
         let error = validate_network_flags(&config).unwrap_err();
         assert!(error.contains("mutually exclusive"));
+
+        let private = Config {
+            network: Some(true),
+            allow_private_hosts: vec!["git.internal.example".into()],
+            ..Config::default()
+        };
+        assert!(validate_network_flags(&private).is_err());
     }
 
     #[test]
@@ -1522,6 +1538,13 @@ mod tests {
         let error = validate_network_flags(&config).unwrap_err();
         assert!(error.contains("--browser"));
         assert!(error.contains("--allow-host"));
+
+        let private = Config {
+            browser_profile: Some("hard".into()),
+            allow_private_hosts: vec!["git.internal.example".into()],
+            ..Config::default()
+        };
+        assert!(validate_network_flags(&private).is_err());
     }
 
     #[test]
@@ -1573,7 +1596,7 @@ mod tests {
             ..Config::default()
         };
         let error = super::prepare_secrets(&mut config).unwrap_err();
-        assert!(error.contains("not in allow_hosts"));
+        assert!(error.contains("not in allow_hosts or allow_private_hosts"));
 
         // Scheme/path in the host is rejected.
         let mut config = Config {

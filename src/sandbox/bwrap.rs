@@ -1385,6 +1385,10 @@ fn landlock_wrapper_args(
         args.push("--allow-host".into());
         args.push(host.clone());
     }
+    for host in config.allow_private_hosts() {
+        args.push("--allow-private-host".into());
+        args.push(host.clone());
+    }
     if config.network_mode() == crate::config::NetworkMode::Filtered {
         args.push("--proxy-bridge-port".into());
         args.push(crate::proxy::BRIDGE_PORT.to_string());
@@ -1836,6 +1840,7 @@ fn discover_mounts_full(
         let mut vars = crate::proxy::env_vars(
             crate::proxy::BRIDGE_PORT,
             config.forward_ports(),
+            true,
         );
         if lockdown {
             for key in config.secret_hosts.keys() {
@@ -4549,6 +4554,7 @@ mod tests {
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let config = Config {
             allow_hosts: vec!["api.anthropic.com".into()],
+            allow_private_hosts: vec!["git.internal.example".into()],
             ..minimal_test_config()
         };
         let sources = MountSources::from_guard(&guard);
@@ -4594,8 +4600,14 @@ mod tests {
             .position(|w| w[0] == "--allow-host")
             .expect("expected --allow-host in wrapper args");
         assert_eq!(args[host_pos + 1], "api.anthropic.com");
+        let private_host_pos = args
+            .windows(2)
+            .position(|w| w[0] == "--allow-private-host")
+            .expect("expected --allow-private-host in wrapper args");
+        assert_eq!(args[private_host_pos + 1], "git.internal.example");
         // The forced proxy env names the in-sandbox bridge port, and
-        // no_proxy is emptied.
+        // Linux loopback belongs to the private network namespace, so local
+        // client/server traffic bypasses the proxy without reaching the host.
         let url = format!("http://127.0.0.1:{}", crate::proxy::BRIDGE_PORT);
         assert!(args.windows(3).any(|w| {
             w[0] == "--setenv" && w[1] == "http_proxy" && w[2] == url
@@ -4604,7 +4616,9 @@ mod tests {
             w[0] == "--setenv" && w[1] == "HTTPS_PROXY" && w[2] == url
         }));
         assert!(args.windows(3).any(|w| {
-            w[0] == "--setenv" && w[1] == "no_proxy" && w[2].is_empty()
+            w[0] == "--setenv"
+                && w[1] == "no_proxy"
+                && w[2] == "127.0.0.1,localhost,::1"
         }));
         // The outer proxy's own TCP port never appears.
         assert!(

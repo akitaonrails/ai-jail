@@ -173,7 +173,9 @@ skip_serializing_if = "Vec::is_empty")]`, plus the mandatory old-format
 - Env injection: filtered mode forces `http_proxy`/`https_proxy`/
   `all_proxy=http://127.0.0.1:<port>` (+ uppercase) via a post-`--clearenv`
   `--setenv` block (the `claude_env` pattern, `bwrap.rs:360-365`), also in
-  the lockdown env branch (`bwrap.rs:285-305`); `no_proxy` is cleared.
+  the lockdown env branch (`bwrap.rs:285-305`). Linux exempts loopback because
+  its private netns cannot reach host loopback; macOS exempts loopback only for
+  an explicitly forwarded port because it shares the host network stack.
   Project config already cannot inject env (`config.rs:1069-1074`).
 - `ai-jail status` prints the filtered mode and effective allowlist; the
   v1.22.0 capability-gap warning treats filtered as "network satisfied" for

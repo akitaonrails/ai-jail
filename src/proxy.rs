@@ -66,6 +66,10 @@ pub(crate) struct ProxyConfig {
     /// only themselves. Matching is case-insensitive and trailing-dot
     /// normalized (see [`allowlist_matches`]).
     pub allowlist: Vec<String>,
+    /// Trusted hosts allowed to resolve to private/CGNAT addresses. These
+    /// entries are also present in `allowlist`; this second list only grants
+    /// the narrow address-range exception.
+    pub allow_private_hosts: Vec<String>,
     /// Maximum simultaneous connections; excess is refused with 503.
     pub max_connections: usize,
     /// Timeout for dialing the CONNECT target.
@@ -96,6 +100,7 @@ impl ProxyConfig {
     pub(crate) fn new(allowlist: Vec<String>) -> Self {
         ProxyConfig {
             allowlist,
+            allow_private_hosts: Vec::new(),
             max_connections: 256,
             connect_timeout: Duration::from_secs(10),
             read_timeout: Duration::from_secs(10),
@@ -568,12 +573,9 @@ fn connect_upstream(
     };
     let mut dialable = false;
     for addr in addrs {
-        if !config.danger_allow_private
-            && let Some(class) = denied_class(&addr.ip())
-        {
+        if !address_is_allowed(host, &addr.ip(), config) {
             // The caller records one deny verdict for the request; the
             // per-answer class detail stays internal to this filter.
-            let _ = class;
             continue;
         }
         dialable = true;
@@ -590,6 +592,19 @@ fn connect_upstream(
     } else {
         Reject::ForbiddenRange
     })
+}
+
+fn address_is_allowed(host: &str, ip: &IpAddr, config: &ProxyConfig) -> bool {
+    let Some(class) = denied_class(ip) else {
+        return true;
+    };
+    if config.danger_allow_private {
+        return true;
+    }
+    matches!(
+        class,
+        "private address range" | "carrier-grade NAT address range"
+    ) && allowlist_matches(&config.allow_private_hosts, host)
 }
 
 /// Parse an absolute-form request line (`METHOD http://host[:port]/...
@@ -873,12 +888,13 @@ pub(crate) fn default_socket_path() -> PathBuf {
 
 /// The forced proxy environment for a filtered-egress sandbox
 /// (post-`--clearenv`, so nothing else can precede it). `no_proxy` is
-/// emptied explicitly: an inherited exclusion would route around the
-/// proxy straight into the netns wall. With `--forward-port` it names
-/// loopback, which the proxy refuses; unforwarded ports stay closed.
+/// emptied explicitly unless loopback is isolated from the host or a
+/// `--forward-port` deliberately exposes it. An inherited exclusion must not
+/// route around the proxy on macOS, where the host network stack is shared.
 pub(crate) fn env_vars(
     port: u16,
     forward_ports: &[u16],
+    loopback_is_isolated: bool,
 ) -> Vec<(String, String)> {
     let url = format!("http://127.0.0.1:{port}");
     let mut vars: Vec<(String, String)> = [
@@ -892,17 +908,18 @@ pub(crate) fn env_vars(
     .iter()
     .map(|key| ((*key).to_string(), url.clone()))
     .collect();
-    let no_proxy = if forward_ports.is_empty() {
-        String::new()
-    } else {
+    let no_proxy = if loopback_is_isolated || !forward_ports.is_empty() {
         LOOPBACK_NO_PROXY.to_string()
+    } else {
+        String::new()
     };
     vars.push(("no_proxy".to_string(), no_proxy.clone()));
     vars.push(("NO_PROXY".to_string(), no_proxy));
     vars
 }
 
-/// Loopback names exempted from the proxy when a port is forwarded.
+/// Loopback names exempted when the host cannot be reached through them, or
+/// when a named port is deliberately forwarded.
 const LOOPBACK_NO_PROXY: &str = "127.0.0.1,localhost,::1";
 
 /// Env var asking the bridge to print `ready` on stdout once bound.
@@ -1173,6 +1190,37 @@ mod tests {
             let ip: IpAddr = addr.parse().unwrap();
             assert_eq!(denied_class(&ip), Some(class), "{addr}");
         }
+    }
+
+    #[test]
+    fn private_host_grant_is_narrow_and_keeps_sensitive_ranges_denied() {
+        let mut config = ProxyConfig::new(entries(&["gitlab.example.com"]));
+        config.allow_private_hosts = entries(&["gitlab.example.com"]);
+
+        for addr in ["10.1.2.3", "192.168.1.4", "100.64.1.2", "fd00::1"] {
+            let ip: IpAddr = addr.parse().unwrap();
+            assert!(address_is_allowed("gitlab.example.com", &ip, &config));
+            assert!(address_is_allowed("ci.gitlab.example.com", &ip, &config));
+            assert!(!address_is_allowed("other.example.com", &ip, &config));
+        }
+        for addr in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "169.254.169.254",
+            "169.254.1.2",
+            "224.0.0.1",
+            "::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            let ip: IpAddr = addr.parse().unwrap();
+            assert!(!address_is_allowed("gitlab.example.com", &ip, &config));
+        }
+        assert!(address_is_allowed(
+            "gitlab.example.com",
+            &"93.184.216.34".parse().unwrap(),
+            &config
+        ));
     }
 
     #[test]

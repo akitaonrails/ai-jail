@@ -225,6 +225,15 @@ no UDP, and no working DNS inside the sandbox on Linux (on macOS the system
 resolver is not fenced). It cannot combine with `--network` or `--browser`,
 and a project `.ai-jail` may only shrink the list, never grow it.
 
+Private, ULA, and carrier-grade NAT answers stay blocked by default even for
+an allowed hostname. For a self-hosted service, use the narrower trusted grant
+`--allow-private-host gitlab.example.com` (or
+`allow_private_hosts = ["gitlab.example.com"]` in the global config). It also
+allows the host and its subdomains through filtered egress, but only relaxes
+those private address classes; loopback, link-local, multicast, unspecified,
+and cloud-metadata addresses remain blocked. A project `.ai-jail` cannot add
+this capability.
+
 ### Phantom credentials: `--secret KEY=host`
 
 With filtered egress on, `--secret ANTHROPIC_API_KEY=api.anthropic.com`
@@ -263,11 +272,13 @@ without a relay there is no `127.0.0.1` to `::1` fallback: dial the address
 the service listens on. The port rules are the same as on Linux, so one
 global entry works on both.
 
-Under filtered egress the forced proxy env would send
-`http://127.0.0.1:PORT` to the CONNECT proxy, which refuses loopback
-targets, so a forward also sets `no_proxy`/`NO_PROXY` to
-`127.0.0.1,localhost,::1`. That exempts nothing else: loopback ports that
-are not forwarded stay closed.
+On Linux, filtered egress always sets `no_proxy`/`NO_PROXY` to
+`127.0.0.1,localhost,::1`, so an application's own loopback client/server
+traffic does not hit the CONNECT proxy; the private network namespace still
+keeps host loopback unreachable. On macOS, where loopback is shared with the
+host, that exemption is added only when `--forward-port` names a port and the
+Seatbelt profile permits that exact endpoint. Unforwarded host ports stay
+closed on both platforms.
 
 It cannot combine with `--network`, where the host loopback is already
 reachable, and it is refused outside Linux and macOS — so a `forward_ports`
@@ -590,6 +601,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --agent-state / --no-agent-state  mount the command's credential state (default on)
 --env NAME[=VALUE]              forward or set an environment variable (repeatable)
 --forward-port PORT             relay host 127.0.0.1:PORT into the sandbox (Linux and macOS, repeatable)
+--allow-private-host HOST       allow one named host to resolve to private/ULA/CGNAT addresses (repeatable)
 --inherit-env / --no-inherit-env  pass the full parent environment (default: allowlist)
 --update-check / --no-update-check  host-side version check (default off)
 --lockdown / --no-lockdown      strict read-only mode, no network by default
@@ -696,14 +708,15 @@ profile bwrap /usr/bin/bwrap flags=(unconfined) {
 
 Then `sudo apparmor_parser -r /etc/apparmor.d/bwrap`.
 
-**opencode hangs at "Starting background server...".** opencode 2.x runs as a
-client of a shared background service whose socket lives under
-`~/.local/share/opencode`. The jail is a one-shot wrapper with a fresh tmpfs
-home, so that service can neither persist nor be found across runs — a shared
-daemon model does not fit the jail by design. Run opencode's own
-self-contained mode instead, pinned in the config so it is not typed each
-time (`command = ["opencode", "--standalone"]`). ai-jail also warns about
-this at launch when the command is opencode without `--standalone`.
+**opencode hangs at "Starting background server...".** For a normal terminal
+session, run opencode's self-contained mode, optionally pinned in config so it
+is not typed each time (`command = ["opencode", "--standalone"]`). The pair/web
+flow needs opencode's shared service instead: keep
+`ai-jail opencode serve --service` running in one terminal, then run
+`ai-jail opencode pair` in another. ai-jail already shares opencode's state
+directory between those jails by default, including the service socket; no
+extra `--rw-map` is needed. The `pair` command prints the URL and exits while
+the service continues answering it.
 
 **`Failed to create stream fd: No such file or directory` at startup.**
 This comes from mise setup, not from ai-jail. mise activation runs under a

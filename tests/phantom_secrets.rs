@@ -157,7 +157,7 @@ fn phantom_proxy_substitutes_real_value_over_tls() {
     require_sandbox!();
     let fixture = tls_fixture();
     let script = format!(
-        "curl -sS --retry 20 --retry-delay 0 --retry-connrefused \
+        "curl --noproxy '' -sS --retry 20 --retry-delay 0 --retry-connrefused \
          --max-time 20 -H \"x-test-key: $X_TEST_KEY\" \
          http://127.0.0.1:{fixture}/v1/models"
     );
@@ -185,7 +185,7 @@ fn phantom_lockdown_still_substitutes() {
     require_lockdown_tools!("bash", "curl");
     let fixture = tls_fixture();
     let script = format!(
-        "curl -sS --retry 20 --retry-delay 0 --retry-connrefused \
+        "curl --noproxy '' -sS --retry 20 --retry-delay 0 --retry-connrefused \
          --max-time 20 -H \"x-test-key: $X_TEST_KEY\" \
          http://127.0.0.1:{fixture}/"
     );
@@ -206,7 +206,7 @@ fn phantom_absolute_form_to_non_secret_host_is_405() {
     // it keeps the 405 (the proxy is not a general HTTP relay). For
     // plain HTTP the proxy's 405 is a normal response, so assert the
     // status code, not curl's exit code.
-    let script = "curl -sS -o /dev/null -w \"%{http_code}\" \
+    let script = "curl --noproxy '' -sS -o /dev/null -w \"%{http_code}\" \
                   --max-time 10 http://127.0.0.2:1/";
     let output = phantom_run(0, false, script);
     let stdout = String::from_utf8_lossy(&output.stdout);

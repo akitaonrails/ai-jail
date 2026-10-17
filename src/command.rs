@@ -275,7 +275,7 @@ pub(crate) fn capability_gap_warnings(
     }
     if filtered
         && let Some(host) = api_host(name)
-        && !crate::proxy::allowlist_matches(config.allow_hosts(), host)
+        && !config.host_is_allowlisted(host)
     {
         warnings.push(format!(
             "ai-jail: filtered egress is on but `{name}`'s API host \
@@ -287,14 +287,19 @@ pub(crate) fn capability_gap_warnings(
     // `ai-jail <harness>` already mounts the harness's login/session data.
     // `--no-agent-state` and `--lockdown` disable it deliberately, so nudging
     // toward `--agent-state` there would just contradict the user's choice.
+    let opencode_service = config
+        .command
+        .windows(2)
+        .any(|args| args[0] == "serve" && args[1] == "--service");
     if name == "opencode"
         && !config.command.iter().any(|arg| arg == "--standalone")
+        && !opencode_service
     {
         warnings.push(
-            "ai-jail: opencode 2.x runs as a client of a shared background \
-             server, which does not survive the jail — if startup hangs at \
-             \"Starting background server\", add `--standalone` to the \
-             command (issue #137)"
+            "ai-jail: opencode 2.x needs `--standalone` or a shared service; \
+             for pair/web, keep `ai-jail opencode serve --service` running in \
+             another terminal, then run the client in a second jail (issues \
+             #137, #176)"
                 .to_string(),
         );
     }
@@ -554,15 +559,18 @@ mod tests {
 
     #[test]
     fn capability_gap_warns_opencode_without_standalone() {
-        // Issue #137: opencode 2.x is a client of a shared background
-        // server that does not survive the jail; --standalone avoids it.
+        // Issues #137 and #176: standalone is simplest, while pair/web uses a
+        // long-running service in another jail through shared agent state.
         let mut config = gap_config("opencode", Some(true), Some(true));
         let warnings = capability_gap_warnings(&config);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("--standalone"));
-        assert!(warnings[0].contains("#137"));
+        assert!(warnings[0].contains("#176"));
 
         config.command = args(&["opencode", "--standalone"]);
+        assert!(capability_gap_warnings(&config).is_empty());
+
+        config.command = args(&["opencode", "serve", "--service"]);
         assert!(capability_gap_warnings(&config).is_empty());
     }
 

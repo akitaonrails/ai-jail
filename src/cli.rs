@@ -126,6 +126,9 @@ OPTIONS:
     --allow-host <HOST>            Allow CONNECT egress to HOST and its subdomains via the
                                    built-in filtered proxy (repeatable; implies filtered
                                    network mode; cannot combine with --network)
+    --allow-private-host <HOST>    Like --allow-host, and also permit HOST and its subdomains
+                                   to resolve to private/CGNAT addresses (repeatable; trusted
+                                   config/CLI only; loopback, link-local, and metadata stay denied)
     --forward-port <PORT>          Expose the host's 127.0.0.1:PORT on the sandbox's own
                                    loopback (repeatable; cannot combine with --network;
                                    the service behind PORT is reachable in full)
@@ -184,6 +187,7 @@ pub struct CliArgs {
     pub status_bar_style: Option<String>,
     pub allow_tcp_ports: Vec<u16>,
     pub allow_hosts: Vec<String>,
+    pub allow_private_hosts: Vec<String>,
     pub forward_ports: Vec<u16>,
     pub claude_dir: Option<PathBuf>,
     pub agent_state: Option<bool>,
@@ -368,6 +372,16 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     return Err("--allow-host requires a non-empty host".into());
                 }
                 args.allow_hosts.push(host.into_owned());
+            }
+            Long("allow-private-host") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let host = val.to_string_lossy();
+                if host.is_empty() {
+                    return Err(
+                        "--allow-private-host requires a non-empty host".into(),
+                    );
+                }
+                args.allow_private_hosts.push(host.into_owned());
             }
             Long("forward-port") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -711,6 +725,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--hide-dotdir",
     "--allow-tcp-port",
     "--allow-host",
+    "--allow-private-host",
     "--systemd-user",
     "--no-systemd-user",
     "--worktree",
@@ -1854,6 +1869,30 @@ mod tests {
         let error =
             parse_test(&["claude", "--allow-host=example.com"]).unwrap_err();
         assert!(error.contains("after command"));
+    }
+
+    #[test]
+    fn parse_allow_private_host_repeatable_and_guarded() {
+        let args = parse_test(&[
+            "--allow-private-host",
+            "gitlab.example.com",
+            "--allow-private-host=registry.example.com",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.allow_private_hosts,
+            vec![
+                "gitlab.example.com".to_string(),
+                "registry.example.com".to_string()
+            ]
+        );
+        assert!(parse_test(&["--allow-private-host"]).is_err());
+        assert!(
+            parse_test(&["bash", "--allow-private-host=gitlab.example.com"])
+                .unwrap_err()
+                .contains("after command")
+        );
     }
 
     #[test]

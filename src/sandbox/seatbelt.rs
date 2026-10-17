@@ -250,7 +250,8 @@ fn apply_child_env(
     if config.network_mode() == crate::config::NetworkMode::Filtered
         && let Some(port) = proxy_port
     {
-        for (key, value) in crate::proxy::env_vars(port, config.forward_ports())
+        for (key, value) in
+            crate::proxy::env_vars(port, config.forward_ports(), false)
         {
             cmd.env(key, value);
         }

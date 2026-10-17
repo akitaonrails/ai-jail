@@ -83,6 +83,13 @@ fn filtered_run_holding_lock(
 const CURL_RETRY: &str =
     "--retry 20 --retry-delay 0 --retry-connrefused --max-time 20";
 
+fn python3_available() -> bool {
+    Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
 #[test]
 fn filtered_egress_allowlisted_host_tunnels() {
     require_bwrap_net!();
@@ -92,7 +99,7 @@ fn filtered_egress_allowlisted_host_tunnels() {
         "echo \"PROXY=$http_proxy\"; \
          echo \"NOPROXY=${{no_proxy-unset}}\"; \
          ls -a /tmp; \
-         curl -p -sS {CURL_RETRY} http://127.0.0.1:{fixture}/"
+         curl --noproxy '' -p -sS {CURL_RETRY} http://127.0.0.1:{fixture}/"
     );
     let output = filtered_run(&["127.0.0.1"], &[], &script);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -107,12 +114,8 @@ fn filtered_egress_allowlisted_host_tunnels() {
         "forced proxy env missing: {stdout:?}"
     );
     assert!(
-        stdout.contains("NOPROXY="),
-        "no_proxy not emptied: {stdout:?}"
-    );
-    assert!(
-        !stdout.contains("NOPROXY=unset"),
-        "no_proxy was unset instead of emptied: {stdout:?}"
+        stdout.contains("NOPROXY=127.0.0.1,localhost,::1"),
+        "Linux loopback bypass missing: {stdout:?}"
     );
     // Bytes flowed fixture -> proxy -> bridge -> child.
     assert!(stdout.contains("ok"), "fixture body missing: {stdout:?}");
@@ -136,7 +139,7 @@ fn filtered_egress_disallowed_host_gets_403() {
     // The fixture is reachable but NOT allowlisted; the allowlist
     // covers only 127.0.0.2 (nothing listens there).
     let script = format!(
-        "curl -p -sS {CURL_RETRY} http://127.0.0.1:{fixture}/ 2>&1; \
+        "curl --noproxy '' -p -sS {CURL_RETRY} http://127.0.0.1:{fixture}/ 2>&1; \
          echo \"CURL_EXIT=$?\""
     );
     let output = filtered_run(&["127.0.0.2"], &[], &script);
@@ -224,10 +227,35 @@ fn filtered_egress_forced_env_wins_over_user_env() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("SEEN=http://127.0.0.1:15919/"),
+        stdout.contains("SEEN=http://127.0.0.1:15919/127.0.0.1,localhost,::1"),
         "user --env overrode the forced proxy env: stdout={stdout:?} \
          stderr={stderr:?}"
     );
+}
+
+#[test]
+fn filtered_egress_preserves_in_sandbox_loopback_services() {
+    require_bwrap_net!();
+    require_curl!();
+    if !python3_available() {
+        eprintln!("skipping: python3 unavailable");
+        return;
+    }
+
+    let script = format!(
+        "python3 -m http.server 18371 --bind 127.0.0.1 >/tmp/local-http.log 2>&1 & \
+         server=$!; trap 'kill $server' EXIT; \
+         curl -f -sS {CURL_RETRY} http://127.0.0.1:18371/ >/dev/null; \
+         echo LOCAL_LOOPBACK_OK"
+    );
+    let output = filtered_run(&["example.com"], &[], &script);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "sandbox loopback request failed: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(stdout.contains("LOCAL_LOOPBACK_OK"), "stdout={stdout:?}");
 }
 
 #[test]
@@ -242,7 +270,7 @@ fn filtered_egress_lockdown_still_tunnels() {
     let fixture = http_fixture();
     let script = format!(
         "echo \"PROXY=$http_proxy\"; \
-         curl -p -sS {CURL_RETRY} http://127.0.0.1:{fixture}/"
+         curl --noproxy '' -p -sS {CURL_RETRY} http://127.0.0.1:{fixture}/"
     );
     let output = filtered_run_locked(&["127.0.0.1"], &[], &script, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
