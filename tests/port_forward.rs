@@ -8,121 +8,13 @@
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::{Mutex, OnceLock};
+use std::process::Command;
 
-// Serialize launches: parallel bwrap runs against one project dir race.
-static SANDBOX_RUN_LOCK: Mutex<()> = Mutex::new(());
+mod common;
 
-fn bwrap_net_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        Command::new("bwrap")
-            .args([
-                "--ro-bind",
-                "/",
-                "/",
-                "--proc",
-                "/proc",
-                "--unshare-pid",
-                "--unshare-uts",
-                "--unshare-ipc",
-                "--unshare-net",
-                "--",
-                "true",
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-fn curl_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        Command::new("curl")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-macro_rules! require_sandbox {
-    () => {
-        if !bwrap_net_available() {
-            eprintln!(
-                "SKIPPED: bwrap cannot create network namespaces \
-                 on this system (AppArmor/kernel restriction)"
-            );
-            return;
-        }
-        if !curl_available() {
-            eprintln!("SKIPPED: curl not found in PATH");
-            return;
-        }
-    };
-}
-
-fn ai_jail() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_ai-jail"))
-}
-
-/// Minimal HTTP fixture on host loopback: one request in, a fixed
-/// `ok` body out. Runs forever on its own thread.
-fn http_fixture() -> u16 {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for conn in listener.incoming().map_while(Result::ok) {
-            std::thread::spawn(move || {
-                let mut stream = conn;
-                let mut buf = [0_u8; 4096];
-                let _ = stream.read(&mut buf);
-                let _ = stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
-                );
-            });
-        }
-    });
-    port
-}
-
-/// No `--retry-connrefused`: the agent is exec'd only once every
-/// forward bridge reports it is listening, so a refused first connect is
-/// a regression, not a race to paper over.
-const CURL_OPTS: &str = "--max-time 20";
-
-/// Run `bash -c <script>` in a sandbox from `dir` with extra flags.
-fn run_in(dir: Option<&Path>, flags: &[&str], script: &str) -> Output {
-    let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
-    let mut command = Command::new(ai_jail());
-    command.args(["--no-status-bar", "--exec", "--no-save-config"]);
-    if dir.is_none() {
-        command.arg("--clean");
-    }
-    command.args(flags);
-    if let Some(dir) = dir {
-        command.current_dir(dir);
-    }
-    command.args(["bash", "-c", script]);
-    command.output().expect("failed to spawn ai-jail")
-}
-
-fn curl(port: u16) -> String {
-    format!("curl --noproxy '*' -sS {CURL_OPTS} http://127.0.0.1:{port}/")
-}
-
-fn assert_ok(output: &Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "sandbox run failed: stdout={stdout:?} stderr={stderr:?}"
-    );
-    stdout
-}
+use common::{
+    CURL_OPTS, SANDBOX_RUN_LOCK, ai_jail, assert_ok, curl, http_fixture, run_in,
+};
 
 #[test]
 fn forward_port_reaches_host_service_without_network() {
@@ -138,7 +30,7 @@ fn forward_port_composes_with_filtered_egress_and_lockdown() {
     require_sandbox!();
     let port = http_fixture();
     let port_text = port.to_string();
-    let output = run_in(
+    let output = run_in_or_skip!(
         None,
         &[
             "--lockdown",
@@ -164,7 +56,7 @@ fn forward_port_under_filtered_egress_bypasses_the_proxy() {
          curl -fsS --max-time 3 http://127.0.0.1:{other}/ \
          && echo LEAK || echo BLOCKED"
     );
-    let output = run_in(
+    let output = run_in_or_skip!(
         None,
         &[
             "--lockdown",

@@ -6,30 +6,9 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn bwrap_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        Command::new("bwrap")
-            .args([
-                "--ro-bind",
-                "/",
-                "/",
-                "--proc",
-                "/proc",
-                "--unshare-pid",
-                "--unshare-uts",
-                "--unshare-ipc",
-                "--",
-                "true",
-            ])
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-    })
-}
+mod common;
 
 struct DevinFixture {
     root: PathBuf,
@@ -222,10 +201,7 @@ fn assert_success(output: &Output, context: &str) {
 
 #[test]
 fn devin_state_is_writable_but_install_read_only_and_opt_out_hides_it() {
-    if !bwrap_available() {
-        eprintln!("SKIPPED: bwrap cannot create user namespaces");
-        return;
-    }
+    require_bwrap!();
 
     let fixture = DevinFixture::new();
     assert!(!fixture.data_home.starts_with(&fixture.home));
@@ -304,10 +280,7 @@ fn devin_state_is_writable_but_install_read_only_and_opt_out_hides_it() {
 
 #[test]
 fn devin_incomplete_or_symlink_installations_fail_conservatively() {
-    if !bwrap_available() {
-        eprintln!("SKIPPED: bwrap cannot create user namespaces");
-        return;
-    }
+    require_bwrap!();
     for layout in ["missing-versions", "symlink-cli", "symlink-versions"] {
         let fixture = DevinFixture::new();
         let cli = fixture.data_home.join("devin/cli");
@@ -354,10 +327,7 @@ fn devin_incomplete_or_symlink_installations_fail_conservatively() {
 
 #[test]
 fn devin_external_installation_keeps_credentials_and_history_writable() {
-    if !bwrap_available() {
-        eprintln!("SKIPPED: bwrap cannot create user namespaces");
-        return;
-    }
+    require_bwrap!();
     let fixture = DevinFixture::new();
     let cli = fixture.data_home.join("devin/cli");
     std::fs::remove_dir_all(&cli).unwrap();
@@ -394,10 +364,7 @@ fn devin_external_installation_keeps_credentials_and_history_writable() {
 
 #[test]
 fn devin_missing_xdg_bases_warn_once_each_and_opt_out_does_not_warn() {
-    if !bwrap_available() {
-        eprintln!("SKIPPED: bwrap cannot create user namespaces");
-        return;
-    }
+    require_bwrap!();
     let mut fixture = DevinFixture::new();
     fixture.config_home = fixture.root.join("missing-config");
     let data = fixture.root.join("missing-data");
@@ -429,10 +396,7 @@ fn devin_missing_xdg_bases_warn_once_each_and_opt_out_does_not_warn() {
 
 #[test]
 fn devin_opt_out_only_protects_installations_already_visible_in_home() {
-    if !bwrap_available() {
-        eprintln!("SKIPPED: bwrap cannot create user namespaces");
-        return;
-    }
+    require_bwrap!();
     let mut fixture = DevinFixture::new();
     let output = fixture.run_extra(
         "probe-hidden",
@@ -473,10 +437,7 @@ fn devin_opt_out_only_protects_installations_already_visible_in_home() {
 
 #[test]
 fn devin_xdg_symlink_parent_and_relative_fallback_match_child_paths() {
-    if !bwrap_available() {
-        eprintln!("SKIPPED: bwrap cannot create user namespaces");
-        return;
-    }
+    require_bwrap!();
     let mut fixture = DevinFixture::new();
     let physical = fixture.root.join("physical");
     std::fs::create_dir_all(physical.join("nested")).unwrap();
@@ -516,10 +477,7 @@ fn devin_xdg_symlink_parent_and_relative_fallback_match_child_paths() {
 #[test]
 fn devin_explicit_writable_map_can_override_automatic_installation_protection()
 {
-    if !bwrap_available() {
-        eprintln!("SKIPPED: bwrap cannot create user namespaces");
-        return;
-    }
+    require_bwrap!();
     let fixture = DevinFixture::new();
     let data = fixture.data_home.join("devin");
     let path = data.to_str().unwrap();

@@ -17,125 +17,12 @@
 // main.rs's proxy construction; it is never documented.
 #![cfg(target_os = "linux")]
 
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener};
-use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-// Serialize launches: the orphan scan must not see another test's
-// bridge, and parallel bwrap runs against one project dir race.
-static SANDBOX_RUN_LOCK: Mutex<()> = Mutex::new(());
+mod common;
 
-/// bwrap needs unprivileged user namespaces, and filtered egress adds a
-/// network namespace on top; detect restrictions at runtime and skip.
-fn bwrap_net_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        Command::new("bwrap")
-            .args([
-                "--ro-bind",
-                "/",
-                "/",
-                "--proc",
-                "/proc",
-                "--unshare-pid",
-                "--unshare-uts",
-                "--unshare-ipc",
-                "--unshare-net",
-                "--",
-                "true",
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-/// The fixture requests need a host curl binary to drive HTTP traffic
-/// through the proxy bridge; detect availability and skip when absent.
-fn curl_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        Command::new("curl")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-macro_rules! require_curl {
-    () => {
-        if !curl_available() {
-            eprintln!("SKIPPED: curl not found in PATH");
-            return;
-        }
-    };
-}
-
-/// Lockdown mode clears the environment and sets PATH to standard FHS
-/// directories (/usr/bin, /bin); on non-FHS systems (NixOS, etc.) guest
-/// binaries like bash or curl are not present in those locations.
-fn lockdown_cmd_available(cmd: &str) -> bool {
-    const LOCKDOWN_PATH: &str =
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    LOCKDOWN_PATH
-        .split(':')
-        .any(|dir| std::path::Path::new(dir).join(cmd).is_file())
-}
-
-macro_rules! require_lockdown_tools {
-    ($($cmd:expr),+ $(,)?) => {
-        $(
-            if !lockdown_cmd_available($cmd) {
-                eprintln!(
-                    "SKIPPED: {} not found in lockdown PATH \
-                     (non-FHS system / NixOS)",
-                    $cmd
-                );
-                return;
-            }
-        )+
-    };
-}
-
-macro_rules! require_bwrap_net {
-    () => {
-        if !bwrap_net_available() {
-            eprintln!(
-                "SKIPPED: bwrap cannot create network namespaces \
-                 on this system (AppArmor/kernel restriction)"
-            );
-            return;
-        }
-    };
-}
-
-fn ai_jail() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_ai-jail"))
-}
-
-/// Minimal HTTP fixture on host loopback: one request in, a fixed
-/// `ok` body out. Runs forever on its own thread.
-fn http_fixture() -> u16 {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for conn in listener.incoming().map_while(Result::ok) {
-            std::thread::spawn(move || {
-                let mut stream = conn;
-                let mut buf = [0_u8; 4096];
-                let _ = stream.read(&mut buf);
-                let _ = stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
-                );
-            });
-        }
-    });
-    port
-}
+use common::{SANDBOX_RUN_LOCK, ai_jail, http_fixture};
 
 /// Run `bash -c <script>` inside a filtered-egress sandbox.
 fn filtered_run(

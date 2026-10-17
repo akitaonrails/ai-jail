@@ -19,57 +19,11 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
-static SANDBOX_RUN_LOCK: Mutex<()> = Mutex::new(());
+mod common;
 
-fn bwrap_net_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        Command::new("bwrap")
-            .args([
-                "--ro-bind",
-                "/",
-                "/",
-                "--proc",
-                "/proc",
-                "--unshare-pid",
-                "--unshare-uts",
-                "--unshare-ipc",
-                "--unshare-net",
-                "--",
-                "true",
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-fn curl_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        Command::new("curl")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-/// Lockdown mode clears the environment and sets PATH to standard FHS
-/// directories; on non-FHS systems (NixOS) guest binaries are absent.
-fn lockdown_cmd_available(cmd: &str) -> bool {
-    const LOCKDOWN_PATH: &str =
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    LOCKDOWN_PATH
-        .split(':')
-        .any(|dir| std::path::Path::new(dir).join(cmd).is_file())
-}
-
-fn ai_jail() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_ai-jail"))
-}
+use common::{SANDBOX_RUN_LOCK, ai_jail};
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -180,10 +134,7 @@ fn phantom_run(fixture: u16, lockdown: bool, script: &str) -> Output {
 
 #[test]
 fn phantom_child_env_shows_placeholder_not_real_value() {
-    if !bwrap_net_available() {
-        eprintln!("SKIPPED: bwrap cannot create network namespaces");
-        return;
-    }
+    require_bwrap_net!();
     let output = phantom_run(0, false, "echo \"SEEN=$X_TEST_KEY\"");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -203,10 +154,7 @@ fn phantom_child_env_shows_placeholder_not_real_value() {
 
 #[test]
 fn phantom_proxy_substitutes_real_value_over_tls() {
-    if !bwrap_net_available() || !curl_available() {
-        eprintln!("SKIPPED: bwrap netns or curl unavailable");
-        return;
-    }
+    require_sandbox!();
     let fixture = tls_fixture();
     let script = format!(
         "curl -sS --retry 20 --retry-delay 0 --retry-connrefused \
@@ -233,14 +181,8 @@ fn phantom_proxy_substitutes_real_value_over_tls() {
 
 #[test]
 fn phantom_lockdown_still_substitutes() {
-    if !bwrap_net_available() || !curl_available() {
-        eprintln!("SKIPPED: bwrap netns or curl unavailable");
-        return;
-    }
-    if !lockdown_cmd_available("bash") || !lockdown_cmd_available("curl") {
-        eprintln!("SKIPPED: bash/curl not in lockdown PATH (non-FHS system)");
-        return;
-    }
+    require_sandbox!();
+    require_lockdown_tools!("bash", "curl");
     let fixture = tls_fixture();
     let script = format!(
         "curl -sS --retry 20 --retry-delay 0 --retry-connrefused \
@@ -259,10 +201,7 @@ fn phantom_lockdown_still_substitutes() {
 
 #[test]
 fn phantom_absolute_form_to_non_secret_host_is_405() {
-    if !bwrap_net_available() || !curl_available() {
-        eprintln!("SKIPPED: bwrap netns or curl unavailable");
-        return;
-    }
+    require_sandbox!();
     // 127.0.0.2 is allowlisted but not secret-bound: absolute-form to
     // it keeps the 405 (the proxy is not a general HTTP relay). For
     // plain HTTP the proxy's 405 is a normal response, so assert the
