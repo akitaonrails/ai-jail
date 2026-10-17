@@ -1,55 +1,9 @@
+mod common;
+
+use common::{AuditFixture, MAX_RECORD};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
-use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-const MAX_RECORD: usize = 8 * 1024 * 1024;
-static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-
-struct Fixture {
-    root: PathBuf,
-    home: PathBuf,
-    log: PathBuf,
-}
-
-impl Fixture {
-    fn new() -> Self {
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("audit-verify-{}-{id}", std::process::id()));
-        let home = root.join("home");
-        fs::create_dir_all(&home).unwrap();
-        let log = home.join(".local/share/ai-jail/history.jsonl");
-        Self { root, home, log }
-    }
-
-    fn write(&self, content: impl AsRef<[u8]>) {
-        fs::create_dir_all(self.log.parent().unwrap()).unwrap();
-        fs::write(&self.log, content).unwrap();
-        fs::set_permissions(&self.log, fs::Permissions::from_mode(0o600))
-            .unwrap();
-    }
-
-    fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ai-jail"));
-        command
-            .arg("--audit-verify")
-            .env("HOME", &self.home)
-            .current_dir(&self.root);
-        command
-    }
-
-    fn run(&self) -> Output {
-        self.command().output().unwrap()
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
 
 fn legacy() -> &'static [u8] {
     b"{\"ts\":\"now\",\"type\":\"future\"}\n"
@@ -57,7 +11,7 @@ fn legacy() -> &'static [u8] {
 
 #[test]
 fn intact_and_broken_logs_keep_existing_exit_semantics() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-verify", "--audit-verify");
     fixture.write(legacy());
     let output = fixture.run();
     assert!(output.status.success(), "{output:?}");
@@ -73,7 +27,7 @@ fn intact_and_broken_logs_keep_existing_exit_semantics() {
 
 #[test]
 fn missing_home_and_missing_log_have_distinct_exit_codes() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-verify", "--audit-verify");
     for output in [
         fixture.command().env_remove("HOME").output().unwrap(),
         fixture.command().env("HOME", "").output().unwrap(),
@@ -97,7 +51,7 @@ fn missing_home_and_missing_log_have_distinct_exit_codes() {
 
 #[test]
 fn refuses_public_log_but_allows_private_read_only_log() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-verify", "--audit-verify");
     fixture.write(legacy());
     fs::set_permissions(&fixture.log, fs::Permissions::from_mode(0o644))
         .unwrap();
@@ -115,7 +69,7 @@ fn refuses_symlinks_below_home() {
         ".local/share/ai-jail",
         ".local/share/ai-jail/history.jsonl",
     ] {
-        let fixture = Fixture::new();
+        let fixture = AuditFixture::new("audit-verify", "--audit-verify");
         fixture.write(legacy());
         let original = fixture.home.join(relative);
         let target = fixture.root.join("moved");
@@ -127,7 +81,7 @@ fn refuses_symlinks_below_home() {
 
 #[test]
 fn supports_trusted_symlinked_home_spellings() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-verify", "--audit-verify");
     fixture.write(legacy());
     let real_home = fixture.root.join("real-home");
     fs::rename(&fixture.home, &real_home).unwrap();
@@ -152,7 +106,7 @@ fn refuses_directory_and_fifo_without_blocking() {
     use std::time::{Duration, Instant};
 
     for home_fifo in [false, true] {
-        let fixture = Fixture::new();
+        let fixture = AuditFixture::new("audit-verify", "--audit-verify");
         let fifo = if home_fifo {
             fs::remove_dir(&fixture.home).unwrap();
             fixture.home.clone()
@@ -184,14 +138,14 @@ fn refuses_directory_and_fifo_without_blocking() {
         }
     }
 
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-verify", "--audit-verify");
     fs::create_dir_all(&fixture.log).unwrap();
     assert_eq!(fixture.run().status.code(), Some(1));
 }
 
 #[test]
 fn oversized_records_are_drained_and_later_records_are_processed() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-verify", "--audit-verify");
     let mut content = vec![b'x'; MAX_RECORD + 1];
     content.push(b'\n');
     content.extend_from_slice(legacy());
@@ -212,7 +166,7 @@ fn oversized_records_are_drained_and_later_records_are_processed() {
 
 #[test]
 fn aggregate_larger_than_record_cap_is_still_valid() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-verify", "--audit-verify");
     let mut content = Vec::new();
     for _ in 0..300_000 {
         content.extend_from_slice(legacy());

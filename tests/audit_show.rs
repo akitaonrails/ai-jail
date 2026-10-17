@@ -1,55 +1,9 @@
+mod common;
+
+use common::{AuditFixture, MAX_RECORD};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
-use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-const MAX_RECORD: usize = 8 * 1024 * 1024;
-static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-
-struct Fixture {
-    root: PathBuf,
-    home: PathBuf,
-    log: PathBuf,
-}
-
-impl Fixture {
-    fn new() -> Self {
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("audit-show-{}-{id}", std::process::id()));
-        let home = root.join("home");
-        fs::create_dir_all(&home).unwrap();
-        let log = home.join(".local/share/ai-jail/history.jsonl");
-        Self { root, home, log }
-    }
-
-    fn write(&self, content: impl AsRef<[u8]>) {
-        fs::create_dir_all(self.log.parent().unwrap()).unwrap();
-        fs::write(&self.log, content).unwrap();
-        fs::set_permissions(&self.log, fs::Permissions::from_mode(0o600))
-            .unwrap();
-    }
-
-    fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ai-jail"));
-        command
-            .arg("--audit-show")
-            .env("HOME", &self.home)
-            .current_dir(&self.root);
-        command
-    }
-
-    fn run(&self) -> Output {
-        self.command().output().unwrap()
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
 
 fn event() -> String {
     serde_json::json!({
@@ -63,7 +17,7 @@ fn event() -> String {
 
 #[test]
 fn shows_events_without_loading_or_writing_config() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-show", "--audit-show");
     let records = [
         serde_json::json!({"ts":"now", "type":"launch", "command":["bash", "-c", "echo one two"], "exit_code":3, "duration_s":1.25}),
         serde_json::from_str::<serde_json::Value>(&event()).unwrap(),
@@ -107,7 +61,7 @@ fn shows_events_without_loading_or_writing_config() {
 
 #[test]
 fn missing_and_empty_logs_have_distinct_exit_codes() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-show", "--audit-show");
     let output = fixture.run();
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
@@ -120,7 +74,7 @@ fn missing_and_empty_logs_have_distinct_exit_codes() {
 
 #[test]
 fn malformed_records_fail_but_do_not_hide_later_events() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-show", "--audit-show");
     fixture.write(
         String::from("{broken\nnull\n{\"ts\":\"now\",\"type\":\"connect\"}\n")
             + &event(),
@@ -136,7 +90,7 @@ fn malformed_records_fail_but_do_not_hide_later_events() {
 
 #[test]
 fn invalid_utf8_records_do_not_hide_later_events() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-show", "--audit-show");
     let mut content = event().into_bytes();
     // A write truncated inside a multibyte character, then an invalid byte
     // inside an otherwise well-formed JSON record.
@@ -159,7 +113,7 @@ fn invalid_utf8_records_do_not_hide_later_events() {
 
 #[test]
 fn oversized_records_are_invalid_and_later_records_are_displayed() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-show", "--audit-show");
     let mut content = vec![b'x'; MAX_RECORD + 1];
     content.push(b'\n');
     content.extend_from_slice(event().as_bytes());
@@ -181,7 +135,7 @@ fn oversized_records_are_invalid_and_later_records_are_displayed() {
 
 #[test]
 fn many_small_records_can_exceed_record_cap_in_aggregate() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-show", "--audit-show");
     let line = event();
     let count = MAX_RECORD / line.len() + 1;
     fixture.write(line.repeat(count));
@@ -195,7 +149,7 @@ fn many_small_records_can_exceed_record_cap_in_aggregate() {
 
 #[test]
 fn refuses_public_log_but_allows_private_read_only_log() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-show", "--audit-show");
     fixture.write(event());
     fs::set_permissions(&fixture.log, fs::Permissions::from_mode(0o644))
         .unwrap();
@@ -215,7 +169,7 @@ fn refuses_symlinks_at_each_log_path_component() {
         ".local/share/ai-jail",
         ".local/share/ai-jail/history.jsonl",
     ] {
-        let fixture = Fixture::new();
+        let fixture = AuditFixture::new("audit-show", "--audit-show");
         fixture.write(event());
         let original = fixture.home.join(relative);
         let target = fixture.root.join("moved");
@@ -229,7 +183,7 @@ fn refuses_symlinks_at_each_log_path_component() {
 
 #[test]
 fn supports_trusted_symlinked_home_spellings() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-show", "--audit-show");
     fixture.write(event());
     let real_home = fixture.root.join("real-home");
     fs::rename(&fixture.home, &real_home).unwrap();
@@ -254,7 +208,7 @@ fn supports_trusted_symlinked_home_spellings() {
 
 #[test]
 fn refuses_directory_as_log() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-show", "--audit-show");
     fs::create_dir_all(&fixture.log).unwrap();
     let output = fixture.run();
     assert_eq!(output.status.code(), Some(1));
@@ -266,7 +220,7 @@ fn refuses_fifo_without_blocking() {
     use std::os::unix::ffi::OsStrExt;
     use std::time::{Duration, Instant};
 
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-show", "--audit-show");
     fs::create_dir_all(fixture.log.parent().unwrap()).unwrap();
     let path =
         std::ffi::CString::new(fixture.log.as_os_str().as_bytes()).unwrap();
@@ -295,7 +249,7 @@ fn refuses_fifo_without_blocking() {
 
 #[test]
 fn escapes_terminal_controls_and_record_separators() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-show", "--audit-show");
     let mut record: serde_json::Value = serde_json::from_str(&event()).unwrap();
     record["host"] = "bad\u{1b}[2J\nforged\r\t\u{9b}2J".into();
     fixture.write(record.to_string());
@@ -324,7 +278,7 @@ fn escapes_unicode_direction_controls_and_line_separators() {
         ('\u{2068}', r"\u{2068}"),
         ('\u{2069}', r"\u{2069}"),
     ] {
-        let fixture = Fixture::new();
+        let fixture = AuditFixture::new("audit-show", "--audit-show");
         let mut record: serde_json::Value =
             serde_json::from_str(&event()).unwrap();
         record["host"] = format!("café例.example{control}").into();
@@ -346,7 +300,7 @@ fn escapes_unicode_direction_controls_and_line_separators() {
 #[cfg(target_os = "linux")]
 #[test]
 fn output_failure_returns_error() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-show", "--audit-show");
     fixture.write(event());
     let output = fixture
         .command()
@@ -362,7 +316,7 @@ fn output_failure_returns_error() {
 
 #[test]
 fn missing_or_empty_home_is_an_error() {
-    let fixture = Fixture::new();
+    let fixture = AuditFixture::new("audit-show", "--audit-show");
     for output in [
         fixture.command().env_remove("HOME").output().unwrap(),
         fixture.command().env("HOME", "").output().unwrap(),
