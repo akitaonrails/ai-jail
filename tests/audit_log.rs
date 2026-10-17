@@ -6,34 +6,12 @@
 // tests/sandbox_escape.rs.
 #![cfg(target_os = "linux")]
 
+mod common;
+
+use common::ai_jail;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::OnceLock;
-
-fn bwrap_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        Command::new("bwrap")
-            .args([
-                "--ro-bind",
-                "/",
-                "/",
-                "--proc",
-                "/proc",
-                "--unshare-pid",
-                "--",
-                "true",
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-fn ai_jail() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_ai-jail"))
-}
 
 fn test_tree(name: &str) -> (PathBuf, PathBuf) {
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -58,10 +36,7 @@ fn run(project: &PathBuf, home: &PathBuf, args: &[&str]) -> Output {
 
 #[test]
 fn audit_log_records_one_launch_with_exit_code() {
-    if !bwrap_available() {
-        eprintln!("SKIPPED: bwrap cannot create user namespaces");
-        return;
-    }
+    require_bwrap!();
     let (project, home) = test_tree("launch");
     let output = run(
         &project,
@@ -114,10 +89,7 @@ fn audit_log_records_one_launch_with_exit_code() {
 
 #[test]
 fn audit_log_supports_symlinked_home() {
-    if !bwrap_available() {
-        eprintln!("SKIPPED: bwrap cannot create user namespaces");
-        return;
-    }
+    require_bwrap!();
     let (project, home) = test_tree("symlink-home");
     let real_home = home.with_file_name("real-home");
     std::fs::rename(&home, &real_home).unwrap();
@@ -144,10 +116,7 @@ fn audit_log_supports_symlinked_home() {
 
 #[test]
 fn audit_open_security_failure_preserves_child_exit() {
-    if !bwrap_available() {
-        eprintln!("SKIPPED: bwrap cannot create user namespaces");
-        return;
-    }
+    require_bwrap!();
     let (project, home) = test_tree("symlink-failure");
     let outside = home.with_file_name("outside");
     std::fs::create_dir_all(&outside).unwrap();
@@ -175,10 +144,7 @@ fn audit_open_security_failure_preserves_child_exit() {
 
 #[test]
 fn missing_home_disables_audit_without_changing_child_exit() {
-    if !bwrap_available() {
-        eprintln!("SKIPPED: bwrap cannot create user namespaces");
-        return;
-    }
+    require_bwrap!();
     let (project, home) = test_tree("missing-home");
     let fallback_log = PathBuf::from("/tmp/.local/share/ai-jail/history.jsonl");
     let fallback_before = std::fs::metadata(&fallback_log)
@@ -214,10 +180,7 @@ fn missing_home_disables_audit_without_changing_child_exit() {
 
 #[test]
 fn audit_log_off_by_default_creates_no_file() {
-    if !bwrap_available() {
-        eprintln!("SKIPPED: bwrap cannot create user namespaces");
-        return;
-    }
+    require_bwrap!();
     let (project, home) = test_tree("default-off");
     let output = run(
         &project,

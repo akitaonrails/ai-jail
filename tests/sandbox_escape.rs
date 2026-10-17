@@ -19,97 +19,13 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+
+mod common;
+
+use common::{SANDBOX_RUN_LOCK, ai_jail};
 
 static COMPILE_HELPER: OnceLock<bool> = OnceLock::new();
-// Keep integration tests deterministic when the developer's project
-// `.ai-jail` enables passthrough like `ssh = true`, and avoid parallel
-// bwrap mount races against the same project-local `.ai-jail` mask.
-static SANDBOX_RUN_LOCK: Mutex<()> = Mutex::new(());
-
-// ── Runtime prerequisite checks ─────────────────
-//
-// bwrap needs unprivileged user namespaces which some kernels
-// restrict (Ubuntu 24.04+ AppArmor policy, Debian hardened
-// sysctl, etc.). Detect this at runtime so tests skip cleanly
-// instead of failing with confusing bwrap errors.
-
-/// Can bwrap create the namespaces needed for normal mode?
-fn bwrap_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        Command::new("bwrap")
-            .args([
-                "--ro-bind",
-                "/",
-                "/",
-                "--proc",
-                "/proc",
-                "--unshare-pid",
-                "--unshare-uts",
-                "--unshare-ipc",
-                "--",
-                "true",
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-/// Can bwrap also create a network namespace (lockdown mode)?
-fn bwrap_net_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        bwrap_available()
-            && Command::new("bwrap")
-                .args([
-                    "--ro-bind",
-                    "/",
-                    "/",
-                    "--proc",
-                    "/proc",
-                    "--unshare-pid",
-                    "--unshare-uts",
-                    "--unshare-ipc",
-                    "--unshare-net",
-                    "--",
-                    "true",
-                ])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-    })
-}
-
-macro_rules! require_bwrap {
-    () => {
-        if !bwrap_available() {
-            eprintln!(
-                "SKIPPED: bwrap cannot create user namespaces \
-                 on this system (AppArmor/kernel restriction)"
-            );
-            return;
-        }
-    };
-}
-
-macro_rules! require_bwrap_net {
-    () => {
-        if !bwrap_net_available() {
-            eprintln!(
-                "SKIPPED: bwrap cannot create network \
-                 namespaces on this system \
-                 (AppArmor/kernel restriction)"
-            );
-            return;
-        }
-    };
-}
-
-fn ai_jail() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_ai-jail"))
-}
 
 fn helper_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
