@@ -85,6 +85,7 @@ This is the single most important invariant of the project. Users generate `.ai-
     which disables both automatic defaults, while a non-empty `allow_hosts`
     keeps `network_mode` filtered rather than fully offline. `--no-network`
     with no filtered host list forces strict offline regardless.
+
   - `--allow-private-host` / `allow_private_hosts` is a trusted-only, named-host
     exception for private, unique-local, and carrier-grade NAT addresses. It
     must never permit loopback, link-local, metadata, multicast, or unspecified
