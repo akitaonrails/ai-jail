@@ -3530,6 +3530,16 @@ fn extra_mounts_with_check(
         }
     }
 
+    // bwrap applies mounts in order and the later mount wins, so a nested
+    // destination must be emitted AFTER its ancestor: emitted first, it is
+    // silently shadowed when the ancestor is mounted over it (#183 — a user
+    // `--rw-map ~/.cache/deno` listed before the auto-injected toolchain
+    // cache map for `~/.cache` never appeared inside the sandbox, and
+    // Landlock then skipped its path as not found). Stable sort by
+    // destination depth: parents first, children after, insertion order
+    // kept within a level.
+    mounts.sort_by_key(|mount| mount.dest().components().count());
+
     mounts
 }
 
@@ -5107,6 +5117,42 @@ mod tests {
 
         assert!(mounts.is_empty());
         assert_eq!(checked.into_inner(), vec![PathBuf::from("/missing")]);
+    }
+
+    #[test]
+    fn nested_extra_mounts_emit_parent_first_so_children_win() {
+        // Regression for #183: bwrap gives the later mount precedence, so a
+        // child destination emitted before an ancestor mount is silently
+        // shadowed by it. The auto-injected toolchain cache map for
+        // `~/.cache` is appended after user maps, which is exactly how a
+        // user `--rw-map ~/.cache/deno` was lost.
+        let parent_src = PathBuf::from("/store/xdg");
+        let parent_dest = PathBuf::from("/home/u/.cache");
+        let child_src = PathBuf::from("/home/u/.cache/deno");
+        let mounts = extra_mounts_with_check(
+            // Insertion order is the bug's shape: child listed first, the
+            // auto-injected parent (appended later) second.
+            &[
+                child_src.clone(),
+                format!("{}:{}", parent_src.display(), parent_dest.display())
+                    .into(),
+            ],
+            &[],
+            |_| true,
+        );
+
+        let parent_index = mounts
+            .iter()
+            .position(|m| m.dest() == parent_dest)
+            .expect("parent mount present");
+        let child_index = mounts
+            .iter()
+            .position(|m| m.dest() == child_src)
+            .expect("child mount present");
+        assert!(
+            parent_index < child_index,
+            "parent must be mounted before the nested child ({mounts:?})"
+        );
     }
 
     #[test]

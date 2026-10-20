@@ -244,6 +244,16 @@ still reads the real files — for example the Docker daemon under `--docker`,
 or an MCP server or broker reached through a mapped socket. A tool that serves
 a sandboxed agent from the host has to apply the same masks itself.
 
+On Linux those placeholder mounts pin the file's inode, so replacing the path
+on the host while the sandbox runs — `mv` of a temp file over it, which is
+what `sed -i` and many editors' saves do, or delete-and-recreate — detaches
+the mount and the running sandbox reads the new, unmasked file. Writing in
+place keeps the mask; the jailed process cannot cause this itself (the masked
+path is a mount point and renames over it fail with `EBUSY`). Keep a secret
+you will edit during a session inside a masked directory, or restart the
+sandbox after saving it. macOS rules match the path, not the inode, and are
+not affected.
+
 ## Reporting vulnerabilities
 
 Do not open a public issue for a suspected vulnerability. Use GitHub's private

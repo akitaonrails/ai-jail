@@ -512,6 +512,18 @@ covered. Create the file before launching (an empty `.env` is enough) when you
 need the rule enforced. Quote glob patterns so ai-jail receives the pattern
 instead of your shell expanding it first.
 
+On Linux there is a second window: a masked or denied file is pinned by
+inode for the life of the sandbox, so **replacing that path on the host while
+the sandbox runs drops the rule** — `mv` of a temp file over it (`sed -i`,
+many editors' save-as), or delete-and-recreate, gives the running sandbox the
+new, unmasked file. Writing in place (plain `>`, Neovim's default `:w`) keeps
+the rule, and the jailed process itself cannot trigger the replacement (the
+masked path is a mount point; renames over it fail with `EBUSY`). Editing a
+secret you expect the agent never to see? Keep it inside a masked
+_directory_ — a directory's mount covers files replaced within it — or
+restart the sandbox after saving. macOS matches by path, not inode, and is
+not affected.
+
 ## Ephemeral home and temp
 
 The private home is a fresh tmpfs per launch. Nothing persists between runs
