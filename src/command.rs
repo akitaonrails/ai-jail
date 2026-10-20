@@ -331,6 +331,7 @@ fn canonical_harness_name(value: &str) -> Option<&'static str> {
         "opencode" | "open-code" => Some("opencode"),
         "pi" => Some("pi"),
         "omp" | "oh-my-pi" => Some("omp"),
+        "agy" | "antigravity" | "antigravity-cli" => Some("antigravity"),
         _ => None,
     }
 }
@@ -362,6 +363,9 @@ mod tests {
             ("pi", "pi"),
             ("omp", "omp"),
             ("oh-my-pi", "omp"),
+            ("agy", "antigravity"),
+            ("antigravity", "antigravity"),
+            ("antigravity-cli", "antigravity"),
         ] {
             let command = args(&["/home/u/bin/ai-memory", "run", value]);
             assert_eq!(effective_name(&command), Some(expected));
