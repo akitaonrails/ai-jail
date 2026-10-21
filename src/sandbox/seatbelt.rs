@@ -378,6 +378,11 @@ fn generate_sbpl_profile_for_tty(
     let lockdown = config.lockdown_enabled();
     let exempt = super::dotdir_exemptions(config);
     let agent_state = agent_state_paths(config);
+    let credentials = if !lockdown {
+        super::credential_ro_paths(config)
+    } else {
+        Vec::new()
+    };
     let mut deny_paths = macos_read_deny_paths(&config.hide_dotdirs, &exempt);
     if !agent_state.is_empty() {
         // Agent-state passthrough is an explicit opt-in; like the
@@ -387,6 +392,20 @@ fn generate_sbpl_profile_for_tty(
         // Explicit --deny-path/--mask entries still win: they are
         // appended below, after this retain.
         deny_paths.retain(|p| !agent_state.contains(p));
+    }
+    if !credentials.is_empty() {
+        // Credential passthrough (--aws, --kube, --gcloud,
+        // --docker-config) injects a read-only map for its own path; a
+        // built-in dotdir deny for that same path would win — SBPL is
+        // last-match-wins — and silently defeat the opt-in: ~/.aws
+        // under --aws stayed unreadable (#187). Drop the deny for
+        // exactly the granted paths, like agent-state above. A grant
+        // nested inside a still-denied dir (--docker-config's
+        // config.json under ~/.docker) is re-allowed AFTER the deny
+        // loop in push_file_read_section, which also covers the
+        // mask/explicit denies appended after this point. Lockdown
+        // keeps its denies: the injection itself is lockdown-gated.
+        deny_paths.retain(|p| !credentials.contains(p));
     }
     let mask_patterns = super::effective_mask_patterns(config, project_dir);
     deny_paths.extend(mask_patterns.clone());
@@ -438,6 +457,7 @@ fn generate_sbpl_profile_for_tty(
         config,
         project_dir,
         &deny_paths,
+        &credentials,
         is_claude,
     );
     push_file_write_section(
@@ -840,6 +860,7 @@ fn push_file_read_section(
     config: &Config,
     project_dir: &Path,
     deny_paths: &[PathBuf],
+    credentials: &[PathBuf],
     is_claude: bool,
 ) {
     profile.push_str("; File reads: explicit allow-list\n");
@@ -916,6 +937,16 @@ fn push_file_read_section(
     profile.push('\n');
     for deny_path in deny_paths {
         push_path_rule(profile, "deny", "file-read*", deny_path);
+    }
+    // Credential grants that sit inside a still-denied subtree need
+    // their allow AFTER the denies: SBPL is last-match-wins, so an
+    // earlier allow would lose. --docker-config's config.json under the
+    // denied ~/.docker is the case; full-dir grants were already
+    // retained out of the deny list (#187).
+    for path in credentials {
+        if !deny_paths.contains(path) {
+            push_path_rule(profile, "allow", "file-read*", path);
+        }
     }
     profile.push('\n');
 }
@@ -1691,6 +1722,105 @@ mod tests {
         };
         assert!(!docker_active(&browser, false));
         assert!(!docker_active(&enabled, true));
+    }
+
+    #[test]
+    fn aws_grant_outranks_builtin_dotdir_deny() {
+        // Regression for #187: --aws injects a read-only map for ~/.aws,
+        // but the built-in dotdir deny for .aws is emitted after the
+        // allow and SBPL is last-match-wins, so ~/.aws stayed unreadable.
+        let _env = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-seatbelt-aws-grant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".aws")).unwrap();
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
+
+        let config = Config {
+            command: vec!["bash".into()],
+            no_mise: Some(true),
+            aws: Some(true),
+            ..Config::default()
+        };
+        let profile =
+            generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
+        let aws = home.join(".aws");
+        assert!(profile.contains(&format!(
+            "(allow file-read* (subpath \"{}\"))",
+            aws.display()
+        )));
+        assert!(
+            !profile.contains(&format!(
+                "(deny file-read* (subpath \"{}\"))",
+                aws.display()
+            )),
+            "--aws must outrank the built-in .aws read deny"
+        );
+        // Read-only passthrough: the write deny from the injected
+        // read-only map stays.
+        assert!(profile.contains(&format!(
+            "(deny file-write* (subpath \"{}\"))",
+            aws.display()
+        )));
+
+        // Lockdown keeps its deny: the credential injection is
+        // lockdown-gated, so nothing outranks it there.
+        let lockdown = Config {
+            lockdown: Some(true),
+            ..config
+        };
+        let profile =
+            generate_sbpl_profile(&lockdown, Path::new("/tmp/test-project"));
+        assert!(profile.contains(&format!(
+            "(deny file-read* (subpath \"{}\"))",
+            aws.display()
+        )));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn docker_config_grant_inside_denied_dir_is_allowed_after_deny() {
+        // --docker-config grants only ~/.docker/config.json; the .docker
+        // dir deny stays, and the file's allow must be emitted AFTER the
+        // deny loop or it loses (last-match-wins).
+        let _env = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-seatbelt-docker-config-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".docker")).unwrap();
+        std::fs::write(home.join(".docker/config.json"), "{}\n").unwrap();
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
+
+        let config = Config {
+            command: vec!["bash".into()],
+            no_mise: Some(true),
+            docker_config: Some(true),
+            ..Config::default()
+        };
+        let profile =
+            generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
+        let docker = home.join(".docker");
+        let config_json = docker.join("config.json");
+        let deny =
+            format!("(deny file-read* (subpath \"{}\"))", docker.display());
+        let allow = format!(
+            "(allow file-read* (literal \"{}\"))",
+            config_json.display()
+        );
+        let (Some(deny_at), Some(allow_at)) =
+            (profile.find(&deny), profile.find(&allow))
+        else {
+            panic!("missing docker deny/allow in profile:\n{profile}");
+        };
+        assert!(
+            allow_at > deny_at,
+            "config.json allow must follow the .docker deny"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
