@@ -1822,13 +1822,14 @@ mod tests {
         let profile =
             generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
         let (Some(deny_at), Some(allow_at)) =
-            (profile.find(&deny), profile.find(&allow))
+            (profile.find(&deny), profile.rfind(&allow))
         else {
             panic!("missing docker deny/allow in profile:\n{profile}");
         };
         assert!(
             allow_at > deny_at,
-            "config.json allow must follow the .docker deny"
+            "config.json's winning allow (its last occurrence) must follow \
+             the .docker deny; SBPL is last-match-wins"
         );
 
         let _ = std::fs::remove_dir_all(&home);
