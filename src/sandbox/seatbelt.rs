@@ -1734,6 +1734,9 @@ mod tests {
             .join(format!("ai-jail-seatbelt-aws-grant-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join(".aws")).unwrap();
+        // macOS temp paths sit behind /var -> /private/var; the profile
+        // canonicalizes, so the expectations must too.
+        let home = std::fs::canonicalize(&home).unwrap();
         let _home = EnvVarGuard::set("HOME", home.as_os_str());
 
         let config = Config {
@@ -1796,6 +1799,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join(".docker")).unwrap();
         std::fs::write(home.join(".docker/config.json"), "{}\n").unwrap();
+        // Canonical like the profile: /var -> /private/var on macOS.
+        let home = std::fs::canonicalize(&home).unwrap();
         let _home = EnvVarGuard::set("HOME", home.as_os_str());
 
         let docker = home.join(".docker");
