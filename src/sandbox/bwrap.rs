@@ -488,6 +488,10 @@ struct MountSources<'a> {
     empty_path: &'a Path,
     deny_file_path: &'a Path,
     deny_dir_path: &'a Path,
+    /// Whether discovery may create the host-side directories a mount
+    /// needs (the soft browser profile, overlay layer storage). `--dry-run`
+    /// turns it off: it prints the same mounts without creating them.
+    create_dirs: bool,
 }
 
 impl<'a> MountSources<'a> {
@@ -499,6 +503,7 @@ impl<'a> MountSources<'a> {
             empty_path: guard.empty_path(),
             deny_file_path: guard.deny_file_path(),
             deny_dir_path: guard.deny_dir_path(),
+            create_dirs: true,
         }
     }
 
@@ -515,6 +520,7 @@ impl<'a> MountSources<'a> {
             empty_path,
             deny_file_path: empty_path,
             deny_dir_path: empty_path,
+            create_dirs: true,
         }
     }
 }
@@ -1640,7 +1646,10 @@ pub fn dry_run(
     proxy_socket: Option<&Path>,
     forward_sockets: &[(u16, PathBuf)],
 ) -> Result<String, String> {
-    let sources = MountSources::from_guard(guard);
+    let sources = MountSources {
+        create_dirs: false,
+        ..MountSources::from_guard(guard)
+    };
     let args = build_dry_run_args_forwarded(
         config,
         project_dir,
@@ -1869,8 +1878,12 @@ fn discover_mounts_full(
     );
     let pictures_mount =
         discover_pictures_mount(config, lockdown, browser_mode);
-    let browser_state_mount =
-        discover_browser_state_mount(config, browser_profile, verbose);
+    let browser_state_mount = discover_browser_state_mount(
+        config,
+        browser_profile,
+        sources.create_dirs,
+        verbose,
+    );
     let home_dotfiles = discover_home_dotfiles_full(
         config,
         private_home,
@@ -1898,7 +1911,12 @@ fn discover_mounts_full(
         }
         (vec![], vec![])
     } else {
-        overlay_mounts(&config.overlay_maps, project_dir, verbose)?
+        overlay_mounts(
+            &config.overlay_maps,
+            project_dir,
+            sources.create_dirs,
+            verbose,
+        )?
     };
     // Lockdown clears the environment to paths already supplied by the
     // sandbox, so it intentionally skips host command exemptions.
@@ -2423,6 +2441,7 @@ fn safe_state_file(path: &Path) -> bool {
 fn discover_browser_state_mount(
     config: &Config,
     profile: Option<crate::config::BrowserProfile>,
+    create_dir: bool,
     verbose: bool,
 ) -> Vec<Mount> {
     if profile != Some(crate::config::BrowserProfile::Soft) {
@@ -2431,7 +2450,9 @@ fn discover_browser_state_mount(
     let Some(path) = super::browser_state_dir(config) else {
         return vec![];
     };
-    if let Err(e) = std::fs::create_dir_all(&path) {
+    // --dry-run shows the bind a launch would make without creating the
+    // profile directory on the host.
+    if create_dir && let Err(e) = std::fs::create_dir_all(&path) {
         output::warn(&format!(
             "Browser profile: cannot create {}: {e}",
             path.display()
@@ -3595,6 +3616,7 @@ fn overlay_storage_name(dest: &Path) -> String {
 fn overlay_mounts(
     overlay_maps: &[PathBuf],
     project_dir: &Path,
+    create_dirs: bool,
     verbose: bool,
 ) -> Result<(Vec<Mount>, Vec<Mount>), String> {
     if overlay_maps.is_empty() {
@@ -3645,9 +3667,10 @@ fn overlay_mounts(
         let base = storage_root.join(overlay_storage_name(dest));
         let upper = base.join("upper");
         let work = base.join("work");
-        if let Err(e) =
-            create_safe_overlay_dirs(&[&storage_root, &base, &upper, &work])
-        {
+        if let Err(e) = create_safe_overlay_dirs(
+            &[&storage_root, &base, &upper, &work],
+            create_dirs,
+        ) {
             return Err(format!(
                 "overlay map {}: cannot create layer storage {}: {e}",
                 dest.display(),
@@ -3683,7 +3706,9 @@ fn overlay_mounts(
     // accident, then hide the raw storage from inside the sandbox so
     // the agent cannot read or tamper with the upper/work layers
     // directly — it must go through the overlay mount at the dest.
-    write_overlay_gitignore(&storage_root);
+    if create_dirs {
+        write_overlay_gitignore(&storage_root);
+    }
     if verbose {
         output::verbose(&format!("Overlay maps: {} active", mounts.len()));
     }
@@ -3693,8 +3718,13 @@ fn overlay_mounts(
 
 /// Create each overlay component without ever following a pre-existing
 /// symlink. Overlay storage is host-writable state, so following one could
-/// write outside the project before bwrap starts.
-fn create_safe_overlay_dirs(paths: &[&Path]) -> std::io::Result<()> {
+/// write outside the project before bwrap starts. With `create` off
+/// (`--dry-run`), existing components are still validated and missing
+/// ones are left missing.
+fn create_safe_overlay_dirs(
+    paths: &[&Path],
+    create: bool,
+) -> std::io::Result<()> {
     for path in paths {
         match path.symlink_metadata() {
             Ok(metadata)
@@ -3705,6 +3735,9 @@ fn create_safe_overlay_dirs(paths: &[&Path]) -> std::io::Result<()> {
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !create {
+                    continue;
+                }
                 std::fs::create_dir(path)?;
                 let metadata = path.symlink_metadata()?;
                 if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -4930,6 +4963,7 @@ mod tests {
         let mounts = discover_browser_state_mount(
             &config,
             Some(crate::config::BrowserProfile::Soft),
+            true,
             false,
         );
 
@@ -4946,6 +4980,41 @@ mod tests {
         assert!(
             expected.is_dir(),
             "soft profile should pre-create the state dir on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&fake_home);
+    }
+
+    /// `--dry-run` prints the soft profile's bind but must not create the
+    /// profile directory on the host.
+    #[test]
+    fn dry_run_does_not_create_browser_state_dir() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fake_home = std::env::temp_dir()
+            .join(format!("ai-jail-browser-dry-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fake_home);
+        std::fs::create_dir_all(&fake_home).unwrap();
+        let _home = EnvVarGuard::set("HOME", fake_home.as_os_str());
+
+        let config = Config {
+            command: vec!["chromium".into()],
+            browser_profile: Some("soft".into()),
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let output =
+            dry_run(&guard, &config, &fake_home, false, None, &[]).unwrap();
+
+        let state = fake_home.join(".local/share/ai-jail/browsers/chromium");
+        assert!(
+            output.contains(&state.display().to_string()),
+            "dry run should still show the profile bind: {output}"
+        );
+        assert!(
+            !fake_home.join(".local").exists(),
+            "dry run must not create {}",
+            state.display()
         );
 
         let _ = std::fs::remove_dir_all(&fake_home);
@@ -4970,6 +5039,7 @@ mod tests {
         let mounts = discover_browser_state_mount(
             &config,
             Some(crate::config::BrowserProfile::Hard),
+            true,
             false,
         );
         assert!(
@@ -6241,9 +6311,13 @@ mod tests {
     #[test]
     fn overlay_mounts_creates_layers_and_hide() {
         let (project, source) = overlay_test_dirs("create");
-        let (mounts, hide) =
-            overlay_mounts(std::slice::from_ref(&source), &project, false)
-                .unwrap();
+        let (mounts, hide) = overlay_mounts(
+            std::slice::from_ref(&source),
+            &project,
+            true,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(mounts.len(), 1);
         match &mounts[0] {
@@ -6285,7 +6359,7 @@ mod tests {
         let child = source.join("sub");
         std::fs::create_dir_all(&child).unwrap();
         let maps = vec![source.clone(), child];
-        let err = overlay_mounts(&maps, &project, false).unwrap_err();
+        let err = overlay_mounts(&maps, &project, true, false).unwrap_err();
         assert!(err.contains("overlaps"), "got: {err}");
         let _ = std::fs::remove_dir_all(project.parent().unwrap());
     }
@@ -6296,9 +6370,13 @@ mod tests {
         // writable original.
         let (project, _source) = overlay_test_dirs("missing");
         let missing = project.join("does-not-exist");
-        let err =
-            overlay_mounts(std::slice::from_ref(&missing), &project, false)
-                .unwrap_err();
+        let err = overlay_mounts(
+            std::slice::from_ref(&missing),
+            &project,
+            true,
+            false,
+        )
+        .unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
         let _ = std::fs::remove_dir_all(project.parent().unwrap());
     }
@@ -6320,11 +6398,38 @@ mod tests {
         std::os::unix::fs::symlink(&outside, project.join(OVERLAY_STORAGE_DIR))
             .unwrap();
 
-        let err =
-            overlay_mounts(std::slice::from_ref(&source), &project, false)
-                .unwrap_err();
+        let err = overlay_mounts(
+            std::slice::from_ref(&source),
+            &project,
+            true,
+            false,
+        )
+        .unwrap_err();
         assert!(err.contains("storage root"));
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+
+    #[test]
+    fn dry_run_does_not_create_overlay_storage() {
+        let (project, source) = overlay_test_dirs("dry-run");
+        let mut config = minimal_test_config();
+        config.overlay_maps = vec![source.clone()];
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+
+        let output =
+            dry_run(&guard, &config, &project, false, None, &[]).unwrap();
+
+        assert!(
+            output.contains("--overlay-src"),
+            "dry run should still show the overlay: {output}"
+        );
+        assert!(
+            !project.join(OVERLAY_STORAGE_DIR).exists(),
+            "dry run must not create overlay storage in the project"
+        );
 
         let _ = std::fs::remove_dir_all(project.parent().unwrap());
     }
