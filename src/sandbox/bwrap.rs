@@ -4693,6 +4693,18 @@ mod tests {
 
     #[test]
     fn forward_port_dry_run_mounts_socket_and_forces_wrapper() {
+        // `http_proxy` and friends are on the default inherit allowlist,
+        // so a tester shell exporting them would leak `--setenv`
+        // entries into the dry-run argv. Strip them for a hermetic run.
+        let _env = ENV_LOCK.lock().unwrap();
+        let _http_proxy = EnvVarGuard::remove("http_proxy");
+        let _https_proxy = EnvVarGuard::remove("https_proxy");
+        let _all_proxy = EnvVarGuard::remove("all_proxy");
+        let _no_proxy = EnvVarGuard::remove("no_proxy");
+        let _http_proxy_upper = EnvVarGuard::remove("HTTP_PROXY");
+        let _https_proxy_upper = EnvVarGuard::remove("HTTPS_PROXY");
+        let _all_proxy_upper = EnvVarGuard::remove("ALL_PROXY");
+        let _no_proxy_upper = EnvVarGuard::remove("NO_PROXY");
         let guard =
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let config = Config {
@@ -4840,6 +4852,18 @@ mod tests {
 
     #[test]
     fn non_filtered_dry_run_has_no_proxy_wiring() {
+        // See `forward_port_dry_run_mounts_socket_and_forces_wrapper`:
+        // allowlisted proxy vars from the tester shell would otherwise
+        // appear as `--setenv` entries and fail this assertion.
+        let _env = ENV_LOCK.lock().unwrap();
+        let _http_proxy = EnvVarGuard::remove("http_proxy");
+        let _https_proxy = EnvVarGuard::remove("https_proxy");
+        let _all_proxy = EnvVarGuard::remove("all_proxy");
+        let _no_proxy = EnvVarGuard::remove("no_proxy");
+        let _http_proxy_upper = EnvVarGuard::remove("HTTP_PROXY");
+        let _https_proxy_upper = EnvVarGuard::remove("HTTPS_PROXY");
+        let _all_proxy_upper = EnvVarGuard::remove("ALL_PROXY");
+        let _no_proxy_upper = EnvVarGuard::remove("NO_PROXY");
         let guard =
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let config = minimal_test_config();

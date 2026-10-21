@@ -2160,6 +2160,19 @@ mod tests {
     #[test]
     fn build_child_env_non_filtered_has_no_proxy_env() {
         let _env = ENV_LOCK.lock().unwrap();
+        // `*_proxy` vars are on the default inherit allowlist, so a
+        // tester shell exporting them would leak into the child env.
+        // Remove them for a hermetic run (mirrors the bwrap dry-run
+        // tests `forward_port_dry_run_mounts_socket_and_forces_wrapper`
+        // and `non_filtered_dry_run_has_no_proxy_wiring`).
+        let _http_proxy = EnvVarGuard::remove("http_proxy");
+        let _https_proxy = EnvVarGuard::remove("https_proxy");
+        let _all_proxy = EnvVarGuard::remove("all_proxy");
+        let _no_proxy = EnvVarGuard::remove("no_proxy");
+        let _http_proxy_upper = EnvVarGuard::remove("HTTP_PROXY");
+        let _https_proxy_upper = EnvVarGuard::remove("HTTPS_PROXY");
+        let _all_proxy_upper = EnvVarGuard::remove("ALL_PROXY");
+        let _no_proxy_upper = EnvVarGuard::remove("NO_PROXY");
         let config = Config {
             command: vec!["bash".into()],
             no_mise: Some(true),
