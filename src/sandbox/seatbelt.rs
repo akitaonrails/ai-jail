@@ -1740,6 +1740,10 @@ mod tests {
             command: vec!["bash".into()],
             no_mise: Some(true),
             aws: Some(true),
+            // main.rs injects the credential path into ro_maps before the
+            // backend builds the profile; a direct Config here must mirror
+            // that or the read allow never exists.
+            ro_maps: vec![home.join(".aws")],
             ..Config::default()
         };
         let profile =
@@ -1794,22 +1798,24 @@ mod tests {
         std::fs::write(home.join(".docker/config.json"), "{}\n").unwrap();
         let _home = EnvVarGuard::set("HOME", home.as_os_str());
 
+        let docker = home.join(".docker");
+        let config_json = docker.join("config.json");
         let config = Config {
             command: vec!["bash".into()],
             no_mise: Some(true),
             docker_config: Some(true),
+            // Mirrors main.rs's ro_maps injection for the credential.
+            ro_maps: vec![config_json.clone()],
             ..Config::default()
         };
-        let profile =
-            generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
-        let docker = home.join(".docker");
-        let config_json = docker.join("config.json");
         let deny =
             format!("(deny file-read* (subpath \"{}\"))", docker.display());
         let allow = format!(
             "(allow file-read* (literal \"{}\"))",
             config_json.display()
         );
+        let profile =
+            generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
         let (Some(deny_at), Some(allow_at)) =
             (profile.find(&deny), profile.find(&allow))
         else {
