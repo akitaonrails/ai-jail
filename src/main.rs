@@ -984,7 +984,7 @@ fn run() -> Result<i32, String> {
     // so the filtered-egress proxy below can share the handle; the
     // launch record itself is appended when the child exits.
     let audit_home = audit_home();
-    let audit_log = if config.audit_log_enabled() {
+    let audit_log = if !cli.dry_run && config.audit_log_enabled() {
         match audit_home.as_deref() {
             Some(home) => audit::AuditLog::open(home),
             None => {

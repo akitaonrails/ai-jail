@@ -88,6 +88,16 @@ pub fn build(
     proxy_port: Option<u16>,
 ) -> Result<Command, String> {
     let lockdown = config.lockdown_enabled();
+    // Profile generation is also used by --dry-run. Prepare writable
+    // storage only here, when constructing an actual launch.
+    let session_tmpdir = if !lockdown {
+        if let Some(state) = super::browser_state_dir(config) {
+            let _ = std::fs::create_dir_all(state);
+        }
+        macos_session_tmpdir()
+    } else {
+        None
+    };
     let codex_ps_shim = if !lockdown
         && crate::command::effective_name(&config.command) == Some("codex")
     {
@@ -111,7 +121,7 @@ pub fn build(
     // The profile only grants RW inside the dedicated session scratch
     // dir; TMPDIR must point there or every temp operation in the
     // child is denied.
-    if !lockdown && let Some(tmpdir) = macos_session_tmpdir() {
+    if let Some(tmpdir) = session_tmpdir {
         cmd.env("TMPDIR", tmpdir);
     }
 
@@ -1165,16 +1175,22 @@ fn validated_macos_tmpdir() -> Option<PathBuf> {
     Some(trusted)
 }
 
-/// Dedicated per-session scratch directory inside Darwin's trusted
-/// per-user temp root: `<tmp>/ai-jail-<pid>`, created with mode 0700.
+/// Planned per-session scratch directory inside Darwin's trusted
+/// per-user temp root: `<tmp>/ai-jail-<pid>`. Resolving the profile's
+/// paths must not create storage during --dry-run.
 /// Allowing the whole validated root would expose every host temp
 /// file to the sandbox; the child only ever sees its own session
 /// subtree, and the child's TMPDIR is pointed at it in [`build`].
+fn macos_session_tmpdir_path() -> Option<PathBuf> {
+    let root = validated_macos_tmpdir()?;
+    Some(root.join(format!("ai-jail-{}", std::process::id())))
+}
+
+/// Prepare the real launch's session directory with mode 0700.
 fn macos_session_tmpdir() -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
-    let root = validated_macos_tmpdir()?;
-    let session = root.join(format!("ai-jail-{}", std::process::id()));
+    let session = macos_session_tmpdir_path()?;
     if std::fs::create_dir(&session).is_err() && !session.is_dir() {
         output::warn(&format!(
             "cannot create session temp dir {}; temp access disabled",
@@ -1339,10 +1355,9 @@ fn macos_writable_paths(
             paths.push(p.clone());
         }
         if let Some(state) = super::browser_state_dir(config) {
-            let _ = std::fs::create_dir_all(&state);
             paths.push(state);
         }
-        if let Some(tmpdir) = macos_session_tmpdir() {
+        if let Some(tmpdir) = macos_session_tmpdir_path() {
             paths.push(tmpdir);
         }
         return paths;
@@ -1397,7 +1412,7 @@ fn macos_writable_paths(
 
     // Grant only the dedicated session scratch dir, never the whole
     // validated per-user temp root (host temp files stay invisible).
-    if let Some(tmpdir) = macos_session_tmpdir() {
+    if let Some(tmpdir) = macos_session_tmpdir_path() {
         paths.push(tmpdir);
     }
 
@@ -1635,7 +1650,7 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
     // Lockdown gets no temp access at all (no writes anywhere, so a
     // fresh TMPDIR would only mislead).
     if !config.lockdown_enabled()
-        && let Some(tmpdir) = macos_session_tmpdir()
+        && let Some(tmpdir) = macos_session_tmpdir_path()
     {
         push_unique(tmpdir);
     }
@@ -4036,9 +4051,6 @@ mod tests {
             !writable.contains(&root),
             "the whole per-user temp root must not be writable"
         );
-        use std::os::unix::fs::PermissionsExt;
-        let mode = session.metadata().unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700, "session tmpdir must be mode 0700");
     }
 
     #[test]
@@ -4060,6 +4072,35 @@ mod tests {
             .find(|(key, _)| key == &std::ffi::OsStr::new("TMPDIR"))
             .and_then(|(_, value)| value);
         assert_eq!(tmpdir, Some(session.as_os_str()));
+        use std::os::unix::fs::PermissionsExt;
+        let mode = session.metadata().unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "session tmpdir must be mode 0700");
+    }
+
+    #[test]
+    fn build_creates_browser_profile_storage() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-seatbelt-browser-storage-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let project = root.join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
+        let config = Config {
+            command: vec!["chromium".into()],
+            browser_profile: Some("soft".into()),
+            no_mise: Some(true),
+            ..Config::default()
+        };
+        let state = super::super::browser_state_dir(&config).unwrap();
+        assert!(!state.exists());
+        build(&config, &project, false, None, None).unwrap();
+        assert!(state.is_dir(), "a real launch must prepare browser storage");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
