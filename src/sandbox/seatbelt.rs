@@ -1181,9 +1181,27 @@ fn validated_macos_tmpdir() -> Option<PathBuf> {
 /// Allowing the whole validated root would expose every host temp
 /// file to the sandbox; the child only ever sees its own session
 /// subtree, and the child's TMPDIR is pointed at it in [`build`].
-fn macos_session_tmpdir_path() -> Option<PathBuf> {
+pub(super) fn macos_session_tmpdir_path() -> Option<PathBuf> {
     let root = validated_macos_tmpdir()?;
     Some(root.join(format!("ai-jail-{}", std::process::id())))
+}
+
+fn application_bundle_root(path: &Path) -> Option<PathBuf> {
+    if !path.starts_with("/Applications") {
+        return None;
+    }
+    let mut root = PathBuf::new();
+    for component in path.components() {
+        root.push(component.as_os_str());
+        if component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.ends_with(".app"))
+        {
+            return Some(root);
+        }
+    }
+    None
 }
 
 /// Prepare the real launch's session directory with mode 0700.
@@ -1599,6 +1617,7 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
         }
     }
 
+    let command_paths = super::command_paths_under(config, Path::new("/"));
     if !browser_mode && !config.lockdown_enabled() {
         for p in config.rw_maps.iter().chain(config.ro_maps.iter()) {
             if super::path_exists(p) {
@@ -1612,8 +1631,8 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
         // covers the whole filesystem rather than just $HOME — an agent
         // installed under /Applications or /nix/store needs the same
         // grant that a ~/.local/bin one does (issue #120).
-        for p in super::command_paths_under(config, Path::new("/")) {
-            push_unique(canonicalize_or_keep(&p));
+        for p in &command_paths {
+            push_unique(canonicalize_or_keep(p));
         }
         if config.ssh_enabled() {
             let ssh_dir = super::home_dir().join(".ssh");
@@ -1629,8 +1648,19 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
         }
     }
 
-    // A command under /Applications needs its bundle, but do not expose all
-    // installed applications merely because one command is launched.
+    // Native applications load libraries and resources from throughout their
+    // selected .app bundle. Grant that one bundle, never /Applications as a
+    // whole. This is required in browser mode too, where the broad command
+    // install-path discovery above is intentionally skipped.
+    for path in &command_paths {
+        if let Some(bundle) = application_bundle_root(path) {
+            push_unique(canonicalize_or_keep(&bundle));
+        }
+    }
+
+    // Keep the literal executable visible as a fallback when path discovery
+    // cannot resolve it. Resolved native applications receive their selected
+    // bundle above; neither path exposes all installed applications.
     for command in crate::command::executable_candidates(&config.command) {
         let path = PathBuf::from(command);
         if path.starts_with("/Applications") && path.exists() {
@@ -2773,6 +2803,32 @@ mod tests {
     }
 
     #[test]
+    fn application_bundle_root_selects_only_the_invoked_bundle() {
+        assert_eq!(
+            application_bundle_root(Path::new(
+                "/Applications/Firefox.app/Contents/MacOS/firefox"
+            )),
+            Some(PathBuf::from("/Applications/Firefox.app"))
+        );
+        assert_eq!(
+            application_bundle_root(Path::new(
+                "/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+            )),
+            Some(PathBuf::from("/Applications/Utilities/Terminal.app"))
+        );
+        assert_eq!(
+            application_bundle_root(Path::new("/Applications/helper/bin/run")),
+            None
+        );
+        assert_eq!(
+            application_bundle_root(Path::new(
+                "/tmp/Firefox.app/Contents/MacOS/firefox"
+            )),
+            None
+        );
+    }
+
+    #[test]
     fn reads_allow_command_installed_outside_home() {
         // Regression for #120: the read grant for the invoked command
         // used to stop at $HOME, so an agent installed anywhere else —
@@ -3536,6 +3592,9 @@ mod tests {
             (vec!["crush"], vec![".crush"]),
             (vec!["kimi"], vec![".kimi", ".kimi-code"]),
             (vec!["gemini"], vec![".gemini"]),
+            (vec!["antigravity"], vec![".gemini"]),
+            (vec!["agy"], vec![".gemini"]),
+            (vec!["antigravity-cli"], vec![".gemini"]),
             (vec!["grok"], vec![".grok"]),
             (vec!["pi"], vec![".pi", ".pi-lens"]),
             (vec!["aider"], vec![".aider"]),

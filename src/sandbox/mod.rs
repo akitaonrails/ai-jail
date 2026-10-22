@@ -497,6 +497,58 @@ pub(crate) fn browser_state_dir(config: &Config) -> Option<PathBuf> {
     }
 }
 
+pub(crate) fn hard_browser_state_dir(browser: &str) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(session) = seatbelt::macos_session_tmpdir_path() {
+        return session.join(format!("ai-jail-browser-{browser}"));
+    }
+
+    PathBuf::from(format!("/tmp/ai-jail-browser-{browser}"))
+}
+
+pub(crate) struct BrowserProfileGuard {
+    #[cfg(target_os = "macos")]
+    hard_state: Option<PathBuf>,
+}
+
+impl Drop for BrowserProfileGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(path) = &self.hard_state
+            && let Err(error) = std::fs::remove_dir_all(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            output::warn(&format!(
+                "cannot remove ephemeral browser profile {}: {error}",
+                path.display()
+            ));
+        }
+    }
+}
+
+pub(crate) fn browser_profile_guard(config: &Config) -> BrowserProfileGuard {
+    #[cfg(target_os = "macos")]
+    {
+        let hard_state = if config.browser_profile()
+            == Some(crate::config::BrowserProfile::Hard)
+        {
+            config
+                .command
+                .first()
+                .and_then(|program| browser_basename(program))
+                .map(hard_browser_state_dir)
+        } else {
+            None
+        };
+        BrowserProfileGuard { hard_state }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = config;
+        BrowserProfileGuard {}
+    }
+}
+
 /// Build the list of dotdir names exempted from the deny list by
 /// explicit user flags (e.g. --ssh exempts ".ssh").
 pub fn dotdir_exemptions(config: &Config) -> Vec<&'static str> {
@@ -1414,7 +1466,7 @@ fn browser_profile_launch_command(
         "firefox" | "librewolf" => {
             let profile_dir = match profile {
                 crate::config::BrowserProfile::Hard => {
-                    format!("/tmp/ai-jail-browser-{browser}")
+                    hard_browser_state_dir(browser).display().to_string()
                 }
                 crate::config::BrowserProfile::Soft => {
                     browser_state_dir(config)
@@ -1436,7 +1488,10 @@ fn browser_profile_launch_command(
         _ => {
             let data_dir = match profile {
                 crate::config::BrowserProfile::Hard => {
-                    format!("/tmp/ai-jail-browser-{browser}/data")
+                    hard_browser_state_dir(browser)
+                        .join("data")
+                        .display()
+                        .to_string()
                 }
                 crate::config::BrowserProfile::Soft => {
                     browser_state_dir(config)
@@ -1452,7 +1507,10 @@ fn browser_profile_launch_command(
             };
             let cache_dir = match profile {
                 crate::config::BrowserProfile::Hard => {
-                    format!("/tmp/ai-jail-browser-{browser}/cache")
+                    hard_browser_state_dir(browser)
+                        .join("cache")
+                        .display()
+                        .to_string()
                 }
                 crate::config::BrowserProfile::Soft => {
                     browser_state_dir(config)
@@ -2583,14 +2641,16 @@ mod tests {
         assert!(cmd.args.contains(&"--no-first-run".into()));
         assert!(cmd.args.contains(&"--disable-sync".into()));
         assert!(cmd.args.contains(&"--password-store=basic".into()));
-        assert!(
-            cmd.args.iter().any(|arg| arg
-                == "--user-data-dir=/tmp/ai-jail-browser-chromium/data")
-        );
-        assert!(
-            cmd.args.iter().any(|arg| arg
-                == "--disk-cache-dir=/tmp/ai-jail-browser-chromium/cache")
-        );
+        let state = hard_browser_state_dir("chromium");
+        assert!(cmd.args.iter().any(|arg| {
+            arg == &format!("--user-data-dir={}", state.join("data").display())
+        }));
+        assert!(cmd.args.iter().any(|arg| {
+            arg == &format!(
+                "--disk-cache-dir={}",
+                state.join("cache").display()
+            )
+        }));
     }
 
     #[test]
@@ -2644,7 +2704,9 @@ mod tests {
         assert_eq!(cmd.program, "firefox");
         assert!(cmd.args.contains(&"--no-remote".into()));
         assert!(cmd.args.contains(&"--profile".into()));
-        assert!(cmd.args.contains(&"/tmp/ai-jail-browser-firefox".into()));
+        assert!(cmd.args.contains(
+            &hard_browser_state_dir("firefox").display().to_string()
+        ));
     }
 
     #[test]

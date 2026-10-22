@@ -7277,6 +7277,8 @@ mod tests {
             ("kimi", &[".kimi", ".kimi-code"]),
             ("gemini", &[".gemini"]),
             ("antigravity", &[".gemini"]),
+            ("agy", &[".gemini"]),
+            ("antigravity-cli", &[".gemini"]),
             ("grok", &[".grok"]),
             // jcode keeps credentials in ~/.jcode/auth.json and reads
             // provider env files from ~/.config/jcode on Linux, so both

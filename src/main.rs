@@ -1102,6 +1102,12 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
 
+    // macOS has no private /tmp mount. Hard browser profiles therefore live
+    // inside the launch's dedicated session scratch directory and must be
+    // removed when this supervisor exits. Linux hard profiles live in the
+    // sandbox's tmpfs, so this guard is a no-op there.
+    let _browser_profile_guard = sandbox::browser_profile_guard(&config);
+
     output::info(&format!("Jail Active: {}", project_dir.display()));
 
     // Install signal handlers before spawning
