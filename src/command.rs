@@ -169,7 +169,10 @@ fn is_run_bool_option(argument: &str) -> bool {
 pub(crate) fn effective_name(command: &[String]) -> Option<&str> {
     managed_harness(command)
         .map(|harness| harness.name)
-        .or_else(|| basename(command))
+        .or_else(|| {
+            let name = basename(command)?;
+            Some(canonical_harness_name(name).unwrap_or(name))
+        })
 }
 
 /// Agents known to be network API clients. Kept in sync with the
@@ -350,6 +353,21 @@ mod tests {
         assert_eq!(basename(&command), Some("codex"));
         assert_eq!(effective_name(&command), Some("codex"));
         assert_eq!(managed_harness(&command), None);
+    }
+
+    #[test]
+    fn direct_command_canonicalizes_supported_aliases() {
+        for (value, expected) in [
+            ("claude-code", "claude"),
+            ("open-code", "opencode"),
+            ("oh-my-pi", "omp"),
+            ("agy", "antigravity"),
+            ("antigravity-cli", "antigravity"),
+        ] {
+            let command = args(&[value]);
+            assert_eq!(effective_name(&command), Some(expected));
+            assert_eq!(managed_harness(&command), None);
+        }
     }
 
     #[test]

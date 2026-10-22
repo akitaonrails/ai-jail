@@ -62,8 +62,11 @@ default, not an oversight.
 `--display` does not imply X11: X11 needs `--x11`. `--browser` reuses an
 isolated profile but still requires explicit `--network` and, on Linux,
 `--display` (or `--x11`) to reach anything; on macOS the display is
-system-level, so only `--network` applies there. Systemd user integration
-uses explicit narrow sockets only. Docker requires `DOCKER_HOST` to name an
+system-level, so only `--network` applies there. A macOS hard browser profile
+lives in the launch's dedicated session scratch directory and is removed when
+the browser exits; only the selected native `.app` bundle is readable, not all
+of `/Applications`. Systemd user integration uses explicit narrow sockets
+only. Docker requires `DOCKER_HOST` to name an
 actual Unix socket; network endpoints are not mounted, and `~/.docker` is not
 broadly mounted. Kimi and other agent state is command-specific under private
 home.

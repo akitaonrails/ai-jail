@@ -72,7 +72,8 @@ fn audit_dry_run_does_not_create_history() {
 fn macos_dry_run_does_not_create_profile_directories() {
     for (name, args) in [
         ("ordinary", vec!["/usr/bin/true"]),
-        ("browser", vec!["--browser=soft", "chromium"]),
+        ("browser-soft", vec!["--browser=soft", "chromium"]),
+        ("browser-hard", vec!["--browser=hard", "chromium"]),
     ] {
         let tree = TestTree::new(name);
         let (output, pid) = tree.run(&args);
@@ -93,9 +94,59 @@ fn macos_dry_run_does_not_create_profile_directories() {
             !tree.home.join(".local").exists(),
             "a browser dry run must not create persistent profile storage"
         );
-        if name == "browser" {
+        if name == "browser-soft" {
             assert!(stdout.contains("/browsers/chromium"));
             assert!(stdout.contains("--user-data-dir="));
+        } else if name == "browser-hard" {
+            assert!(stdout.contains(&format!(
+                "--user-data-dir={}/ai-jail-browser-chromium/data",
+                session.display()
+            )));
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_hard_browser_uses_and_cleans_session_storage() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tree = TestTree::new("browser-hard-launch");
+    let browser = tree.project.join("chromium");
+    std::fs::write(
+        &browser,
+        "#!/bin/sh\nset -eu\nfor arg; do\n  case \"$arg\" in\n    --user-data-dir=*) data=${arg#*=} ;;\n  esac\ndone\nmkdir -p \"$data\"\nprintf '%s\\n' \"$data\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o755))
+        .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ai-jail"))
+        .args([
+            "--no-mise",
+            "--no-toolchains",
+            "--no-agent-state",
+            "--no-network",
+            "--no-save-config",
+            "--browser=hard",
+            "./chromium",
+        ])
+        .env("HOME", &tree.home)
+        .env_remove("AI_JAIL_QUIET")
+        .current_dir(&tree.project)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let state = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    assert!(
+        state
+            .to_string_lossy()
+            .contains("/ai-jail-browser-chromium/data"),
+        "unexpected hard-profile path: {}",
+        state.display()
+    );
+    assert!(
+        !state.exists(),
+        "hard-profile state must be removed after the browser exits"
+    );
 }

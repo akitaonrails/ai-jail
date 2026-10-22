@@ -547,7 +547,9 @@ produces a browser that cannot load pages — and on Linux cannot open a window.
 X11-based browsers need `--x11` instead of `--display`. Audio (e.g. video
 playback) additionally needs `--audio`, which binds the validated
 PipeWire/PulseAudio sockets — `ai-jail --browser=soft --network --display
---audio chromium`.
+--audio chromium`. On macOS, a hard profile lives inside the launch's dedicated
+session scratch directory and is removed when the browser exits; only the
+selected native `.app` bundle is made readable, not all of `/Applications`.
 
 ## Configuration
 
@@ -729,6 +731,14 @@ flow needs opencode's shared service instead: keep
 directory between those jails by default, including the service socket; no
 extra `--rw-map` is needed. The `pair` command prints the URL and exits while
 the service continues answering it.
+
+**Antigravity cannot resume a conversation created before ai-jail.** Run the
+same project with `ai-jail --network agy --conversation <conversation-id>`.
+Agent state is on by default, and the `agy`, `antigravity`, and
+`antigravity-cli` names all select Antigravity's complete `~/.gemini` state.
+Mapping only `antigravity-cli/brain/<conversation-id>` is not enough: the CLI
+also needs its conversation database and metadata alongside `brain/`.
+`--no-agent-state` deliberately disables this sharing.
 
 **`Failed to create stream fd: No such file or directory` at startup.**
 This comes from mise setup, not from ai-jail. mise activation runs under a
