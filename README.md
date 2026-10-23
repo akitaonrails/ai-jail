@@ -173,6 +173,7 @@ only when deliberately granting broad host-home access; `--map` and
 | `--inherit-env` / `--no-inherit-env`                   | Default is a minimal environment allowlist. `--inherit-env` passes the full parent environment, secrets included.                                                                                                                                                                                                                                                       |
 | `--update-check` / `--no-update-check`                 | Enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active (default off; all other launches make no network requests).                                                                                                                                                                               |
 | `--macos-host-ipc` / `--no-macos-host-ipc`             | Enables/disables macOS Mach, IOKit, and host IPC exposure.                                                                                                                                                                                                                                                                                                              |
+| `--macos-chromium` / `--no-macos-chromium`             | Enables/disables Chromium's own Mach rendezvous service on macOS (needed by headless Chromium and Playwright).                                                                                                                                                                                                                                                          |
 | `--worktree` / `--no-worktree`                         | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only.                                                                                                                                                                          |
 | `--private-home` / `--no-private-home`                 | Enables/disables the default private home. Disabling it is broad host-home access.                                                                                                                                                                                                                                                                                      |
 | `--toolchains` / `--no-toolchains`                     | On by default (Linux only; issue #148). Persists dependency caches (cargo/npm/go/maven/...) in a jail-owned store and maps Rust's toolchain binaries read-only; when the network posture is otherwise unset, also default-allows filtered egress to package registries. `--no-toolchains` disables both; disabled under `--lockdown`; no effect on macOS.               |
@@ -577,8 +578,9 @@ masks) append.
 Common fields: `command`, `rw_maps`, `ro_maps`, `overlay_maps`, `mask`,
 `deny_paths`, `mask_exceptions`, `deny_path_exceptions`, `hide_dotdirs`,
 `network`, `x11`, `host_shm`, `terminal_passthrough`, `macos_host_ipc`,
-`systemd_user`, `kvm`, `ssh`, `pictures`, `private_home`, `lockdown`,
-`browser_profile`, `claude_dir`, `allow_tcp_ports`, `status_bar_style`.
+`macos_chromium`, `systemd_user`, `kvm`, `ssh`, `pictures`, `private_home`,
+`lockdown`, `browser_profile`, `claude_dir`, `allow_tcp_ports`,
+`status_bar_style`.
 
 Global config only: `env_pass` (see Environment policy above) and
 `trust_project_config`, which lists directories whose project

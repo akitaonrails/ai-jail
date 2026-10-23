@@ -220,6 +220,11 @@ pub struct Config {
     /// intentionally opt-in because those rules weaken process isolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub macos_host_ipc: Option<bool>,
+    /// Let Chromium register and look up its own Mach rendezvous service
+    /// on macOS. Opt-in, but far narrower than `macos_host_ipc`: only the
+    /// `*.MachPortRendezvousServer.<pid>` names are reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_chromium: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x11: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -416,6 +421,9 @@ impl Config {
     }
     pub fn macos_host_ipc_enabled(&self) -> bool {
         self.macos_host_ipc == Some(true)
+    }
+    pub fn macos_chromium_enabled(&self) -> bool {
+        self.macos_chromium == Some(true)
     }
     pub fn mise_enabled(&self) -> bool {
         self.no_mise != Some(true)
@@ -1095,6 +1103,7 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(kvm);
     take!(network);
     take!(macos_host_ipc);
+    take!(macos_chromium);
     take!(x11);
     take!(host_shm);
     take!(terminal_passthrough);
@@ -1449,6 +1458,8 @@ pub fn merge_with_global_report(
     monotonic!(network, |config: &Config| config.network_enabled());
     monotonic!(macos_host_ipc, |config: &Config| config
         .macos_host_ipc_enabled());
+    monotonic!(macos_chromium, |config: &Config| config
+        .macos_chromium_enabled());
     monotonic!(x11, |config: &Config| config.x11_enabled());
     monotonic!(host_shm, |config: &Config| config.host_shm_enabled());
     monotonic!(terminal_passthrough, |config: &Config| {
@@ -1986,6 +1997,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     direct!(kvm);
     direct!(network);
     direct!(macos_host_ipc);
+    direct!(macos_chromium);
     direct!(x11);
     direct!(host_shm);
     direct!(terminal_passthrough);
@@ -2159,6 +2171,7 @@ pub fn display_status(config: &Config) {
     print_opt_in_enabled("  KVM", config.kvm);
     print_network_mode(config);
     print_opt_in_enabled("  macOS host IPC", config.macos_host_ipc);
+    print_opt_in_enabled("  macOS Chromium", config.macos_chromium);
     print_opt_in_enabled("  X11", config.x11);
     print_opt_in_enabled("  Host shared memory", config.host_shm);
     print_opt_in_enabled("  Terminal passthrough", config.terminal_passthrough);
@@ -2472,6 +2485,37 @@ mod tests {
         assert_eq!(cfg.lockdown, None);
         assert_eq!(cfg.macos_host_ipc, None);
         assert!(!cfg.macos_host_ipc_enabled());
+        assert_eq!(cfg.macos_chromium, None);
+        assert!(!cfg.macos_chromium_enabled());
+    }
+
+    #[test]
+    fn macos_chromium_is_opt_in_and_project_cannot_enable_it() {
+        let project = Config {
+            macos_chromium: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(!merged.macos_chromium_enabled());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("macos_chromium"))
+        );
+
+        let enabled = Config {
+            macos_chromium: Some(true),
+            ..Config::default()
+        };
+        assert!(
+            serialize_config(&enabled)
+                .unwrap()
+                .contains("macos_chromium = true")
+        );
     }
 
     #[test]
@@ -3686,6 +3730,7 @@ no_gpu = true
             kvm: Some(true),
             network: None,
             macos_host_ipc: None,
+            macos_chromium: None,
             x11: Some(true),
             host_shm: Some(true),
             terminal_passthrough: Some(true),
@@ -4026,6 +4071,7 @@ tailscale = true
             no_display: None,
             network: None,
             macos_host_ipc: None,
+            macos_chromium: None,
             no_worktree: Some(true),
             no_mise: Some(true),
             no_save_config: Some(true),
@@ -4972,6 +5018,22 @@ allow_tcp_ports = []
                 .iter()
                 .any(|w| w.contains("allow_hosts") && w.contains("evil.com"))
         );
+    }
+
+    #[test]
+    fn regression_v2_11_2_config_without_macos_chromium() {
+        // Configs written before macos_chromium existed must still parse,
+        // with the Chromium rendezvous rules left off.
+        let toml = r#"
+command = ["claude"]
+network = true
+macos_host_ipc = false
+rw_maps = []
+ro_maps = []
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.macos_chromium_enabled());
+        assert!(!toml::to_string(&config).unwrap().contains("macos_chromium"));
     }
 
     #[test]
@@ -6742,6 +6804,7 @@ hide_dotdirs = [".my_secrets"]
             kvm: None,
             network: None,
             macos_host_ipc: None,
+            macos_chromium: None,
             x11: None,
             host_shm: None,
             terminal_passthrough: None,

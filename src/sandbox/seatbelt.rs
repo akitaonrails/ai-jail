@@ -458,6 +458,7 @@ fn generate_sbpl_profile_for_tty(
     );
     push_claude_keychain_section(&mut profile, config);
     push_codex_mach_section(&mut profile, config);
+    push_chromium_rendezvous_section(&mut profile, config);
     push_network_section(&mut profile, config, proxy_port);
     push_codex_control_socket_section(&mut profile, config);
     let is_claude =
@@ -820,6 +821,25 @@ fn push_codex_control_socket_section(profile: &mut String, config: &Config) {
         "(allow network-bind (local unix-socket \
          (path-regex #\"^/private/tmp/codex-daemon-{uid}/[0-9a-f]+$\")))\n\n"
     ));
+}
+
+/// `--macos-chromium`: the Chromium browser process registers a bootstrap
+/// service named `<bundle id>.MachPortRendezvousServer.<pid>` and its child
+/// processes look it up to receive their ports. Without both rules the
+/// browser dies with SIGTRAP (registration denied) or hangs (children cannot
+/// find the server). `--macos-host-ipc` does not help: it grants every
+/// lookup but no `mach-register`. Only the rendezvous names are opened;
+/// every other host service stays denied.
+fn push_chromium_rendezvous_section(profile: &mut String, config: &Config) {
+    if config.lockdown_enabled() || !config.macos_chromium_enabled() {
+        return;
+    }
+
+    let name = "(global-name-regex #\"^[A-Za-z0-9._-]+\\.\
+                MachPortRendezvousServer\\.[0-9]+$\")";
+    profile.push_str("; Chromium Mach rendezvous (--macos-chromium)\n");
+    profile.push_str(&format!("(allow mach-register {name})\n"));
+    profile.push_str(&format!("(allow mach-lookup {name})\n\n"));
 }
 
 /// Codex's managed app-server initializes macOS account and notification
@@ -2034,6 +2054,62 @@ mod tests {
         assert!(profile.contains("(allow ipc-posix-shm-write-create)"));
         assert!(profile.contains("(allow ipc-posix-sem)"));
         assert!(!profile.contains("mach-register"));
+    }
+
+    fn chromium_profile(lockdown: bool) -> String {
+        let config = Config {
+            macos_chromium: Some(true),
+            lockdown: Some(lockdown),
+            ..Config::default()
+        };
+        generate_sbpl_profile(&config, Path::new("/tmp/test-project"))
+    }
+
+    #[test]
+    fn chromium_rendezvous_is_opt_in() {
+        let profile = generate_sbpl_profile(
+            &Config::default(),
+            Path::new("/tmp/test-project"),
+        );
+        assert!(!profile.contains("MachPortRendezvousServer"));
+    }
+
+    #[test]
+    fn chromium_rendezvous_grants_only_its_own_service_names() {
+        let profile = chromium_profile(false);
+        let name = "(global-name-regex #\"^[A-Za-z0-9._-]+\\.\
+                    MachPortRendezvousServer\\.[0-9]+$\")";
+        assert!(profile.contains(&format!("(allow mach-register {name})")));
+        assert!(profile.contains(&format!("(allow mach-lookup {name})")));
+        // Not a back door to the broad host-IPC rules.
+        assert!(!profile.contains("(allow mach-lookup)\n"));
+        assert!(!profile.contains("(allow mach-register)\n"));
+    }
+
+    #[test]
+    fn chromium_rendezvous_is_dropped_under_lockdown() {
+        assert!(!chromium_profile(true).contains("MachPortRendezvousServer"));
+    }
+
+    #[test]
+    fn chromium_rendezvous_profile_compiles() {
+        // A malformed regex makes sandbox-exec reject the whole profile,
+        // which would take every --macos-chromium launch down with it.
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(chromium_profile(false))
+            .arg("--")
+            .arg("/usr/bin/true")
+            .output()
+            .expect("sandbox-exec should run");
+        assert!(
+            output.status.success(),
+            "profile rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
