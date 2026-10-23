@@ -68,6 +68,10 @@ OPTIONS:
     --network / --no-network       Enable/disable unrestricted network access (default: off)
     --macos-host-ipc / --no-macos-host-ipc
                                     Enable/disable broad macOS host IPC compatibility (default: off)
+    --macos-chromium / --no-macos-chromium
+                                    Enable/disable Chromium's own Mach rendezvous
+                                    service on macOS, needed by headless Chromium
+                                    and Playwright (default: off)
     --x11 / --no-x11               Enable/disable X11 socket passthrough (default: off)
     --host-shm / --no-host-shm     Enable/disable host shared-memory passthrough (default: off)
     --terminal-passthrough / --no-terminal-passthrough
@@ -172,6 +176,7 @@ pub struct CliArgs {
     pub kvm: Option<bool>,
     pub network: Option<bool>,
     pub macos_host_ipc: Option<bool>,
+    pub macos_chromium: Option<bool>,
     pub x11: Option<bool>,
     pub host_shm: Option<bool>,
     pub terminal_passthrough: Option<bool>,
@@ -435,6 +440,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long(s @ ("macos-host-ipc" | "no-macos-host-ipc")) => {
                 args.macos_host_ipc = Some(s == "macos-host-ipc");
             }
+            Long(s @ ("macos-chromium" | "no-macos-chromium")) => {
+                args.macos_chromium = Some(s == "macos-chromium");
+            }
             Long(s @ ("x11" | "no-x11")) => {
                 args.x11 = Some(s == "x11");
             }
@@ -695,6 +703,8 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-network",
     "--macos-host-ipc",
     "--no-macos-host-ipc",
+    "--macos-chromium",
+    "--no-macos-chromium",
     "--no-gpu",
     "--gpu",
     "--no-docker",
@@ -823,6 +833,7 @@ mod tests {
             "kvm",
             "network",
             "macos-host-ipc",
+            "macos-chromium",
             "gpu",
             "docker",
             "tailscale",
@@ -1119,6 +1130,14 @@ mod tests {
             parse_test(&["--macos-host-ipc", "--no-macos-host-ipc", "bash"])
                 .unwrap();
         assert_eq!(args.macos_host_ipc, Some(false));
+    }
+
+    #[test]
+    fn parse_macos_chromium_last_wins() {
+        let args =
+            parse_test(&["--no-macos-chromium", "--macos-chromium", "bash"])
+                .unwrap();
+        assert_eq!(args.macos_chromium, Some(true));
     }
 
     #[test]
