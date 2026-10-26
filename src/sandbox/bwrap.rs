@@ -1266,8 +1266,10 @@ fn resolve_landlock_wrapper(
         // restriction control off: spawning the in-sandbox proxy bridge
         // before the agent execs.
         && config.network_mode() != crate::config::NetworkMode::Filtered
-        // Port forwards need it for the same reason: their bridges.
+        // Port forwards and publishes need it for the same reason: their
+        // bridges.
         && config.forward_ports().is_empty()
+        && config.publish_ports().is_empty()
     {
         return Ok(None);
     }
@@ -1406,6 +1408,12 @@ fn landlock_wrapper_args(
         args.push("--forward-port".into());
         args.push(port.to_string());
     }
+    // Published ports likewise: one reverse bridge per port, and lockdown's
+    // ruleset lets the jailed service bind each one.
+    for port in config.publish_ports() {
+        args.push("--publish-port".into());
+        args.push(port.to_string());
+    }
 
     if config.browser_profile().is_none() {
         args.extend_from_slice(map_args);
@@ -1437,7 +1445,7 @@ pub fn build(
     project_dir: &Path,
     verbose: bool,
     proxy_socket: Option<&Path>,
-    forward_sockets: &[(u16, PathBuf)],
+    bridge_sockets: &super::BridgeSockets,
 ) -> Result<Command, String> {
     let sources = MountSources::from_guard(guard);
     let mount_set =
@@ -1473,7 +1481,7 @@ pub fn build(
     }
 
     opt_args.extend(proxy_socket_mount_args(config, proxy_socket)?);
-    opt_args.extend(forward_socket_mount_args(config, forward_sockets)?);
+    opt_args.extend(bridge_socket_mount_args(config, bridge_sockets)?);
 
     opt_args.extend(mount_set.isolation_args(
         project_dir,
@@ -1611,29 +1619,44 @@ fn proxy_socket_mount_args(
     }
 }
 
-/// Port forwards: bind each host-side forward socket into the sandbox
-/// at its fixed per-port path. Same placement and reasoning as the proxy
-/// socket above. Fails closed when a configured port has no socket --
-/// the bridge would otherwise listen on a port that leads nowhere.
-fn forward_socket_mount_args(
+/// Port forwards and publishes: bind each host-side bridge socket into
+/// the sandbox at its fixed per-port path. Same placement and reasoning
+/// as the proxy socket above. Fails closed when a configured port has no
+/// socket -- its bridge would otherwise lead nowhere.
+fn bridge_socket_mount_args(
     config: &Config,
-    forward_sockets: &[(u16, PathBuf)],
+    sockets: &super::BridgeSockets,
 ) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
-    for &port in config.forward_ports() {
-        let Some((_, sock)) = forward_sockets.iter().find(|(p, _)| *p == port)
-        else {
-            return Err(format!(
-                "--forward-port {port} requires its host-side Unix socket"
-            ));
-        };
-        args.extend(
-            Mount::Bind {
-                src: sock.clone(),
-                dest: crate::proxy::forward_in_sandbox_path(port),
-            }
-            .to_args(),
-        );
+    for (ports, sockets, flag, in_sandbox_path) in [
+        (
+            config.forward_ports(),
+            &sockets.forward,
+            "--forward-port",
+            crate::proxy::forward_in_sandbox_path as fn(u16) -> PathBuf,
+        ),
+        (
+            config.publish_ports(),
+            &sockets.publish,
+            "--publish-port",
+            crate::proxy::publish_in_sandbox_path,
+        ),
+    ] {
+        for &port in ports {
+            let Some((_, sock)) = sockets.iter().find(|(p, _)| *p == port)
+            else {
+                return Err(format!(
+                    "{flag} {port} requires its host-side Unix socket"
+                ));
+            };
+            args.extend(
+                Mount::Bind {
+                    src: sock.clone(),
+                    dest: in_sandbox_path(port),
+                }
+                .to_args(),
+            );
+        }
     }
     Ok(args)
 }
@@ -1644,7 +1667,7 @@ pub fn dry_run(
     project_dir: &Path,
     verbose: bool,
     proxy_socket: Option<&Path>,
-    forward_sockets: &[(u16, PathBuf)],
+    bridge_sockets: &super::BridgeSockets,
 ) -> Result<String, String> {
     let sources = MountSources {
         create_dirs: false,
@@ -1656,7 +1679,7 @@ pub fn dry_run(
         &sources,
         verbose,
         proxy_socket,
-        forward_sockets,
+        bridge_sockets,
     )?;
     Ok(format_dry_run_args(&args))
 }
@@ -1688,7 +1711,7 @@ fn build_dry_run_args_full(
         sources,
         verbose,
         proxy_socket,
-        &[],
+        &super::BridgeSockets::default(),
     )
 }
 
@@ -1698,7 +1721,7 @@ fn build_dry_run_args_forwarded(
     sources: &MountSources<'_>,
     verbose: bool,
     proxy_socket: Option<&Path>,
-    forward_sockets: &[(u16, PathBuf)],
+    bridge_sockets: &super::BridgeSockets,
 ) -> Result<Vec<String>, String> {
     let mount_set =
         discover_mounts_full(config, project_dir, sources, verbose)?;
@@ -1721,7 +1744,7 @@ fn build_dry_run_args_forwarded(
     }
 
     args.extend(proxy_socket_mount_args(config, proxy_socket)?);
-    args.extend(forward_socket_mount_args(config, forward_sockets)?);
+    args.extend(bridge_socket_mount_args(config, bridge_sockets)?);
 
     args.extend(mount_set.isolation_args(
         project_dir,
@@ -4719,7 +4742,10 @@ mod tests {
             &sources,
             false,
             None,
-            &[(49374, sock.clone())],
+            &crate::sandbox::BridgeSockets {
+                forward: vec![(49374, sock.clone())],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -4770,7 +4796,13 @@ mod tests {
             &sources,
             false,
             Some(Path::new("/tmp/ai-jail-proxy-test.sock")),
-            &[(49374, PathBuf::from("/tmp/ai-jail-forward-test.49374.sock"))],
+            &crate::sandbox::BridgeSockets {
+                forward: vec![(
+                    49374,
+                    PathBuf::from("/tmp/ai-jail-forward-test.49374.sock"),
+                )],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -4805,9 +4837,84 @@ mod tests {
             &sources,
             false,
             None,
-            &[(49374, PathBuf::from("/tmp/only-one.sock"))],
+            &crate::sandbox::BridgeSockets {
+                forward: vec![(49374, PathBuf::from("/tmp/only-one.sock"))],
+                ..Default::default()
+            },
         );
         assert!(result.unwrap_err().contains("--forward-port 8080"));
+    }
+
+    #[test]
+    fn publish_port_dry_run_mounts_socket_and_forces_wrapper() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            publish_ports: vec![4096],
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let sock = PathBuf::from("/tmp/ai-jail-publish-test.4096.sock");
+        let args = build_dry_run_args_forwarded(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            None,
+            &crate::sandbox::BridgeSockets {
+                publish: vec![(4096, sock.clone())],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // The private netns stays: only the named port crosses it.
+        assert!(args.iter().any(|arg| arg == "--unshare-net"));
+        let tmpfs_tmp = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/tmp")
+            .expect("expected /tmp tmpfs mount");
+        let dest = crate::proxy::publish_in_sandbox_path(4096)
+            .display()
+            .to_string();
+        let socket_mount = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--bind"
+                    && w[1] == sock.display().to_string()
+                    && w[2] == dest
+            })
+            .expect("expected publish socket bind mount");
+        assert!(socket_mount > tmpfs_tmp);
+        // The wrapper is forced (it spawns the bridge) and sees the port.
+        assert!(args.iter().any(|arg| arg == "--landlock-exec"));
+        let pos = args
+            .iter()
+            .position(|arg| arg == "--publish-port")
+            .expect("expected --publish-port in wrapper args");
+        assert_eq!(args[pos + 1], "4096");
+        assert!(!args.iter().any(|arg| arg == "--forward-port"));
+        assert!(!args.iter().any(|arg| arg == "--proxy-bridge-port"));
+    }
+
+    #[test]
+    fn publish_port_without_its_socket_fails_closed() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            publish_ports: vec![4096],
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let result = build_dry_run_args_forwarded(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            None,
+            &crate::sandbox::BridgeSockets::default(),
+        );
+        assert!(result.unwrap_err().contains("--publish-port 4096"));
     }
 
     #[test]
@@ -5027,8 +5134,15 @@ mod tests {
         };
         let guard =
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
-        let output =
-            dry_run(&guard, &config, &fake_home, false, None, &[]).unwrap();
+        let output = dry_run(
+            &guard,
+            &config,
+            &fake_home,
+            false,
+            None,
+            &crate::sandbox::BridgeSockets::default(),
+        )
+        .unwrap();
 
         let state = fake_home.join(".local/share/ai-jail/browsers/chromium");
         assert!(
@@ -6443,8 +6557,15 @@ mod tests {
         let guard =
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
 
-        let output =
-            dry_run(&guard, &config, &project, false, None, &[]).unwrap();
+        let output = dry_run(
+            &guard,
+            &config,
+            &project,
+            false,
+            None,
+            &crate::sandbox::BridgeSockets::default(),
+        )
+        .unwrap();
 
         assert!(
             output.contains("--overlay-src"),
@@ -6782,7 +6903,15 @@ mod tests {
             SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
         let project = PathBuf::from("/home/user/project");
 
-        let cmd = build(&guard, &config, &project, false, None, &[]).unwrap();
+        let cmd = build(
+            &guard,
+            &config,
+            &project,
+            false,
+            None,
+            &crate::sandbox::BridgeSockets::default(),
+        )
+        .unwrap();
         let argv: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())

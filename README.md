@@ -295,6 +295,40 @@ open a forward: a project `.ai-jail` cannot, unless the global config lists
 it under `trust_project_config`. Forwards are never written into a project
 file by auto-save or `--init`.
 
+### Sandbox web UIs from the host: `--publish-port PORT`
+
+The reverse of `--forward-port`, on Linux. A web UI or dev server started
+inside the jail listens on the sandbox's own loopback, which the host cannot
+reach, and `--network` would turn off the network fence entirely just to
+open it in a host browser. `--publish-port 4096`
+(repeatable, or `publish_ports = [...]` in the global config) has the
+supervisor listen on the host's `127.0.0.1:4096` and relay each connection to
+the sandbox's `127.0.0.1:4096` (falling back to `[::1]:4096`). The relay
+crosses through a per-launch Unix socket mounted in the sandbox. An
+in-sandbox bridge connects to it before the agent starts, and the supervisor
+hands it each accepted host connection. The bridge is non-dumpable, so the
+agent cannot take those connections from it. The sandbox gains no outbound
+path, and filtered egress, `--allow-private-host` and `--audit-log` keep
+applying to everything else. Under `--lockdown`, the jailed service may bind
+the published port and no other; the port joins the connect allow set like a
+forward.
+
+**A published port exposes the jailed service to every process on the host's
+loopback**, with no authentication added: anything that can reach your
+`127.0.0.1` can use the service the way the host browser does. It never
+listens on `0.0.0.0`. At most 256 relays run at once. The launch fails before
+the sandbox starts if the host port is already taken. It also fails if the
+bridge cannot come up. The host-side socket is removed on exit.
+
+The rules match `--forward-port`. It cannot combine with `--network`, where
+the sandbox already shares the host's loopback. Ports below 1024 are refused.
+A port cannot be both forwarded and published. Only the CLI and global config
+(including `[commands.<name>]` tables) can publish a port: a project
+`.ai-jail` cannot, unless the global config lists it under
+`trust_project_config`. Published ports are never written into a project file
+by auto-save or `--init`. It is refused on macOS, where Seatbelt shares the
+host's network stack.
+
 `--allow-tcp-port` remains accepted for backward compatibility, but launch
 fails closed because UDP cannot be securely constrained through this option —
 use `--allow-host` for filtered egress instead.
@@ -617,6 +651,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --agent-state / --no-agent-state  mount the command's credential state (default on)
 --env NAME[=VALUE]              forward or set an environment variable (repeatable)
 --forward-port PORT             relay host 127.0.0.1:PORT into the sandbox (Linux and macOS, repeatable)
+--publish-port PORT             expose the sandbox's 127.0.0.1:PORT on the host's 127.0.0.1:PORT (Linux, repeatable)
 --allow-private-host HOST       allow one named host to resolve to private/ULA/CGNAT addresses (repeatable)
 --inherit-env / --no-inherit-env  pass the full parent environment (default: allowlist)
 --update-check / --no-update-check  host-side version check (default off)
