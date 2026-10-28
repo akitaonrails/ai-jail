@@ -845,7 +845,11 @@ fn run() -> Result<i32, String> {
     let command_from_untrusted_project = cli.command.is_empty()
         && !project_config.command.is_empty()
         && !project_trusted;
-    if cli.command.is_empty() && !project_config.command.is_empty() {
+    // The trusted project merge may have replaced the baseline command.
+    // Command precedence remains CLI > project > global in both trust modes.
+    if !cli.command.is_empty() {
+        config.command = cli.command.clone();
+    } else if !project_config.command.is_empty() {
         config.command = project_config.command.clone();
     }
     // GHSA-v2fr-83mr-f9cg question A: an untrusted project .ai-jail may
