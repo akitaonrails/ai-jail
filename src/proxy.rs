@@ -24,6 +24,8 @@ use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream, ToSocketAddrs,
 };
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -989,16 +991,16 @@ pub(crate) fn forward_in_sandbox_path(port: u16) -> PathBuf {
     PathBuf::from(format!("/tmp/.ai-jail-forward.{port}.sock"))
 }
 
-/// Simultaneous relays one `--forward-port` serves; the same bound the
-/// egress proxy applies to its tunnels.
+/// Simultaneous relays one `--forward-port` or `--publish-port` serves;
+/// the same bound the egress proxy applies to its tunnels.
 #[cfg(target_os = "linux")]
 pub(crate) const MAX_FORWARD_CONNECTIONS: usize = 256;
 
-/// Dial the host's loopback on `port`: IPv4 first, then IPv6. A service
-/// that binds `localhost` may listen on `::1` only (Node >= 17 dev
-/// servers do); the sandbox side always listens on 127.0.0.1.
+/// Dial loopback on `port`: IPv4 first, then IPv6. A service that binds
+/// `localhost` may listen on `::1` only (Node >= 17 dev servers do); the
+/// other end of a forward or publish always listens on 127.0.0.1.
 #[cfg(target_os = "linux")]
-fn connect_host_loopback(port: u16) -> io::Result<TcpStream> {
+fn connect_loopback(port: u16) -> io::Result<TcpStream> {
     TcpStream::connect((Ipv4Addr::LOCALHOST, port))
         .or_else(|_| TcpStream::connect((Ipv6Addr::LOCALHOST, port)))
 }
@@ -1057,7 +1059,7 @@ impl PortForward {
                 }
                 let active = Arc::clone(&active);
                 thread::spawn(move || {
-                    match connect_host_loopback(port) {
+                    match connect_loopback(port) {
                         Ok(upstream) => relay(client, upstream),
                         Err(e) if verbose => crate::output::verbose(&format!(
                             "forward {port}: host service unreachable: {e}"
@@ -1090,6 +1092,330 @@ impl Drop for PortForward {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.unix_path);
     }
+}
+
+/// Fixed path inside the sandbox where the host-side Unix socket of a
+/// `--publish-port` is bind-mounted (Linux). One per port, next to the
+/// forward sockets on the fresh /tmp tmpfs.
+#[cfg(target_os = "linux")]
+pub(crate) fn publish_in_sandbox_path(port: u16) -> PathBuf {
+    PathBuf::from(format!("/tmp/.ai-jail-publish.{port}.sock"))
+}
+
+/// Host-side end of a `--publish-port` (Linux), the mirror of
+/// [`PortForward`]: a TCP listener on the host's 127.0.0.1:<port> and a
+/// Unix listener the sandbox sees at [`publish_in_sandbox_path`]. The
+/// in-sandbox publish bridge connects to the Unix socket once, before
+/// the agent runs; every host connection is then handed to it as a file
+/// descriptor (SCM_RIGHTS) and relayed to the sandbox's own
+/// 127.0.0.1:<port>. The sandbox gains no outbound path: what it
+/// receives are streams a host client already opened to it.
+#[cfg(target_os = "linux")]
+pub(crate) struct PortPublish {
+    port: u16,
+    unix_path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl PortPublish {
+    /// Bind 127.0.0.1:<port> on the host (never 0.0.0.0; fails when the
+    /// port is taken) and the Unix listener (mode 0600) at a per-launch
+    /// nonce path, then hand connections over on a dedicated thread.
+    pub(crate) fn start(port: u16, verbose: bool) -> io::Result<PortPublish> {
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = std::env::temp_dir().join(format!(
+            "ai-jail-publish.{}.{}.{port}.sock",
+            std::process::id(),
+            nonce
+        ));
+        let _ = std::fs::remove_file(&path);
+        let unix = UnixListener::bind(&path)?;
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(0o600),
+        )?;
+        thread::spawn(move || hand_off_published(tcp, unix, port, verbose));
+        Ok(PortPublish {
+            port,
+            unix_path: path,
+        })
+    }
+
+    /// Host loopback port this publish listens on.
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Host-side Unix socket path.
+    pub(crate) fn unix_path(&self) -> &Path {
+        &self.unix_path
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PortPublish {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.unix_path);
+    }
+}
+
+/// Supervisor loop of a `--publish-port`. The first Unix connection from
+/// our own uid is the bridge's: the landlock wrapper makes it before it
+/// execs the agent. The listener is closed right after, so nothing else
+/// in the sandbox can claim the stream later. Host connections that
+/// arrive before the bridge wait in the TCP backlog. When the bridge is
+/// gone the TCP listener closes and later host connections are refused.
+#[cfg(target_os = "linux")]
+fn hand_off_published(
+    tcp: TcpListener,
+    unix: UnixListener,
+    port: u16,
+    verbose: bool,
+) {
+    // The socket briefly had umask permissions before its chmod: a peer
+    // of another uid that slipped in is dropped, never made the bridge.
+    let bridge = loop {
+        let peer = accept_next("publish bridge listener", &mut || {
+            unix.accept().map(|(stream, _)| stream)
+        });
+        if peer_uid(&peer).is_ok_and(|uid| uid == nix::unistd::getuid()) {
+            break peer;
+        }
+    };
+    drop(unix);
+    loop {
+        let client = accept_next("publish listener", &mut || {
+            tcp.accept().map(|(stream, _)| stream)
+        });
+        // The supervisor's copy closes when `client` drops; the bridge
+        // holds its own. Only a dead bridge ends the publish; any other
+        // failure costs just this connection.
+        match send_fd(&bridge, &client) {
+            Ok(()) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::NotConnected
+                ) =>
+            {
+                if verbose {
+                    crate::output::verbose(&format!(
+                        "publish {port}: the in-sandbox bridge is gone: {e}"
+                    ));
+                }
+                return;
+            }
+            Err(e) if verbose => crate::output::verbose(&format!(
+                "publish {port}: connection dropped: {e}"
+            )),
+            Err(_) => {}
+        }
+    }
+}
+
+/// Uid of the process at the other end of `stream` (SO_PEERCRED).
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> io::Result<nix::unistd::Uid> {
+    use nix::libc;
+    // SAFETY: getsockopt writes at most `len` bytes into `cred`, a
+    // properly sized and aligned ucred.
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        if libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &mut len,
+        ) < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(nix::unistd::Uid::from_raw(cred.uid))
+    }
+}
+
+/// The in-sandbox end of a `--publish-port` (Linux): connect once to the
+/// supervisor's Unix socket mounted at `socket`, then relay every host
+/// connection it hands over to 127.0.0.1:<port> in here. Spawned and
+/// left unrestricted by the landlock wrapper, like [`run_bridge`]; it
+/// only ever dials the sandbox's own loopback.
+///
+/// Unlike the other bridges it holds sockets of the host's network
+/// namespace, which a TCP socket can be disconnected and reconnected
+/// from. So it makes itself non-dumpable first: the agent, its parent,
+/// has no CAP_SYS_PTRACE in the sandbox's user namespace, and cannot
+/// then ptrace it or open its /proc/<pid>/mem, even without Landlock.
+#[cfg(target_os = "linux")]
+pub(crate) fn run_publish_bridge(
+    port: u16,
+    socket: &Path,
+) -> Result<(), String> {
+    // SAFETY: PR_SET_DUMPABLE takes plain integer arguments.
+    if unsafe { nix::libc::prctl(nix::libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0
+    {
+        return Err(format!(
+            "publish bridge cannot make itself non-dumpable: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let wait_ready = std::env::var_os(BRIDGE_READY_ENV).is_some();
+    if wait_ready {
+        test_bridge_delay();
+    }
+    let control = UnixStream::connect(socket).map_err(|e| {
+        format!("publish bridge cannot reach {}: {e}", socket.display())
+    })?;
+    if wait_ready {
+        let mut out = io::stdout();
+        out.write_all(b"ready\n")
+            .and_then(|()| out.flush())
+            .map_err(|e| format!("bridge cannot report readiness: {e}"))?;
+    }
+    serve_published(&control, port);
+    Ok(())
+}
+
+/// Relay each descriptor received on `control` to 127.0.0.1:<port>,
+/// until the supervisor hangs up. Bounded like the forward path: at most
+/// [`MAX_FORWARD_CONNECTIONS`] relays at once, excess connections are
+/// closed.
+#[cfg(target_os = "linux")]
+fn serve_published(control: &UnixStream, port: u16) {
+    let active = Arc::new(AtomicUsize::new(0));
+    loop {
+        let client = match recv_fd(control) {
+            Ok(Some(fd)) => TcpStream::from(fd),
+            Ok(None) => return,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::InvalidData
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => return,
+        };
+        if active.fetch_add(1, Ordering::SeqCst) >= MAX_FORWARD_CONNECTIONS {
+            active.fetch_sub(1, Ordering::SeqCst);
+            drop(client);
+            continue;
+        }
+        let active = Arc::clone(&active);
+        thread::spawn(move || {
+            if let Ok(upstream) = connect_loopback(port) {
+                relay(client, upstream);
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+}
+
+/// Send one byte carrying `fd` as SCM_RIGHTS ancillary data. std has no
+/// stable API for it, and nix's would pull in its `socket` feature.
+#[cfg(target_os = "linux")]
+fn send_fd(stream: &UnixStream, fd: &impl AsRawFd) -> io::Result<()> {
+    use nix::libc;
+    let byte = [0_u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_ptr() as *mut libc::c_void,
+        iov_len: byte.len(),
+    };
+    // u64 storage keeps the cmsghdr aligned; 32 bytes hold one fd.
+    let mut control = [0_u64; 4];
+    let fd_len = std::mem::size_of::<RawFd>() as libc::c_uint;
+    loop {
+        // SAFETY: `msg` points at `iov` and `control`, both alive for
+        // the call; CMSG_SPACE(fd_len) fits in `control`, so the first
+        // header and its data are in bounds. sendmsg only reads them.
+        let sent = unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = libc::CMSG_SPACE(fd_len) as _;
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(fd_len) as _;
+            std::ptr::write_unaligned(
+                libc::CMSG_DATA(cmsg).cast::<RawFd>(),
+                fd.as_raw_fd(),
+            );
+            libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL)
+        };
+        if sent >= 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Receive one byte and the descriptor [`send_fd`] attached to it.
+/// `Ok(None)` at end of stream; `InvalidData` for a byte that carried no
+/// descriptor. Extra descriptors in one message are closed.
+#[cfg(target_os = "linux")]
+fn recv_fd(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
+    use nix::libc;
+    let mut byte = [0_u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: byte.len(),
+    };
+    let mut control = [0_u64; 4];
+    let mut received = None;
+    // SAFETY: `msg` points at `iov` and `control`, both alive for the
+    // call. The kernel fills at most `msg_controllen` bytes and the CMSG_*
+    // walk stays within what it reports; each SCM_RIGHTS entry is a fresh
+    // descriptor this process now owns, so wrapping it in OwnedFd is sound.
+    unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = std::mem::size_of_val(&control) as _;
+        let read =
+            libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC);
+        if read < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if read == 0 {
+            return Ok(None);
+        }
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET
+                && (*cmsg).cmsg_type == libc::SCM_RIGHTS
+            {
+                let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+                let count = ((*cmsg).cmsg_len as usize
+                    - libc::CMSG_LEN(0) as usize)
+                    / std::mem::size_of::<RawFd>();
+                for i in 0..count {
+                    let fd = OwnedFd::from_raw_fd(std::ptr::read_unaligned(
+                        data.add(i),
+                    ));
+                    if received.is_none() {
+                        received = Some(fd);
+                    }
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    received.map(Some).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "no descriptor attached")
+    })
 }
 
 #[cfg(test)]
@@ -1940,5 +2266,82 @@ mod tests {
 
         drop(bridge);
         drop(proxy);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn free_loopback_port() -> u16 {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publish_hands_host_connections_to_the_bridge() {
+        // The jailed service: greets and hangs up.
+        let service = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let service_port = service.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for mut conn in service.incoming().map_while(Result::ok) {
+                let _ = conn.write_all(b"hello");
+            }
+        });
+        let host_port = free_loopback_port();
+        let publish = PortPublish::start(host_port, false).unwrap();
+        let control = UnixStream::connect(publish.unix_path()).unwrap();
+        thread::spawn(move || serve_published(&control, service_port));
+
+        for _ in 0..3 {
+            let mut client =
+                TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reply = String::new();
+            client.read_to_string(&mut reply).unwrap();
+            assert_eq!(reply, "hello");
+        }
+        // Only the bridge's own connection was ever accepted.
+        assert!(UnixStream::connect(publish.unix_path()).is_err());
+        let path = publish.unix_path().to_path_buf();
+        drop(publish);
+        assert!(!path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publish_refuses_host_connections_once_the_bridge_is_gone() {
+        let host_port = free_loopback_port();
+        let publish = PortPublish::start(host_port, false).unwrap();
+        drop(UnixStream::connect(publish.unix_path()).unwrap());
+        let refused = (0..100).any(|_| {
+            if TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).is_err() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+            false
+        });
+        assert!(refused, "host port still accepting without a bridge");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publish_refuses_a_taken_host_port() {
+        let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = taken.local_addr().unwrap().port();
+        assert!(PortPublish::start(port, false).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recv_fd_rejects_a_byte_without_descriptor() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        sender.write_all(b"x").unwrap();
+        let error = recv_fd(&receiver).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        drop(sender);
+        assert!(recv_fd(&receiver).unwrap().is_none());
     }
 }

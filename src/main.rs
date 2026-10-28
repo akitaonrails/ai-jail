@@ -258,7 +258,46 @@ fn validate_network_flags(config: &config::Config) -> Result<(), String> {
     if config.browser_profile().is_some() && config.has_filtered_hosts() {
         return Err("--browser and --allow-host/--allow-private-host cannot be combined: browsers need real DNS and many domains".into());
     }
-    validate_forward_ports(config)
+    validate_forward_ports(config)?;
+    validate_publish_ports(config)
+}
+
+/// `--publish-port` contradiction checks, fail-closed at launch. The
+/// forward rules apply, mirrored: a publish only means something while
+/// the sandbox has its own loopback, which also rules out macOS (the
+/// sandbox shares the host's network stack there). A port cannot be
+/// both forwarded and published: both bridges would claim it in here.
+fn validate_publish_ports(config: &config::Config) -> Result<(), String> {
+    if config.publish_ports().is_empty() {
+        return Ok(());
+    }
+    if cfg!(not(target_os = "linux")) {
+        return Err("--publish-port is supported on Linux only".into());
+    }
+    if config.network_enabled() {
+        return Err("--network and --publish-port are mutually exclusive: with unrestricted network the sandbox already listens on the host's loopback".into());
+    }
+    for &port in config.publish_ports() {
+        if port == 0 {
+            return Err("--publish-port 0 is not a port".into());
+        }
+        if port < 1024 {
+            return Err(format!(
+                "--publish-port {port}: ports below 1024 are not supported"
+            ));
+        }
+        if port == proxy::BRIDGE_PORT {
+            return Err(format!(
+                "--publish-port {port} is reserved for the proxy bridge"
+            ));
+        }
+        if config.forward_ports().contains(&port) {
+            return Err(format!(
+                "--forward-port {port} and --publish-port {port} cannot be combined: both need the sandbox's 127.0.0.1:{port}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `--forward-port` contradiction checks, fail-closed at launch. A
@@ -457,16 +496,34 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     #[cfg(target_os = "linux")]
     if let Some(port) = cli.proxy_bridge_port {
         spawn_bridge(
+            "--proxy-bridge",
             port,
             std::path::Path::new(proxy::IN_SANDBOX_SOCK_PATH),
-            false,
+            None,
         )?;
     }
     // Port forwards: the same bridge, one per port, pumping into the
     // host-side forward socket bwrap mounted at the per-port path.
     #[cfg(target_os = "linux")]
     for &port in config.forward_ports() {
-        spawn_bridge(port, &proxy::forward_in_sandbox_path(port), true)?;
+        spawn_bridge(
+            "--proxy-bridge",
+            port,
+            &proxy::forward_in_sandbox_path(port),
+            Some("--forward-port"),
+        )?;
+    }
+    // Published ports: the reverse bridge, one per port, connected to the
+    // supervisor's socket before the agent runs so it is the only peer
+    // the supervisor ever accepts there.
+    #[cfg(target_os = "linux")]
+    for &port in config.publish_ports() {
+        spawn_bridge(
+            "--publish-bridge",
+            port,
+            &proxy::publish_in_sandbox_path(port),
+            Some("--publish-port"),
+        )?;
     }
 
     // Apply Landlock inside the sandbox (after bwrap namespace setup).
@@ -520,23 +577,27 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     Err(format!("Failed to exec {}: {err}", cli.command[0]))
 }
 
-/// Spawn an in-sandbox bridge (127.0.0.1:<port> -> Unix `socket`) as a
-/// child of the landlock wrapper: the filtered-egress proxy bridge, or a
-/// `--forward-port` bridge. Fatal on spawn failure: without the bridge,
-/// the port the launch asked for silently leads nowhere. The child is
-/// never reaped or waited on -- it lives exactly as long as the
-/// sandbox's pid namespace (see the call site).
+/// Spawn an in-sandbox bridge as a child of the landlock wrapper, in the
+/// internal `mode` (`--proxy-bridge`: 127.0.0.1:<port> -> Unix `socket`,
+/// for filtered egress and each `--forward-port`; `--publish-bridge`:
+/// Unix `socket` -> 127.0.0.1:<port>, for each `--publish-port`). Fatal
+/// on spawn failure: without the bridge, the port the launch asked for
+/// silently leads nowhere. The child is never reaped or waited on -- it
+/// lives exactly as long as the sandbox's pid namespace (see the call
+/// site).
 ///
-/// With `wait_ready`, also fatal when the bridge cannot bind, and the
-/// agent is not exec'd until the port is listening: the bridge reports
-/// `ready` on a piped stdout once bound, and exits (EOF) if it cannot.
-/// Without it (the proxy bridge) behaviour is unchanged: the bridge
-/// inherits the agent's stdout, which it must never write to.
+/// With `wait_ready_for` (the launch flag, for the error), also fatal
+/// when the bridge cannot come up, and the agent is not exec'd until it
+/// has: the bridge reports `ready` on a piped stdout once bound (or
+/// connected), and exits (EOF) if it cannot. Without it (the proxy
+/// bridge) behaviour is unchanged: the bridge inherits the agent's
+/// stdout, which it must never write to.
 #[cfg(target_os = "linux")]
 fn spawn_bridge(
+    mode: &str,
     port: u16,
     socket: &std::path::Path,
-    wait_ready: bool,
+    wait_ready_for: Option<&str>,
 ) -> Result<(), String> {
     use std::io::BufRead;
     let exe = std::env::current_exe().map_err(|e| {
@@ -544,14 +605,14 @@ fn spawn_bridge(
     })?;
     let mut command = std::process::Command::new(exe);
     command
-        .arg("--proxy-bridge")
+        .arg(mode)
         .arg(port.to_string())
         .arg(socket)
-        // The internal-mode marker --proxy-bridge refuses to run
-        // without; an agent that can already reach the proxy socket
+        // The internal-mode marker both bridge modes refuse to run
+        // without; an agent that can already reach the bridge socket
         // gains nothing by setting it itself.
         .env("AI_JAIL_PROXY_BRIDGE", "1");
-    if wait_ready {
+    if wait_ready_for.is_some() {
         command
             .env(proxy::BRIDGE_READY_ENV, "1")
             .stdout(std::process::Stdio::piped());
@@ -559,7 +620,7 @@ fn spawn_bridge(
     let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to spawn the bridge on {port}: {e}"))?;
-    if wait_ready {
+    if let Some(flag) = wait_ready_for {
         let mut line = String::new();
         let ready = child
             .stdout
@@ -568,7 +629,7 @@ fn spawn_bridge(
             .is_some_and(|r| r.is_ok());
         if !ready || line.trim() != "ready" {
             return Err(format!(
-                "--forward-port {port}: the in-sandbox bridge did not come up"
+                "{flag} {port}: the in-sandbox bridge did not come up"
             ));
         }
     }
@@ -667,7 +728,7 @@ fn run() -> Result<i32, String> {
 
     let internal_quiet = internal_mode_inherits_quiet(
         cli.landlock_exec,
-        cli.proxy_bridge.is_some(),
+        cli.proxy_bridge.is_some() || cli.publish_bridge.is_some(),
         std::env::var_os("AI_JAIL_QUIET").is_some(),
     );
     if internal_quiet {
@@ -691,6 +752,24 @@ fn run() -> Result<i32, String> {
     }
     if let Some((port, socket)) = &cli.proxy_bridge {
         return proxy::run_bridge(*port, socket).map(|()| 0);
+    }
+    // Internal: the in-sandbox end of a --publish-port, under the same
+    // marker.
+    if cli.publish_bridge.is_some()
+        && std::env::var_os("AI_JAIL_PROXY_BRIDGE").is_none()
+    {
+        return Err(
+            "--publish-bridge is an internal mode, not a launch option".into(),
+        );
+    }
+    if let Some((port, socket)) = &cli.publish_bridge {
+        #[cfg(target_os = "linux")]
+        return proxy::run_publish_bridge(*port, socket).map(|()| 0);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (port, socket);
+            return Err("--publish-bridge is supported on Linux only".into());
+        }
     }
 
     // Offline audit commands bypass configuration and sandbox setup.
@@ -1065,13 +1144,32 @@ fn run() -> Result<i32, String> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    // Published ports (Linux): the host listens on 127.0.0.1:<port> from
+    // here on (a taken port is fatal) and connections wait in the backlog
+    // until the in-sandbox bridge connects to the mounted Unix socket.
     #[cfg(target_os = "linux")]
-    let forward_sockets: Vec<(u16, std::path::PathBuf)> = port_forwards
+    let port_publishes = config
+        .publish_ports()
         .iter()
-        .map(|f| (f.port(), f.unix_path().to_path_buf()))
-        .collect();
+        .map(|&port| {
+            proxy::PortPublish::start(port, cli.verbose).map_err(|e| {
+                format!("Failed to publish port {port} on 127.0.0.1: {e}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(target_os = "linux")]
+    let bridge_sockets = sandbox::BridgeSockets {
+        forward: port_forwards
+            .iter()
+            .map(|f| (f.port(), f.unix_path().to_path_buf()))
+            .collect(),
+        publish: port_publishes
+            .iter()
+            .map(|p| (p.port(), p.unix_path().to_path_buf()))
+            .collect(),
+    };
     #[cfg(not(target_os = "linux"))]
-    let forward_sockets: Vec<(u16, std::path::PathBuf)> = Vec::new();
+    let bridge_sockets = sandbox::BridgeSockets::default();
 
     let project_dir = std::env::current_dir()
         .map_err(|e| format!("Cannot determine current directory: {e}"))?;
@@ -1096,7 +1194,7 @@ fn run() -> Result<i32, String> {
             &project_dir,
             cli.verbose,
             egress_proxy.as_ref(),
-            &forward_sockets,
+            &bridge_sockets,
         )?;
         output::dry_run_line(&formatted);
         return Ok(0);
@@ -1198,7 +1296,7 @@ fn run() -> Result<i32, String> {
         cli.verbose,
         sandbox_tty.as_deref(),
         egress_proxy.as_ref(),
-        &forward_sockets,
+        &bridge_sockets,
     )?;
 
     // Apply NOFILE and CORE limits on the parent (inherited by child
@@ -1513,6 +1611,47 @@ mod tests {
         assert_eq!(
             validate_network_flags(&ok).is_ok(),
             cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+    }
+
+    #[test]
+    fn publish_port_contradictions_hard_error() {
+        let with_network = Config {
+            network: Some(true),
+            publish_ports: vec![4096],
+            ..Config::default()
+        };
+        let error = validate_network_flags(&with_network).unwrap_err();
+        if cfg!(target_os = "linux") {
+            assert!(error.contains("mutually exclusive"), "{error}");
+        } else {
+            assert!(error.contains("Linux only"), "{error}");
+        }
+        for port in [0, 80, 443, 1023, crate::proxy::BRIDGE_PORT] {
+            let config = Config {
+                publish_ports: vec![port],
+                ..Config::default()
+            };
+            assert!(validate_network_flags(&config).is_err(), "port {port}");
+        }
+        let both_ways = Config {
+            forward_ports: vec![4096],
+            publish_ports: vec![4096],
+            ..Config::default()
+        };
+        assert!(validate_network_flags(&both_ways).is_err());
+        let ok = Config {
+            publish_ports: vec![4096],
+            forward_ports: vec![49374],
+            allow_hosts: vec!["api.anthropic.com".into()],
+            allow_private_hosts: vec!["git.internal.example".into()],
+            audit_log: Some(true),
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        assert_eq!(
+            validate_network_flags(&ok).is_ok(),
+            cfg!(target_os = "linux")
         );
     }
 

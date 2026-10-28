@@ -326,6 +326,10 @@ fn apply_net_rules(
                 created = created
                     .add_rule(NetPort::new(port, AccessNet::ConnectTcp))?;
             }
+            for &port in allowed_bind_ports(config) {
+                created =
+                    created.add_rule(NetPort::new(port, AccessNet::BindTcp))?;
+            }
             created.restrict_self()
         });
 
@@ -399,14 +403,24 @@ fn apply_net_rules(
 /// `--allow-tcp-port` entries plus, in filtered-egress mode, the
 /// in-sandbox proxy bridge port (see apply_net_rules), plus every
 /// `--forward-port` -- each has a bridge on in-sandbox loopback, and
-/// like the proxy bridge port it names nothing else inside the netns.
+/// like the proxy bridge port it names nothing else inside the netns --
+/// plus every `--publish-port`, so the agent can reach its own service.
 fn allowed_connect_ports(config: &Config) -> Vec<u16> {
     let mut ports = config.allow_tcp_ports().to_vec();
     if config.network_mode() == crate::config::NetworkMode::Filtered {
         ports.push(crate::proxy::BRIDGE_PORT);
     }
     ports.extend_from_slice(config.forward_ports());
+    ports.extend_from_slice(config.publish_ports());
     ports
+}
+
+/// TCP ports the lockdown net ruleset allows BindTcp to: every
+/// `--publish-port`, where the jailed service must listen for the
+/// publish bridge to reach it. Inside the private netns the port is only
+/// reachable on loopback and through that bridge.
+fn allowed_bind_ports(config: &Config) -> &[u16] {
+    config.publish_ports()
 }
 
 /// Lockdown paths: minimal set for a read-only sandbox.
@@ -1699,6 +1713,23 @@ mod tests {
             allowed_connect_ports(&config),
             vec![crate::proxy::BRIDGE_PORT, 49374]
         );
+    }
+
+    #[test]
+    fn lockdown_lets_the_service_bind_and_reach_published_ports() {
+        let config = Config {
+            lockdown: Some(true),
+            forward_ports: vec![49374],
+            publish_ports: vec![4096],
+            ..Config::default()
+        };
+        assert_eq!(allowed_connect_ports(&config), vec![49374, 4096]);
+        assert_eq!(allowed_bind_ports(&config), &[4096]);
+        let forward_only = Config {
+            publish_ports: vec![],
+            ..config
+        };
+        assert!(allowed_bind_ports(&forward_only).is_empty());
     }
 
     #[test]

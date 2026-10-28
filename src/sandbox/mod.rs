@@ -1715,6 +1715,15 @@ fn prepare_seatbelt_config(config: &Config) -> Result<Config, String> {
     Ok(prepared)
 }
 
+/// Host-side Unix sockets of the port bridges (Linux), by port: one per
+/// `--forward-port` and one per `--publish-port`. Empty elsewhere.
+#[derive(Debug, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct BridgeSockets {
+    pub forward: Vec<(u16, PathBuf)>,
+    pub publish: Vec<(u16, PathBuf)>,
+}
+
 /// Build the sandbox command.
 ///
 /// `sandbox_tty` is the device the child will use as its terminal, when
@@ -1733,7 +1742,7 @@ pub fn build(
     verbose: bool,
     sandbox_tty: Option<&Path>,
     proxy: Option<&crate::proxy::Proxy>,
-    forward_sockets: &[(u16, PathBuf)],
+    bridge_sockets: &BridgeSockets,
 ) -> Result<Command, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1744,12 +1753,12 @@ pub fn build(
             project_dir,
             verbose,
             proxy.and_then(|p| p.unix_path()),
-            forward_sockets,
+            bridge_sockets,
         )
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (guard, forward_sockets);
+        let _ = (guard, bridge_sockets);
         let prepared = prepare_seatbelt_config(config)?;
         seatbelt::build(
             &prepared,
@@ -1767,7 +1776,7 @@ pub fn dry_run(
     project_dir: &Path,
     verbose: bool,
     proxy: Option<&crate::proxy::Proxy>,
-    forward_sockets: &[(u16, PathBuf)],
+    bridge_sockets: &BridgeSockets,
 ) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1777,12 +1786,12 @@ pub fn dry_run(
             project_dir,
             verbose,
             proxy.and_then(|p| p.unix_path()),
-            forward_sockets,
+            bridge_sockets,
         )
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (guard, forward_sockets);
+        let _ = (guard, bridge_sockets);
         let prepared = prepare_seatbelt_config(config)?;
         Ok(seatbelt::dry_run(
             &prepared,

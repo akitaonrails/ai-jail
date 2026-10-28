@@ -136,6 +136,9 @@ OPTIONS:
     --forward-port <PORT>          Expose the host's 127.0.0.1:PORT on the sandbox's own
                                    loopback (repeatable; cannot combine with --network;
                                    the service behind PORT is reachable in full)
+    --publish-port <PORT>          Expose the sandbox's own 127.0.0.1:PORT on the host's
+                                   127.0.0.1:PORT (Linux; repeatable; cannot combine with
+                                   --network; every host process on loopback can reach it)
     --claude-dir <PATH>            Use PATH as Claude config dir (sets CLAUDE_CONFIG_DIR)
     --clean                        Ignore project .ai-jail config, start fresh
     --dry-run                      Print the sandbox command without executing
@@ -194,6 +197,7 @@ pub struct CliArgs {
     pub allow_hosts: Vec<String>,
     pub allow_private_hosts: Vec<String>,
     pub forward_ports: Vec<u16>,
+    pub publish_ports: Vec<u16>,
     pub claude_dir: Option<PathBuf>,
     pub agent_state: Option<bool>,
     pub inherit_env: Option<bool>,
@@ -221,6 +225,10 @@ pub struct CliArgs {
     /// as (loopback port, outer proxy's Unix socket path). Spawned by
     /// the --landlock-exec wrapper before it restricts itself.
     pub proxy_bridge: Option<(u16, PathBuf)>,
+    /// Internal: run the in-sandbox end of a `--publish-port`, as
+    /// (sandbox loopback port, supervisor's Unix socket path). Spawned
+    /// by the --landlock-exec wrapper before it restricts itself.
+    pub publish_bridge: Option<(u16, PathBuf)>,
     /// Internal: loopback port the wrapper's proxy bridge should listen
     /// on; only valid with --landlock-exec.
     pub proxy_bridge_port: Option<u16>,
@@ -395,6 +403,14 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     .parse()
                     .map_err(|_| format!("invalid port number: {port_text}"))?;
                 args.forward_ports.push(port);
+            }
+            Long("publish-port") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let port_text = val.to_string_lossy();
+                let port: u16 = port_text
+                    .parse()
+                    .map_err(|_| format!("invalid port number: {port_text}"))?;
+                args.publish_ports.push(port);
             }
             Long("claude-dir") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -573,6 +589,16 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     parser.value().map_err(|e| e.to_string())?.into();
                 args.proxy_bridge = Some((port, sock));
             }
+            Long("publish-bridge") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let port_text = val.to_string_lossy();
+                let port: u16 = port_text.parse().map_err(|_| {
+                    format!("invalid publish bridge port: {port_text}")
+                })?;
+                let sock: PathBuf =
+                    parser.value().map_err(|e| e.to_string())?.into();
+                args.publish_bridge = Some((port, sock));
+            }
             Long("proxy-bridge-port") => {
                 if !args.landlock_exec {
                     return Err(
@@ -660,7 +686,8 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             || args.bootstrap
             || args.dry_run
             || args.landlock_exec
-            || args.proxy_bridge.is_some())
+            || args.proxy_bridge.is_some()
+            || args.publish_bridge.is_some())
     {
         return Err(
             "--audit-show cannot be combined with another command or action"
@@ -752,6 +779,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--agent-state",
     "--no-agent-state",
     "--forward-port",
+    "--publish-port",
     "--inherit-env",
     "--no-inherit-env",
     "--update-check",
@@ -1800,6 +1828,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_publish_port_repeatable() {
+        let args = parse_test(&[
+            "--publish-port",
+            "4096",
+            "--publish-port",
+            "3000",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.publish_ports, vec![4096, 3000]);
+        assert!(args.forward_ports.is_empty());
+        assert_eq!(args.command, vec!["bash"]);
+    }
+
+    #[test]
+    fn publish_port_after_the_command_is_refused() {
+        assert!(parse_test(&["bash", "--publish-port", "4096"]).is_err());
+        assert!(parse_test(&["bash", "--", "--publish-port", "4096"]).is_ok());
+    }
+
+    #[test]
+    fn parse_publish_port_invalid() {
+        assert!(parse_test(&["--publish-port", "70000", "bash"]).is_err());
+        assert!(parse_test(&["--publish-port", "http", "bash"]).is_err());
+        assert!(parse_test(&["--publish-port"]).is_err());
+    }
+
+    #[test]
     fn parse_forward_port_invalid() {
         assert!(parse_test(&["--forward-port", "70000", "bash"]).is_err());
         assert!(parse_test(&["--forward-port", "http", "bash"]).is_err());
@@ -1928,6 +1984,22 @@ mod tests {
         );
         assert!(parse_test(&["--proxy-bridge", "nope", "/tmp/s"]).is_err());
         assert!(parse_test(&["--proxy-bridge", "15919"]).is_err());
+    }
+
+    #[test]
+    fn parse_publish_bridge_internal_mode() {
+        let args = parse_test(&[
+            "--publish-bridge",
+            "4096",
+            "/tmp/.ai-jail-publish.4096.sock",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.publish_bridge,
+            Some((4096, PathBuf::from("/tmp/.ai-jail-publish.4096.sock")))
+        );
+        assert!(parse_test(&["--publish-bridge", "nope", "/tmp/s"]).is_err());
+        assert!(parse_test(&["--publish-bridge", "4096"]).is_err());
     }
 
     #[test]

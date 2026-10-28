@@ -291,6 +291,12 @@ pub struct Config {
     /// the untrusted project `.ai-jail` may only shrink this list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forward_ports: Vec<u16>,
+    /// Sandbox loopback ports exposed on the host's 127.0.0.1 (Linux),
+    /// the reverse of `forward_ports`: a jailed service becomes reachable
+    /// from every process on the host's loopback. Trusted capability:
+    /// the untrusted project `.ai-jail` may only shrink this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publish_ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_dir: Option<PathBuf>,
     /// Trusted capability: mount the invoked agent's own state
@@ -509,6 +515,9 @@ impl Config {
     }
     pub fn forward_ports(&self) -> &[u16] {
         &self.forward_ports
+    }
+    pub fn publish_ports(&self) -> &[u16] {
+        &self.publish_ports
     }
     /// Effective network posture: `network = true` wins as unrestricted,
     /// a non-empty filtered host list selects filtered egress through the
@@ -1141,6 +1150,9 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     c.forward_ports.extend(local.forward_ports);
     c.forward_ports.sort_unstable();
     c.forward_ports.dedup();
+    c.publish_ports.extend(local.publish_ports);
+    c.publish_ports.sort_unstable();
+    c.publish_ports.dedup();
     take!(claude_dir);
     // Status bar + resize redraw key stay from global — local should
     // not override user-level preferences.
@@ -1565,6 +1577,23 @@ pub fn merge_with_global_report(
         warnings.push(format!(
             "project .ai-jail forward_ports ignored: {}",
             dropped_forwards
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    // Publishing is shrink-only too: a project cannot expose a jailed
+    // service on the host's loopback.
+    let dropped_publishes: Vec<_> = local
+        .publish_ports
+        .into_iter()
+        .filter(|port| !c.publish_ports.contains(port))
+        .collect();
+    if !dropped_publishes.is_empty() {
+        warnings.push(format!(
+            "project .ai-jail publish_ports ignored: {}",
+            dropped_publishes
                 .iter()
                 .map(u16::to_string)
                 .collect::<Vec<_>>()
@@ -2042,6 +2071,12 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     config.forward_ports.sort_unstable();
     config.forward_ports.dedup();
 
+    config
+        .publish_ports
+        .extend(cli.publish_ports.iter().copied());
+    config.publish_ports.sort_unstable();
+    config.publish_ports.dedup();
+
     config.env_pass.extend(cli.env.iter().cloned());
     dedup_strings(&mut config.env_pass);
 
@@ -2114,9 +2149,10 @@ pub fn project_config_for_init(
 /// Fields a project file must not carry even when the CLI set them.
 /// These fields are trusted-only. Written into the untrusted project file,
 /// they could never take effect and would only warn on every launch. Forwarded
-/// ports also tend to change from one launch to the next.
+/// and published ports also tend to change from one launch to the next.
 fn drop_launch_only_fields(to_save: &mut Config) {
     to_save.forward_ports.clear();
+    to_save.publish_ports.clear();
     to_save.allow_private_hosts.clear();
 }
 
@@ -2357,6 +2393,15 @@ fn print_network_mode(config: &Config) {
             .collect::<Vec<_>>()
             .join(", ");
         output::status_header("  Forward ports", &joined);
+    }
+    if !config.publish_ports.is_empty() {
+        let joined = config
+            .publish_ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        output::status_header("  Publish ports", &joined);
     }
 }
 
@@ -3755,6 +3800,7 @@ no_gpu = true
             allow_hosts: vec!["api.anthropic.com".into()],
             allow_private_hosts: vec!["git.internal.example".into()],
             forward_ports: vec![49374],
+            publish_ports: vec![4096],
             claude_dir: None,
             agent_state: Some(true),
             inherit_env: None,
@@ -3805,6 +3851,7 @@ no_gpu = true
             config.allow_private_hosts
         );
         assert_eq!(deserialized.forward_ports, config.forward_ports);
+        assert_eq!(deserialized.publish_ports, config.publish_ports);
         assert_eq!(deserialized.claude_dir, config.claude_dir);
         assert_eq!(deserialized.agent_state, config.agent_state);
         assert_eq!(deserialized.inherit_env, config.inherit_env);
@@ -5050,6 +5097,128 @@ ro_maps = []
         assert!(config.forward_ports().is_empty());
         // And an empty list is never written back.
         assert!(!toml::to_string(&config).unwrap().contains("forward_ports"));
+    }
+
+    #[test]
+    fn regression_v2_12_0_config_without_publish_ports() {
+        // Configs written before publish_ports existed must still parse,
+        // with no port published.
+        let toml = r#"
+command = ["claude"]
+allow_hosts = ["api.anthropic.com"]
+forward_ports = [49374]
+rw_maps = []
+ro_maps = []
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.publish_ports().is_empty());
+        assert_eq!(config.forward_ports(), &[49374]);
+        // And an empty list is never written back.
+        assert!(!toml::to_string(&config).unwrap().contains("publish_ports"));
+    }
+
+    #[test]
+    fn project_publish_ports_cannot_extend_baseline() {
+        let baseline = Config {
+            publish_ports: vec![4096],
+            ..Config::default()
+        };
+        let project = Config {
+            publish_ports: vec![4096, 3000],
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(baseline, project, Path::new("/project"));
+        assert_eq!(merged.publish_ports, vec![4096]);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("publish_ports") && w.contains("3000"))
+        );
+    }
+
+    #[test]
+    fn project_publish_ports_alone_grant_nothing() {
+        let project = Config {
+            publish_ports: vec![4096],
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(merged.publish_ports.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("publish_ports")));
+    }
+
+    #[test]
+    fn publish_ports_are_never_saved_into_the_project() {
+        let cli = CliArgs {
+            publish_ports: vec![4096],
+            ..CliArgs::default()
+        };
+        let project = Config {
+            publish_ports: vec![3000],
+            ..Config::default()
+        };
+        let auto = project_config_for_auto_save(
+            &cli,
+            project.clone(),
+            Path::new("/project"),
+        );
+        assert!(auto.publish_ports.is_empty());
+        let init =
+            project_config_for_init(&cli, project, Path::new("/project"));
+        assert!(init.publish_ports.is_empty());
+    }
+
+    #[test]
+    fn trusted_layers_and_cli_union_publish_ports() {
+        let global = Config {
+            publish_ports: vec![4096, 3000],
+            ..Config::default()
+        };
+        let trusted = merge_with_global(
+            global,
+            Config {
+                publish_ports: vec![3000, 8080],
+                ..Config::default()
+            },
+        );
+        assert_eq!(trusted.publish_ports, vec![3000, 4096, 8080]);
+        let cli = CliArgs {
+            publish_ports: vec![5173, 8080],
+            ..CliArgs::default()
+        };
+        assert_eq!(
+            merge(&cli, trusted).publish_ports,
+            vec![3000, 4096, 5173, 8080]
+        );
+    }
+
+    #[test]
+    fn command_table_publish_ports_apply_only_to_that_command() {
+        let toml = r#"
+publish_ports = [3000]
+
+[commands.openchamber]
+publish_ports = [4096]
+"#;
+        let for_command = |name: &str| {
+            let cli = CliArgs {
+                command: vec![name.into()],
+                ..CliArgs::default()
+            };
+            global_config_for_command(
+                parse_global_toml(toml).unwrap(),
+                &cli,
+                &Config::default(),
+            )
+            .publish_ports
+        };
+        assert_eq!(for_command("openchamber"), vec![3000, 4096]);
+        assert_eq!(for_command("claude"), vec![3000]);
     }
 
     #[test]
@@ -6829,6 +6998,7 @@ hide_dotdirs = [".my_secrets"]
             allow_hosts: vec![],
             allow_private_hosts: vec![],
             forward_ports: vec![],
+            publish_ports: vec![],
             claude_dir: None,
             agent_state: None,
             inherit_env: None,
