@@ -3574,6 +3574,39 @@ fn extra_mounts_with_check(
         }
     }
 
+    // A same-path bind (source == destination) is redundant when an
+    // ancestor destination is already bound from the same host path with
+    // the same writability: the ancestor's mount brings the whole subtree
+    // in. Worse than redundant, the re-bind now fails the launch: the
+    // parent-first sort below lands the directory first, and when the
+    // inner path is a symlink there (e.g. ~/.local/bin/claude under the
+    // mise auto-map of ~/.local/bin) bwrap refuses to "mount on symlink
+    // destination" (#196). Alternate-destination (src != dest) and
+    // writability-changing mounts are never redundant this way and stay.
+    let covered: Vec<(bool, PathBuf)> = mounts
+        .iter()
+        .filter_map(|m| match m {
+            Mount::Bind { src, dest } if src == dest => {
+                Some((true, dest.clone()))
+            }
+            Mount::RoBind { src, dest } if src == dest => {
+                Some((false, dest.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    mounts.retain(|m| {
+        let (writable, src, dest) = match m {
+            Mount::Bind { src, dest } => (true, src, dest),
+            Mount::RoBind { src, dest } => (false, src, dest),
+            _ => return true,
+        };
+        src != dest
+            || !covered.iter().any(|(w, ancestor)| {
+                *w == writable && dest.starts_with(ancestor) && dest != ancestor
+            })
+    });
+
     // bwrap applies mounts in order and the later mount wins, so a nested
     // destination must be emitted AFTER its ancestor: emitted first, it is
     // silently shadowed when the ancestor is mounted over it (#183 — a user
@@ -5361,6 +5394,72 @@ mod tests {
             parent_index < child_index,
             "parent must be mounted before the nested child ({mounts:?})"
         );
+    }
+
+    #[test]
+    fn same_path_map_under_a_same_path_ancestor_is_dropped() {
+        // Regression for #196: with the parent-first sort, a file map
+        // whose host path is a symlink (e.g. ~/.local/bin/claude) lands
+        // after the auto-injected directory map of its parent
+        // (~/.local/bin, from mise_auto_map_dirs), and bwrap refuses to
+        // "mount on symlink destination". The inner same-path bind is
+        // redundant — the ancestor's mount already brings the subtree in —
+        // so it is dropped instead.
+        let mounts = extra_mounts_with_check(
+            &[],
+            &[
+                PathBuf::from("/home/u/.local/bin/claude"),
+                PathBuf::from("/home/u/.local/bin"),
+            ],
+            |_| true,
+        );
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m.dest() == Path::new("/home/u/.local/bin")),
+            "ancestor dir mount must remain: {mounts:?}"
+        );
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| m.dest() == Path::new("/home/u/.local/bin/claude")),
+            "redundant inner mount must be dropped: {mounts:?}"
+        );
+    }
+
+    #[test]
+    fn same_path_dedupe_keeps_alternate_destination_parent() {
+        // An inner same-path mount is not redundant when its ancestor has
+        // an alternate destination (source != destination): the in-sandbox
+        // subtree then shows the other source, not the host path. This is
+        // the #183 toolchain-cache shape and both mounts must survive.
+        let mounts = extra_mounts_with_check(
+            &[
+                PathBuf::from("/home/u/.cache/deno"),
+                PathBuf::from("/store/xdg:/home/u/.cache"),
+            ],
+            &[],
+            |_| true,
+        );
+        assert_eq!(mounts.len(), 2, "{mounts:?}");
+    }
+
+    #[test]
+    fn same_path_dedupe_drops_writable_inner_over_writable_ancestor() {
+        // The rw twin of the #196 shape: a same-path rw file under a
+        // same-path rw directory bind is likewise redundant.
+        // (Writability-mismatched overlaps never reach this dedupe: the
+        // ro/rw overlap guard above rejects them first.)
+        let mounts = extra_mounts_with_check(
+            &[
+                PathBuf::from("/home/u/.local/share/claude/key"),
+                PathBuf::from("/home/u/.local/share/claude"),
+            ],
+            &[],
+            |_| true,
+        );
+        assert_eq!(mounts.len(), 1, "{mounts:?}");
+        assert_eq!(mounts[0].dest(), Path::new("/home/u/.local/share/claude"));
     }
 
     #[test]
