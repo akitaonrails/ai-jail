@@ -637,17 +637,10 @@ fn command_paths_under_impl(
     };
 
     let start = if cmd.contains('/') {
-        let p = PathBuf::from(cmd);
-        if !p.is_absolute() {
-            // Relative-with-slash resolves against the project cwd,
-            // which is always mounted.
-            return vec![];
-        }
-        p
+        PathBuf::from(cmd)
     } else {
         match path_env
             .split(':')
-            .filter(|d| !d.is_empty())
             .map(|d| Path::new(d).join(cmd))
             .find(|c| is_executable_file(c))
         {
@@ -663,7 +656,17 @@ fn command_paths_under_impl(
         }
     };
 
-    let mut cur = start;
+    // Relative commands and relative (including empty) PATH entries resolve
+    // against the project cwd. The entry may be mounted with the project,
+    // but a symlink can point to an otherwise hidden installation directory.
+    let mut cur = if start.is_absolute() {
+        start
+    } else {
+        let Ok(cwd) = std::env::current_dir() else {
+            return vec![];
+        };
+        crate::config::normalize_path(&cwd.join(start))
+    };
     // Cap the walk so a symlink loop can't hang sandbox setup.
     for _ in 0..16 {
         match std::fs::read_link(&cur) {
@@ -3286,7 +3289,7 @@ mod tests {
     }
 
     #[test]
-    fn command_paths_under_ignores_missing_and_relative_commands() {
+    fn command_paths_under_ignores_missing_commands() {
         let home = command_home_fixture("miss");
         let path_env = home.join(".local/bin").display().to_string();
 
@@ -3295,8 +3298,7 @@ mod tests {
             command_paths_under_impl("no-such-agent", &home, &path_env)
                 .is_empty()
         );
-        // Relative-with-slash resolves against the project cwd, which
-        // is always mounted.
+        // An absent relative-with-slash command does not search PATH.
         assert!(
             command_paths_under_impl("./agent", &home, &path_env).is_empty()
         );
