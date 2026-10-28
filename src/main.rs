@@ -244,6 +244,28 @@ fn test_allow_private() -> bool {
     false
 }
 
+/// GHSA-v2fr-83mr-f9cg, open question A: when the effective command came
+/// from an untrusted project `.ai-jail` and names a known API harness,
+/// the harness defaults still provision its credentials (state dir
+/// mounted read-write, API key forwarded, API hosts default-allowed).
+/// Selecting what runs is an allowed project power; silently gaining the
+/// user's agent credentials is not — the launch warns. Returns the
+/// harness name when the warning applies.
+fn untrusted_project_command_carries_credentials(
+    command_from_untrusted_project: bool,
+    config: &config::Config,
+) -> Option<String> {
+    if !command_from_untrusted_project || !config.agent_state_enabled() {
+        return None;
+    }
+    let name = command::effective_name(&config.command)?;
+    if command::is_known_api_agent(name) {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
 /// Network-mode contradiction checks, all fail-closed at launch.
 /// `--allow-tcp-port` stays dead (the filtered-egress proxy is the
 /// strictly better answer, docs/connect-proxy-plan.md), and filtered
@@ -825,6 +847,22 @@ fn run() -> Result<i32, String> {
         && !project_trusted;
     if cli.command.is_empty() && !project_config.command.is_empty() {
         config.command = project_config.command.clone();
+    }
+    // GHSA-v2fr-83mr-f9cg question A: an untrusted project .ai-jail may
+    // choose what runs, but when it names a known harness the harness
+    // defaults key on that name — its state directory mounts read-write,
+    // its API key is forwarded, its API hosts are default-allowed. That
+    // is the documented agent-state trade-off; it must not be silent.
+    if let Some(name) = untrusted_project_command_carries_credentials(
+        command_from_untrusted_project,
+        &config,
+    ) {
+        output::security_warn(&format!(
+            "project .ai-jail selected the command {name:?}: its credentials \
+             travel with it (state dir mounted read-write, API key forwarded, \
+             API host allowed). Remove `command` from the project config or \
+             list the directory in the global trust_project_config."
+        ));
     }
     for warning in security_warnings {
         output::security_warn(&warning);
@@ -1447,7 +1485,8 @@ mod tests {
         prune_missing_path_entries, pty_proxy_active, resolve_browser_profile,
         running_inside_multiplexer, should_auto_save_project_config,
         should_check_update, should_save_global_preferences,
-        validate_network_flags, validate_write_flags,
+        untrusted_project_command_carries_credentials, validate_network_flags,
+        validate_write_flags,
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
@@ -1652,6 +1691,44 @@ mod tests {
         assert_eq!(
             validate_network_flags(&ok).is_ok(),
             cfg!(target_os = "linux")
+        );
+    }
+
+    #[test]
+    fn untrusted_project_command_warns_only_with_credentials() {
+        let claude = |agent_state| Config {
+            command: vec!["claude".into()],
+            agent_state,
+            ..Config::default()
+        };
+        // The warning needs all three: untrusted provenance, a known
+        // harness, and agent state left on.
+        assert_eq!(
+            untrusted_project_command_carries_credentials(true, &claude(None))
+                .as_deref(),
+            Some("claude")
+        );
+        // Trusted (CLI or trusted project) choice: the user picked it.
+        assert!(
+            untrusted_project_command_carries_credentials(false, &claude(None))
+                .is_none()
+        );
+        // Unknown commands carry no harness credentials.
+        let bash = Config {
+            command: vec!["bash".into()],
+            ..Config::default()
+        };
+        assert!(
+            untrusted_project_command_carries_credentials(true, &bash)
+                .is_none()
+        );
+        // --no-agent-state / lockdown: no credential surface to warn about.
+        assert!(
+            untrusted_project_command_carries_credentials(
+                true,
+                &claude(Some(false))
+            )
+            .is_none()
         );
     }
 

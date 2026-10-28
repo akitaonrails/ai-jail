@@ -195,7 +195,7 @@ const KNOWN_API_AGENTS: &[&str] = &[
     "kiro-cli",
 ];
 
-fn is_known_api_agent(name: &str) -> bool {
+pub(crate) fn is_known_api_agent(name: &str) -> bool {
     KNOWN_API_AGENTS.contains(&name) || name.starts_with("kimi")
 }
 
