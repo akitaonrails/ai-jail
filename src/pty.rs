@@ -888,6 +888,10 @@ struct TerminalFilter {
     /// Continuation bytes still expected for the UTF-8 character in
     /// progress; while non-zero, `0x80..=0xbf` is character data.
     utf8_remaining: u8,
+    /// `0xc2` lead byte held back in Ground state until its continuation
+    /// arrives: `c2 80..=c2 9f` is a UTF-8-encoded C1 control and is
+    /// dropped like its raw 8-bit form.
+    c1_lead: bool,
 }
 
 impl TerminalFilter {
@@ -896,6 +900,7 @@ impl TerminalFilter {
             state: FilterState::Ground,
             pending: Vec::new(),
             utf8_remaining: 0,
+            c1_lead: false,
         }
     }
 
@@ -923,6 +928,32 @@ impl TerminalFilter {
     fn feed(&mut self, data: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(data.len());
         for &b in data {
+            // UTF-8-encoded C1 controls (U+0080..=U+009F, bytes
+            // `c2 80..=c2 9f`): a terminal that honours UTF-8 C1 acts on
+            // them exactly like the raw 8-bit forms this filter drops,
+            // so the pair is dropped too. The `c2` lead is held back in
+            // Ground until the continuation decides; a non-C1
+            // continuation (e.g. `c2 a0`, U+00A0) forwards both bytes.
+            if self.c1_lead {
+                self.c1_lead = false;
+                if (0x80..=0xbf).contains(&b) {
+                    self.utf8_remaining = 0;
+                    if (0x80..=0x9f).contains(&b) {
+                        continue;
+                    }
+                    out.push(0xc2);
+                    out.push(b);
+                    continue;
+                }
+                // Truncated sequence: the held lead is lone data and
+                // `b` stands on its own.
+                out.push(0xc2);
+                self.utf8_remaining = 0;
+            } else if matches!(self.state, FilterState::Ground) && b == 0xc2 {
+                self.c1_lead = true;
+                self.utf8_remaining = 1;
+                continue;
+            }
             if self.utf8_char_byte(b) {
                 // Character data: never an introducer or terminator.
                 match self.state {
@@ -1883,6 +1914,30 @@ mod tests {
         long.extend(std::iter::repeat_n(b'x', super::OSC_TITLE_MAX_LEN + 1));
         long.push(0x07);
         assert!(capture_filtered_osc(&[&long]).is_empty());
+    }
+
+    #[test]
+    fn utf8_encoded_c1_controls_are_dropped() {
+        // A terminal that honours UTF-8 C1 acts on `c2 9b` (U+009B CSI)
+        // exactly like the raw 8-bit form the filter already drops, so
+        // the encoded form goes too — including across feed chunks.
+        let mut filter = super::TerminalFilter::new();
+        assert!(filter.feed(b"\xc2").is_empty());
+        // The pair is dropped; the would-be CSI body is literal text.
+        assert_eq!(filter.feed(b"\x9b[6n"), b"[6n");
+        for seq in [&b"\xc2\x80"[..], b"\xc2\x85", b"\xc2\x9f"] {
+            assert!(filter.feed(seq).is_empty(), "{seq:?}");
+        }
+        // Legitimate `c2` characters (U+00A0 and friends) pass, and the
+        // banner block characters (E2 96 90..9F) are untouched.
+        let mut filter = super::TerminalFilter::new();
+        assert_eq!(filter.feed(b"\xc2\xa0"), b"\xc2\xa0");
+        assert_eq!(filter.feed("▐".as_bytes()), "▐".as_bytes());
+        // A held `c2` with no continuation is lone data: emitted as-is
+        // once the next byte proves the sequence truncated.
+        let mut filter = super::TerminalFilter::new();
+        assert!(filter.feed(b"\xc2").is_empty());
+        assert_eq!(filter.feed(b"x"), b"\xc2x");
     }
 
     /// Run one child-output chunk through the IO loop and return what
