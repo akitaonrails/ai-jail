@@ -596,7 +596,7 @@ fn credential_ro_paths_from(
 /// Paths below `root` that must stay visible for the sandboxed command
 /// itself to start (issue #81).
 ///
-/// Resolves the command the way exec will (host `PATH` search), then walks
+/// Resolves the command the way exec will (child `PATH` search), then walks
 /// the symlink chain: every hop below `root` is collected, and for the final
 /// regular-file target its parent directory is collected so version payloads
 /// and launcher siblings resolve. Tools with needs beyond their install
@@ -611,7 +611,18 @@ pub(crate) fn command_paths_under(
     config: &Config,
     root: &Path,
 ) -> Vec<PathBuf> {
-    let path_env = std::env::var("PATH").unwrap_or_default();
+    let path_env = if config.lockdown_enabled() {
+        LOCKDOWN_PATH.to_string()
+    } else {
+        // PATH is allowlisted even without --inherit-env. Apply the same
+        // explicit overrides as the child before choosing its executable.
+        let host: Vec<_> = std::env::vars().collect();
+        crate::config::filtered_child_env(config.env_pass(), &host)
+            .into_iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value)
+            .unwrap_or_default()
+    };
     let mut paths = Vec::new();
     for executable in crate::command::executable_candidates(&config.command) {
         for path in command_paths_under_impl(executable, root, &path_env) {
@@ -3151,6 +3162,22 @@ mod tests {
         std::os::unix::fs::symlink(&target, home.join(".local/bin/agent"))
             .unwrap();
         home
+    }
+
+    #[test]
+    fn command_discovery_keeps_the_lockdown_path() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = command_home_fixture("lockdown-path");
+        let bin = home.join(".local/bin");
+        let _path = EnvVarGuard::set("PATH", &bin);
+        let config = Config {
+            command: vec!["agent".into()],
+            env_pass: vec![format!("PATH={}", bin.display())],
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        assert!(command_paths_under(&config, &home).is_empty());
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
