@@ -682,6 +682,8 @@ profile modes.
 
 Activation is best-effort: if mise cannot run, or has neither its config nor
 its installs inside the sandbox, it is skipped and your command still starts.
+The wrapper restores the `(jail)` prompt marker before launching your command,
+so managed launchers such as `ai-memory` can recognize the sandbox on macOS.
 
 `PATH` is also pruned to the directories that actually exist inside the
 sandbox, so entries describing the host's layout no longer make tools look
