@@ -316,6 +316,8 @@ pub(crate) struct AuditLog {
 
 struct ChainState {
     file: std::fs::File,
+    /// End of the bytes already incorporated into this handle's chain.
+    offset: u64,
     /// sha256 of the last line written, as lowercase hex.
     prev: Option<String>,
     seq: u64,
@@ -350,35 +352,55 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
-/// Seed the chain from the same inode that will receive appends. Records are
-/// bounded in memory and oversized records are still hashed incrementally.
-/// Any read failure yields the safe genesis state: logging must never break a
-/// launch.
-fn seed_chain(file: &std::fs::File) -> (Option<String>, u64, bool) {
-    use std::io::{Seek, SeekFrom};
+/// Serialize tail refresh and append across independently opened log handles,
+/// including other ai-jail processes. The lock stays on the validated inode.
+struct AppendLock(std::fs::File);
 
-    let Ok(mut file) = file.try_clone() else {
-        return (None, 0, false);
-    };
-    if file.seek(SeekFrom::Start(0)).is_err() {
-        return (None, 0, false);
+impl AppendLock {
+    fn acquire(file: &std::fs::File) -> std::io::Result<Self> {
+        let file = file.try_clone()?;
+        file.lock()?;
+        Ok(Self(file))
     }
-    let mut reader = std::io::BufReader::new(file);
-    let mut prev = None;
-    let mut seq = 0_u64;
-    let mut needs_newline = false;
-    loop {
-        match read_bounded_record(&mut reader) {
-            Ok(Some(record)) => {
-                prev = Some(record.hash);
-                seq += 1;
-                needs_newline = !record.terminated;
-            }
-            Ok(None) => break,
-            Err(_) => return (None, 0, false),
+}
+
+impl Drop for AppendLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+impl ChainState {
+    /// Incorporate records appended by other sessions while holding the file
+    /// lock. Only read new bytes in the normal append-only case; reopening the
+    /// entire history for each proxy event would make logging quadratic.
+    fn refresh(&mut self) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom};
+
+        let len = self.file.metadata()?.len();
+        if len == self.offset {
+            return Ok(());
         }
+        // A truncation or a previously incomplete tail needs a fresh scan.
+        let restart = len < self.offset || self.needs_newline;
+        let offset = if restart { 0 } else { self.offset };
+        let mut prev = if restart { None } else { self.prev.clone() };
+        let mut seq = if restart { 0 } else { self.seq };
+        let mut needs_newline = false;
+        let mut file = self.file.try_clone()?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut reader = std::io::BufReader::new(file);
+        while let Some(record) = read_bounded_record(&mut reader)? {
+            prev = Some(record.hash);
+            seq += 1;
+            needs_newline = !record.terminated;
+        }
+        self.offset = reader.stream_position()?;
+        self.prev = prev;
+        self.seq = seq;
+        self.needs_newline = needs_newline;
+        Ok(())
     }
-    (prev, seq, needs_newline)
 }
 
 fn validate_directory(file: &std::fs::File) -> std::io::Result<()> {
@@ -520,13 +542,13 @@ impl AuditLog {
                 return None;
             }
         };
-        let (prev, seq, needs_newline) = seed_chain(&file);
         Some(std::sync::Arc::new(AuditLog {
             chain: Mutex::new(ChainState {
                 file,
-                prev,
-                seq,
-                needs_newline,
+                offset: 0,
+                prev: None,
+                seq: 0,
+                needs_newline: false,
             }),
             warned: AtomicBool::new(false),
         }))
@@ -540,32 +562,36 @@ impl AuditLog {
     pub(crate) fn record(&self, entry: serde_json::Value) {
         let mut entry = entry;
         let mut state = self.chain.lock().unwrap();
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert("seq".to_string(), state.seq.into());
-            obj.insert(
-                "prev".to_string(),
-                state
-                    .prev
-                    .as_deref()
-                    .map_or(serde_json::Value::Null, |p| p.into()),
-            );
-        }
-        // The chain hashes the raw line bytes as written, without the
-        // trailing newline.
-        let mut line = entry.to_string();
-        let hash = sha256_hex(line.as_bytes());
-        line.push('\n');
-        if state.needs_newline {
-            line.insert(0, '\n');
-            state.needs_newline = false;
-        }
-        let result = state.file.write_all(line.as_bytes());
-        if result.is_err() && !self.warned.swap(true, Ordering::SeqCst) {
-            output::warn("audit log write failed; further errors suppressed");
-        }
-        if result.is_ok() {
+        let result = (|| -> std::io::Result<()> {
+            let _lock = AppendLock::acquire(&state.file)?;
+            state.refresh()?;
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("seq".to_string(), state.seq.into());
+                obj.insert(
+                    "prev".to_string(),
+                    state
+                        .prev
+                        .as_deref()
+                        .map_or(serde_json::Value::Null, |p| p.into()),
+                );
+            }
+            // The chain hashes the raw line bytes as written, without the
+            // trailing newline.
+            let mut line = entry.to_string();
+            let hash = sha256_hex(line.as_bytes());
+            line.push('\n');
+            if state.needs_newline {
+                line.insert(0, '\n');
+            }
+            state.file.write_all(line.as_bytes())?;
             state.prev = Some(hash);
             state.seq += 1;
+            state.offset += line.len() as u64;
+            state.needs_newline = false;
+            Ok(())
+        })();
+        if result.is_err() && !self.warned.swap(true, Ordering::SeqCst) {
+            output::warn("audit log write failed; further errors suppressed");
         }
     }
 }
@@ -1007,6 +1033,65 @@ mod tests {
         assert_eq!(report.chained, 0);
         assert_eq!(report.first_break, Some(1));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn overlapping_log_handles_continue_the_latest_chain() {
+        let home = test_home("overlapping-writers");
+        let first = AuditLog::open(&home).unwrap();
+        let second = AuditLog::open(&home).unwrap();
+        probe(&first, 1);
+        probe(&second, 2);
+        probe(&first, 3);
+
+        let report =
+            verify(std::fs::File::open(log_path(&home)).unwrap()).unwrap();
+        assert_eq!(report.total, 3);
+        assert_eq!(report.first_break, None);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn concurrent_log_handles_keep_every_record_in_one_chain() {
+        let home = test_home("concurrent-writers");
+        let logs: Vec<_> =
+            (0..4).map(|_| AuditLog::open(&home).unwrap()).collect();
+        let barrier = std::sync::Barrier::new(logs.len());
+        std::thread::scope(|scope| {
+            for log in &logs {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for n in 0..32 {
+                        probe(log, n);
+                    }
+                });
+            }
+        });
+
+        let report =
+            verify(std::fs::File::open(log_path(&home)).unwrap()).unwrap();
+        assert_eq!(report.total, 128);
+        assert_eq!(report.first_break, None);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn live_log_handle_preserves_a_truncated_tail_as_a_break() {
+        let home = test_home("live-truncated-tail");
+        let log = AuditLog::open(&home).unwrap();
+        probe(&log, 1);
+        probe(&log, 2);
+        let path = log_path(&home);
+        let content = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &content[..content.len() - 20]).unwrap();
+        probe(&log, 3);
+
+        let report = verify(std::fs::File::open(path).unwrap()).unwrap();
+        assert_eq!(report.first_break, Some(2));
+        assert_eq!(report.total, 3);
+        assert_eq!(report.chained, 2);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
