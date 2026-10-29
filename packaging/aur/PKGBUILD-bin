@@ -2,7 +2,7 @@
 
 pkgname=ai-jail-bin
 _pkgname=ai-jail
-pkgver=2.13.0
+pkgver=2.13.1
 pkgrel=1
 pkgdesc="Sandbox wrapper for AI coding agents (prebuilt binary)"
 arch=('x86_64')
@@ -28,7 +28,7 @@ sha256sums=(
     '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986'
     '189fbb968b7bb58b6480c5bb8e080e0f33ff821884ff6a22ba68937618e262f9'
 )
-sha256sums_x86_64=('49f5b40c1ea8be8f31db251dbde94625ca6a8c74ebbe37f3a5895ea0491b0cf2')
+sha256sums_x86_64=('bc9776c644cd9d08ada0cf2a407d27cefc6bf9a5c83ddfa3886d4e3cec74f813')
 
 package() {
     install -Dm0755 -t "$pkgdir/usr/bin/"                     "ai-jail"
