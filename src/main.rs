@@ -670,7 +670,9 @@ fn prune_missing_path_entries(
 ) -> Option<(std::ffi::OsString, usize, usize)> {
     let total = std::env::split_paths(path).count();
     let kept: Vec<std::path::PathBuf> = std::env::split_paths(path)
-        .filter(|entry| entry.is_dir())
+        // An empty PATH component means the current directory, not a
+        // missing directory. Preserve that spelling and its search order.
+        .filter(|entry| entry.as_os_str().is_empty() || entry.is_dir())
         .collect();
     if kept.len() == total {
         return None;
@@ -1987,6 +1989,18 @@ mod tests {
         // Nothing to do when every entry exists: callers skip the rewrite.
         let all_real = std::env::join_paths([real.clone(), real]).unwrap();
         assert!(prune_missing_path_entries(&all_real).is_none());
+    }
+
+    #[test]
+    fn path_pruning_keeps_empty_current_directory_entries() {
+        let empty = std::path::PathBuf::new();
+        let missing = std::env::temp_dir()
+            .join(format!("ai-jail-missing-path-entry-{}", std::process::id()));
+        let path = std::env::join_paths([&empty, &missing, &empty]).unwrap();
+        let (pruned, kept, total) = prune_missing_path_entries(&path).unwrap();
+        assert_eq!((kept, total), (2, 3));
+        assert_eq!(pruned, std::env::join_paths([&empty, &empty]).unwrap());
+        assert!(prune_missing_path_entries(std::ffi::OsStr::new("")).is_none());
     }
 
     #[test]
