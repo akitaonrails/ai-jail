@@ -25,6 +25,7 @@ fn project_config_dangerous_opt_ins(
         (config.gcloud_enabled(), "gcloud credentials"),
         (config.docker_config_enabled(), "Docker config"),
         (config.kvm_enabled(), "KVM device"),
+        (config.prompt_hosts_enabled(), "Interactive host prompt"),
     ] {
         if enabled {
             items.push(name.into());

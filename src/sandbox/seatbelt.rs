@@ -53,6 +53,9 @@ pub fn platform_notes(config: &Config) {
     if config.kvm_enabled() {
         output::warn("--kvm has no effect on macOS");
     }
+    if config.prompt_hosts_enabled() {
+        output::warn("--prompt-hosts has no effect on macOS");
+    }
     if config.tailscale_enabled() {
         output::warn(
             "--tailscale has no effect on macOS (no socket bind; \

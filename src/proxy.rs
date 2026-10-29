@@ -20,19 +20,22 @@
 // dead_code allowance for that target.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{
-    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream, ToSocketAddrs,
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream,
+    ToSocketAddrs,
 };
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Hard cap on the CONNECT request (request line plus headers).
 const REQUEST_CAP: usize = 8 * 1024;
@@ -96,6 +99,11 @@ pub(crate) struct ProxyConfig {
     /// self-signed fixture in tests/. Same rule as
     /// `danger_allow_private`: never config- or CLI-exposable.
     pub danger_extra_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    /// Interactive host prompt (`--prompt-hosts`): a CONNECT to a host
+    /// outside `allowlist` asks the user once per session instead of
+    /// being refused outright. The SSRF address-range guard still
+    /// applies to approved hosts.
+    pub prompt: Option<Arc<dyn HostPrompt>>,
 }
 
 impl ProxyConfig {
@@ -110,8 +118,101 @@ impl ProxyConfig {
             audit: None,
             secrets: Vec::new(),
             danger_extra_roots: Vec::new(),
+            prompt: None,
         }
     }
+}
+
+/// Asks the user whether a host outside the allowlist may be reached.
+/// Runs on the connection's own thread, which blocks until it returns.
+pub(crate) trait HostPrompt: Send + Sync {
+    /// `true` only on an explicit approval; every failure is a deny.
+    /// `internal` lists the host's private/CGNAT addresses (empty for a
+    /// public host): approving opens them for the rest of the session.
+    fn ask(&self, host: &str, port: u16, internal: &[IpAddr]) -> bool;
+}
+
+/// Desktop-notification prompt (Linux): `notify-send --wait` with
+/// Allow/Deny actions. A dismissal, a missing or failing `notify-send`,
+/// or no answer within `timeout` all count as a deny.
+pub(crate) struct NotifySendPrompt {
+    /// Absolute path of a trusted `notify-send`.
+    pub program: PathBuf,
+    /// Command name shown in the notification title.
+    pub label: String,
+    pub timeout: Duration,
+}
+
+const NOTIFY_POLL: Duration = Duration::from_millis(100);
+
+impl HostPrompt for NotifySendPrompt {
+    fn ask(&self, host: &str, port: u16, internal: &[IpAddr]) -> bool {
+        let (summary, body) = notify_text(&self.label, host, port, internal);
+        let spawned = Command::new(&self.program)
+            .arg("--app-name=ai-jail")
+            .arg("--urgency=critical")
+            .arg(format!("--expire-time={}", self.timeout.as_millis()))
+            .arg("--wait")
+            .arg("--action=allow=Allow")
+            .arg("--action=deny=Deny")
+            .arg(summary)
+            .arg(body)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = spawned else {
+            return false;
+        };
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(NOTIFY_POLL);
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+            }
+        }
+        let mut reply = String::new();
+        if let Some(mut stdout) = child.stdout.take() {
+            let _ = stdout.read_to_string(&mut reply);
+        }
+        notify_reply_allows(&reply)
+    }
+}
+
+/// Notification summary and body. An internal host is called out in the
+/// summary and its addresses are listed, since approving it opens part of
+/// the local network to the sandbox.
+fn notify_text(
+    label: &str,
+    host: &str,
+    port: u16,
+    internal: &[IpAddr],
+) -> (String, String) {
+    if internal.is_empty() {
+        return (
+            format!("ai-jail: {label} wants to reach a new host"),
+            format!("{host}:{port}"),
+        );
+    }
+    let addresses: Vec<String> =
+        internal.iter().map(ToString::to_string).collect();
+    (
+        format!("ai-jail: {label} wants to reach an INTERNAL host"),
+        format!("{host}:{port}\nInternal address: {}", addresses.join(", ")),
+    )
+}
+
+/// `notify-send --wait` prints the invoked action's name, or nothing
+/// when the notification is dismissed or expires.
+fn notify_reply_allows(reply: &str) -> bool {
+    reply.trim_end() == "allow"
 }
 
 /// Running proxy handle. Reports where the listeners are; see the
@@ -132,6 +233,8 @@ impl Proxy {
         let shared = Arc::new(Shared {
             config,
             active: AtomicUsize::new(0),
+            decisions: Mutex::new(HashMap::new()),
+            decided: Condvar::new(),
         });
 
         let port = if unix_socket_path.is_none() {
@@ -206,6 +309,21 @@ impl Drop for Proxy {
 struct Shared {
     config: ProxyConfig,
     active: AtomicUsize,
+    /// Session verdicts of the host prompt, keyed by normalized host.
+    /// Kept in memory only: a new session asks again.
+    decisions: Mutex<HashMap<String, Decision>>,
+    /// Wakes connections waiting on a `Pending` host.
+    decided: Condvar,
+}
+
+#[derive(Clone, Copy)]
+enum Decision {
+    Pending,
+    /// `internal`: the approval covered private/CGNAT answers too.
+    Allow {
+        internal: bool,
+    },
+    Deny,
 }
 
 /// Decrements the active-connection count when the handler returns.
@@ -334,18 +452,39 @@ fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
         }
     };
 
-    if !allowlist_matches(&shared.config.allowlist, &host) {
+    let allowlisted = allowlist_matches(&shared.config.allowlist, &host);
+    let prompting = !allowlisted
+        && shared.config.prompt.is_some()
+        && promptable_host(&host);
+    if !allowlisted && !prompting {
         audit_verdict(&shared, &host, port, "deny", "not-in-allowlist");
         reject(&mut client, &Reject::ForbiddenHost);
         return;
     }
 
-    let upstream = match connect_upstream(&host, port, &shared.config) {
-        Ok(stream) => stream,
+    // One resolution serves both the prompt and the dial (DNS pinning):
+    // the addresses the user approves are the ones dialed.
+    let addrs = match resolve(&host, port) {
+        Ok(addrs) => addrs,
         Err(why) => {
-            // Only policy refusals are verdicts; a failed resolution or
-            // dial is an upstream error, not a deny.
-            if matches!(why, Reject::ForbiddenRange) {
+            reject(&mut client, &why);
+            return;
+        }
+    };
+    let mut allow_reason = "in-allowlist";
+    let mut internal_ok = false;
+    if prompting {
+        match prompt_verdict(&shared, &host, port, &addrs) {
+            Some(Decision::Allow { internal }) => {
+                allow_reason = "prompt-allow";
+                internal_ok = internal;
+            }
+            Some(_) => {
+                audit_verdict(&shared, &host, port, "deny", "prompt-deny");
+                reject(&mut client, &Reject::ForbiddenHost);
+                return;
+            }
+            None => {
                 audit_verdict(
                     &shared,
                     &host,
@@ -353,17 +492,108 @@ fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
                     "deny",
                     "forbidden-address-range",
                 );
+                reject(&mut client, &Reject::ForbiddenRange);
+                return;
             }
-            reject(&mut client, &why);
-            return;
         }
-    };
-    audit_verdict(&shared, &host, port, "allow", "in-allowlist");
+    }
+
+    let upstream =
+        match dial_resolved(&host, &addrs, &shared.config, internal_ok) {
+            Ok(stream) => stream,
+            Err(why) => {
+                // Only policy refusals are verdicts; a failed resolution or
+                // dial is an upstream error, not a deny.
+                if matches!(why, Reject::ForbiddenRange) {
+                    audit_verdict(
+                        &shared,
+                        &host,
+                        port,
+                        "deny",
+                        "forbidden-address-range",
+                    );
+                }
+                reject(&mut client, &why);
+                return;
+            }
+        };
+    audit_verdict(&shared, &host, port, "allow", allow_reason);
 
     if client.write_all(REPLY_OK.as_bytes()).is_err() {
         return;
     }
     relay(client, upstream);
+}
+
+/// Session verdict (`Allow` or `Deny`) for a promptable host outside the
+/// allowlist, given its resolved `addrs`. `None` when no answer could ever
+/// be dialed (loopback, link-local, metadata, ...), so the user is never
+/// asked. Answers in private/CGNAT ranges are shown to the user, and an
+/// approval then opens those ranges for the host. Each host is asked at
+/// most once per session; concurrent connections to a host being asked
+/// about wait for that one answer.
+fn prompt_verdict(
+    shared: &Shared,
+    host: &str,
+    port: u16,
+    addrs: &[SocketAddr],
+) -> Option<Decision> {
+    let prompt = shared.config.prompt.as_ref()?;
+    let mut internal: Vec<IpAddr> = Vec::new();
+    let mut offerable = false;
+    for ip in addrs.iter().map(SocketAddr::ip) {
+        if address_is_allowed(host, &ip, &shared.config) {
+            offerable = true;
+        } else if is_internal_class(&ip) {
+            offerable = true;
+            if !internal.contains(&ip) {
+                internal.push(ip);
+            }
+        }
+    }
+    if !offerable {
+        return None;
+    }
+
+    let key = normalize_host(host);
+    let lock = || shared.decisions.lock().unwrap_or_else(|e| e.into_inner());
+    let mut decisions = lock();
+    loop {
+        match decisions.get(&key).copied() {
+            Some(Decision::Pending) => {
+                decisions = shared
+                    .decided
+                    .wait(decisions)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+            Some(decided) => return Some(decided),
+            None => break,
+        }
+    }
+    decisions.insert(key.clone(), Decision::Pending);
+    drop(decisions);
+
+    let decision = if prompt.ask(&key, port, &internal) {
+        Decision::Allow {
+            internal: !internal.is_empty(),
+        }
+    } else {
+        Decision::Deny
+    };
+    lock().insert(key, decision);
+    shared.decided.notify_all();
+    Some(decision)
+}
+
+/// Only plain DNS names and IP literals reach the user: the host comes
+/// from the sandbox, and anything else (spaces, markup) could make the
+/// notification misleading.
+fn promptable_host(host: &str) -> bool {
+    host.parse::<IpAddr>().is_ok()
+        || (host.len() <= 253
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b)))
 }
 
 /// Append a CONNECT verdict record when the launch audit log is on.
@@ -569,44 +799,75 @@ fn connect_upstream(
     port: u16,
     config: &ProxyConfig,
 ) -> Result<TcpStream, Reject> {
-    let addrs = match (host, port).to_socket_addrs() {
-        Ok(addrs) => addrs,
-        Err(_) => return Err(Reject::BadGateway),
-    };
-    let mut dialable = false;
+    dial_resolved(host, &resolve(host, port)?, config, false)
+}
+
+fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, Reject> {
+    (host, port)
+        .to_socket_addrs()
+        .map(Iterator::collect)
+        .map_err(|_| Reject::BadGateway)
+}
+
+/// Dial the first answer of an already-resolved set that passes the SSRF
+/// guard. `internal_ok` is a session approval of an internal host through
+/// the prompt: it relaxes the same private/CGNAT classes as
+/// `allow_private_hosts`, nothing more.
+fn dial_resolved(
+    host: &str,
+    addrs: &[SocketAddr],
+    config: &ProxyConfig,
+    internal_ok: bool,
+) -> Result<TcpStream, Reject> {
+    let mut any_dialable = false;
     for addr in addrs {
-        if !address_is_allowed(host, &addr.ip(), config) {
+        if !dialable(host, &addr.ip(), config, internal_ok) {
             // The caller records one deny verdict for the request; the
             // per-answer class detail stays internal to this filter.
             continue;
         }
-        dialable = true;
+        any_dialable = true;
         if let Ok(stream) =
-            TcpStream::connect_timeout(&addr, config.connect_timeout)
+            TcpStream::connect_timeout(addr, config.connect_timeout)
         {
             return Ok(stream);
         }
     }
     // Every answer filtered out is a policy refusal; answers that
     // refused or timed out the dial are upstream failures.
-    Err(if dialable {
+    Err(if any_dialable {
         Reject::BadGateway
     } else {
         Reject::ForbiddenRange
     })
 }
 
+fn dialable(
+    host: &str,
+    ip: &IpAddr,
+    config: &ProxyConfig,
+    internal_ok: bool,
+) -> bool {
+    address_is_allowed(host, ip, config)
+        || (internal_ok && is_internal_class(ip))
+}
+
+/// Private and carrier-grade NAT ranges: the only classes a trusted grant
+/// (`allow_private_hosts` or an approved prompt) may open. Loopback,
+/// link-local, metadata, multicast, and unspecified never qualify.
+fn is_internal_class(ip: &IpAddr) -> bool {
+    matches!(
+        denied_class(ip),
+        Some("private address range" | "carrier-grade NAT address range")
+    )
+}
+
 fn address_is_allowed(host: &str, ip: &IpAddr, config: &ProxyConfig) -> bool {
-    let Some(class) = denied_class(ip) else {
-        return true;
-    };
-    if config.danger_allow_private {
+    if denied_class(ip).is_none() || config.danger_allow_private {
         return true;
     }
-    matches!(
-        class,
-        "private address range" | "carrier-grade NAT address range"
-    ) && allowlist_matches(&config.allow_private_hosts, host)
+    is_internal_class(ip)
+        && allowlist_matches(&config.allow_private_hosts, host)
 }
 
 /// Parse an absolute-form request line (`METHOD http://host[:port]/...
@@ -1771,6 +2032,240 @@ mod tests {
         assert_eq!(read_reply_head(&stream), "HTTP/1.1 403 Forbidden\r\n\r\n");
     }
 
+    /// Fake host prompt: answers `allow`, counts calls, records the
+    /// internal addresses each call was shown, and holds each answer for
+    /// `delay` so concurrent connections overlap.
+    struct FakePrompt {
+        allow: bool,
+        delay: Duration,
+        calls: AtomicUsize,
+        internal_seen: Mutex<Vec<Vec<IpAddr>>>,
+    }
+
+    impl FakePrompt {
+        fn new(allow: bool, delay: Duration) -> Arc<FakePrompt> {
+            Arc::new(FakePrompt {
+                allow,
+                delay,
+                calls: AtomicUsize::new(0),
+                internal_seen: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl HostPrompt for FakePrompt {
+        fn ask(&self, _host: &str, _port: u16, internal: &[IpAddr]) -> bool {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.internal_seen.lock().unwrap().push(internal.to_vec());
+            thread::sleep(self.delay);
+            self.allow
+        }
+    }
+
+    fn prompted_proxy(
+        allow: bool,
+        delay: Duration,
+    ) -> (Proxy, Arc<FakePrompt>) {
+        let prompt = FakePrompt::new(allow, delay);
+        let mut config = test_config(&["example.com"]);
+        config.prompt = Some(Arc::clone(&prompt) as Arc<dyn HostPrompt>);
+        (Proxy::start(config, None).unwrap(), prompt)
+    }
+
+    /// Like [`prompted_proxy`] but with the real SSRF guard, so private
+    /// and loopback answers are classified as they are in production.
+    fn guarded_prompted_proxy(allow: bool) -> (Proxy, Arc<FakePrompt>) {
+        let prompt = FakePrompt::new(allow, Duration::ZERO);
+        let mut config = ProxyConfig::new(Vec::new());
+        config.connect_timeout = Duration::from_millis(200);
+        config.prompt = Some(Arc::clone(&prompt) as Arc<dyn HostPrompt>);
+        (Proxy::start(config, None).unwrap(), prompt)
+    }
+
+    #[test]
+    fn e2e_prompt_shows_internal_addresses() {
+        let (proxy, prompt) = guarded_prompted_proxy(false);
+        let stream =
+            connect_and_send(proxy.port(), &connect_request("10.1.2.3:443"));
+        assert_eq!(read_reply_head(&stream), "HTTP/1.1 403 Forbidden\r\n\r\n");
+        let seen = prompt.internal_seen.lock().unwrap();
+        assert_eq!(*seen, vec![vec!["10.1.2.3".parse::<IpAddr>().unwrap()]]);
+    }
+
+    #[test]
+    fn e2e_prompt_shows_no_internal_address_for_public_hosts() {
+        let (proxy, prompt) = guarded_prompted_proxy(false);
+        let stream =
+            connect_and_send(proxy.port(), &connect_request("203.0.113.5:443"));
+        assert_eq!(read_reply_head(&stream), "HTTP/1.1 403 Forbidden\r\n\r\n");
+        let seen = prompt.internal_seen.lock().unwrap();
+        assert_eq!(*seen, vec![Vec::<IpAddr>::new()]);
+    }
+
+    #[test]
+    fn e2e_prompt_never_offers_loopback_or_metadata() {
+        let (proxy, prompt) = guarded_prompted_proxy(true);
+        for target in ["127.0.0.1:80", "169.254.169.254:80", "[::1]:80"] {
+            let stream =
+                connect_and_send(proxy.port(), &connect_request(target));
+            assert_eq!(
+                read_reply_head(&stream),
+                "HTTP/1.1 403 Forbidden address range\r\n\r\n",
+                "{target}"
+            );
+        }
+        assert_eq!(prompt.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn e2e_prompt_unresolvable_host_is_not_asked() {
+        let (proxy, prompt) = guarded_prompted_proxy(true);
+        let stream = connect_and_send(
+            proxy.port(),
+            &connect_request("ai-jail-no-such-host.invalid:443"),
+        );
+        assert_eq!(
+            read_reply_head(&stream),
+            "HTTP/1.1 502 Bad Gateway\r\n\r\n"
+        );
+        assert_eq!(prompt.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn approved_internal_host_dials_only_grantable_ranges() {
+        let config = ProxyConfig::new(Vec::new());
+        let private: IpAddr = "10.1.2.3".parse().unwrap();
+        let cgnat: IpAddr = "100.64.0.1".parse().unwrap();
+        let public: IpAddr = "203.0.113.5".parse().unwrap();
+        for ip in [private, cgnat, public] {
+            assert!(dialable("h.test", &ip, &config, true), "{ip}");
+        }
+        assert!(!dialable("h.test", &private, &config, false));
+        assert!(!dialable("h.test", &cgnat, &config, false));
+        assert!(dialable("h.test", &public, &config, false));
+        for never in
+            ["127.0.0.1", "169.254.169.254", "::1", "fe80::1", "0.0.0.0"]
+        {
+            let ip: IpAddr = never.parse().unwrap();
+            assert!(!dialable("h.test", &ip, &config, true), "{never}");
+        }
+    }
+
+    #[test]
+    fn e2e_prompt_allow_tunnels_and_is_remembered() {
+        let echo = echo_server();
+        let (proxy, prompt) = prompted_proxy(true, Duration::ZERO);
+        let request = connect_request(&format!("127.0.0.1:{echo}"));
+        for _ in 0..2 {
+            let stream = connect_and_send(proxy.port(), &request);
+            assert_eq!(read_reply_head(&stream), REPLY_OK);
+            (&stream).write_all(b"ping").unwrap();
+            let mut buf = [0_u8; 4];
+            (&mut &stream).read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"ping");
+        }
+        assert_eq!(prompt.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn e2e_prompt_deny_is_403_and_never_asked_again() {
+        let (proxy, prompt) = prompted_proxy(false, Duration::ZERO);
+        for _ in 0..2 {
+            let stream = connect_and_send(
+                proxy.port(),
+                &connect_request("203.0.113.5:443"),
+            );
+            assert_eq!(
+                read_reply_head(&stream),
+                "HTTP/1.1 403 Forbidden\r\n\r\n"
+            );
+        }
+        assert_eq!(prompt.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn e2e_prompt_decision_is_per_host_case_insensitive() {
+        let (proxy, prompt) = prompted_proxy(false, Duration::ZERO);
+        // Names that resolve offline: /etc/hosts maps localhost.
+        for host in ["LocalHost:443", "localhost:80", "203.0.113.5:443"] {
+            let stream = connect_and_send(proxy.port(), &connect_request(host));
+            read_reply_head(&stream);
+        }
+        assert_eq!(prompt.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn e2e_concurrent_connections_share_one_prompt() {
+        let (proxy, prompt) = prompted_proxy(false, Duration::from_millis(300));
+        let port = proxy.port();
+        let clients: Vec<_> = (0..4)
+            .map(|_| {
+                thread::spawn(move || {
+                    let stream = connect_and_send(
+                        port,
+                        &connect_request("203.0.113.5:443"),
+                    );
+                    read_reply_head(&stream)
+                })
+            })
+            .collect();
+        for client in clients {
+            assert_eq!(
+                client.join().unwrap(),
+                "HTTP/1.1 403 Forbidden\r\n\r\n"
+            );
+        }
+        assert_eq!(prompt.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn e2e_prompt_skips_hosts_with_unexpected_characters() {
+        let (proxy, prompt) = prompted_proxy(true, Duration::ZERO);
+        for host in ["<b>evil</b>:443", "a b.test:443", "x&y.test:443"] {
+            let stream = connect_and_send(proxy.port(), &connect_request(host));
+            read_reply_head(&stream);
+        }
+        assert_eq!(prompt.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn e2e_prompt_is_not_asked_for_allowlisted_hosts() {
+        let echo = echo_server();
+        let prompt = FakePrompt::new(false, Duration::ZERO);
+        let mut config = test_config(&["127.0.0.1"]);
+        config.prompt = Some(Arc::clone(&prompt) as Arc<dyn HostPrompt>);
+        let proxy = Proxy::start(config, None).unwrap();
+        let stream = connect_and_send(
+            proxy.port(),
+            &connect_request(&format!("127.0.0.1:{echo}")),
+        );
+        assert_eq!(read_reply_head(&stream), REPLY_OK);
+        assert_eq!(prompt.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn notify_text_calls_out_internal_hosts_with_their_addresses() {
+        let (summary, body) = notify_text("claude", "example.com", 443, &[]);
+        assert_eq!(summary, "ai-jail: claude wants to reach a new host");
+        assert_eq!(body, "example.com:443");
+
+        let internal: Vec<IpAddr> =
+            vec!["10.0.0.5".parse().unwrap(), "fd00::5".parse().unwrap()];
+        let (summary, body) =
+            notify_text("claude", "gitlab.lan", 443, &internal);
+        assert!(summary.contains("INTERNAL"));
+        assert_eq!(body, "gitlab.lan:443\nInternal address: 10.0.0.5, fd00::5");
+    }
+
+    #[test]
+    fn notify_reply_allows_only_the_allow_action() {
+        assert!(notify_reply_allows("allow\n"));
+        assert!(notify_reply_allows("allow"));
+        assert!(!notify_reply_allows("deny\n"));
+        assert!(!notify_reply_allows(""));
+        assert!(!notify_reply_allows("allowed\n"));
+    }
+
     #[test]
     fn e2e_ssrf_range_is_403_even_when_allowlisted() {
         // No danger_allow_private here: the allowlist alone must never
@@ -1865,6 +2360,40 @@ mod tests {
         assert_eq!(records[1]["host"], "127.0.0.1");
         assert_eq!(records[1]["verdict"], "allow");
         assert_eq!(records[1]["reason"], "in-allowlist");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn e2e_audit_records_prompt_verdicts() {
+        let echo = echo_server();
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-proxy-prompt-audit-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let log = crate::audit::AuditLog::open(&home).unwrap();
+
+        let mut config = test_config(&[]);
+        config.audit = Some(log);
+        config.prompt = Some(FakePrompt::new(true, Duration::ZERO));
+        let proxy = Proxy::start(config, None).unwrap();
+        let allowed = connect_and_send(
+            proxy.port(),
+            &connect_request(&format!("127.0.0.1:{echo}")),
+        );
+        assert_eq!(read_reply_head(&allowed), REPLY_OK);
+        drop(allowed);
+        drop(proxy);
+
+        let content = std::fs::read_to_string(
+            home.join(".local/share/ai-jail/history.jsonl"),
+        )
+        .unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(record["verdict"], "allow");
+        assert_eq!(record["reason"], "prompt-allow");
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -235,6 +235,21 @@ those private address classes; loopback, link-local, multicast, unspecified,
 and cloud-metadata addresses remain blocked. A project `.ai-jail` cannot add
 this capability.
 
+On Linux, `--prompt-hosts` (or `prompt_hosts = true` in the global config)
+turns a refusal into a question: when the sandbox CONNECTs to a host outside
+the allowlist, ai-jail shows a desktop notification (`notify-send`, from a
+root-owned system directory) with **Allow** and **Deny** buttons and holds the
+connection until you answer. Each answer holds for the rest of the session and
+is never saved; a denied host is refused without asking again until the next
+launch. Dismissing the notification, no answer within 60 seconds, or a missing
+`notify-send` counts as a deny. The host is resolved before asking, and the
+connection dials exactly those answers. When some resolve to private, ULA, or
+carrier-grade NAT addresses, the notification flags an **internal** host and
+lists them; approving it opens those classes for that host for the session,
+like `--allow-private-host`. Loopback, link-local, multicast, unspecified, and
+cloud-metadata answers are refused without asking. A project `.ai-jail` cannot
+enable it, and `--lockdown` disables it.
+
 ### Phantom credentials: `--secret KEY=host`
 
 With filtered egress on, `--secret ANTHROPIC_API_KEY=api.anthropic.com`
@@ -653,6 +668,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --forward-port PORT             relay host 127.0.0.1:PORT into the sandbox (Linux and macOS, repeatable)
 --publish-port PORT             expose the sandbox's 127.0.0.1:PORT on the host's 127.0.0.1:PORT (Linux, repeatable)
 --allow-private-host HOST       allow one named host to resolve to private/ULA/CGNAT addresses (repeatable)
+--prompt-hosts / --no-prompt-hosts  ask via a desktop notification before refusing an unlisted host (Linux, default off)
 --inherit-env / --no-inherit-env  pass the full parent environment (default: allowlist)
 --update-check / --no-update-check  host-side version check (default off)
 --lockdown / --no-lockdown      strict read-only mode, no network by default

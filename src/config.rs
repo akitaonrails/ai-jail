@@ -214,6 +214,13 @@ pub struct Config {
     /// disable it, never enable it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kvm: Option<bool>,
+    /// Trusted capability: in filtered egress mode, ask through a desktop
+    /// notification (`notify-send`) before refusing a host outside the
+    /// allowlist. Each answer holds for the session only. Opt-in (Linux
+    /// only); the untrusted project `.ai-jail` may only disable it, never
+    /// enable it. `--lockdown` disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_hosts: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<bool>,
     /// Permit macOS Seatbelt's broad host IPC compatibility rules. This is
@@ -412,6 +419,9 @@ impl Config {
     }
     pub fn kvm_enabled(&self) -> bool {
         self.kvm == Some(true)
+    }
+    pub fn prompt_hosts_enabled(&self) -> bool {
+        self.prompt_hosts == Some(true)
     }
     pub fn x11_enabled(&self) -> bool {
         self.x11 == Some(true)
@@ -1110,6 +1120,7 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(gcloud);
     take!(docker_config);
     take!(kvm);
+    take!(prompt_hosts);
     take!(network);
     take!(macos_host_ipc);
     take!(macos_chromium);
@@ -1467,6 +1478,8 @@ pub fn merge_with_global_report(
     monotonic!(docker_config, |config: &Config| config
         .docker_config_enabled());
     monotonic!(kvm, |config: &Config| config.kvm_enabled());
+    monotonic!(prompt_hosts, |config: &Config| config
+        .prompt_hosts_enabled());
     monotonic!(network, |config: &Config| config.network_enabled());
     monotonic!(macos_host_ipc, |config: &Config| config
         .macos_host_ipc_enabled());
@@ -2024,6 +2037,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     direct!(gcloud);
     direct!(docker_config);
     direct!(kvm);
+    direct!(prompt_hosts);
     direct!(network);
     direct!(macos_host_ipc);
     direct!(macos_chromium);
@@ -2206,6 +2220,7 @@ pub fn display_status(config: &Config) {
     print_opt_in_enabled("  Docker config", config.docker_config);
     print_opt_in_enabled("  KVM", config.kvm);
     print_network_mode(config);
+    print_opt_in_enabled("  Host prompt", config.prompt_hosts);
     print_opt_in_enabled("  macOS host IPC", config.macos_host_ipc);
     print_opt_in_enabled("  macOS Chromium", config.macos_chromium);
     print_opt_in_enabled("  X11", config.x11);
@@ -2757,6 +2772,56 @@ mod tests {
         let (merged, _) =
             merge_with_global_report(enabled, project, Path::new("/project"));
         assert!(!merged.kvm_enabled());
+    }
+
+    #[test]
+    fn prompt_hosts_is_opt_in_and_project_cannot_enable_it() {
+        assert!(!Config::default().prompt_hosts_enabled());
+        let project = Config {
+            prompt_hosts: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(!merged.prompt_hosts_enabled());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("prompt_hosts"))
+        );
+
+        let enabled = Config {
+            prompt_hosts: Some(true),
+            ..Config::default()
+        };
+        assert!(enabled.prompt_hosts_enabled());
+        assert!(
+            serialize_config(&enabled)
+                .unwrap()
+                .contains("prompt_hosts = true")
+        );
+
+        // A project may still turn off a globally enabled prompt.
+        let project = Config {
+            prompt_hosts: Some(false),
+            ..Config::default()
+        };
+        let (merged, _) =
+            merge_with_global_report(enabled, project, Path::new("/project"));
+        assert!(!merged.prompt_hosts_enabled());
+    }
+
+    #[test]
+    fn merge_prompt_hosts_flag_overrides() {
+        let cli = CliArgs {
+            prompt_hosts: Some(true),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, Config::default());
+        assert!(merged.prompt_hosts_enabled());
     }
 
     #[test]
@@ -3677,6 +3742,21 @@ audio = true
     }
 
     #[test]
+    fn regression_v2_13_1_config_without_prompt_hosts() {
+        // Configs written before prompt_hosts existed must still parse,
+        // with the interactive host prompt left off.
+        let toml = r#"
+command = ["claude"]
+allow_hosts = ["github.com"]
+kvm = true
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.prompt_hosts, None);
+        assert!(!cfg.prompt_hosts_enabled());
+        assert!(cfg.kvm_enabled());
+    }
+
+    #[test]
     fn parse_config_with_overlay_maps() {
         let toml = r#"
 command = ["claude"]
@@ -3773,6 +3853,7 @@ no_gpu = true
             gcloud: None,
             docker_config: None,
             kvm: Some(true),
+            prompt_hosts: Some(true),
             network: None,
             macos_host_ipc: None,
             macos_chromium: None,
@@ -3830,6 +3911,7 @@ no_gpu = true
         );
         assert_eq!(deserialized.no_gpu, config.no_gpu);
         assert_eq!(deserialized.kvm, config.kvm);
+        assert_eq!(deserialized.prompt_hosts, config.prompt_hosts);
         assert_eq!(deserialized.no_docker, config.no_docker);
         assert_eq!(deserialized.tailscale, config.tailscale);
         assert_eq!(deserialized.no_display, config.no_display);
@@ -6971,6 +7053,7 @@ hide_dotdirs = [".my_secrets"]
             gcloud: None,
             docker_config: None,
             kvm: None,
+            prompt_hosts: None,
             network: None,
             macos_host_ipc: None,
             macos_chromium: None,

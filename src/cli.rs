@@ -130,6 +130,11 @@ OPTIONS:
     --allow-host <HOST>            Allow CONNECT egress to HOST and its subdomains via the
                                    built-in filtered proxy (repeatable; implies filtered
                                    network mode; cannot combine with --network)
+    --prompt-hosts / --no-prompt-hosts
+                                   In filtered egress mode, ask through a desktop
+                                   notification (notify-send) before refusing a host
+                                   outside the allowlist; each answer holds for the
+                                   session (Linux only; default: off; off under --lockdown)
     --allow-private-host <HOST>    Like --allow-host, and also permit HOST and its subdomains
                                    to resolve to private/CGNAT addresses (repeatable; trusted
                                    config/CLI only; loopback, link-local, and metadata stay denied)
@@ -177,6 +182,7 @@ pub struct CliArgs {
     pub gcloud: Option<bool>,
     pub docker_config: Option<bool>,
     pub kvm: Option<bool>,
+    pub prompt_hosts: Option<bool>,
     pub network: Option<bool>,
     pub macos_host_ipc: Option<bool>,
     pub macos_chromium: Option<bool>,
@@ -449,6 +455,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("kvm" | "no-kvm")) => {
                 args.kvm = Some(s == "kvm");
+            }
+            Long(s @ ("prompt-hosts" | "no-prompt-hosts")) => {
+                args.prompt_hosts = Some(s == "prompt-hosts");
             }
             Long(s @ ("network" | "no-network")) => {
                 args.network = Some(s == "network");
@@ -726,6 +735,8 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-docker-config",
     "--kvm",
     "--no-kvm",
+    "--prompt-hosts",
+    "--no-prompt-hosts",
     "--network",
     "--no-network",
     "--macos-host-ipc",
@@ -859,6 +870,7 @@ mod tests {
             "gcloud",
             "docker-config",
             "kvm",
+            "prompt-hosts",
             "network",
             "macos-host-ipc",
             "macos-chromium",
@@ -1102,6 +1114,15 @@ mod tests {
     fn parse_no_audio() {
         let args = parse_test(&["--no-audio", "bash"]).unwrap();
         assert_eq!(args.audio, Some(false));
+    }
+
+    #[test]
+    fn parse_prompt_hosts() {
+        assert_eq!(parse_test(&["bash"]).unwrap().prompt_hosts, None);
+        let args = parse_test(&["--prompt-hosts", "bash"]).unwrap();
+        assert_eq!(args.prompt_hosts, Some(true));
+        let args = parse_test(&["--no-prompt-hosts", "bash"]).unwrap();
+        assert_eq!(args.prompt_hosts, Some(false));
     }
 
     #[test]

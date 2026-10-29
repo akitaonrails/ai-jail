@@ -42,6 +42,39 @@ fn command_needs_direct_tty(command: &[String]) -> bool {
     )
 }
 
+/// How long a host prompt waits for an answer before counting as a deny.
+#[cfg(target_os = "linux")]
+const HOST_PROMPT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Interactive host prompt (`--prompt-hosts`) for the egress proxy, never
+/// under `--lockdown`. Without a trusted `notify-send`, hosts outside the
+/// allowlist stay refused as before.
+#[cfg(target_os = "linux")]
+fn host_prompt(
+    config: &config::Config,
+) -> Option<std::sync::Arc<dyn proxy::HostPrompt>> {
+    if !config.prompt_hosts_enabled() || config.lockdown_enabled() {
+        return None;
+    }
+    let Some(program) = sandbox::bwrap::trusted_system_binary("notify-send")
+    else {
+        output::warn(
+            "--prompt-hosts: no trusted notify-send found; hosts outside \
+             the allowlist stay refused",
+        );
+        return None;
+    };
+    let label = command::effective_name(&config.command)
+        .unwrap_or("the agent")
+        .to_string();
+    Some(std::sync::Arc::new(proxy::NotifySendPrompt {
+        program,
+        label,
+        timeout: HOST_PROMPT_TIMEOUT,
+    }))
+}
+
 fn command_is_browser(command: &[String]) -> bool {
     command::effective_name(command)
         .is_some_and(sandbox::is_browser_command_name)
@@ -1145,11 +1178,17 @@ fn run() -> Result<i32, String> {
         // the file it appends to.
         proxy_config.audit = audit_log.clone();
         proxy_config.secrets = secrets;
+        proxy_config.prompt = host_prompt(&config);
         let socket = proxy::default_socket_path();
         let proxy = proxy::Proxy::start(proxy_config, Some(&socket))
             .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
         Some(proxy)
     } else {
+        if config.prompt_hosts_enabled() {
+            output::warn(
+                "--prompt-hosts has no effect: network egress is not filtered",
+            );
+        }
         None
     };
     #[cfg(target_os = "macos")]

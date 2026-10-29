@@ -758,6 +758,26 @@ fn should_use_new_session() -> bool {
     !crate::statusbar::is_active() && !std::io::stdin().is_terminal()
 }
 
+/// Trusted system copy of the helper `name`, under the same ownership rules
+/// as bwrap. Never a PATH lookup: the supervisor runs it outside the
+/// sandbox, so a copy planted in a writable PATH entry must not win.
+pub(crate) fn trusted_system_binary(name: &str) -> Option<PathBuf> {
+    if name.contains('/') {
+        return None;
+    }
+    let mut rejected = Vec::new();
+    [
+        "/usr/bin",
+        "/bin",
+        "/usr/local/bin",
+        "/run/current-system/sw/bin",
+    ]
+    .iter()
+    .find_map(|dir| {
+        trusted_bwrap_candidate(&Path::new(dir).join(name), &mut rejected)
+    })
+}
+
 /// Returns the canonical path when `path` is a trusted bwrap. A candidate
 /// that exists but is refused is recorded in `rejected` (once per canonical
 /// path) with the reason, so the final error can say it was found rather
@@ -8181,6 +8201,16 @@ mod tests {
         assert!(!trusted_binary_metadata(true, 1000, 0o555, false));
         assert!(!trusted_binary_metadata(true, 0, 0o775, false));
         assert!(!trusted_binary_metadata(true, 0, 0o644, false));
+    }
+
+    #[test]
+    fn trusted_system_binary_only_resolves_system_dirs() {
+        // `sh` ships root-owned in /usr/bin or /bin on every Linux host.
+        let sh = trusted_system_binary("sh").unwrap();
+        assert!(sh.is_absolute());
+        assert!(trusted_system_binary("ai-jail-no-such-binary").is_none());
+        // A name is never a path: no escaping the trusted directories.
+        assert!(trusted_system_binary("../bin/sh").is_none());
     }
 
     #[test]
