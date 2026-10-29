@@ -1146,7 +1146,7 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(update_check);
     take!(audit_log);
     c.env_pass.extend(local.env_pass);
-    dedup_strings(&mut c.env_pass);
+    dedup_env_pass(&mut c.env_pass);
     c.env_from_file.extend(local.env_from_file);
     dedup_paths(&mut c.env_from_file);
     c.secret_hosts.extend(local.secret_hosts);
@@ -1826,6 +1826,16 @@ fn dedup_strings(strings: &mut Vec<String>) {
     strings.retain(|s| seen.insert(s.clone()));
 }
 
+fn dedup_env_pass(entries: &mut Vec<String>) {
+    // Environment overrides are ordered: keep the last occurrence, so
+    // MODE=a, MODE=b, MODE=a still ends with MODE=a. Deduplicate complete
+    // entries, not names: a missing bare host variable must not erase an
+    // earlier literal value when apply_env_pass skips it.
+    entries.reverse();
+    dedup_strings(entries);
+    entries.reverse();
+}
+
 /// Expand a leading `~` or `~/` in a path using `$HOME`.
 /// Returns the path unchanged if `$HOME` is unset or the path
 /// does not start with `~`. Only leading-tilde forms are
@@ -2092,7 +2102,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     config.publish_ports.dedup();
 
     config.env_pass.extend(cli.env.iter().cloned());
-    dedup_strings(&mut config.env_pass);
+    dedup_env_pass(&mut config.env_pass);
 
     config
         .env_from_file
@@ -2934,7 +2944,7 @@ lockdown = false
         assert_eq!(merged.update_check, Some(false));
         assert_eq!(
             merged.env_pass,
-            vec!["ANTHROPIC_API_KEY".to_string(), "CUSTOM=value".to_string()]
+            vec!["CUSTOM=value".to_string(), "ANTHROPIC_API_KEY".to_string()]
         );
     }
 
@@ -3124,6 +3134,91 @@ env_pass = ["ANTHROPIC_API_KEY"]
             &sample_host_env(),
         );
         assert!(!env.iter().any(|(name, _)| name == "NOT_SET_ANYWHERE"));
+    }
+
+    #[test]
+    fn merge_cli_env_restores_an_earlier_value() {
+        for entries in [
+            vec!["MODE=first", "MODE=second", "MODE=first"],
+            vec!["MODE", "MODE=second", "MODE"],
+        ] {
+            let cli = CliArgs {
+                env: entries.iter().map(|entry| (*entry).into()).collect(),
+                ..CliArgs::default()
+            };
+            let merged = merge(&cli, Config::default());
+            let env = filtered_child_env(
+                &merged.env_pass,
+                &[("MODE".into(), "first".into())],
+            );
+            assert_eq!(
+                env,
+                vec![("MODE".into(), "first".into())],
+                "{entries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn regression_env_pass_config_keeps_last_value_after_merge() {
+        // Existing string-list format: repeat an earlier value after an
+        // override. Loading and merging must preserve the documented order.
+        let existing = parse_toml(
+            r#"
+command = ["sh"]
+env_pass = ["MODE=first", "MODE=second", "MODE=first"]
+"#,
+        )
+        .unwrap();
+        let merged = merge(&CliArgs::default(), existing);
+        assert_eq!(
+            filtered_child_env(&merged.env_pass, &[]),
+            vec![("MODE".into(), "first".into())]
+        );
+    }
+
+    #[test]
+    fn command_env_and_cli_can_restore_a_global_value() {
+        let global = parse_global_toml(
+            r#"
+env_pass = ["MODE=first", "MODE=second"]
+
+[commands.sh]
+env_pass = ["MODE=first"]
+"#,
+        )
+        .unwrap();
+        let mut cli = CliArgs {
+            command: vec!["sh".into()],
+            ..CliArgs::default()
+        };
+        let selected =
+            global_config_for_command(global, &cli, &Config::default());
+        assert_eq!(
+            filtered_child_env(&selected.env_pass, &[]),
+            vec![("MODE".into(), "first".into())]
+        );
+
+        // The CLI can in turn restore the base table's other value.
+        cli.env = vec!["MODE=second".into()];
+        let merged = merge(&cli, selected);
+        assert_eq!(
+            filtered_child_env(&merged.env_pass, &[]),
+            vec![("MODE".into(), "second".into())]
+        );
+    }
+
+    #[test]
+    fn merge_env_keeps_literal_when_later_host_variable_is_absent() {
+        let cli = CliArgs {
+            env: vec!["MODE=literal".into(), "MODE".into()],
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, Config::default());
+        assert_eq!(
+            filtered_child_env(&merged.env_pass, &[]),
+            vec![("MODE".into(), "literal".into())]
+        );
     }
 
     #[test]

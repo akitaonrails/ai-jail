@@ -954,6 +954,13 @@ fn parse_absolute_form(buf: &[u8]) -> Option<(String, u16)> {
 fn head_body_framing(head: &[u8]) -> (bool, Option<u64>) {
     let mut chunked = false;
     let mut content_length = None;
+    // read_request may include body bytes from the same socket read. They
+    // can be binary or look like headers, but cannot define HTTP framing.
+    let end = head
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(head.len());
+    let head = &head[..end];
     let Ok(text) = std::str::from_utf8(head) else {
         return (chunked, content_length);
     };
@@ -2602,6 +2609,26 @@ mod tests {
     }
 
     #[test]
+    fn head_body_framing_ignores_bytes_after_the_header_terminator() {
+        for body in [
+            b"\xff\x00\xfe".as_slice(),
+            b"Transfer-Encoding: chunked\r\n".as_slice(),
+            b"Content-Length: 99999\r\n".as_slice(),
+        ] {
+            let mut request = format!(
+                "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            request.extend_from_slice(body);
+            assert_eq!(
+                head_body_framing(&request),
+                (false, Some(body.len() as u64))
+            );
+        }
+    }
+
+    #[test]
     fn force_connection_close_rewrites_and_appends() {
         let head = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
         let out = force_connection_close(head);
@@ -2831,6 +2858,52 @@ mod tests {
             read_reply_head(&stream),
             "HTTP/1.1 501 Not Implemented\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn http_termination_accepts_header_like_text_in_the_body() {
+        let fixture = tls_fixture();
+        let binding = crate::secret::SecretBinding::new(
+            "X_KEY",
+            "synthetic",
+            "127.0.0.1",
+        );
+        let placeholder = binding.placeholder.clone();
+        let mut config = test_config(&["127.0.0.1"]);
+        config.secrets = vec![binding];
+        config.danger_extra_roots = vec![fixture_root()];
+        let shared = Shared {
+            config,
+            active: AtomicUsize::new(0),
+        };
+        let body = "Transfer-Encoding: chunked\r\nContent-Length: 0\r\n";
+        // Supply the read-ahead bytes explicitly so the regression does not
+        // depend on whether TCP delivers headers and body in the same read.
+        let request = format!(
+            "POST http://127.0.0.1:{fixture}/upload HTTP/1.1\r\n\
+             Host: 127.0.0.1:{fixture}\r\n\
+             x-test-key: {placeholder}\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let handler = thread::spawn(move || {
+            handle_http_termination(
+                server,
+                ("127.0.0.1".into(), fixture),
+                request,
+                &shared,
+            );
+        });
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        handler.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("key=synthetic"), "{response}");
     }
 
     #[test]

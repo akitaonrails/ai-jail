@@ -200,29 +200,34 @@ fn prepare_secrets(
             ));
         }
         // Resolve the value the child would actually receive. apply_env_pass
-        // applies entries in order and the last one wins, so the effective
-        // value is the LAST matching entry, not the first. Rewriting only the
+        // applies entries in order, skipping bare variables absent from the
+        // host, so the effective value is the LAST matching entry that has a
+        // value, not the first. Rewriting only the
         // first (the previous behaviour) left a later `KEY=real` entry intact,
         // and the child received the real value despite phantomization
         // (advisory-class duplicate-entry bypass). Match by parsed key so a
         // value containing '=' cannot be mistaken for the name.
-        let last = config.env_pass.iter().rev().find_map(|entry| {
-            config::parse_env_entry(entry)
-                .ok()
-                .filter(|(name, _)| *name == key.as_str())
+        let mut named = false;
+        let real = config.env_pass.iter().rev().find_map(|entry| {
+            let (name, explicit) = config::parse_env_entry(entry).ok()?;
+            if name != key {
+                return None;
+            }
+            named = true;
+            explicit
+                .map(str::to_string)
+                .or_else(|| std::env::var(&key).ok())
         });
-        let Some((_, explicit)) = last else {
-            return Err(format!(
-                "--secret {key}: {key} is not in the sandbox env; pass it via --env or --env-from-file"
-            ));
-        };
-        let real = match explicit {
-            Some(value) => value.to_string(),
-            None => std::env::var(&key).map_err(|_| {
+        let Some(real) = real else {
+            return Err(if named {
                 format!(
                     "--secret {key}: {key} is named in --env but not set in the host environment"
                 )
-            })?,
+            } else {
+                format!(
+                    "--secret {key}: {key} is not in the sandbox env; pass it via --env or --env-from-file"
+                )
+            });
         };
         let binding = secret::SecretBinding::new(&key, &real, &host);
         // Remove EVERY entry for this key, then insert exactly one placeholder,
@@ -698,7 +703,9 @@ fn prune_missing_path_entries(
 ) -> Option<(std::ffi::OsString, usize, usize)> {
     let total = std::env::split_paths(path).count();
     let kept: Vec<std::path::PathBuf> = std::env::split_paths(path)
-        .filter(|entry| entry.is_dir())
+        // An empty PATH component means the current directory, not a
+        // missing directory. Preserve that spelling and its search order.
+        .filter(|entry| entry.as_os_str().is_empty() || entry.is_dir())
         .collect();
     if kept.len() == total {
         return None;
@@ -878,7 +885,11 @@ fn run() -> Result<i32, String> {
     let command_from_untrusted_project = cli.command.is_empty()
         && !project_config.command.is_empty()
         && !project_trusted;
-    if cli.command.is_empty() && !project_config.command.is_empty() {
+    // The trusted project merge may have replaced the baseline command.
+    // Command precedence remains CLI > project > global in both trust modes.
+    if !cli.command.is_empty() {
+        config.command = cli.command.clone();
+    } else if !project_config.command.is_empty() {
         config.command = project_config.command.clone();
     }
     // GHSA-v2fr-83mr-f9cg question A: an untrusted project .ai-jail may
@@ -1918,6 +1929,54 @@ mod tests {
     }
 
     #[test]
+    fn secrets_keep_literal_when_later_host_variable_is_absent() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let key = "AI_JAIL_TEST_ABSENT_SECRET";
+        let _absent = EnvVarGuard::remove(key);
+        let cli = CliArgs {
+            allow_hosts: vec!["example.com".into()],
+            env: vec![key.into(), format!("{key}=synthetic-value"), key.into()],
+            secrets: vec![(key.into(), "example.com".into())],
+            ..CliArgs::default()
+        };
+        let mut config = crate::config::merge(&cli, Config::default());
+        assert_eq!(
+            crate::config::filtered_child_env(&config.env_pass, &[]),
+            vec![(key.into(), "synthetic-value".into())]
+        );
+
+        let bindings = super::prepare_secrets(&mut config).unwrap();
+
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].real, "synthetic-value");
+        assert_eq!(
+            config.env_pass,
+            vec![format!("{key}={}", bindings[0].placeholder)]
+        );
+        assert!(!config.env_pass[0].contains("synthetic-value"));
+    }
+
+    #[test]
+    fn secrets_without_any_value_still_fail() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let key = "AI_JAIL_TEST_ABSENT_SECRET";
+        let _absent = EnvVarGuard::remove(key);
+        let cli = CliArgs {
+            allow_hosts: vec!["example.com".into()],
+            env: vec![key.into()],
+            secrets: vec![(key.into(), "example.com".into())],
+            ..CliArgs::default()
+        };
+        let mut config = crate::config::merge(&cli, Config::default());
+        let error = super::prepare_secrets(&mut config).unwrap_err();
+        assert!(
+            error
+                .contains("named in --env but not set in the host environment")
+        );
+        assert_eq!(config.env_pass, vec![key]);
+    }
+
+    #[test]
     fn opencode_requires_direct_tty() {
         // opencode's ambiguous-width TUI cannot be faithfully rebuilt
         // by the vt100 proxy; it must own the terminal directly (#57).
@@ -1969,6 +2028,18 @@ mod tests {
         // Nothing to do when every entry exists: callers skip the rewrite.
         let all_real = std::env::join_paths([real.clone(), real]).unwrap();
         assert!(prune_missing_path_entries(&all_real).is_none());
+    }
+
+    #[test]
+    fn path_pruning_keeps_empty_current_directory_entries() {
+        let empty = std::path::PathBuf::new();
+        let missing = std::env::temp_dir()
+            .join(format!("ai-jail-missing-path-entry-{}", std::process::id()));
+        let path = std::env::join_paths([&empty, &missing, &empty]).unwrap();
+        let (pruned, kept, total) = prune_missing_path_entries(&path).unwrap();
+        assert_eq!((kept, total), (2, 3));
+        assert_eq!(pruned, std::env::join_paths([&empty, &empty]).unwrap());
+        assert!(prune_missing_path_entries(std::ffi::OsStr::new("")).is_none());
     }
 
     #[test]

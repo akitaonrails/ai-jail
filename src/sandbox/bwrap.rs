@@ -3594,50 +3594,45 @@ fn extra_mounts_with_check(
         }
     }
 
-    // A same-path bind (source == destination) is redundant when an
-    // ancestor destination is already bound from the same host path with
-    // the same writability: the ancestor's mount brings the whole subtree
-    // in. Worse than redundant, the re-bind now fails the launch: the
-    // parent-first sort below lands the directory first, and when the
-    // inner path is a symlink there (e.g. ~/.local/bin/claude under the
-    // mise auto-map of ~/.local/bin) bwrap refuses to "mount on symlink
-    // destination" (#196). Alternate-destination (src != dest) and
-    // writability-changing mounts are never redundant this way and stay.
-    let covered: Vec<(bool, PathBuf)> = mounts
-        .iter()
-        .filter_map(|m| match m {
-            Mount::Bind { src, dest } if src == dest => {
-                Some((true, dest.clone()))
-            }
-            Mount::RoBind { src, dest } if src == dest => {
-                Some((false, dest.clone()))
-            }
-            _ => None,
-        })
-        .collect();
-    mounts.retain(|m| {
-        let (writable, src, dest) = match m {
-            Mount::Bind { src, dest } => (true, src, dest),
-            Mount::RoBind { src, dest } => (false, src, dest),
-            _ => return true,
-        };
-        src != dest
-            || !covered.iter().any(|(w, ancestor)| {
-                *w == writable && dest.starts_with(ancestor) && dest != ancestor
-            })
-    });
-
     // bwrap applies mounts in order and the later mount wins, so a nested
-    // destination must be emitted AFTER its ancestor: emitted first, it is
-    // silently shadowed when the ancestor is mounted over it (#183 — a user
-    // `--rw-map ~/.cache/deno` listed before the auto-injected toolchain
-    // cache map for `~/.cache` never appeared inside the sandbox, and
-    // Landlock then skipped its path as not found). Stable sort by
-    // destination depth: parents first, children after, insertion order
-    // kept within a level.
+    // destination must be emitted AFTER its ancestor (#183). Stable sorting
+    // keeps insertion order for maps of the same destination.
     mounts.sort_by_key(|mount| mount.dest().components().count());
 
-    mounts
+    // A same-path bind is redundant only if the effective earlier mount
+    // already exposes that host subtree with the same writability. Skipping
+    // it also avoids binding over an already-exposed symlink (#196).
+    // Consult the nearest retained destination, including equal destinations:
+    // an intervening alternate-source map may have replaced the subtree, so
+    // a more distant same-path ancestor alone does not cover the child.
+    let mut retained: Vec<Mount> = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        let redundant =
+            match &mount {
+                Mount::Bind { src, dest } | Mount::RoBind { src, dest }
+                    if src == dest =>
+                {
+                    retained
+                        .iter()
+                        .rev()
+                        .find(|previous| dest.starts_with(previous.dest()))
+                        .is_some_and(|previous| match (previous, &mount) {
+                            (Mount::Bind { src, dest }, Mount::Bind { .. })
+                            | (
+                                Mount::RoBind { src, dest },
+                                Mount::RoBind { .. },
+                            ) => src == dest,
+                            _ => false,
+                        })
+                }
+                _ => false,
+            };
+        if !redundant {
+            retained.push(mount);
+        }
+    }
+
+    retained
 }
 
 /// Directory (inside the project) that holds the on-host upper and
@@ -5459,6 +5454,71 @@ mod tests {
                 PathBuf::from("/store/xdg:/home/u/.cache"),
             ],
             &[],
+            |_| true,
+        );
+        assert_eq!(mounts.len(), 2, "{mounts:?}");
+    }
+
+    #[test]
+    fn same_path_dedupe_keeps_child_below_redirected_ancestor() {
+        // The outer same-path map does not make the child redundant:
+        // the intervening alternate source replaces that subtree.
+        for writable in [false, true] {
+            let maps = vec![
+                PathBuf::from("/home/u/config/nested/settings"),
+                PathBuf::from("/home/u/config"),
+                PathBuf::from("/store/defaults:/home/u/config/nested"),
+            ];
+            let mounts = if writable {
+                extra_mounts_with_check(&maps, &[], |_| true)
+            } else {
+                extra_mounts_with_check(&[], &maps, |_| true)
+            };
+            let destinations: Vec<_> =
+                mounts.iter().map(|mount| mount.dest()).collect();
+            assert_eq!(
+                destinations,
+                vec![
+                    Path::new("/home/u/config"),
+                    Path::new("/home/u/config/nested"),
+                    Path::new("/home/u/config/nested/settings"),
+                ],
+                "child must override the alternate source (writable={writable})"
+            );
+        }
+    }
+
+    #[test]
+    fn same_path_dedupe_honors_the_last_mount_at_equal_depth() {
+        let mounts = extra_mounts_with_check(
+            &[],
+            &[
+                PathBuf::from("/home/u/config"),
+                PathBuf::from("/store/defaults:/home/u/config/nested"),
+                PathBuf::from("/home/u/config/nested"),
+            ],
+            |_| true,
+        );
+        assert_eq!(mounts.len(), 3, "{mounts:?}");
+
+        let mounts = extra_mounts_with_check(
+            &[],
+            &[
+                PathBuf::from("/home/u/config"),
+                PathBuf::from("/store/defaults:/home/u/config"),
+                PathBuf::from("/home/u/config/nested"),
+            ],
+            |_| true,
+        );
+        assert_eq!(mounts.len(), 3, "{mounts:?}");
+
+        let mounts = extra_mounts_with_check(
+            &[],
+            &[
+                PathBuf::from("/store/defaults:/home/u/config"),
+                PathBuf::from("/home/u/config"),
+                PathBuf::from("/home/u/config/nested"),
+            ],
             |_| true,
         );
         assert_eq!(mounts.len(), 2, "{mounts:?}");
