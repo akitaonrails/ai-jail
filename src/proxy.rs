@@ -243,12 +243,7 @@ impl Proxy {
         config: ProxyConfig,
         unix_socket_path: Option<&Path>,
     ) -> io::Result<Proxy> {
-        let shared = Arc::new(Shared {
-            config,
-            active: AtomicUsize::new(0),
-            decisions: Mutex::new(HashMap::new()),
-            decided: Condvar::new(),
-        });
+        let shared = Arc::new(Shared::new(config));
 
         let port = if unix_socket_path.is_none() {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
@@ -327,6 +322,17 @@ struct Shared {
     decisions: Mutex<HashMap<String, Decision>>,
     /// Wakes connections waiting on a `Pending` host.
     decided: Condvar,
+}
+
+impl Shared {
+    fn new(config: ProxyConfig) -> Self {
+        Shared {
+            config,
+            active: AtomicUsize::new(0),
+            decisions: Mutex::new(HashMap::new()),
+            decided: Condvar::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2872,10 +2878,7 @@ mod tests {
         let mut config = test_config(&["127.0.0.1"]);
         config.secrets = vec![binding];
         config.danger_extra_roots = vec![fixture_root()];
-        let shared = Shared {
-            config,
-            active: AtomicUsize::new(0),
-        };
+        let shared = Shared::new(config);
         let body = "Transfer-Encoding: chunked\r\nContent-Length: 0\r\n";
         // Supply the read-ahead bytes explicitly so the regression does not
         // depend on whether TCP delivers headers and body in the same read.

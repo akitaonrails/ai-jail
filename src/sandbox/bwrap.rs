@@ -8265,9 +8265,13 @@ mod tests {
 
     #[test]
     fn trusted_system_binary_only_resolves_system_dirs() {
-        // `sh` ships root-owned in /usr/bin or /bin on every Linux host.
-        let sh = trusted_system_binary("sh").unwrap();
-        assert!(sh.is_absolute());
+        // Ownership is environment-dependent (rootless containers and the
+        // Nix build sandbox see root as the overflow uid), so only check
+        // what holds everywhere; the trust rule itself is covered by the
+        // trusted_binary_metadata tests.
+        if let Some(sh) = trusted_system_binary("sh") {
+            assert!(sh.is_absolute());
+        }
         assert!(trusted_system_binary("ai-jail-no-such-binary").is_none());
         // A name is never a path: no escaping the trusted directories.
         assert!(trusted_system_binary("../bin/sh").is_none());
