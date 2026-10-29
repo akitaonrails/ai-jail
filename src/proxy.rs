@@ -126,15 +126,24 @@ impl ProxyConfig {
 /// Asks the user whether a host outside the allowlist may be reached.
 /// Runs on the connection's own thread, which blocks until it returns.
 pub(crate) trait HostPrompt: Send + Sync {
-    /// `true` only on an explicit approval; every failure is a deny.
     /// `internal` lists the host's private/CGNAT addresses (empty for a
     /// public host): approving opens them for the rest of the session.
-    fn ask(&self, host: &str, port: u16, internal: &[IpAddr]) -> bool;
+    fn ask(&self, host: &str, port: u16, internal: &[IpAddr]) -> PromptAnswer;
+}
+
+/// The user's answer. Only `Allow` and `Deny` are remembered for the
+/// session; `NoAnswer` refuses the waiting connection(s) and the next
+/// connection to that host asks again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromptAnswer {
+    Allow,
+    Deny,
+    NoAnswer,
 }
 
 /// Desktop-notification prompt (Linux): `notify-send --wait` with
 /// Allow/Deny actions. A dismissal, a missing or failing `notify-send`,
-/// or no answer within `timeout` all count as a deny.
+/// or no answer within `timeout` are all `NoAnswer`.
 pub(crate) struct NotifySendPrompt {
     /// Absolute path of a trusted `notify-send`.
     pub program: PathBuf,
@@ -146,7 +155,7 @@ pub(crate) struct NotifySendPrompt {
 const NOTIFY_POLL: Duration = Duration::from_millis(100);
 
 impl HostPrompt for NotifySendPrompt {
-    fn ask(&self, host: &str, port: u16, internal: &[IpAddr]) -> bool {
+    fn ask(&self, host: &str, port: u16, internal: &[IpAddr]) -> PromptAnswer {
         let (summary, body) = notify_text(&self.label, host, port, internal);
         let spawned = Command::new(&self.program)
             .arg("--app-name=ai-jail")
@@ -162,7 +171,7 @@ impl HostPrompt for NotifySendPrompt {
             .stderr(Stdio::null())
             .spawn();
         let Ok(mut child) = spawned else {
-            return false;
+            return PromptAnswer::NoAnswer;
         };
         let deadline = Instant::now() + self.timeout;
         loop {
@@ -174,7 +183,7 @@ impl HostPrompt for NotifySendPrompt {
                 _ => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return false;
+                    return PromptAnswer::NoAnswer;
                 }
             }
         }
@@ -182,7 +191,7 @@ impl HostPrompt for NotifySendPrompt {
         if let Some(mut stdout) = child.stdout.take() {
             let _ = stdout.read_to_string(&mut reply);
         }
-        notify_reply_allows(&reply)
+        notify_reply(&reply)
     }
 }
 
@@ -211,8 +220,12 @@ fn notify_text(
 
 /// `notify-send --wait` prints the invoked action's name, or nothing
 /// when the notification is dismissed or expires.
-fn notify_reply_allows(reply: &str) -> bool {
-    reply.trim_end() == "allow"
+fn notify_reply(reply: &str) -> PromptAnswer {
+    match reply.trim_end() {
+        "allow" => PromptAnswer::Allow,
+        "deny" => PromptAnswer::Deny,
+        _ => PromptAnswer::NoAnswer,
+    }
 }
 
 /// Running proxy handle. Reports where the listeners are; see the
@@ -316,7 +329,7 @@ struct Shared {
     decided: Condvar,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Decision {
     Pending,
     /// `internal`: the approval covered private/CGNAT answers too.
@@ -324,6 +337,9 @@ enum Decision {
         internal: bool,
     },
     Deny,
+    /// Outcome of an unanswered prompt; never stored, so the host is
+    /// asked again on its next connection.
+    NoAnswer,
 }
 
 /// Decrements the active-connection count when the handler returns.
@@ -479,6 +495,11 @@ fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
                 allow_reason = "prompt-allow";
                 internal_ok = internal;
             }
+            Some(Decision::NoAnswer) => {
+                audit_verdict(&shared, &host, port, "deny", "prompt-no-answer");
+                reject(&mut client, &Reject::ForbiddenHost);
+                return;
+            }
             Some(_) => {
                 audit_verdict(&shared, &host, port, "deny", "prompt-deny");
                 reject(&mut client, &Reject::ForbiddenHost);
@@ -525,13 +546,14 @@ fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
     relay(client, upstream);
 }
 
-/// Session verdict (`Allow` or `Deny`) for a promptable host outside the
-/// allowlist, given its resolved `addrs`. `None` when no answer could ever
-/// be dialed (loopback, link-local, metadata, ...), so the user is never
-/// asked. Answers in private/CGNAT ranges are shown to the user, and an
-/// approval then opens those ranges for the host. Each host is asked at
-/// most once per session; concurrent connections to a host being asked
-/// about wait for that one answer.
+/// Verdict for a promptable host outside the allowlist, given its resolved
+/// `addrs`. `None` when no answer could ever be dialed (loopback,
+/// link-local, metadata, ...), so the user is never asked. Answers in
+/// private/CGNAT ranges are shown to the user, and an approval then opens
+/// those ranges for the host. An `Allow` or `Deny` holds for the session,
+/// so each host is answered at most once; `NoAnswer` is not remembered and
+/// the next connection asks again. Concurrent connections to a host being
+/// asked about wait for that one outcome.
 fn prompt_verdict(
     shared: &Shared,
     host: &str,
@@ -558,29 +580,40 @@ fn prompt_verdict(
     let key = normalize_host(host);
     let lock = || shared.decisions.lock().unwrap_or_else(|e| e.into_inner());
     let mut decisions = lock();
+    let mut waited = false;
     loop {
         match decisions.get(&key).copied() {
             Some(Decision::Pending) => {
+                waited = true;
                 decisions = shared
                     .decided
                     .wait(decisions)
                     .unwrap_or_else(|e| e.into_inner());
             }
             Some(decided) => return Some(decided),
+            // The prompt this connection waited on went unanswered: it
+            // shares that outcome instead of asking again at once.
+            None if waited => return Some(Decision::NoAnswer),
             None => break,
         }
     }
     decisions.insert(key.clone(), Decision::Pending);
     drop(decisions);
 
-    let decision = if prompt.ask(&key, port, &internal) {
-        Decision::Allow {
+    let decision = match prompt.ask(&key, port, &internal) {
+        PromptAnswer::Allow => Decision::Allow {
             internal: !internal.is_empty(),
-        }
-    } else {
-        Decision::Deny
+        },
+        PromptAnswer::Deny => Decision::Deny,
+        PromptAnswer::NoAnswer => Decision::NoAnswer,
     };
-    lock().insert(key, decision);
+    let mut decisions = lock();
+    if decision == Decision::NoAnswer {
+        decisions.remove(&key);
+    } else {
+        decisions.insert(key, decision);
+    }
+    drop(decisions);
     shared.decided.notify_all();
     Some(decision)
 }
@@ -2032,20 +2065,20 @@ mod tests {
         assert_eq!(read_reply_head(&stream), "HTTP/1.1 403 Forbidden\r\n\r\n");
     }
 
-    /// Fake host prompt: answers `allow`, counts calls, records the
+    /// Fake host prompt: gives `answer`, counts calls, records the
     /// internal addresses each call was shown, and holds each answer for
     /// `delay` so concurrent connections overlap.
     struct FakePrompt {
-        allow: bool,
+        answer: PromptAnswer,
         delay: Duration,
         calls: AtomicUsize,
         internal_seen: Mutex<Vec<Vec<IpAddr>>>,
     }
 
     impl FakePrompt {
-        fn new(allow: bool, delay: Duration) -> Arc<FakePrompt> {
+        fn new(answer: PromptAnswer, delay: Duration) -> Arc<FakePrompt> {
             Arc::new(FakePrompt {
-                allow,
+                answer,
                 delay,
                 calls: AtomicUsize::new(0),
                 internal_seen: Mutex::new(Vec::new()),
@@ -2054,28 +2087,79 @@ mod tests {
     }
 
     impl HostPrompt for FakePrompt {
-        fn ask(&self, _host: &str, _port: u16, internal: &[IpAddr]) -> bool {
+        fn ask(
+            &self,
+            _host: &str,
+            _port: u16,
+            internal: &[IpAddr],
+        ) -> PromptAnswer {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.internal_seen.lock().unwrap().push(internal.to_vec());
             thread::sleep(self.delay);
-            self.allow
+            self.answer
         }
     }
 
     fn prompted_proxy(
-        allow: bool,
+        answer: PromptAnswer,
         delay: Duration,
     ) -> (Proxy, Arc<FakePrompt>) {
-        let prompt = FakePrompt::new(allow, delay);
+        let prompt = FakePrompt::new(answer, delay);
         let mut config = test_config(&["example.com"]);
         config.prompt = Some(Arc::clone(&prompt) as Arc<dyn HostPrompt>);
         (Proxy::start(config, None).unwrap(), prompt)
     }
 
+    #[test]
+    fn e2e_prompt_no_answer_denies_but_asks_again() {
+        let (proxy, prompt) =
+            prompted_proxy(PromptAnswer::NoAnswer, Duration::ZERO);
+        for _ in 0..2 {
+            let stream = connect_and_send(
+                proxy.port(),
+                &connect_request("203.0.113.5:443"),
+            );
+            assert_eq!(
+                read_reply_head(&stream),
+                "HTTP/1.1 403 Forbidden\r\n\r\n"
+            );
+        }
+        assert_eq!(prompt.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn e2e_concurrent_connections_share_one_unanswered_prompt() {
+        // Connections waiting on a prompt that goes unanswered are denied
+        // with it rather than each re-asking at once.
+        let (proxy, prompt) =
+            prompted_proxy(PromptAnswer::NoAnswer, Duration::from_millis(300));
+        let port = proxy.port();
+        let clients: Vec<_> = (0..4)
+            .map(|_| {
+                thread::spawn(move || {
+                    let stream = connect_and_send(
+                        port,
+                        &connect_request("203.0.113.5:443"),
+                    );
+                    read_reply_head(&stream)
+                })
+            })
+            .collect();
+        for client in clients {
+            assert_eq!(
+                client.join().unwrap(),
+                "HTTP/1.1 403 Forbidden\r\n\r\n"
+            );
+        }
+        assert_eq!(prompt.calls.load(Ordering::SeqCst), 1);
+    }
+
     /// Like [`prompted_proxy`] but with the real SSRF guard, so private
     /// and loopback answers are classified as they are in production.
-    fn guarded_prompted_proxy(allow: bool) -> (Proxy, Arc<FakePrompt>) {
-        let prompt = FakePrompt::new(allow, Duration::ZERO);
+    fn guarded_prompted_proxy(
+        answer: PromptAnswer,
+    ) -> (Proxy, Arc<FakePrompt>) {
+        let prompt = FakePrompt::new(answer, Duration::ZERO);
         let mut config = ProxyConfig::new(Vec::new());
         config.connect_timeout = Duration::from_millis(200);
         config.prompt = Some(Arc::clone(&prompt) as Arc<dyn HostPrompt>);
@@ -2084,7 +2168,7 @@ mod tests {
 
     #[test]
     fn e2e_prompt_shows_internal_addresses() {
-        let (proxy, prompt) = guarded_prompted_proxy(false);
+        let (proxy, prompt) = guarded_prompted_proxy(PromptAnswer::Deny);
         let stream =
             connect_and_send(proxy.port(), &connect_request("10.1.2.3:443"));
         assert_eq!(read_reply_head(&stream), "HTTP/1.1 403 Forbidden\r\n\r\n");
@@ -2094,7 +2178,7 @@ mod tests {
 
     #[test]
     fn e2e_prompt_shows_no_internal_address_for_public_hosts() {
-        let (proxy, prompt) = guarded_prompted_proxy(false);
+        let (proxy, prompt) = guarded_prompted_proxy(PromptAnswer::Deny);
         let stream =
             connect_and_send(proxy.port(), &connect_request("203.0.113.5:443"));
         assert_eq!(read_reply_head(&stream), "HTTP/1.1 403 Forbidden\r\n\r\n");
@@ -2104,7 +2188,7 @@ mod tests {
 
     #[test]
     fn e2e_prompt_never_offers_loopback_or_metadata() {
-        let (proxy, prompt) = guarded_prompted_proxy(true);
+        let (proxy, prompt) = guarded_prompted_proxy(PromptAnswer::Allow);
         for target in ["127.0.0.1:80", "169.254.169.254:80", "[::1]:80"] {
             let stream =
                 connect_and_send(proxy.port(), &connect_request(target));
@@ -2119,7 +2203,7 @@ mod tests {
 
     #[test]
     fn e2e_prompt_unresolvable_host_is_not_asked() {
-        let (proxy, prompt) = guarded_prompted_proxy(true);
+        let (proxy, prompt) = guarded_prompted_proxy(PromptAnswer::Allow);
         let stream = connect_and_send(
             proxy.port(),
             &connect_request("ai-jail-no-such-host.invalid:443"),
@@ -2154,7 +2238,8 @@ mod tests {
     #[test]
     fn e2e_prompt_allow_tunnels_and_is_remembered() {
         let echo = echo_server();
-        let (proxy, prompt) = prompted_proxy(true, Duration::ZERO);
+        let (proxy, prompt) =
+            prompted_proxy(PromptAnswer::Allow, Duration::ZERO);
         let request = connect_request(&format!("127.0.0.1:{echo}"));
         for _ in 0..2 {
             let stream = connect_and_send(proxy.port(), &request);
@@ -2169,7 +2254,8 @@ mod tests {
 
     #[test]
     fn e2e_prompt_deny_is_403_and_never_asked_again() {
-        let (proxy, prompt) = prompted_proxy(false, Duration::ZERO);
+        let (proxy, prompt) =
+            prompted_proxy(PromptAnswer::Deny, Duration::ZERO);
         for _ in 0..2 {
             let stream = connect_and_send(
                 proxy.port(),
@@ -2185,7 +2271,8 @@ mod tests {
 
     #[test]
     fn e2e_prompt_decision_is_per_host_case_insensitive() {
-        let (proxy, prompt) = prompted_proxy(false, Duration::ZERO);
+        let (proxy, prompt) =
+            prompted_proxy(PromptAnswer::Deny, Duration::ZERO);
         // Names that resolve offline: /etc/hosts maps localhost.
         for host in ["LocalHost:443", "localhost:80", "203.0.113.5:443"] {
             let stream = connect_and_send(proxy.port(), &connect_request(host));
@@ -2196,7 +2283,8 @@ mod tests {
 
     #[test]
     fn e2e_concurrent_connections_share_one_prompt() {
-        let (proxy, prompt) = prompted_proxy(false, Duration::from_millis(300));
+        let (proxy, prompt) =
+            prompted_proxy(PromptAnswer::Deny, Duration::from_millis(300));
         let port = proxy.port();
         let clients: Vec<_> = (0..4)
             .map(|_| {
@@ -2220,7 +2308,8 @@ mod tests {
 
     #[test]
     fn e2e_prompt_skips_hosts_with_unexpected_characters() {
-        let (proxy, prompt) = prompted_proxy(true, Duration::ZERO);
+        let (proxy, prompt) =
+            prompted_proxy(PromptAnswer::Allow, Duration::ZERO);
         for host in ["<b>evil</b>:443", "a b.test:443", "x&y.test:443"] {
             let stream = connect_and_send(proxy.port(), &connect_request(host));
             read_reply_head(&stream);
@@ -2231,7 +2320,7 @@ mod tests {
     #[test]
     fn e2e_prompt_is_not_asked_for_allowlisted_hosts() {
         let echo = echo_server();
-        let prompt = FakePrompt::new(false, Duration::ZERO);
+        let prompt = FakePrompt::new(PromptAnswer::Deny, Duration::ZERO);
         let mut config = test_config(&["127.0.0.1"]);
         config.prompt = Some(Arc::clone(&prompt) as Arc<dyn HostPrompt>);
         let proxy = Proxy::start(config, None).unwrap();
@@ -2258,12 +2347,13 @@ mod tests {
     }
 
     #[test]
-    fn notify_reply_allows_only_the_allow_action() {
-        assert!(notify_reply_allows("allow\n"));
-        assert!(notify_reply_allows("allow"));
-        assert!(!notify_reply_allows("deny\n"));
-        assert!(!notify_reply_allows(""));
-        assert!(!notify_reply_allows("allowed\n"));
+    fn notify_reply_maps_actions_and_treats_the_rest_as_no_answer() {
+        assert_eq!(notify_reply("allow\n"), PromptAnswer::Allow);
+        assert_eq!(notify_reply("allow"), PromptAnswer::Allow);
+        assert_eq!(notify_reply("deny\n"), PromptAnswer::Deny);
+        // Dismissed or expired: notify-send prints nothing.
+        assert_eq!(notify_reply(""), PromptAnswer::NoAnswer);
+        assert_eq!(notify_reply("allowed\n"), PromptAnswer::NoAnswer);
     }
 
     #[test]
@@ -2376,7 +2466,8 @@ mod tests {
 
         let mut config = test_config(&[]);
         config.audit = Some(log);
-        config.prompt = Some(FakePrompt::new(true, Duration::ZERO));
+        config.prompt =
+            Some(FakePrompt::new(PromptAnswer::Allow, Duration::ZERO));
         let proxy = Proxy::start(config, None).unwrap();
         let allowed = connect_and_send(
             proxy.port(),

@@ -133,8 +133,9 @@ OPTIONS:
     --prompt-hosts / --no-prompt-hosts
                                    In filtered egress mode, ask through a desktop
                                    notification (notify-send) before refusing a host
-                                   outside the allowlist; each answer holds for the
-                                   session (Linux only; default: off; off under --lockdown)
+                                   outside the allowlist; Allow/Deny holds for the
+                                   session, no answer refuses only that connection
+                                   (Linux only; default: off; off under --lockdown)
     --allow-private-host <HOST>    Like --allow-host, and also permit HOST and its subdomains
                                    to resolve to private/CGNAT addresses (repeatable; trusted
                                    config/CLI only; loopback, link-local, and metadata stay denied)
