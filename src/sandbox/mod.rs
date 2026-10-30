@@ -2754,12 +2754,26 @@ mod tests {
     fn mise_wrapper_preserves_jail_marker_for_managed_launchers() {
         // Non-interactive Bash unsets an inherited PS1. Exercise the real
         // wrapper shell, including missing and failing mise activation.
-        for mise in ["/usr/bin/true", "/usr/bin/false", "/missing/mise"] {
+        let resolve = |name: &str| {
+            std::env::split_paths(
+                &std::env::var_os("PATH").expect("test PATH must be set"),
+            )
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| panic!("test command {name:?} not found"))
+        };
+        let printenv = resolve("printenv");
+        let mise_paths = [
+            resolve("true"),
+            resolve("false"),
+            PathBuf::from("/missing/mise"),
+        ];
+        for mise in &mise_paths {
             for login in [false, true] {
                 let wrapped = mise_wrapper_command(
-                    Path::new(mise),
+                    mise,
                     LaunchCommand {
-                        program: "/usr/bin/printenv".into(),
+                        program: printenv.display().to_string(),
                         args: vec!["PS1".into()],
                     },
                     login,
@@ -2773,14 +2787,16 @@ mod tests {
                     .expect("run the mise wrapper through Bash");
                 assert!(
                     output.status.success(),
-                    "marker missing with mise={mise}, login={login}"
+                    "marker missing with mise={}, login={login}",
+                    mise.display()
                 );
                 assert_eq!(
                     String::from_utf8(output.stdout)
                         .unwrap()
                         .trim_end_matches('\n'),
                     JAIL_PS1,
-                    "mise={mise}, login={login}"
+                    "mise={}, login={login}",
+                    mise.display()
                 );
             }
         }
