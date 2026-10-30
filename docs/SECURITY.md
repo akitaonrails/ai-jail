@@ -77,6 +77,17 @@ home.
 cannot be securely constrained by that interface. Use `--network` if the
 resulting unrestricted network access is explicitly intended.
 
+On Linux, `--prompt-hosts` turns a filtered-egress refusal into an interactive
+desktop approval. This is a trusted capability: only the CLI or global config
+may enable it, and `--lockdown` disables it. Decisions last only for the
+current process. The proxy resolves the hostname before prompting and dials
+only that answer set; loopback, link-local, multicast, unspecified, and cloud
+metadata addresses are always refused without prompting. Private, unique-local,
+and carrier-grade NAT answers are identified in the prompt and require an
+explicit approval. A missing notification helper, dismissal, timeout, or any
+prompt error fails closed for that connection. The helper is accepted only
+from a fixed system directory with trusted ownership and permissions.
+
 Read-only for the five credential flags above protects the file from
 modification, not the credential from use: anything in the sandbox can act as
 you on that service for as long as the credential is valid. That is why each

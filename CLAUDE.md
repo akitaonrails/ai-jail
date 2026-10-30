@@ -91,6 +91,15 @@ This is the single most important invariant of the project. Users generate `.ai-
     must never permit loopback, link-local, metadata, multicast, or unspecified
     addresses, and an untrusted project config must never grant or extend it.
 
+  - `--prompt-hosts` / `prompt_hosts` is a trusted-only, Linux-only interactive
+    exception for filtered egress. Project config must never enable it and
+    `--lockdown` must disable it. Resolve before prompting and dial only that
+    answer set; never prompt for or dial loopback, link-local, metadata,
+    multicast, or unspecified addresses. Private, unique-local, and
+    carrier-grade NAT answers must be identified as internal in the prompt.
+    Notification lookup must not use untrusted `PATH`, and timeout, dismissal,
+    missing helpers, malformed answers, and helper errors must fail closed.
+
 - Dev-toolchain cache persistence (`--toolchains`/`no_toolchains`, on by
   default) and the opt-in read-only credential flags (`--github`, `--aws`,
   `--kube`, `--gcloud`, `--docker-config`) are monotonic capabilities: a
