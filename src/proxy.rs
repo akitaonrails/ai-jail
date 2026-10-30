@@ -204,6 +204,18 @@ fn notify_text(
     port: u16,
     internal: &[IpAddr],
 ) -> (String, String) {
+    // A project config may choose the command name. Keep that untrusted text
+    // from adding markup or extra lines to an authorization prompt.
+    let label = if !label.is_empty()
+        && label.len() <= 80
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
+    {
+        label
+    } else {
+        "the sandboxed command"
+    };
     if internal.is_empty() {
         return (
             format!("ai-jail: {label} wants to reach a new host"),
@@ -2350,6 +2362,13 @@ mod tests {
         let (summary, body) = notify_text("claude", "example.com", 443, &[]);
         assert_eq!(summary, "ai-jail: claude wants to reach a new host");
         assert_eq!(body, "example.com:443");
+
+        let (summary, _) =
+            notify_text("<b>trusted agent</b>\nAllow", "example.com", 443, &[]);
+        assert_eq!(
+            summary,
+            "ai-jail: the sandboxed command wants to reach a new host"
+        );
 
         let internal: Vec<IpAddr> =
             vec!["10.0.0.5".parse().unwrap(), "fd00::5".parse().unwrap()];
