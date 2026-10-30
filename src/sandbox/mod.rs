@@ -1440,7 +1440,7 @@ fn mise_wrapper_command(
     // running it anyway makes mise resolve every declared tool over the
     // network, costing a multi-second timeout each before the agent starts,
     // then failing on shims that cannot resolve (issue #113).
-    let script = concat!(
+    let activation = concat!(
         "MISE=\"$1\"; shift; ",
         "if [ -x \"$MISE\" ] && { ",
         "[ -d \"${MISE_DATA_DIR:-$HOME/.local/share/mise}\" ] || ",
@@ -1448,11 +1448,16 @@ fn mise_wrapper_command(
         "\"$MISE\" trust -q && eval \"$(\"$MISE\" activate bash)\" && ",
         "eval \"$(\"$MISE\" env)\"; ",
         "fi; ",
-        "exec \"$@\"",
+    );
+    // Non-interactive Bash discards an inherited PS1. Restore our marker
+    // after activation so managed launchers can still recognize the jail.
+    let script = format!(
+        "{activation}export PS1={}; exec \"$@\"",
+        quote_shell_arg(JAIL_PS1)
     );
     let mut args = vec![
         if login_shell { "-lc" } else { "-c" }.into(),
-        script.into(),
+        script,
         "ai-jail-mise".into(),
         mise_path.display().to_string(),
         user_cmd.program,
@@ -2745,6 +2750,42 @@ mod tests {
     }
 
     #[test]
+    fn mise_wrapper_preserves_jail_marker_for_managed_launchers() {
+        // Non-interactive Bash unsets an inherited PS1. Exercise the real
+        // wrapper shell, including missing and failing mise activation.
+        for mise in ["/usr/bin/true", "/usr/bin/false", "/missing/mise"] {
+            for login in [false, true] {
+                let wrapped = mise_wrapper_command(
+                    Path::new(mise),
+                    LaunchCommand {
+                        program: "/usr/bin/printenv".into(),
+                        args: vec!["PS1".into()],
+                    },
+                    login,
+                );
+                let output = std::process::Command::new(&wrapped.program)
+                    .args(["--noprofile", "--norc"])
+                    .args(&wrapped.args)
+                    .env("PS1", JAIL_PS1)
+                    .env("MISE_DATA_DIR", std::env::temp_dir())
+                    .output()
+                    .expect("run the mise wrapper through Bash");
+                assert!(
+                    output.status.success(),
+                    "marker missing with mise={mise}, login={login}"
+                );
+                assert_eq!(
+                    String::from_utf8(output.stdout)
+                        .unwrap()
+                        .trim_end_matches('\n'),
+                    JAIL_PS1,
+                    "mise={mise}, login={login}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn regression_mise_wrapper_forwards_user_argv_verbatim() {
         let user_cmd = LaunchCommand {
             program: "echo".into(),
@@ -2817,7 +2858,7 @@ mod tests {
             !script.contains("&& exec \"$@\""),
             "activation must not gate the user command: {script}"
         );
-        assert!(script.contains("fi; exec \"$@\""));
+        assert!(script.contains("fi; export PS1="));
         // Activation only when mise has something to activate against.
         assert!(script.contains("MISE_DATA_DIR"));
         assert!(script.contains("MISE_CONFIG_DIR"));
