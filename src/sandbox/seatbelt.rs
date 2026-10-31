@@ -462,6 +462,7 @@ fn generate_sbpl_profile_for_tty(
     push_claude_keychain_section(&mut profile, config);
     push_codex_mach_section(&mut profile, config);
     push_chromium_rendezvous_section(&mut profile, config);
+    push_trustd_section(&mut profile, config);
     push_network_section(&mut profile, config, proxy_port);
     push_codex_control_socket_section(&mut profile, config);
     let is_claude =
@@ -843,6 +844,22 @@ fn push_chromium_rendezvous_section(profile: &mut String, config: &Config) {
     profile.push_str("; Chromium Mach rendezvous (--macos-chromium)\n");
     profile.push_str(&format!("(allow mach-register {name})\n"));
     profile.push_str(&format!("(allow mach-lookup {name})\n\n"));
+}
+
+/// `--macos-trustd`: Go's crypto/x509 and Security.framework TLS clients
+/// (e.g. `gh`) hand certificate chains to `trustd` for evaluation. With the
+/// lookup denied, verification fails with `OSStatus -26276` even though the
+/// network itself works. Only that one service is opened; the broad
+/// `--macos-host-ipc` rules stay off.
+fn push_trustd_section(profile: &mut String, config: &Config) {
+    if config.lockdown_enabled() || !config.macos_trustd_enabled() {
+        return;
+    }
+
+    profile.push_str("; macOS trust evaluation (--macos-trustd)\n");
+    profile.push_str(
+        "(allow mach-lookup (global-name \"com.apple.trustd.agent\"))\n\n",
+    );
 }
 
 /// Codex's managed app-server initializes macOS account and notification
@@ -2092,6 +2109,75 @@ mod tests {
     #[test]
     fn chromium_rendezvous_is_dropped_under_lockdown() {
         assert!(!chromium_profile(true).contains("MachPortRendezvousServer"));
+    }
+
+    fn trustd_profile(lockdown: bool) -> String {
+        let config = Config {
+            command: vec!["gh".into()],
+            macos_trustd: Some(true),
+            lockdown: Some(lockdown),
+            ..Config::default()
+        };
+        generate_sbpl_profile(&config, Path::new("/tmp/test-project"))
+    }
+
+    #[test]
+    fn trustd_is_opt_in() {
+        let config = Config {
+            command: vec!["gh".into()],
+            ..Config::default()
+        };
+        let profile =
+            generate_sbpl_profile(&config, Path::new("/tmp/test-project"));
+        assert!(!profile.contains("com.apple.trustd.agent"));
+    }
+
+    #[test]
+    fn trustd_grants_only_the_trustd_service() {
+        let enabled = trustd_profile(false);
+        let rule =
+            "(allow mach-lookup (global-name \"com.apple.trustd.agent\"))";
+        assert_eq!(enabled.matches(rule).count(), 1);
+        // Not a back door to the broad host-IPC rules.
+        assert!(!enabled.contains("(allow mach-lookup)\n"));
+        assert!(!enabled.contains("(allow iokit-open)"));
+        assert!(!enabled.contains("com.apple.SecurityServer"));
+
+        // The profile differs from the default only by that section.
+        let disabled = generate_sbpl_profile(
+            &Config {
+                command: vec!["gh".into()],
+                ..Config::default()
+            },
+            Path::new("/tmp/test-project"),
+        );
+        let section =
+            format!("; macOS trust evaluation (--macos-trustd)\n{rule}\n\n");
+        assert_eq!(enabled.replacen(&section, "", 1), disabled);
+    }
+
+    #[test]
+    fn trustd_is_dropped_under_lockdown() {
+        assert!(!trustd_profile(true).contains("com.apple.trustd.agent"));
+    }
+
+    #[test]
+    fn trustd_profile_compiles() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(trustd_profile(false))
+            .arg("--")
+            .arg("/usr/bin/true")
+            .output()
+            .expect("sandbox-exec should run");
+        assert!(
+            output.status.success(),
+            "profile rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
