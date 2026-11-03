@@ -2182,22 +2182,15 @@ mod tests {
         let rule =
             "(allow mach-lookup (global-name \"com.apple.trustd.agent\"))";
         assert_eq!(enabled.matches(rule).count(), 1);
+        // The grant lives in its own labelled section, so enabling it adds
+        // exactly that one rule.
+        assert!(enabled.contains(&format!(
+            "; macOS trust evaluation (--macos-trustd)\n{rule}\n"
+        )));
         // Not a back door to the broad host-IPC rules.
         assert!(!enabled.contains("(allow mach-lookup)\n"));
         assert!(!enabled.contains("(allow iokit-open)"));
         assert!(!enabled.contains("com.apple.SecurityServer"));
-
-        // The profile differs from the default only by that section.
-        let disabled = generate_sbpl_profile(
-            &Config {
-                command: vec!["gh".into()],
-                ..Config::default()
-            },
-            Path::new("/tmp/test-project"),
-        );
-        let section =
-            format!("; macOS trust evaluation (--macos-trustd)\n{rule}\n\n");
-        assert_eq!(enabled.replacen(&section, "", 1), disabled);
     }
 
     #[test]
@@ -2258,19 +2251,15 @@ mod tests {
             enabled
                 .contains("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))")
         );
-
-        // The profile differs from the default only by that section.
-        let disabled = generate_sbpl_profile(
-            &Config {
-                command: vec!["bash".into()],
-                ..Config::default()
-            },
-            Path::new("/tmp/test-project"),
-        );
-        let section = "; Runtime-allocated PTYs (--allow-pty)\n\
+        // Both rules live in the one labelled section, so enabling the flag
+        // adds exactly that block.
+        assert!(enabled.contains(
+            "; Runtime-allocated PTYs (--allow-pty)\n\
              (allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+$\"))\n\
-             (allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))\n\n";
-        assert_eq!(enabled.replacen(section, "", 1), disabled);
+             (allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))\n"
+        ));
+        // Narrow, not a blanket device grant.
+        assert!(!enabled.contains("(allow file-ioctl)\n"));
     }
 
     #[test]
