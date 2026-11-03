@@ -232,6 +232,12 @@ pub struct Config {
     /// `*.MachPortRendezvousServer.<pid>` names are reachable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub macos_chromium: Option<bool>,
+    /// Let Apple's TLS trust evaluation reach `trustd` on macOS, so Go and
+    /// Security.framework clients (e.g. `gh`) can verify certificates.
+    /// Opt-in, but far narrower than `macos_host_ipc`: only the
+    /// `com.apple.trustd.agent` lookup is granted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_trustd: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x11: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -440,6 +446,9 @@ impl Config {
     }
     pub fn macos_chromium_enabled(&self) -> bool {
         self.macos_chromium == Some(true)
+    }
+    pub fn macos_trustd_enabled(&self) -> bool {
+        self.macos_trustd == Some(true)
     }
     pub fn mise_enabled(&self) -> bool {
         self.no_mise != Some(true)
@@ -1124,6 +1133,7 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(network);
     take!(macos_host_ipc);
     take!(macos_chromium);
+    take!(macos_trustd);
     take!(x11);
     take!(host_shm);
     take!(terminal_passthrough);
@@ -1485,6 +1495,8 @@ pub fn merge_with_global_report(
         .macos_host_ipc_enabled());
     monotonic!(macos_chromium, |config: &Config| config
         .macos_chromium_enabled());
+    monotonic!(macos_trustd, |config: &Config| config
+        .macos_trustd_enabled());
     monotonic!(x11, |config: &Config| config.x11_enabled());
     monotonic!(host_shm, |config: &Config| config.host_shm_enabled());
     monotonic!(terminal_passthrough, |config: &Config| {
@@ -2051,6 +2063,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     direct!(network);
     direct!(macos_host_ipc);
     direct!(macos_chromium);
+    direct!(macos_trustd);
     direct!(x11);
     direct!(host_shm);
     direct!(terminal_passthrough);
@@ -2233,6 +2246,7 @@ pub fn display_status(config: &Config) {
     print_opt_in_enabled("  Host prompt", config.prompt_hosts);
     print_opt_in_enabled("  macOS host IPC", config.macos_host_ipc);
     print_opt_in_enabled("  macOS Chromium", config.macos_chromium);
+    print_opt_in_enabled("  macOS trustd", config.macos_trustd);
     print_opt_in_enabled("  X11", config.x11);
     print_opt_in_enabled("  Host shared memory", config.host_shm);
     print_opt_in_enabled("  Terminal passthrough", config.terminal_passthrough);
@@ -2557,6 +2571,52 @@ mod tests {
         assert!(!cfg.macos_host_ipc_enabled());
         assert_eq!(cfg.macos_chromium, None);
         assert!(!cfg.macos_chromium_enabled());
+        assert_eq!(cfg.macos_trustd, None);
+        assert!(!cfg.macos_trustd_enabled());
+    }
+
+    #[test]
+    fn macos_trustd_is_opt_in_and_project_cannot_enable_it() {
+        let project = Config {
+            macos_trustd: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(!merged.macos_trustd_enabled());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("macos_trustd"))
+        );
+
+        // A trusted layer may enable it, and the project may still
+        // tighten it back off.
+        let global = Config {
+            macos_trustd: Some(true),
+            ..Config::default()
+        };
+        let project = Config {
+            macos_trustd: Some(false),
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(global, project, Path::new("/project"));
+        assert!(!merged.macos_trustd_enabled());
+        assert!(warnings.is_empty());
+
+        let enabled = Config {
+            macos_trustd: Some(true),
+            ..Config::default()
+        };
+        assert!(
+            serialize_config(&enabled)
+                .unwrap()
+                .contains("macos_trustd = true")
+        );
     }
 
     #[test]
@@ -3952,6 +4012,7 @@ no_gpu = true
             network: None,
             macos_host_ipc: None,
             macos_chromium: None,
+            macos_trustd: None,
             x11: Some(true),
             host_shm: Some(true),
             terminal_passthrough: Some(true),
@@ -4296,6 +4357,7 @@ tailscale = true
             network: None,
             macos_host_ipc: None,
             macos_chromium: None,
+            macos_trustd: None,
             no_worktree: Some(true),
             no_mise: Some(true),
             no_save_config: Some(true),
@@ -5258,6 +5320,31 @@ ro_maps = []
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.macos_chromium_enabled());
         assert!(!toml::to_string(&config).unwrap().contains("macos_chromium"));
+    }
+
+    #[test]
+    fn regression_v2_14_0_config_without_macos_trustd() {
+        // Configs written before macos_trustd existed must still parse,
+        // with the trustd Mach lookup left off.
+        let toml = r#"
+command = ["claude"]
+network = true
+macos_host_ipc = false
+macos_chromium = false
+rw_maps = []
+ro_maps = []
+
+[commands.claude]
+macos_host_ipc = false
+"#;
+        let config: GlobalConfig = toml::from_str(toml).unwrap();
+        assert!(!config.base.macos_trustd_enabled());
+        assert!(!config.commands["claude"].macos_trustd_enabled());
+        assert!(
+            !toml::to_string(&config.base)
+                .unwrap()
+                .contains("macos_trustd")
+        );
     }
 
     #[test]
@@ -7152,6 +7239,7 @@ hide_dotdirs = [".my_secrets"]
             network: None,
             macos_host_ipc: None,
             macos_chromium: None,
+            macos_trustd: None,
             x11: None,
             host_shm: None,
             terminal_passthrough: None,

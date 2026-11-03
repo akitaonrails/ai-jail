@@ -72,6 +72,10 @@ OPTIONS:
                                     Enable/disable Chromium's own Mach rendezvous
                                     service on macOS, needed by headless Chromium
                                     and Playwright (default: off)
+    --macos-trustd / --no-macos-trustd
+                                    Enable/disable only the macOS trustd service
+                                    so TLS clients like gh can verify
+                                    certificates (default: off)
     --x11 / --no-x11               Enable/disable X11 socket passthrough (default: off)
     --host-shm / --no-host-shm     Enable/disable host shared-memory passthrough (default: off)
     --terminal-passthrough / --no-terminal-passthrough
@@ -187,6 +191,7 @@ pub struct CliArgs {
     pub network: Option<bool>,
     pub macos_host_ipc: Option<bool>,
     pub macos_chromium: Option<bool>,
+    pub macos_trustd: Option<bool>,
     pub x11: Option<bool>,
     pub host_shm: Option<bool>,
     pub terminal_passthrough: Option<bool>,
@@ -469,6 +474,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long(s @ ("macos-chromium" | "no-macos-chromium")) => {
                 args.macos_chromium = Some(s == "macos-chromium");
             }
+            Long(s @ ("macos-trustd" | "no-macos-trustd")) => {
+                args.macos_trustd = Some(s == "macos-trustd");
+            }
             Long(s @ ("x11" | "no-x11")) => {
                 args.x11 = Some(s == "x11");
             }
@@ -744,6 +752,8 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-macos-host-ipc",
     "--macos-chromium",
     "--no-macos-chromium",
+    "--macos-trustd",
+    "--no-macos-trustd",
     "--no-gpu",
     "--gpu",
     "--no-docker",
@@ -875,6 +885,7 @@ mod tests {
             "network",
             "macos-host-ipc",
             "macos-chromium",
+            "macos-trustd",
             "gpu",
             "docker",
             "tailscale",
@@ -1188,6 +1199,16 @@ mod tests {
             parse_test(&["--no-macos-chromium", "--macos-chromium", "bash"])
                 .unwrap();
         assert_eq!(args.macos_chromium, Some(true));
+    }
+
+    #[test]
+    fn parse_macos_trustd_last_wins() {
+        let args = parse_test(&["--no-macos-trustd", "--macos-trustd", "bash"])
+            .unwrap();
+        assert_eq!(args.macos_trustd, Some(true));
+        let args = parse_test(&["--macos-trustd", "--no-macos-trustd", "bash"])
+            .unwrap();
+        assert_eq!(args.macos_trustd, Some(false));
     }
 
     #[test]
