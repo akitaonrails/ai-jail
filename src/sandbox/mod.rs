@@ -1715,13 +1715,13 @@ fn prepare_seatbelt_maps(
                 encoded.display()
             ));
         }
-        if !path_exists(&spec.source) {
-            output::warn(&format!(
-                "Path {} not found, skipping.",
-                spec.source.display()
-            ));
-            continue;
-        }
+        // Unlike bubblewrap's bind mounts, a Seatbelt `(literal ...)` /
+        // `(subpath ...)` rule does not require the path to exist when the
+        // profile is compiled. Emit the rule even for a source that is
+        // absent at launch (issue #208): tools that create, lock and unlink
+        // a fixed-path file on every run were otherwise unmappable, since
+        // the file is gone again after the first run and a literal map was
+        // skipped on the next launch.
         prepared.push(spec.encode());
     }
     Ok(prepared)
@@ -2217,7 +2217,7 @@ mod tests {
     }
 
     #[test]
-    fn seatbelt_config_skips_invalid_and_missing_same_path_maps() {
+    fn seatbelt_config_skips_invalid_but_keeps_missing_same_path_maps() {
         let config = Config {
             ro_maps: vec![
                 PathBuf::from("/"),
@@ -2229,7 +2229,31 @@ mod tests {
 
         let prepared = prepare_seatbelt_config(&config).unwrap();
 
-        assert!(prepared.ro_maps.is_empty());
+        // The two malformed entries are dropped, but the well-formed path
+        // that is simply not present at launch is kept so a Seatbelt rule
+        // is still emitted for it (issue #208).
+        assert_eq!(
+            prepared.ro_maps,
+            vec![PathBuf::from("/definitely/missing/ai-jail-map")]
+        );
+    }
+
+    #[test]
+    fn regression_208_seatbelt_keeps_map_whose_target_is_missing() {
+        // A fixed-path lock file a tool creates and unlinks on every run is
+        // absent when the jail starts. The map must still produce a rule
+        // rather than being skipped as it was before #208.
+        let missing =
+            temp_test_dir("seatbelt-208-missing").join(".example-lock");
+        assert!(!path_exists(&missing));
+        let config = Config {
+            rw_maps: vec![missing.clone()],
+            ..Config::default()
+        };
+
+        let prepared = prepare_seatbelt_config(&config).unwrap();
+
+        assert_eq!(prepared.rw_maps, vec![missing]);
     }
 
     #[test]
