@@ -6,7 +6,6 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
 
@@ -21,12 +20,18 @@ struct DevinFixture {
 
 impl DevinFixture {
     fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
+        // A per-process atomic counter, not a timestamp: every test in this
+        // file calls `new()` with no distinguishing name, and parallel test
+        // threads can read the same nanosecond, so a timestamp nonce lets two
+        // fixtures share a root and race each other's `symlink`/
+        // `create_dir_all`. Paired with the pid (CARGO_TARGET_TMPDIR is shared
+        // across this crate's test binaries) the id is unique across both
+        // threads and processes.
+        static NEXT_ID: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("devin-state-{}-{nonce}", std::process::id()));
+            .join(format!("devin-state-{}-{id}", std::process::id()));
         let home = root.join("home");
         let project = root.join("project");
         let data_home = root.join("xdg-data");
