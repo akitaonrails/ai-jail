@@ -38,6 +38,7 @@ impl Fixture {
     }
 
     fn run(&self, executable: &str, path: &str) -> String {
+        let bwrap = std::env::var_os("BWRAP_BIN");
         common::assert_ok(
             &Command::new(common::ai_jail())
                 .args([
@@ -53,6 +54,7 @@ impl Fixture {
                 ])
                 .current_dir(&self.project)
                 .env_clear()
+                .envs(bwrap.map(|value| ("BWRAP_BIN", value)))
                 .env("HOME", &self.home)
                 .env("PATH", path)
                 .output()
