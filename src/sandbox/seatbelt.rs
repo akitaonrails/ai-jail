@@ -463,6 +463,7 @@ fn generate_sbpl_profile_for_tty(
     push_codex_mach_section(&mut profile, config);
     push_chromium_rendezvous_section(&mut profile, config);
     push_trustd_section(&mut profile, config);
+    push_allow_pty_section(&mut profile, config);
     push_network_section(&mut profile, config, proxy_port);
     push_codex_control_socket_section(&mut profile, config);
     let is_claude =
@@ -766,6 +767,26 @@ fn push_network_section(
                     "(allow network-outbound (remote ip \"localhost:{port}\"))\n\n"
                 ));
             }
+            // --allow-loopback-listen: let the sandboxed process bind and
+            // accept on loopback while egress stays filtered, for tools that
+            // start a local server on 127.0.0.1 (issue #213). Off by default
+            // and dropped under --lockdown; scoped to localhost so it never
+            // opens a routable listener. Seatbelt shares the host network
+            // stack, so this is the host's loopback -- the opt-in the user
+            // accepts instead of --network, which would drop egress
+            // filtering entirely.
+            if config.allow_loopback_listen_enabled()
+                && !config.lockdown_enabled()
+            {
+                profile
+                    .push_str("; Loopback listen (--allow-loopback-listen)\n");
+                profile.push_str(
+                    "(allow network-bind (local ip \"localhost:*\"))\n",
+                );
+                profile.push_str(
+                    "(allow network-inbound (local ip \"localhost:*\"))\n\n",
+                );
+            }
         }
         _ => {}
     }
@@ -860,6 +881,29 @@ fn push_trustd_section(profile: &mut String, config: &Config) {
     profile.push_str(
         "(allow mach-lookup (global-name \"com.apple.trustd.agent\"))\n\n",
     );
+}
+
+/// `--allow-pty`: cover the PTY slave nodes a sandboxed process allocates at
+/// runtime (`expect`, `script`, terminal multiplexers, `xcodebuild` driving
+/// an iOS Simulator), whose `/dev/ttysNNN` number is unknown when this
+/// profile is built. The scoped literal in `push_static_sections` only covers
+/// the single PTY ai-jail itself allocated; SBPL cannot scope a rule to the
+/// sandbox's own process tree, so reaching arbitrary runtime PTYs needs the
+/// blanket `^/dev/ttys[0-9]+$` regex that advisory GHSA-w976-gw52-hvx2 #4
+/// removed from the default (it also grants write/TIOCSTI on the user's other
+/// terminals). It is therefore off by default and dropped under `--lockdown`.
+/// It is still far narrower than the only previous workaround,
+/// `rw_maps = ["/dev"]`, which makes every device node writable (issue #209).
+fn push_allow_pty_section(profile: &mut String, config: &Config) {
+    if config.lockdown_enabled() || !config.allow_pty_enabled() {
+        return;
+    }
+
+    profile.push_str("; Runtime-allocated PTYs (--allow-pty)\n");
+    profile.push_str(
+        "(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+$\"))\n",
+    );
+    profile.push_str("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))\n\n");
 }
 
 /// Codex's managed app-server initializes macOS account and notification
@@ -2180,6 +2224,79 @@ mod tests {
         );
     }
 
+    fn allow_pty_profile(lockdown: bool) -> String {
+        let config = Config {
+            command: vec!["bash".into()],
+            allow_pty: Some(true),
+            lockdown: Some(lockdown),
+            ..Config::default()
+        };
+        generate_sbpl_profile(&config, Path::new("/tmp/test-project"))
+    }
+
+    #[test]
+    fn allow_pty_is_opt_in() {
+        // The default profile grants no blanket /dev/ttys* rule; advisory
+        // GHSA-w976-gw52-hvx2 #4 keeps that off by default.
+        let profile = generate_sbpl_profile(
+            &Config {
+                command: vec!["bash".into()],
+                ..Config::default()
+            },
+            Path::new("/tmp/test-project"),
+        );
+        assert!(!profile.contains("^/dev/ttys[0-9]+$"));
+    }
+
+    #[test]
+    fn allow_pty_grants_the_blanket_ttys_regex() {
+        let enabled = allow_pty_profile(false);
+        assert!(enabled.contains(
+            "(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+$\"))"
+        ));
+        assert!(
+            enabled
+                .contains("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))")
+        );
+
+        // The profile differs from the default only by that section.
+        let disabled = generate_sbpl_profile(
+            &Config {
+                command: vec!["bash".into()],
+                ..Config::default()
+            },
+            Path::new("/tmp/test-project"),
+        );
+        let section = "; Runtime-allocated PTYs (--allow-pty)\n\
+             (allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+$\"))\n\
+             (allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))\n\n";
+        assert_eq!(enabled.replacen(section, "", 1), disabled);
+    }
+
+    #[test]
+    fn allow_pty_is_dropped_under_lockdown() {
+        assert!(!allow_pty_profile(true).contains("^/dev/ttys[0-9]+$"));
+    }
+
+    #[test]
+    fn allow_pty_profile_compiles() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(allow_pty_profile(false))
+            .arg("--")
+            .arg("/usr/bin/true")
+            .output()
+            .expect("sandbox-exec should run");
+        assert!(
+            output.status.success(),
+            "profile rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn chromium_rendezvous_profile_compiles() {
         // A malformed regex makes sandbox-exec reject the whole profile,
@@ -2348,6 +2465,95 @@ mod tests {
             "(allow network-outbound (remote ip \"localhost:15919\"))"
         ));
         assert!(!locked_profile.contains("(allow network-inbound)"));
+    }
+
+    #[test]
+    fn loopback_listen_is_opt_in_in_filtered_mode() {
+        let config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile_filtered(
+            &config,
+            Path::new("/tmp/test-project"),
+            15919,
+        );
+        // Without the opt-in, filtered mode emits no bind/inbound rule.
+        assert!(!profile.contains("(allow network-bind"));
+        assert!(!profile.contains("(allow network-inbound"));
+    }
+
+    #[test]
+    fn loopback_listen_grants_bind_and_inbound_scoped_to_localhost() {
+        let config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            allow_loopback_listen: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile_filtered(
+            &config,
+            Path::new("/tmp/test-project"),
+            15919,
+        );
+        assert!(
+            profile.contains("(allow network-bind (local ip \"localhost:*\"))")
+        );
+        assert!(
+            profile
+                .contains("(allow network-inbound (local ip \"localhost:*\"))")
+        );
+        // Still scoped to loopback: no blanket bind/inbound to any address.
+        assert!(!profile.contains("(allow network-bind)\n"));
+        assert!(!profile.contains("(allow network-inbound)\n"));
+        // And egress stays filtered to the proxy, not opened up.
+        assert!(!profile.contains("(allow network-outbound)\n"));
+    }
+
+    #[test]
+    fn loopback_listen_is_dropped_under_lockdown() {
+        let config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            allow_loopback_listen: Some(true),
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile_filtered(
+            &config,
+            Path::new("/tmp/test-project"),
+            15919,
+        );
+        assert!(!profile.contains("localhost:*"));
+        assert!(!profile.contains("(allow network-bind"));
+        assert!(!profile.contains("(allow network-inbound"));
+    }
+
+    #[test]
+    fn loopback_listen_profile_compiles() {
+        if !Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            allow_loopback_listen: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile_filtered(
+            &config,
+            Path::new("/tmp/test-project"),
+            15919,
+        );
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(profile)
+            .arg("--")
+            .arg("/usr/bin/true")
+            .output()
+            .expect("sandbox-exec should run");
+        assert!(
+            output.status.success(),
+            "profile rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

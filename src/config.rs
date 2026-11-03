@@ -238,6 +238,21 @@ pub struct Config {
     /// `com.apple.trustd.agent` lookup is granted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub macos_trustd: Option<bool>,
+    /// Allow the sandboxed process to open PTY slave nodes it allocates at
+    /// runtime (`/dev/ttysNNN`) on macOS. Needed by tools that spawn their
+    /// own pseudo-terminals -- `expect`, `script`, terminal multiplexers,
+    /// and `xcodebuild` driving an iOS Simulator. Opt-in: the grant covers
+    /// every `/dev/ttys*`, including the user's other terminals, so it is
+    /// off by default and dropped under `--lockdown` (issue #209).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_pty: Option<bool>,
+    /// Allow the sandboxed process to bind and listen on loopback while
+    /// egress stays filtered (`--allow-host`) on macOS. Needed by tools
+    /// that start a local server on `127.0.0.1` without dropping egress
+    /// filtering the way `--network` would. Opt-in, dropped under
+    /// `--lockdown` (issue #213).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_loopback_listen: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x11: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -449,6 +464,12 @@ impl Config {
     }
     pub fn macos_trustd_enabled(&self) -> bool {
         self.macos_trustd == Some(true)
+    }
+    pub fn allow_pty_enabled(&self) -> bool {
+        self.allow_pty == Some(true)
+    }
+    pub fn allow_loopback_listen_enabled(&self) -> bool {
+        self.allow_loopback_listen == Some(true)
     }
     pub fn mise_enabled(&self) -> bool {
         self.no_mise != Some(true)
@@ -1134,6 +1155,8 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(macos_host_ipc);
     take!(macos_chromium);
     take!(macos_trustd);
+    take!(allow_pty);
+    take!(allow_loopback_listen);
     take!(x11);
     take!(host_shm);
     take!(terminal_passthrough);
@@ -1497,6 +1520,9 @@ pub fn merge_with_global_report(
         .macos_chromium_enabled());
     monotonic!(macos_trustd, |config: &Config| config
         .macos_trustd_enabled());
+    monotonic!(allow_pty, |config: &Config| config.allow_pty_enabled());
+    monotonic!(allow_loopback_listen, |config: &Config| config
+        .allow_loopback_listen_enabled());
     monotonic!(x11, |config: &Config| config.x11_enabled());
     monotonic!(host_shm, |config: &Config| config.host_shm_enabled());
     monotonic!(terminal_passthrough, |config: &Config| {
@@ -2064,6 +2090,8 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     direct!(macos_host_ipc);
     direct!(macos_chromium);
     direct!(macos_trustd);
+    direct!(allow_pty);
+    direct!(allow_loopback_listen);
     direct!(x11);
     direct!(host_shm);
     direct!(terminal_passthrough);
@@ -2247,6 +2275,8 @@ pub fn display_status(config: &Config) {
     print_opt_in_enabled("  macOS host IPC", config.macos_host_ipc);
     print_opt_in_enabled("  macOS Chromium", config.macos_chromium);
     print_opt_in_enabled("  macOS trustd", config.macos_trustd);
+    print_opt_in_enabled("  Allow PTY", config.allow_pty);
+    print_opt_in_enabled("  Loopback listen", config.allow_loopback_listen);
     print_opt_in_enabled("  X11", config.x11);
     print_opt_in_enabled("  Host shared memory", config.host_shm);
     print_opt_in_enabled("  Terminal passthrough", config.terminal_passthrough);
@@ -2573,6 +2603,10 @@ mod tests {
         assert!(!cfg.macos_chromium_enabled());
         assert_eq!(cfg.macos_trustd, None);
         assert!(!cfg.macos_trustd_enabled());
+        assert_eq!(cfg.allow_pty, None);
+        assert!(!cfg.allow_pty_enabled());
+        assert_eq!(cfg.allow_loopback_listen, None);
+        assert!(!cfg.allow_loopback_listen_enabled());
     }
 
     #[test]
@@ -2616,6 +2650,88 @@ mod tests {
             serialize_config(&enabled)
                 .unwrap()
                 .contains("macos_trustd = true")
+        );
+    }
+
+    #[test]
+    fn allow_pty_is_opt_in_and_project_cannot_enable_it() {
+        let project = Config {
+            allow_pty: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(!merged.allow_pty_enabled());
+        assert!(warnings.iter().any(|warning| warning.contains("allow_pty")));
+
+        // A trusted layer may enable it, and the project may still tighten
+        // it back off.
+        let global = Config {
+            allow_pty: Some(true),
+            ..Config::default()
+        };
+        let project = Config {
+            allow_pty: Some(false),
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(global, project, Path::new("/project"));
+        assert!(!merged.allow_pty_enabled());
+        assert!(warnings.is_empty());
+
+        let enabled = Config {
+            allow_pty: Some(true),
+            ..Config::default()
+        };
+        assert!(
+            serialize_config(&enabled)
+                .unwrap()
+                .contains("allow_pty = true")
+        );
+    }
+
+    #[test]
+    fn allow_loopback_listen_is_opt_in_and_project_cannot_enable_it() {
+        let project = Config {
+            allow_loopback_listen: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(!merged.allow_loopback_listen_enabled());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("allow_loopback_listen"))
+        );
+
+        let global = Config {
+            allow_loopback_listen: Some(true),
+            ..Config::default()
+        };
+        let project = Config {
+            allow_loopback_listen: Some(false),
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(global, project, Path::new("/project"));
+        assert!(!merged.allow_loopback_listen_enabled());
+        assert!(warnings.is_empty());
+
+        let enabled = Config {
+            allow_loopback_listen: Some(true),
+            ..Config::default()
+        };
+        assert!(
+            serialize_config(&enabled)
+                .unwrap()
+                .contains("allow_loopback_listen = true")
         );
     }
 
@@ -4013,6 +4129,8 @@ no_gpu = true
             macos_host_ipc: None,
             macos_chromium: None,
             macos_trustd: None,
+            allow_pty: None,
+            allow_loopback_listen: None,
             x11: Some(true),
             host_shm: Some(true),
             terminal_passthrough: Some(true),
@@ -4358,6 +4476,8 @@ tailscale = true
             macos_host_ipc: None,
             macos_chromium: None,
             macos_trustd: None,
+            allow_pty: None,
+            allow_loopback_listen: None,
             no_worktree: Some(true),
             no_mise: Some(true),
             no_save_config: Some(true),
@@ -5345,6 +5465,31 @@ macos_host_ipc = false
                 .unwrap()
                 .contains("macos_trustd")
         );
+    }
+
+    #[test]
+    fn regression_v2_14_0_config_without_allow_pty_or_loopback_listen() {
+        // Configs written before allow_pty / allow_loopback_listen existed
+        // must still parse, with both grants left off and nothing new
+        // serialized back.
+        let toml = r#"
+command = ["claude"]
+network = true
+macos_host_ipc = false
+rw_maps = []
+ro_maps = []
+
+[commands.claude]
+macos_host_ipc = false
+"#;
+        let config: GlobalConfig = toml::from_str(toml).unwrap();
+        assert!(!config.base.allow_pty_enabled());
+        assert!(!config.base.allow_loopback_listen_enabled());
+        assert!(!config.commands["claude"].allow_pty_enabled());
+        assert!(!config.commands["claude"].allow_loopback_listen_enabled());
+        let serialized = toml::to_string(&config.base).unwrap();
+        assert!(!serialized.contains("allow_pty"));
+        assert!(!serialized.contains("allow_loopback_listen"));
     }
 
     #[test]
@@ -7240,6 +7385,8 @@ hide_dotdirs = [".my_secrets"]
             macos_host_ipc: None,
             macos_chromium: None,
             macos_trustd: None,
+            allow_pty: None,
+            allow_loopback_listen: None,
             x11: None,
             host_shm: None,
             terminal_passthrough: None,

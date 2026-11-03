@@ -76,6 +76,14 @@ OPTIONS:
                                     Enable/disable only the macOS trustd service
                                     so TLS clients like gh can verify
                                     certificates (default: off)
+    --allow-pty / --no-allow-pty   Allow opening PTY slave nodes allocated at
+                                    runtime on macOS, for tools that spawn their
+                                    own pseudo-terminals; grants every /dev/ttys*
+                                    (default: off, macOS only)
+    --allow-loopback-listen / --no-allow-loopback-listen
+                                    Allow binding/listening on loopback while
+                                    egress stays filtered on macOS (default: off,
+                                    macOS only)
     --x11 / --no-x11               Enable/disable X11 socket passthrough (default: off)
     --host-shm / --no-host-shm     Enable/disable host shared-memory passthrough (default: off)
     --terminal-passthrough / --no-terminal-passthrough
@@ -192,6 +200,8 @@ pub struct CliArgs {
     pub macos_host_ipc: Option<bool>,
     pub macos_chromium: Option<bool>,
     pub macos_trustd: Option<bool>,
+    pub allow_pty: Option<bool>,
+    pub allow_loopback_listen: Option<bool>,
     pub x11: Option<bool>,
     pub host_shm: Option<bool>,
     pub terminal_passthrough: Option<bool>,
@@ -477,6 +487,14 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long(s @ ("macos-trustd" | "no-macos-trustd")) => {
                 args.macos_trustd = Some(s == "macos-trustd");
             }
+            Long(s @ ("allow-pty" | "no-allow-pty")) => {
+                args.allow_pty = Some(s == "allow-pty");
+            }
+            Long(
+                s @ ("allow-loopback-listen" | "no-allow-loopback-listen"),
+            ) => {
+                args.allow_loopback_listen = Some(s == "allow-loopback-listen");
+            }
             Long(s @ ("x11" | "no-x11")) => {
                 args.x11 = Some(s == "x11");
             }
@@ -754,6 +772,10 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-macos-chromium",
     "--macos-trustd",
     "--no-macos-trustd",
+    "--allow-pty",
+    "--no-allow-pty",
+    "--allow-loopback-listen",
+    "--no-allow-loopback-listen",
     "--no-gpu",
     "--gpu",
     "--no-docker",
@@ -886,6 +908,8 @@ mod tests {
             "macos-host-ipc",
             "macos-chromium",
             "macos-trustd",
+            "allow-pty",
+            "allow-loopback-listen",
             "gpu",
             "docker",
             "tailscale",
@@ -1209,6 +1233,34 @@ mod tests {
         let args = parse_test(&["--macos-trustd", "--no-macos-trustd", "bash"])
             .unwrap();
         assert_eq!(args.macos_trustd, Some(false));
+    }
+
+    #[test]
+    fn parse_allow_pty_last_wins() {
+        let args =
+            parse_test(&["--no-allow-pty", "--allow-pty", "bash"]).unwrap();
+        assert_eq!(args.allow_pty, Some(true));
+        let args =
+            parse_test(&["--allow-pty", "--no-allow-pty", "bash"]).unwrap();
+        assert_eq!(args.allow_pty, Some(false));
+    }
+
+    #[test]
+    fn parse_allow_loopback_listen_last_wins() {
+        let args = parse_test(&[
+            "--no-allow-loopback-listen",
+            "--allow-loopback-listen",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.allow_loopback_listen, Some(true));
+        let args = parse_test(&[
+            "--allow-loopback-listen",
+            "--no-allow-loopback-listen",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.allow_loopback_listen, Some(false));
     }
 
     #[test]
