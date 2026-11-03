@@ -123,12 +123,21 @@ jobs:
         run: |
           tar czf ai-jail-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-gnu/release ai-jail
           sha256sum ai-jail-linux-x86_64.tar.gz > ai-jail-linux-x86_64.tar.gz.sha256
+      - name: Build Debian package
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          ./packaging/debian/build-deb.sh "${TAG#v}" \
+            target/x86_64-unknown-linux-gnu/release/ai-jail .
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-release
           path: |
             ai-jail-linux-x86_64.tar.gz
             ai-jail-linux-x86_64.tar.gz.sha256
+            ai-jail_*_amd64.deb
+            ai-jail_*_amd64.deb.sha256
           if-no-files-found: error
 
   build-macos-unsigned:
@@ -242,13 +251,16 @@ jobs:
           name: macos-release
           path: artifacts
       - name: Verify final artifacts
-        run: cd artifacts && sha256sum -c ai-jail-linux-x86_64.tar.gz.sha256 && sha256sum -c ai-jail-macos-aarch64.tar.gz.sha256
+        run: cd artifacts && sha256sum -c ai-jail-linux-x86_64.tar.gz.sha256 && sha256sum -c ai-jail-macos-aarch64.tar.gz.sha256 && sha256sum -c ai-jail_*_amd64.deb.sha256
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: artifacts/ai-jail-linux-x86_64.tar.gz
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: artifacts/ai-jail-macos-aarch64.tar.gz
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: artifacts/ai-jail_*_amd64.deb
 
   release:
     needs: [preflight, build-linux, sign-macos, attest]
@@ -277,6 +289,7 @@ jobs:
           cd artifacts
           sha256sum -c ai-jail-linux-x86_64.tar.gz.sha256
           sha256sum -c ai-jail-macos-aarch64.tar.gz.sha256
+          sha256sum -c ai-jail_*_amd64.deb.sha256
           cd ..
           notes="releases/${TAG}.md"
           [ -f "$notes" ] || {
@@ -299,13 +312,15 @@ jobs:
           brew tap akitaonrails/tap && brew install ai-jail
           yay -S ai-jail-bin
           cargo install --locked ai-jail
+          # Debian/Ubuntu: download the .deb below, then
+          sudo apt install ./ai-jail_*_amd64.deb
           ```
           EOF
       - name: Publish immutable release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" artifacts/*.tar.gz artifacts/*.sha256 --verify-tag --title "$TAG" --notes-file body.md
+        run: gh release create "$TAG" artifacts/*.tar.gz artifacts/*.sha256 artifacts/*.deb --verify-tag --title "$TAG" --notes-file body.md
 
   crates-io:
     needs: [preflight, release]

@@ -36,6 +36,10 @@ brew tap akitaonrails/tap && brew install ai-jail
 yay -S ai-jail-bin       # prebuilt Linux x86_64 binary
 yay -S ai-jail           # build from source
 
+# Debian / Ubuntu (prebuilt .deb; Debian 12+ / Ubuntu 22.04+)
+# download ai-jail_<version>_amd64.deb from the GitHub release, then:
+sudo apt install ./ai-jail_<version>_amd64.deb
+
 # crates.io
 cargo install --locked ai-jail
 
@@ -45,6 +49,7 @@ nix profile install github:akitaonrails/ai-jail
 
 # GitHub Releases (signed archives, checksums alongside)
 # ai-jail-linux-x86_64.tar.gz / ai-jail-macos-aarch64.tar.gz
+# ai-jail_<version>_amd64.deb (Debian/Ubuntu)
 ```
 
 Build from source with Rust `1.97.1`:
