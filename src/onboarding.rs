@@ -24,10 +24,19 @@ pub(crate) mod messages {
     pub const PATH_DRIFT_ID: &str = "AJ-PATH-004";
     pub const ENV_ID: &str = "AJ-ENV-001";
     pub const ENV_MISSING_ID: &str = "AJ-ENV-002";
+    pub const SSH_ID: &str = "AJ-SSH-001";
+    pub const SSH_SCOPE_ID: &str = "AJ-SSH-002";
+    pub const SSH_DRIFT_ID: &str = "AJ-SSH-003";
+    pub const SSH_NETWORK_ID: &str = "AJ-SSH-004";
 
     pub const INTRO: &str = "ai-jail stores this approval outside the project. Files in this repository cannot add access on their own.";
     pub const CANCEL: &str = "Onboarding cancelled. No onboarding grants were saved and the harness was not started. A completed legacy migration is not rolled back.";
 }
+
+pub(crate) const SSH_TRANSCRIPT_BEGIN: &str =
+    "AJ-SSH-TRANSCRIPT-BEGIN selected-key SSH interaction";
+pub(crate) const SSH_TRANSCRIPT_END: &str =
+    "AJ-SSH-TRANSCRIPT-END selected-key SSH interaction";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Risk {
@@ -86,6 +95,7 @@ pub(crate) struct Selection {
     pub ro_dirs: Vec<PathBuf>,
     pub rw_dirs: Vec<PathBuf>,
     pub env_names: Vec<String>,
+    pub restricted_ssh: Option<crate::ssh_restricted::Policy>,
 }
 
 impl Selection {
@@ -102,6 +112,7 @@ impl Selection {
             ro_dirs: config.ro_maps.clone(),
             rw_dirs: config.rw_maps.clone(),
             env_names: Vec::new(),
+            restricted_ssh: None,
         }
     }
 
@@ -109,6 +120,7 @@ impl Selection {
         config: &Config,
         harness: &str,
         approved_env_names: &[String],
+        restricted_ssh: Option<&crate::ssh_restricted::Policy>,
     ) -> Self {
         Self {
             agent_state: config.agent_state == Some(true),
@@ -123,6 +135,7 @@ impl Selection {
             ro_dirs: config.ro_maps.clone(),
             rw_dirs: config.rw_maps.clone(),
             env_names: approved_env_names.to_vec(),
+            restricted_ssh: restricted_ssh.cloned(),
         }
     }
 
@@ -156,6 +169,8 @@ impl Selection {
             approved_env_names: self.env_names.clone(),
             finalized: None,
             directory_grants: Vec::new(),
+            restricted_ssh: self.restricted_ssh.clone(),
+            ssh_transcript_started: false,
         }
     }
 }
@@ -167,6 +182,8 @@ pub(crate) struct ProposedProfile {
     pub(crate) finalized: Option<crate::FinalizedLaunch>,
     pub(crate) directory_grants:
         Vec<crate::config_store::DirectoryGrantIdentity>,
+    pub(crate) restricted_ssh: Option<crate::ssh_restricted::Policy>,
+    pub(crate) ssh_transcript_started: bool,
 }
 
 #[derive(Debug)]
@@ -183,6 +200,7 @@ pub(crate) struct EffectiveContext<'a> {
     pub(crate) constraints: &'a Config,
     pub(crate) trusted_constraints: bool,
     pub(crate) approved_env_names: &'a [String],
+    pub(crate) restricted_ssh: Option<&'a crate::ssh_restricted::Policy>,
 }
 
 fn process_label(harness: &str) -> String {
@@ -411,6 +429,7 @@ fn secret_env_name(name: &str) -> bool {
 
 fn open_env_entry(entry: &str) -> bool {
     entry != "MISE_NOT_FOUND_AUTO_INSTALL=false"
+        && !crate::ssh_restricted::is_runtime_env(entry)
 }
 
 fn open_grant(kind: &str, harness: &str, saved: Option<bool>) -> GrantSpec {
@@ -455,6 +474,52 @@ fn open_grant(kind: &str, harness: &str, saved: Option<bool>) -> GrantSpec {
             authority: None,
             risk: Risk::Open,
         },
+    }
+}
+
+fn restricted_ssh_grant(
+    policy: &crate::ssh_restricted::Policy,
+    harness: &str,
+    saved: Option<bool>,
+) -> GrantSpec {
+    let fingerprints = policy
+        .keys
+        .iter()
+        .map(|key| escape_control_bytes(&key.fingerprint))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let constrained = !policy.destinations.is_empty();
+    GrantSpec {
+        resource: format!("Fresh SSH agent containing only {fingerprints}"),
+        access: "Request signatures; private key files and the ambient agent stay outside the jail".into(),
+        process: process_label(harness),
+        duration: format!(
+            "Agent lives for this jail; loaded keys expire after {} seconds; {}",
+            policy.lifetime_seconds,
+            duration(saved)
+        ),
+        scope: if constrained {
+            format!(
+                "{} Only verified destination constraints: {}",
+                messages::SSH_SCOPE_ID,
+                policy.destinations.join(", ")
+            )
+        } else {
+            format!(
+                "{} Incomplete: no destination constraint; launch and save are refused",
+                messages::SSH_SCOPE_ID
+            )
+        },
+        limits: if constrained {
+            "Destination constraints depend on OpenSSH support and verified known_hosts entries; unrestricted network is separately OPEN; failure refuses launch".into()
+        } else {
+            "No raw selected-key agent is exposed without an enforced OpenSSH destination constraint".into()
+        },
+        default: "Disabled until keys are selected in trusted configuration".into(),
+        consequence: "The harness can authenticate as accounts accepted by the selected keys during this jail run".into(),
+        remote: constrained.then(|| policy.destinations.join(", ")),
+        authority: Some("Only accounts accepted by the selected fingerprints".into()),
+        risk: Risk::Allowed,
     }
 }
 
@@ -533,6 +598,7 @@ pub(crate) fn run(
         existing,
         harness,
         effective.approved_env_names,
+        effective.restricted_ssh,
     );
     eprintln!("\nConfigure {harness} for this project\n");
     eprintln!("Project: {}\n", safe_path(project)?);
@@ -547,6 +613,7 @@ pub(crate) fn run(
         );
     }
 
+    let mut ssh_transcript_started = false;
     loop {
         render_menu(&selection);
         let answer = keyboard_choice()?;
@@ -563,7 +630,19 @@ pub(crate) fn run(
                 &mut selection.dependency_hosts,
                 &dependency_grant(harness, None),
             )?,
-            "4" => toggle_open(&mut selection.ssh, "ssh", harness)?,
+            "4" => {
+                toggle_open(&mut selection.ssh, "ssh", harness)?;
+                if selection.ssh {
+                    selection.restricted_ssh = None;
+                }
+            }
+            "k" => {
+                if !ssh_transcript_started {
+                    eprintln!("{SSH_TRANSCRIPT_BEGIN}");
+                    ssh_transcript_started = true;
+                }
+                edit_restricted_ssh(&mut selection)?;
+            }
             "5" => toggle_open(&mut selection.github, "github", harness)?,
             "6" => toggle_open(
                 &mut selection.unrestricted_network,
@@ -610,10 +689,15 @@ pub(crate) fn run(
                     project,
                     effective.trusted_constraints,
                 )?;
-                let finalized = crate::finalize_launch_config(
+                let finalized = crate::finalize_launch_config_with_ssh(
                     base,
                     project,
                     effective.cli.dry_run,
+                    if effective.cli.ssh == Some(false) {
+                        None
+                    } else {
+                        proposed.restricted_ssh.clone()
+                    },
                 )?;
                 eprintln!(
                     "{}",
@@ -637,6 +721,7 @@ pub(crate) fn run(
                     continue;
                 }
                 proposed.finalized = Some(finalized);
+                proposed.ssh_transcript_started = ssh_transcript_started;
                 let action = if configure_only {
                     prompt(&format!(
                         "{} Save this project profile? [y/N/b] ",
@@ -712,6 +797,14 @@ fn run_sequential(
             &dependency_grant(harness, None),
         )?;
     }
+    let Some(review) =
+        review_choice("Configure selected-key SSH (fresh agent)? [y/N/q] ")?
+    else {
+        return Ok(Outcome::Cancel);
+    };
+    if review {
+        edit_restricted_ssh(&mut selection)?;
+    }
     for (label, field, kind) in [
         ("full host SSH", &mut selection.ssh, "ssh"),
         ("full host GitHub token", &mut selection.github, "github"),
@@ -729,6 +822,9 @@ fn run_sequential(
         if review {
             toggle_open(field, kind, harness)?;
         }
+    }
+    if selection.ssh {
+        selection.restricted_ssh = None;
     }
     loop {
         match prompt("Additional directory: read-only [r], read/write [w], done [Enter], cancel [q]: ")?.as_str() {
@@ -765,8 +861,16 @@ fn run_sequential(
         project,
         effective.trusted_constraints,
     )?;
-    let finalized =
-        crate::finalize_launch_config(base, project, effective.cli.dry_run)?;
+    let finalized = crate::finalize_launch_config_with_ssh(
+        base,
+        project,
+        effective.cli.dry_run,
+        if effective.cli.ssh == Some(false) {
+            None
+        } else {
+            proposed.restricted_ssh.clone()
+        },
+    )?;
     eprintln!(
         "{}",
         render_effective_access(
@@ -844,6 +948,10 @@ fn render_menu(selection: &Selection) {
         mark(selection.ssh)
     );
     eprintln!(
+        "  k [{}] Selected SSH keys (fresh agent)",
+        mark(selection.restricted_ssh.is_some())
+    );
+    eprintln!(
         "  5 [{}] Full host GitHub token              OPEN",
         mark(selection.github)
     );
@@ -854,9 +962,129 @@ fn render_menu(selection: &Selection) {
     eprintln!("  r Add read-only directory   w Add read/write directory");
     eprintln!("  e Environment variables (names only; values stay hidden)");
     eprintln!("  d Remove directory          s Review summary   q Cancel");
+    eprintln!("  Repository-scoped forge access is configured separately.\n");
+}
+
+fn edit_restricted_ssh(selection: &mut Selection) -> Result<(), String> {
     eprintln!(
-        "  Scoped SSH and repository GitHub access are not available yet.\n"
+        "\n{} Selected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared.",
+        messages::SSH_ID
     );
+    if let Some(policy) = &selection.restricted_ssh {
+        eprintln!("Selected identities:");
+        for (index, key) in policy.keys.iter().enumerate() {
+            eprintln!(
+                "  {}. {}  {}  {}",
+                index + 1,
+                safe_path(&key.public_path)?,
+                escape_control_bytes(&key.fingerprint),
+                escape_control_bytes(&key.comment)
+            );
+        }
+        eprintln!(
+            "Lifetime: {} seconds; destinations: {}",
+            policy.lifetime_seconds,
+            if policy.destinations.is_empty() {
+                "not configured (launch and save are refused)".into()
+            } else {
+                policy.destinations.join(", ")
+            }
+        );
+    }
+    match prompt("Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: ")?.as_str() {
+        "a" => {
+            let available = discover_public_ssh_keys();
+            if !available.is_empty() {
+                eprintln!("Available file-backed identities:");
+                for (index, key) in available.iter().enumerate() {
+                    eprintln!(
+                        "  {}. {}  {}  {}",
+                        index + 1,
+                        safe_path(&key.public_path)?,
+                        escape_control_bytes(&key.fingerprint),
+                        escape_control_bytes(&key.comment)
+                    );
+                }
+            }
+            let choice = prompt("Key number, private-key path, or .pub path: ")?;
+            let key = choice
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|index| available.get(index).cloned())
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    crate::ssh_restricted::capture_key(Path::new(&choice))
+                })?;
+            let mut policy = selection.restricted_ssh.take().unwrap_or(crate::ssh_restricted::Policy {
+                keys: Vec::new(),
+                lifetime_seconds: crate::ssh_restricted::DEFAULT_LIFETIME_SECONDS,
+                destinations: Vec::new(),
+            });
+            if !policy.keys.iter().any(|item| item.fingerprint == key.fingerprint) {
+                policy.keys.push(key);
+            }
+            selection.restricted_ssh = Some(policy);
+            selection.ssh = false;
+        }
+        "r" => {
+            if let Some(policy) = &mut selection.restricted_ssh {
+                let index = prompt("Key number to remove: ")?
+                    .parse::<usize>()
+                    .map_err(|_| "Key number must be numeric".to_string())?;
+                if index == 0 || index > policy.keys.len() {
+                    return Err("Key number is out of range".into());
+                }
+                policy.keys.remove(index - 1);
+                if policy.keys.is_empty() {
+                    selection.restricted_ssh = None;
+                }
+            }
+        }
+        "h" => {
+            let value = prompt("Required destinations, comma-separated: ")?;
+            if let Some(policy) = &mut selection.restricted_ssh {
+                let destinations = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                let mut candidate = policy.clone();
+                candidate.destinations = destinations;
+                crate::ssh_restricted::validate_policy(&candidate)?;
+                *policy = candidate;
+            } else {
+                eprintln!("[LOCK] Add a key before setting destinations.");
+            }
+        }
+        "d" => selection.restricted_ssh = None,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn discover_public_ssh_keys() -> Vec<crate::ssh_restricted::KeyIdentity> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    discover_public_ssh_keys_in(&PathBuf::from(home).join(".ssh"))
+}
+
+fn discover_public_ssh_keys_in(
+    directory: &Path,
+) -> Vec<crate::ssh_restricted::KeyIdentity> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut keys: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "pub"))
+        .filter_map(|path| crate::ssh_restricted::capture_key(&path).ok())
+        .collect();
+    keys.sort_by(|a, b| a.public_path.cmp(&b.public_path));
+    keys
 }
 
 fn toggle_open(
@@ -953,13 +1181,14 @@ impl Drop for RawModeGuard {
 }
 
 fn keyboard_choice() -> Result<String, String> {
-    const KEYS: [&str; 11] =
-        ["1", "2", "3", "4", "5", "6", "e", "r", "w", "d", "s"];
-    const LABELS: [&str; 11] = [
+    const KEYS: [&str; 12] =
+        ["1", "2", "3", "4", "k", "5", "6", "e", "r", "w", "d", "s"];
+    const LABELS: [&str; 12] = [
         "filtered model API",
         "host harness state",
         "dependency access",
         "full SSH",
+        "selected-key SSH",
         "full GitHub token",
         "unrestricted network",
         "environment variables",
@@ -995,7 +1224,7 @@ fn keyboard_choice() -> Result<String, String> {
                 }
                 eprintln!("[OK] Selected: {}\r", LABELS[selected]);
             }
-            b'1'..=b'6' | b'e' | b'r' | b'w' | b'd' | b's' => {
+            b'1'..=b'6' | b'k' | b'e' | b'r' | b'w' | b'd' | b's' => {
                 return Ok((byte[0] as char).to_string());
             }
             _ => {}
@@ -1450,9 +1679,18 @@ pub(crate) fn render_summary(
 ) {
     eprintln!("\n{} Final access for {harness}\n", messages::SUMMARY_ID);
     eprintln!("{}", category("RESTRICTED", "\x1b[32m", "[LOCK]"));
-    if !selection.ssh {
+    if !selection.ssh && selection.restricted_ssh.is_none() {
         eprintln!(
             "  SSH       No key files, host agent socket, or SSH configuration"
+        );
+    }
+    if selection
+        .restricted_ssh
+        .as_ref()
+        .is_some_and(|policy| policy.destinations.is_empty())
+    {
+        eprintln!(
+            "  SSH       Selected identity is incomplete; add at least one verified destination before launch or save"
         );
     }
     if !selection.github {
@@ -1480,6 +1718,14 @@ pub(crate) fn render_summary(
     }
     if selection.dependency_hosts {
         eprintln!("\n{}\n", dependency_grant(harness, Some(saved)).render());
+    }
+    if let Some(policy) = &selection.restricted_ssh
+        && !policy.destinations.is_empty()
+    {
+        eprintln!(
+            "\n{}\n",
+            restricted_ssh_grant(policy, harness, Some(saved)).render()
+        );
     }
     for path in &selection.ro_dirs {
         if !broad_directory(path, project) {
@@ -1560,7 +1806,56 @@ pub(crate) fn render_effective_access(
     approved_env_names: &[String],
 ) -> Result<String, String> {
     let project_label = safe_path(project)?;
-    let mut safe_value = serde_json::to_value(config)
+    // Launch-scoped SSH paths contain a PID and sequence number. Show stable,
+    // descriptive placeholders so the disclosure is readable and can be
+    // compared byte-for-byte without hiding any user-controlled field.
+    let mut display_config = config.clone();
+    for (original, displayed) in config
+        .rw_maps
+        .iter()
+        .zip(display_config.rw_maps.iter_mut())
+        .chain(config.ro_maps.iter().zip(display_config.ro_maps.iter_mut()))
+    {
+        if crate::ssh_restricted::is_runtime_map(config, original)
+            && let Ok(spec) = crate::config::MapSpec::parse(original)
+        {
+            let leaf = if spec.source.ends_with("agent.sock") {
+                "agent.sock"
+            } else {
+                "public"
+            };
+            *displayed = crate::config::MapSpec {
+                source: PathBuf::from(format!("<SSH-RUNTIME>/{leaf}")),
+                destination: spec.destination,
+            }
+            .encode();
+        }
+    }
+    for (original, displayed) in config
+        .env_pass
+        .iter()
+        .zip(display_config.env_pass.iter_mut())
+    {
+        if !crate::ssh_restricted::is_runtime_env(original) {
+            continue;
+        }
+        let Some((name, _)) = original.split_once('=') else {
+            continue;
+        };
+        *displayed = match name {
+            "SSH_AUTH_SOCK" => "SSH_AUTH_SOCK=<SSH-RUNTIME>/agent.sock".into(),
+            "GIT_SSH_COMMAND" => {
+                "GIT_SSH_COMMAND=<TRUSTED-SSH> -F <SSH-RUNTIME>/public/config"
+                    .into()
+            }
+            "AI_JAIL_SSH" => "AI_JAIL_SSH=<TRUSTED-SSH>".into(),
+            "AI_JAIL_SSH_CONFIG" => {
+                "AI_JAIL_SSH_CONFIG=<SSH-RUNTIME>/public/config".into()
+            }
+            _ => original.clone(),
+        };
+    }
+    let mut safe_value = serde_json::to_value(&display_config)
         .map_err(|error| format!("Cannot render effective access: {error}"))?;
     sanitize_serialized_strings(&mut safe_value);
     let safe_config: Config = serde_json::from_value(safe_value)
@@ -1607,6 +1902,13 @@ pub(crate) fn render_effective_access(
     authority(
         config.ssh_enabled(),
         "~/.ssh and SSH_AUTH_SOCK; read keys/config and request signatures; every loaded identity and reachable SSH service; jailed processes can impersonate the user",
+    );
+    authority(
+        config
+            .env_pass
+            .iter()
+            .any(|entry| crate::ssh_restricted::is_runtime_env(entry)),
+        "ALLOWED: launch-scoped selected-key SSH agent; request signatures without reading private keys or the ambient agent; selected identities and saved destination constraints; accepted accounts can be used during this jail run",
     );
     authority(
         config.github_enabled(),
@@ -1714,14 +2016,32 @@ pub(crate) fn render_effective_access(
         ("copy-on-write overlay", &config.overlay_maps),
     ] {
         for path in paths {
-            let category = if broad_directory(path, project)
-                || credential_authority_path(path)?
+            let runtime_map =
+                crate::ssh_restricted::is_runtime_map(config, path);
+            let category = if !runtime_map
+                && (broad_directory(path, project)
+                    || credential_authority_path(path)?)
             {
                 "[ERROR] OPEN"
             } else {
                 "[WARN] ALLOWED"
             };
-            lines.push(format!("- {category}: {label} {}; mapped tree access; exact encoded source/destination; readable data can leave through allowed network access", safe_path(path)?));
+            let displayed_path = if runtime_map {
+                let spec = crate::config::MapSpec::parse(path)?;
+                let leaf = if spec.source.ends_with("agent.sock") {
+                    "agent.sock"
+                } else {
+                    "public"
+                };
+                crate::config::MapSpec {
+                    source: PathBuf::from(format!("<SSH-RUNTIME>/{leaf}")),
+                    destination: spec.destination,
+                }
+                .encode()
+            } else {
+                path.clone()
+            };
+            lines.push(format!("- {category}: {label} {}; mapped tree access; exact encoded source/destination; readable data can leave through allowed network access", safe_path(&displayed_path)?));
         }
     }
     if !config.allow_hosts.is_empty() {
@@ -1765,12 +2085,28 @@ pub(crate) fn render_effective_access(
         names.dedup();
         lines.push(format!("Environment names: {}", names.join(", ")));
         for name in names {
-            let category = if name == "MISE_NOT_FOUND_AUTO_INSTALL" {
+            let restricted_ssh_runtime = matches!(
+                name.as_str(),
+                "SSH_AUTH_SOCK"
+                    | "GIT_SSH_COMMAND"
+                    | "AI_JAIL_SSH"
+                    | "AI_JAIL_SSH_CONFIG"
+            ) && config
+                .env_pass
+                .iter()
+                .any(|entry| crate::ssh_restricted::is_runtime_env(entry));
+            let category = if name == "MISE_NOT_FOUND_AUTO_INSTALL"
+                || restricted_ssh_runtime
+            {
                 "[WARN] ALLOWED"
             } else {
                 "[ERROR] OPEN"
             };
-            lines.push(format!("- {category}: host environment variable {name} (value hidden); every jailed descendant can read, use, and copy the current launch value; allowed network access can carry it outside the jail"));
+            if restricted_ssh_runtime {
+                lines.push(format!("- {category}: generated launch-scoped SSH variable {name}; points only to the dedicated agent or generated strict SSH configuration; jailed descendants can use the selected-key authority"));
+            } else {
+                lines.push(format!("- {category}: host environment variable {name} (value hidden); every jailed descendant can read, use, and copy the current launch value; allowed network access can carry it outside the jail"));
+            }
         }
     }
     if approved_env_names.is_empty() {
@@ -1869,7 +2205,10 @@ fn effective_has_open_authority(
         .chain(&config.rw_maps)
         .chain(&config.overlay_maps)
     {
-        if broad_directory(path, project) || credential_authority_path(path)? {
+        if !crate::ssh_restricted::is_runtime_map(config, path)
+            && (broad_directory(path, project)
+                || credential_authority_path(path)?)
+        {
             return Ok(true);
         }
     }
@@ -1904,7 +2243,7 @@ fn category(label: &str, color: &str, icon: &str) -> String {
 #[cfg(test)]
 fn source_linked_fixture() -> String {
     format!(
-        "{} Configure a known harness for one canonical project.\n{} Every selection is off until the user enables it.\n{} Every active grant names resource, access, process, duration, scope, limits, default, and consequence.\n{} Broad access requires typing OPEN.\n{} Final output always contains RESTRICTED, ALLOWED, and OPEN.\n{} Saved policy lives outside the project.\n{} Cancel writes no onboarding grants and starts nothing.\n{} Non-TTY first runs save no onboarding profile.\n{} Non-TTY configure changes nothing.\n{} Complete effective access includes every contributing policy layer.\n{} Unsafe directory syntax is refused.\n{} Credential roots require their dedicated access choice.\n{} Saved directory grants require identity records.\n{} Directory identity drift refuses access.\n{} Environment approvals store names only.\n{} Missing approved host variables fail closed.\n",
+        "{} Configure a known harness for one canonical project.\n{} Every selection is off until the user enables it.\n{} Every active grant names resource, access, process, duration, scope, limits, default, and consequence.\n{} Broad access requires typing OPEN.\n{} Final output always contains RESTRICTED, ALLOWED, and OPEN.\n{} Saved policy lives outside the project.\n{} Cancel writes no onboarding grants and starts nothing.\n{} Non-TTY first runs save no onboarding profile.\n{} Non-TTY configure changes nothing.\n{} Complete effective access includes every contributing policy layer.\n{} Unsafe directory syntax is refused.\n{} Credential roots require their dedicated access choice.\n{} Saved directory grants require identity records.\n{} Directory identity drift refuses access.\n{} Environment approvals store names only.\n{} Missing approved host variables fail closed.\n{} Selected-key SSH never shares private key files or the host agent.\n{} SSH destination limits are claimed only after host-key verification.\n{} A moved or changed selected key refuses launch.\n{} Selected-key SSH requires a separately approved Unrestricted network (OPEN) grant.\n",
         messages::INTRO_ID,
         messages::CHOICE_ID,
         messages::GRANT_ID,
@@ -1921,6 +2260,10 @@ fn source_linked_fixture() -> String {
         messages::PATH_DRIFT_ID,
         messages::ENV_ID,
         messages::ENV_MISSING_ID,
+        messages::SSH_ID,
+        messages::SSH_SCOPE_ID,
+        messages::SSH_DRIFT_ID,
+        messages::SSH_NETWORK_ID,
     )
 }
 
@@ -1986,8 +2329,12 @@ mod tests {
 
     #[test]
     fn first_run_project_selection_does_not_promote_defaults() {
-        let selection =
-            Selection::from_project_grants(&Config::default(), "claude", &[]);
+        let selection = Selection::from_project_grants(
+            &Config::default(),
+            "claude",
+            &[],
+            None,
+        );
         assert!(!selection.api_access);
         assert!(!selection.agent_state);
         assert!(!selection.dependency_hosts);
@@ -2002,6 +2349,79 @@ mod tests {
         for kind in ["ssh", "github", "network"] {
             assert_eq!(open_grant(kind, "claude", None).risk, Risk::Open);
         }
+    }
+
+    #[test]
+    fn restricted_ssh_disclosure_names_scope_and_private_key_boundary() {
+        let policy = crate::ssh_restricted::Policy {
+            keys: vec![crate::ssh_restricted::KeyIdentity {
+                private_path: "/home/test/.ssh/id_test".into(),
+                public_path: "/home/test/.ssh/id_test.pub".into(),
+                fingerprint: "SHA256:fixture".into(),
+                comment: "fixture@example".into(),
+                private_dev: 1,
+                private_ino: 2,
+                public_dev: 1,
+                public_ino: 3,
+            }],
+            lifetime_seconds: 600,
+            destinations: vec!["github.com".into()],
+        };
+        let rendered =
+            restricted_ssh_grant(&policy, "claude", Some(true)).render();
+        assert!(rendered.contains("SHA256:fixture"));
+        assert!(rendered.contains("private key files"));
+        assert!(rendered.contains(messages::SSH_SCOPE_ID));
+        assert!(rendered.contains("github.com"));
+    }
+
+    #[test]
+    fn restricted_ssh_guide_fixture_matches_production_prompts() {
+        let fixture =
+            include_str!("../tests/fixtures/onboarding/pty-restricted-ssh.txt");
+        for prompt in [
+            "Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: ",
+            "Key number, private-key path, or .pub path: ",
+            "Required destinations, comma-separated: ",
+        ] {
+            assert!(fixture.contains(prompt));
+            assert!(include_str!("../docs/USER_GUIDE.md").contains(prompt));
+        }
+        assert!(fixture.contains(messages::SSH_ID));
+        assert!(fixture.contains(messages::SSH_SCOPE_ID));
+        assert!(include_str!("../docs/USER_GUIDE.md").contains("AJ-SSH-004"));
+    }
+
+    #[test]
+    fn restricted_ssh_discovery_refuses_symlinked_public_entries() {
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-discover-ssh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("id_test"), "private fixture").unwrap();
+        std::fs::write(root.join("real.pub"), "public fixture").unwrap();
+        std::os::unix::fs::symlink(
+            root.join("real.pub"),
+            root.join("id_test.pub"),
+        )
+        .unwrap();
+        assert!(discover_public_ssh_keys_in(&root).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restricted_ssh_does_not_pretend_filtered_http_egress_carries_ssh() {
+        let selection = Selection {
+            restricted_ssh: Some(crate::ssh_restricted::Policy {
+                keys: Vec::new(),
+                lifetime_seconds: 600,
+                destinations: vec!["git@github.com".into()],
+            }),
+            ..Selection::default()
+        };
+        let grants = selection.grants("claude");
+        assert!(!grants.network_enabled());
+        assert!(!grants.allow_hosts.iter().any(|host| host == "github.com"));
     }
 
     #[test]

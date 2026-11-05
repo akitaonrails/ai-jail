@@ -12,12 +12,13 @@ AJ-CHOICE-001 Access choices
   2 [ ] Host harness login/state
   3 [ ] Dependency tools and download hosts
   4 [ ] Full host SSH access                 OPEN
+  k [ ] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
-  Scoped SSH and repository GitHub access are not available yet.
+  Repository-scoped forge access is configured separately.
 
 [OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
 [OK] Selected: filtered model API
@@ -38,12 +39,13 @@ AJ-GRANT-001 Enable this grant? [y/N] AJ-CHOICE-001 Access choices
   2 [ ] Host harness login/state
   3 [ ] Dependency tools and download hosts
   4 [ ] Full host SSH access                 OPEN
+  k [ ] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
-  Scoped SSH and repository GitHub access are not available yet.
+  Repository-scoped forge access is configured separately.
 
 [OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
 [OK] Selected: filtered model API

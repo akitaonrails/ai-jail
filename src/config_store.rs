@@ -65,6 +65,8 @@ pub(crate) struct ProjectPolicyDocument {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) approved_env_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restricted_ssh: Option<crate::ssh_restricted::Policy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) migration: Option<MigrationProvenance>,
 }
 
@@ -92,6 +94,7 @@ pub(crate) struct LoadedProject {
     pub(crate) present: bool,
     pub(crate) onboarding_complete: bool,
     pub(crate) approved_env_names: Vec<String>,
+    pub(crate) restricted_ssh: Option<crate::ssh_restricted::Policy>,
 }
 
 pub(crate) struct StoreLock(File);
@@ -595,6 +598,7 @@ fn read_project(
         present: true,
         onboarding_complete: doc.onboarding_complete,
         approved_env_names: doc.approved_env_names,
+        restricted_ssh: doc.restricted_ssh,
     })
 }
 
@@ -943,6 +947,7 @@ fn migrate_project(
             onboarding_complete: false,
             directory_grants: Vec::new(),
             approved_env_names: Vec::new(),
+            restricted_ssh: None,
             migration: None,
         }
     };
@@ -971,6 +976,7 @@ pub(crate) fn save_project_grants(
     mut grants: Config,
     mut approved_env_names: Vec<String>,
     approved_directory_grants: &[DirectoryGrantIdentity],
+    restricted_ssh: Option<crate::ssh_restricted::Policy>,
 ) -> Result<(), String> {
     let _lock = paths.prepare()?;
     validate_directory_grants(
@@ -990,6 +996,7 @@ pub(crate) fn save_project_grants(
             onboarding_complete: false,
             directory_grants: Vec::new(),
             approved_env_names: Vec::new(),
+            restricted_ssh: None,
             migration: None,
         }
     };
@@ -1005,6 +1012,10 @@ pub(crate) fn save_project_grants(
     doc.directory_grants = approved_directory_grants.to_vec();
     doc.grants = grants;
     doc.approved_env_names = approved_env_names;
+    if let Some(policy) = &restricted_ssh {
+        crate::ssh_restricted::validate_policy(policy)?;
+    }
+    doc.restricted_ssh = restricted_ssh;
     doc.onboarding_complete = true;
     write_project_document(&paths.project, &doc)
 }
@@ -1680,6 +1691,7 @@ pub(crate) fn save_project_constraints(
             onboarding_complete: false,
             directory_grants: Vec::new(),
             approved_env_names: Vec::new(),
+            restricted_ssh: None,
             migration: None,
         }
     };
@@ -2527,6 +2539,7 @@ mod tests {
             grants.clone(),
             vec!["CUSTOM_MODE".into()],
             &[],
+            None,
         )
         .unwrap();
         let loaded = load_project(&paths).unwrap();
@@ -2579,6 +2592,7 @@ mod tests {
             },
             Vec::new(),
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(load_project(&paths).unwrap().constraints, constraints);
@@ -2595,6 +2609,7 @@ mod tests {
             },
             Vec::new(),
             &[],
+            None,
         );
         fs::set_permissions(projects, fs::Permissions::from_mode(0o700))
             .unwrap();
@@ -2642,7 +2657,8 @@ mod tests {
         let approved =
             capture_directory_grants(&grants, &paths.canonical_project)
                 .unwrap();
-        save_project_grants(&paths, grants, Vec::new(), &approved).unwrap();
+        save_project_grants(&paths, grants, Vec::new(), &approved, None)
+            .unwrap();
         fs::remove_dir(&first).unwrap();
         fs::rename(&second, &first).unwrap();
         assert!(load_project(&paths).unwrap_err().contains("AJ-PATH-004"));
@@ -2713,7 +2729,7 @@ mod tests {
             legacy_project: project.join(".ai-jail"),
             canonical_project,
         };
-        save_project_grants(&paths, Config::default(), Vec::new(), &[])
+        save_project_grants(&paths, Config::default(), Vec::new(), &[], None)
             .unwrap();
         let before = fs::read(&paths.project).unwrap();
         let grants = Config {
@@ -2730,6 +2746,7 @@ mod tests {
             grants,
             Vec::new(),
             &preview_identities,
+            None,
         )
         .unwrap_err();
         assert!(error.contains(crate::onboarding::messages::PATH_DRIFT_ID));
@@ -2770,5 +2787,43 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("UTF-8"));
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn restricted_ssh_policy_serializes_names_and_identity_not_key_material() {
+        let doc = ProjectPolicyDocument {
+            schema_version: MIGRATION_VERSION,
+            project: ProjectIdentity {
+                canonical_path: "/work/project".into(),
+                key: "project-fixture".into(),
+            },
+            grants: Config::default(),
+            constraints: Config::default(),
+            onboarding_complete: true,
+            directory_grants: Vec::new(),
+            approved_env_names: Vec::new(),
+            restricted_ssh: Some(crate::ssh_restricted::Policy {
+                keys: vec![crate::ssh_restricted::KeyIdentity {
+                    private_path: "/home/test/.ssh/id_test".into(),
+                    public_path: "/home/test/.ssh/id_test.pub".into(),
+                    fingerprint: "SHA256:fixture".into(),
+                    comment: "fixture@example".into(),
+                    private_dev: 1,
+                    private_ino: 2,
+                    public_dev: 1,
+                    public_ino: 3,
+                }],
+                lifetime_seconds: 600,
+                destinations: vec!["git@example.test".into()],
+            }),
+            migration: None,
+        };
+        let text = toml::to_string_pretty(&doc).unwrap();
+        assert!(text.contains("SHA256:fixture"));
+        assert!(!text.contains("PRIVATE KEY"));
+        assert_eq!(
+            toml::from_str::<ProjectPolicyDocument>(&text).unwrap(),
+            doc
+        );
     }
 }

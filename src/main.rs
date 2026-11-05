@@ -19,6 +19,7 @@ mod pty;
 mod sandbox;
 mod secret;
 mod signals;
+mod ssh_restricted;
 mod statusbar;
 
 #[cfg(test)]
@@ -535,6 +536,7 @@ pub(crate) struct FinalizedLaunch {
     pub(crate) config: config::Config,
     secrets: Vec<secret::SecretBinding>,
     github_warning: Option<&'static str>,
+    restricted_ssh: Option<ssh_restricted::Plan>,
 }
 
 /// Immutable owner of all post-finalization launch authority. Production and
@@ -542,11 +544,15 @@ pub(crate) struct FinalizedLaunch {
 /// proxy/sandbox handoff can replace or mutate the finalized policy.
 struct LaunchRunner {
     finalized: FinalizedLaunch,
+    restricted_ssh: Option<ssh_restricted::Runtime>,
 }
 
 impl LaunchRunner {
     fn new(finalized: FinalizedLaunch) -> Self {
-        Self { finalized }
+        Self {
+            finalized,
+            restricted_ssh: None,
+        }
     }
 
     fn config(&self) -> &config::Config {
@@ -571,15 +577,32 @@ impl LaunchRunner {
     ) -> R {
         builder(&self.finalized.config)
     }
+
+    fn start_restricted_ssh(&mut self) -> Result<(), String> {
+        if let Some(plan) = &self.finalized.restricted_ssh {
+            self.restricted_ssh = Some(plan.start()?);
+        }
+        Ok(())
+    }
 }
 
 /// Apply every host-derived launch mutation exactly once. The returned config
 /// is the immutable policy rendered to the user and later passed to sandbox
 /// execution; supervisor-only secrets stay beside it.
+#[cfg(test)]
 pub(crate) fn finalize_launch_config(
+    config: config::Config,
+    project: &std::path::Path,
+    dry_run: bool,
+) -> Result<FinalizedLaunch, String> {
+    finalize_launch_config_with_ssh(config, project, dry_run, None)
+}
+
+pub(crate) fn finalize_launch_config_with_ssh(
     mut config: config::Config,
     project: &std::path::Path,
     dry_run: bool,
+    restricted_ssh: Option<ssh_restricted::Policy>,
 ) -> Result<FinalizedLaunch, String> {
     if config.mise_enabled() && !config.lockdown_enabled() {
         for dir in sandbox::mise_auto_map_dirs() {
@@ -662,11 +685,28 @@ pub(crate) fn finalize_launch_config(
             config.ro_maps.push(path);
         }
     }
+    let restricted_ssh = if config.ssh_enabled() || config.lockdown_enabled() {
+        None
+    } else if let Some(policy) = restricted_ssh {
+        if !config.network_enabled() {
+            return Err(format!(
+                "{} Selected-key SSH needs Unrestricted network (OPEN): filtered egress carries HTTP(S), not native SSH. Enable it knowingly or disable SSH.",
+                onboarding::messages::SSH_NETWORK_ID
+            ));
+        }
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| "HOME is required for restricted SSH".to_string())?;
+        Some(ssh_restricted::plan(policy, &mut config, &home)?)
+    } else {
+        None
+    };
     let secrets = prepare_secrets(&mut config)?;
     Ok(FinalizedLaunch {
         config,
         secrets,
         github_warning: github.warning,
+        restricted_ssh,
     })
 }
 
@@ -1068,6 +1108,9 @@ fn run(
     migration_notices: &mut Vec<config_store::MigrationNotice>,
 ) -> Result<i32, String> {
     let cli = cli::parse()?;
+    if let Some(fd) = cli.supervised_exec_fd {
+        return signals::run_supervised_exec(fd, &cli.command);
+    }
     validate_write_flags(&cli)?;
 
     // Suppress info/warn output in --exec mode for clean stdout
@@ -1166,13 +1209,16 @@ fn run(
         config::load()?
     };
     let using_external_project = stored_project.present;
-    let external_has_grants =
-        stored_project.grants != config::Config::default();
+    let external_has_grants = stored_project.grants
+        != config::Config::default()
+        || stored_project.restricted_ssh.is_some();
     let external_has_constraints =
         stored_project.constraints != config::Config::default();
     let stored_grants_for_onboarding = stored_project.grants.clone();
     let stored_env_names_for_onboarding =
         stored_project.approved_env_names.clone();
+    let stored_ssh_for_onboarding = stored_project.restricted_ssh.clone();
+    let stored_ssh_for_launch = stored_project.restricted_ssh.clone();
     let global_command_selector = if using_external_project {
         &stored_project.grants
     } else {
@@ -1278,6 +1324,7 @@ fn run(
                     constraints: &project_config,
                     trusted_constraints: legacy_project_trusted,
                     approved_env_names: &stored_env_names_for_onboarding,
+                    restricted_ssh: stored_ssh_for_onboarding.as_ref(),
                 },
             )?;
             let (mut profile, save, launch) = match outcome {
@@ -1306,12 +1353,16 @@ fn run(
                     profile.grants.clone(),
                     profile.approved_env_names.clone(),
                     &profile.directory_grants,
+                    profile.restricted_ssh.clone(),
                 )?;
                 eprintln!(
                     "[OK] {} Configuration saved\n  Project policy: {}\n  The project cannot edit or enable this policy from inside the jail.",
                     onboarding::messages::SAVE_ID,
                     onboarding::safe_path(&store.project)?
                 );
+            }
+            if profile.ssh_transcript_started {
+                eprintln!("{}", onboarding::SSH_TRANSCRIPT_END);
             }
             if !launch {
                 return Ok(0);
@@ -1348,8 +1399,12 @@ fn run(
             &invocation_cwd,
             legacy_project_trusted,
         )?;
+        let mut saved_selection = onboarding::Selection::from_config(&config);
+        if cli.ssh != Some(false) && !config.lockdown_enabled() {
+            saved_selection.restricted_ssh = stored_ssh_for_onboarding.clone();
+        }
         onboarding::render_summary(
-            &onboarding::Selection::from_config(&config),
+            &saved_selection,
             harness,
             &invocation_cwd,
             true,
@@ -1470,9 +1525,18 @@ fn run(
 
     let finalized = match prepared_launch.take() {
         Some(finalized) => finalized,
-        None => finalize_launch_config(config, &invocation_cwd, cli.dry_run)?,
+        None => finalize_launch_config_with_ssh(
+            config,
+            &invocation_cwd,
+            cli.dry_run,
+            if cli.ssh == Some(false) {
+                None
+            } else {
+                stored_ssh_for_launch
+            },
+        )?,
     };
-    let launch_runner = LaunchRunner::new(finalized);
+    let mut launch_runner = LaunchRunner::new(finalized);
     if let Some(warning) = launch_runner.github_warning() {
         output::warn(warning);
     }
@@ -1483,6 +1547,11 @@ fn run(
         browser_display_hint(launch_runner.config(), host_has_display())
     {
         output::warn(hint);
+    }
+    if !cli.dry_run {
+        signals::install_handlers();
+        launch_runner.start_restricted_ssh()?;
+        signals::abort_if_cancelled()?;
     }
     let config = launch_runner.config();
     if let Some((harness, saved, approved_env_names)) =
@@ -1499,7 +1568,6 @@ fn run(
             )?
         );
     }
-
     // Check sandbox tool is available
     sandbox::check()?;
 
@@ -1673,9 +1741,6 @@ fn run(
 
     output::info(&format!("Jail Active: {}", project_dir.display()));
 
-    // Install signal handlers before spawning
-    signals::install_handlers();
-
     // Set up status bar if enabled and stdio is attached to a terminal
     let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
@@ -1830,12 +1895,10 @@ fn run(
         }
     } else {
         // Non-interactive and --exec paths preserve inherited/piped stdio.
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to start sandbox: {e}"))?;
+        let gate = signals::wrap_supervised_command(&mut cmd)?;
+        let child = signals::spawn_supervised(&mut cmd, gate)?;
 
         let pid = child.id() as i32;
-        signals::set_child_pid(pid);
 
         let code = signals::wait_child(pid);
         std::mem::forget(child);

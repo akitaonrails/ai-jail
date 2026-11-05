@@ -26,6 +26,10 @@ AJ-PATH-003 Saved directory grants require identity records.
 AJ-PATH-004 Directory identity drift refuses access.
 AJ-ENV-001 Environment approvals store names only.
 AJ-ENV-002 Missing approved host variables fail closed.
+AJ-SSH-001 Selected-key SSH never shares private key files or the host agent.
+AJ-SSH-002 SSH destination limits are claimed only after host-key verification.
+AJ-SSH-003 A moved or changed selected key refuses launch.
+AJ-SSH-004 Selected-key SSH requires a separately approved Unrestricted network (OPEN) grant.
 ```
 
 ## Secure default
@@ -44,6 +48,7 @@ AJ-CHOICE-001 Access choices
   2 [ ] Host harness login/state
   3 [ ] Dependency tools and download hosts
   4 [ ] Full host SSH access                 OPEN
+  k [ ] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
   r Add read-only directory   w Add read/write directory
@@ -188,9 +193,261 @@ Type OPEN to enable this exact grant: OPEN
 ```
 
 Full SSH, the full host GitHub token, and unrestricted network are legacy
-compatibility modes. They are always listed under `OPEN`. Restricted SSH and
-repository-scoped GitHub App choices appear only after their enforcement is
-available; the current editor does not claim they exist.
+compatibility modes. They are always listed under `OPEN`.
+
+## Selected-key SSH
+
+Press `k` to add or remove file-backed identities. ai-jail discovers only
+regular, non-symlinked key pairs. It displays and saves the public SHA-256
+fingerprint, comment, path, and file identity. It never saves or mounts private
+key contents.
+
+```text
+AJ-SSH-TRANSCRIPT-BEGIN selected-key SSH interaction
+AJ-SSH-001 Selected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared.
+Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: a
+Available file-backed identities:
+  1. /home/alice/.ssh/id_ed25519.pub  SHA256:EXAMPLE  alice@example
+Key number, private-key path, or .pub path: 1
+
+AJ-SSH-001 Selected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared.
+Selected identities:
+  1. /home/alice/.ssh/id_ed25519.pub  SHA256:EXAMPLE  alice@example
+Lifetime: 3600 seconds; destinations: not configured (launch and save are refused)
+Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: h
+Required destinations, comma-separated: git@github.com
+
+Resource:    Fresh SSH agent containing only SHA256:EXAMPLE
+Access:      Request signatures; private key files and the ambient agent stay outside the jail
+Duration:    Agent lives for this jail; loaded keys expire after 3600 seconds
+Scope:       AJ-SSH-002 Only verified destination constraints: git@github.com
+Limits:      Destination constraints depend on OpenSSH support and verified known_hosts entries; unrestricted network is separately OPEN; failure refuses launch
+```
+
+Choose `h` to add destination constraints. ai-jail copies only verified public
+host-key lines into a generated `known_hosts` file and uses OpenSSH's
+destination constraints. At least one destination is required. If `ssh-add`
+lacks destination constraints or a destination has no matching verified host
+key, launch and save stop. Host-key checking is always strict. ai-jail does not
+describe `known_hosts` as a limit on raw agent signing authority; the enforced
+boundary is OpenSSH's `ssh-add -h/-H` destination constraint.
+
+Native SSH does not travel through ai-jail's HTTP(S) filtered-egress proxy.
+Select `6 Unrestricted network` and type `OPEN` to use selected-key SSH. This
+opens network reachability, not extra key authority; the fresh agent still
+contains only the selected identities. Without this separate approval, launch
+stops with `AJ-SSH-004`.
+
+Git is forced to use the generated SSH config. For a direct command, use the
+two launch-scoped variables exactly:
+
+```sh
+"$AI_JAIL_SSH" -F "$AI_JAIL_SSH_CONFIG" git@github.com
+```
+
+Running plain `ssh` does not promise these restrictions. The temporary agent is
+killed and its generated public files are removed on normal exit or launch
+failure. SIGINT, SIGTERM, and SIGHUP set launch cancellation before forwarding
+to the supervised child; startup observes cancellation, reaps the temporary
+agent, removes its runtime directory, and does not start the sandbox command.
+Ambient `SSH_AUTH_SOCK`, `GIT_SSH`, and
+`GIT_SSH_COMMAND` values are removed.
+Identities that exist only in the ambient agent cannot be copied selectively;
+use a file-backed key or choose the legacy full SSH mode with `OPEN`.
+
+The following normalized PTY transcript is the executable onboarding fixture.
+Only the temporary root and generated policy filename are replaced.
+
+```text
+AJ-SSH-TRANSCRIPT-BEGIN selected-key SSH interaction
+
+AJ-SSH-001 Selected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared.
+Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: Available file-backed identities:
+  1. <ROOT>/home/.ssh/id_test.pub  SHA256:EXAMPLE  alice@example
+Key number, private-key path, or .pub path: AJ-CHOICE-001 Access choices
+  1 [ ] Filtered model API access
+  2 [ ] Host harness login/state
+  3 [ ] Dependency tools and download hosts
+  4 [ ] Full host SSH access                 OPEN
+  k [x] Selected SSH keys (fresh agent)
+  5 [ ] Full host GitHub token              OPEN
+  6 [ ] Unrestricted network                OPEN
+  r Add read-only directory   w Add read/write directory
+  e Environment variables (names only; values stay hidden)
+  d Remove directory          s Review summary   q Cancel
+  Repository-scoped forge access is configured separately.
+
+[OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
+[OK] Selected: filtered model API
+
+AJ-SSH-001 Selected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared.
+Selected identities:
+  1. <ROOT>/home/.ssh/id_test.pub  SHA256:EXAMPLE  alice@example
+Lifetime: 3600 seconds; destinations: not configured (launch and save are refused)
+Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: Key number to remove: AJ-CHOICE-001 Access choices
+  1 [ ] Filtered model API access
+  2 [ ] Host harness login/state
+  3 [ ] Dependency tools and download hosts
+  4 [ ] Full host SSH access                 OPEN
+  k [ ] Selected SSH keys (fresh agent)
+  5 [ ] Full host GitHub token              OPEN
+  6 [ ] Unrestricted network                OPEN
+  r Add read-only directory   w Add read/write directory
+  e Environment variables (names only; values stay hidden)
+  d Remove directory          s Review summary   q Cancel
+  Repository-scoped forge access is configured separately.
+
+[OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
+[OK] Selected: filtered model API
+
+AJ-SSH-001 Selected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared.
+Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: Available file-backed identities:
+  1. <ROOT>/home/.ssh/id_test.pub  SHA256:EXAMPLE  alice@example
+Key number, private-key path, or .pub path: AJ-CHOICE-001 Access choices
+  1 [ ] Filtered model API access
+  2 [ ] Host harness login/state
+  3 [ ] Dependency tools and download hosts
+  4 [ ] Full host SSH access                 OPEN
+  k [x] Selected SSH keys (fresh agent)
+  5 [ ] Full host GitHub token              OPEN
+  6 [ ] Unrestricted network                OPEN
+  r Add read-only directory   w Add read/write directory
+  e Environment variables (names only; values stay hidden)
+  d Remove directory          s Review summary   q Cancel
+  Repository-scoped forge access is configured separately.
+
+[OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
+[OK] Selected: filtered model API
+
+AJ-SSH-001 Selected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared.
+Selected identities:
+  1. <ROOT>/home/.ssh/id_test.pub  SHA256:EXAMPLE  alice@example
+Lifetime: 3600 seconds; destinations: not configured (launch and save are refused)
+Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: Required destinations, comma-separated: AJ-CHOICE-001 Access choices
+  1 [ ] Filtered model API access
+  2 [ ] Host harness login/state
+  3 [ ] Dependency tools and download hosts
+  4 [ ] Full host SSH access                 OPEN
+  k [x] Selected SSH keys (fresh agent)
+  5 [ ] Full host GitHub token              OPEN
+  6 [ ] Unrestricted network                OPEN
+  r Add read-only directory   w Add read/write directory
+  e Environment variables (names only; values stay hidden)
+  d Remove directory          s Review summary   q Cancel
+  Repository-scoped forge access is configured separately.
+
+[OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
+[OK] Selected: filtered model API
+
+AJ-OPEN-001 OPEN access removes an important boundary.
+
+AJ-GRANT-001
+Resource:    The host's reachable network
+Access:      Connect using any protocol and destination permitted by the host
+Process:     claude and every child process it starts inside this jail
+Duration:    This jail run; saving keeps approval for later runs, while launch once does not
+Scope:       Public, private, local-network, and other host-reachable services
+Limits:      Hostname filtering and destination audit enforcement no longer apply
+Default:     Filtered to explicitly allowed hosts
+Consequence: Any readable jail data can be sent to any reachable service
+Remote:      Any reachable service
+
+AJ-OPEN-001 Type OPEN to enable this exact grant: AJ-CHOICE-001 Access choices
+  1 [ ] Filtered model API access
+  2 [ ] Host harness login/state
+  3 [ ] Dependency tools and download hosts
+  4 [ ] Full host SSH access                 OPEN
+  k [x] Selected SSH keys (fresh agent)
+  5 [ ] Full host GitHub token              OPEN
+  6 [x] Unrestricted network                OPEN
+  r Add read-only directory   w Add read/write directory
+  e Environment variables (names only; values stay hidden)
+  d Remove directory          s Review summary   q Cancel
+  Repository-scoped forge access is configured separately.
+
+[OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
+[OK] Selected: filtered model API
+
+AJ-SUM-001 Final access for claude
+
+[LOCK] RESTRICTED
+  GitHub    No host gh configuration or token
+  Host home See the complete effective access below
+  Network   All destinations are blocked
+
+[WARN] ALLOWED
+AJ-GRANT-001
+Resource:    <ROOT>/project
+Access:      Read and write the complete directory tree
+Process:     claude and every child process it starts inside this jail
+Duration:    While each jail runs; approval remains saved for this project
+Scope:       This canonical project path only
+Limits:      Readable project data can be sent to an allowed network destination
+Default:     Allowed because this is the working project
+Consequence: The harness can inspect, create, modify, rename, and delete project files
+
+
+AJ-GRANT-001
+Resource:    Fresh SSH agent containing only SHA256:EXAMPLE
+Access:      Request signatures; private key files and the ambient agent stay outside the jail
+Process:     claude and every child process it starts inside this jail
+Duration:    Agent lives for this jail; loaded keys expire after 3600 seconds; While each jail runs; approval remains saved for this project
+Scope:       AJ-SSH-002 Only verified destination constraints: git@github.com
+Limits:      Destination constraints depend on OpenSSH support and verified known_hosts entries; unrestricted network is separately OPEN; failure refuses launch
+Default:     Disabled until keys are selected in trusted configuration
+Consequence: The harness can authenticate as accounts accepted by the selected keys during this jail run
+Remote:      git@github.com
+Authority:   Only accounts accepted by the selected fingerprints
+
+
+[ERROR] OPEN
+
+AJ-GRANT-001
+Resource:    The host's reachable network
+Access:      Connect using any protocol and destination permitted by the host
+Process:     claude and every child process it starts inside this jail
+Duration:    While each jail runs; approval remains saved for this project
+Scope:       Public, private, local-network, and other host-reachable services
+Limits:      Hostname filtering and destination audit enforcement no longer apply
+Default:     Filtered to explicitly allowed hosts
+Consequence: Any readable jail data can be sent to any reachable service
+Remote:      Any reachable service
+
+
+AJ-FINAL-001 Complete effective access
+Recipient: claude and every child process it starts inside this jail
+Duration: This jail run; saving keeps approval for later runs, while launch once does not
+Project: <ROOT>/project (read and write)
+Scope: global policy, proposed project grants, command-line grants, project constraints, and derived platform defaults
+Effective policy (every nondefault field):
+command = ["claude"]
+rw_maps = ["<SSH-RUNTIME>/agent.sock:/tmp/ai-jail-ssh-agent.sock"]
+ro_maps = ["<SSH-RUNTIME>/public:/tmp/ai-jail-ssh-public"]
+github = false
+network = true
+no_mise = true
+no_toolchains = true
+ssh = false
+agent_state = false
+Built-in environment names: PATH, HOME, TERM, LANG, SHELL, TMPDIR, COLORTERM, SSL_CERT_FILE, SSL_CERT_DIR, http_proxy, https_proxy, no_proxy, HTTP_PROXY, HTTPS_PROXY, NO_PROXY; prefixes: LC_, XDG_, TERM_PROGRAM
+Authority details (resource; access; scope/limits; consequence):
+- [ERROR] OPEN: host network; unrestricted connections; every host-reachable destination and protocol; readable jail data can reach any service
+- [WARN] ALLOWED: launch-scoped selected-key SSH agent; request signatures without reading private keys or the ambient agent; selected identities and saved destination constraints; accepted accounts can be used during this jail run
+- [WARN] ALLOWED: private persistent jail home; read and write; this harness profile only; state persists across launches
+- [WARN] ALLOWED: read-only map <SSH-RUNTIME>/public:/tmp/ai-jail-ssh-public; mapped tree access; exact encoded source/destination; readable data can leave through allowed network access
+- [WARN] ALLOWED: read/write map <SSH-RUNTIME>/agent.sock:/tmp/ai-jail-ssh-agent.sock; mapped tree access; exact encoded source/destination; readable data can leave through allowed network access
+Environment names: AI_JAIL_SSH, AI_JAIL_SSH_CONFIG, GIT_SSH_COMMAND, SSH_AUTH_SOCK
+- [WARN] ALLOWED: generated launch-scoped SSH variable AI_JAIL_SSH; points only to the dedicated agent or generated strict SSH configuration; jailed descendants can use the selected-key authority
+- [WARN] ALLOWED: generated launch-scoped SSH variable AI_JAIL_SSH_CONFIG; points only to the dedicated agent or generated strict SSH configuration; jailed descendants can use the selected-key authority
+- [WARN] ALLOWED: generated launch-scoped SSH variable GIT_SSH_COMMAND; points only to the dedicated agent or generated strict SSH configuration; jailed descendants can use the selected-key authority
+- [WARN] ALLOWED: generated launch-scoped SSH variable SSH_AUTH_SOCK; points only to the dedicated agent or generated strict SSH configuration; jailed descendants can use the selected-key authority
+User-approved host environment names: none
+Limits: mandatory masks, platform support, and monotonic project restrictions still apply
+AJ-OPEN-001 Complete effective access contains OPEN authority. Type OPEN to continue: AJ-SAVE-001 Save this project profile? [y/N/b] [OK] AJ-SAVE-001 Configuration saved
+  Project policy: <ROOT>/xdg/ai-jail/projects/<POLICY>.toml
+  The project cannot edit or enable this policy from inside the jail.
+AJ-SSH-TRANSCRIPT-END selected-key SSH interaction
+```
 
 ## Migration and reapproval
 
@@ -201,6 +458,7 @@ full host SSH access, full host GitHub credentials, read/write host paths.
 
 AJ-CHOICE-001 Access choices
   4 [ ] Full host SSH access                 OPEN
+  k [ ] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
 ```
 
@@ -247,12 +505,13 @@ AJ-CHOICE-001 Access choices
   2 [ ] Host harness login/state
   3 [ ] Dependency tools and download hosts
   4 [ ] Full host SSH access                 OPEN
+  k [ ] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
-  Scoped SSH and repository GitHub access are not available yet.
+  Repository-scoped forge access is configured separately.
 
 [OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
 [OK] Selected: filtered model API
@@ -273,12 +532,13 @@ AJ-GRANT-001 Enable this grant? [y/N] AJ-CHOICE-001 Access choices
   2 [ ] Host harness login/state
   3 [ ] Dependency tools and download hosts
   4 [ ] Full host SSH access                 OPEN
+  k [ ] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
-  Scoped SSH and repository GitHub access are not available yet.
+  Repository-scoped forge access is configured separately.
 
 [OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
 [OK] Selected: filtered model API

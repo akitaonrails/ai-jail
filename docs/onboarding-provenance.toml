@@ -5,7 +5,7 @@ message_ids = ["AJ-ONB-001", "AJ-CHOICE-001", "AJ-GRANT-001"]
 policy = "onboarding.disclosure"
 enforced_by = ["src/onboarding.rs::GrantSpec", "src/main.rs::run"]
 verified_by = ["onboarding::tests::grant_disclosure_contains_every_required_field"]
-guide_fixture = "tests/fixtures/onboarding/catalog.txt"
+guide_fixture = "tests/fixtures/onboarding/pty-restricted-ssh.txt"
 
 [[claim]]
 message_ids = ["AJ-ENV-001", "AJ-ENV-002"]
@@ -56,3 +56,10 @@ policy = "onboarding.directory_identity_and_credential_boundaries"
 enforced_by = ["src/config_store.rs::validate_directory_grants", "src/authority_inventory.rs::is_protected", "src/onboarding.rs::reject_credential_root"]
 verified_by = ["config_store::tests::directory_grant_identity_refuses_symlink_swap_and_disappearance", "config_store::tests::launch_once_directory_identity_is_reverified_before_execution", "config_store::tests::save_refuses_directory_swapped_after_preview_and_preserves_policy", "authority_inventory::tests::inventory_fixture_drives_classification_and_sandbox_exposure", "authority_inventory::tests::fixture_drives_linux_and_macos_resolved_state_permissions", "sandbox::bwrap::tests::command_state_paths_cover_full_command_list", "sandbox::landlock::tests::inventory_file_state_receives_landlock_write_permission", "onboarding::tests::credential_roots_are_refused_through_home_aliases", "directory_tab_completion_accepts_utf8_paths"]
 guide_fixture = "tests/fixtures/onboarding/catalog.txt"
+
+[[claim]]
+message_ids = ["AJ-SSH-001", "AJ-SSH-002", "AJ-SSH-003", "AJ-SSH-004"]
+policy = "onboarding.restricted_ssh_selected_keys"
+enforced_by = ["src/ssh_restricted.rs::Plan", "src/ssh_restricted.rs::validate_policy", "src/main.rs::LaunchRunner::start_restricted_ssh"]
+verified_by = ["ssh_restricted::tests::capture_refuses_linked_private_key_and_parses_fingerprint", "ssh_restricted::tests::presented_private_and_public_symlinks_are_refused_before_canonicalize", "ssh_restricted::tests::trusted_tool_resolution_ignores_a_path_lookalike", "ssh_restricted::tests::trusted_tool_revalidation_refuses_identity_drift_and_symlink_swap", "ssh_restricted::tests::generated_config_always_uses_strict_host_key_files", "ssh_restricted::tests::unconstrained_selected_key_policy_is_refused", "ssh_restricted::tests::plan_disables_ambient_ssh_and_maps_only_generated_resources", "ssh_restricted::tests::fake_ssh_add_receives_only_selected_key_lifetime_and_constraints", "ssh_restricted::tests::failed_fake_agent_start_removes_runtime_directory", "ssh_restricted::tests::runtime_drop_kills_child_and_removes_private_directory", "ssh_restricted::tests::fake_keygen_limits_known_hosts_copy_to_approved_destination", "signals::tests::pending_signal_is_forwarded_when_a_child_registers_late", "signals::tests::pending_cancellation_prevents_the_sandbox_spawn_seam", "signals::tests::signal_in_spawn_registration_window_never_executes_child", "onboarding::tests::restricted_ssh_disclosure_names_scope_and_private_key_boundary", "onboarding::tests::restricted_ssh_guide_fixture_matches_production_prompts", "scripted_pty_adds_removes_constrains_and_saves_restricted_ssh"]
+guide_fixture = "tests/fixtures/onboarding/pty-restricted-ssh.txt"

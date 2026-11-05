@@ -14,3 +14,7 @@ AJ-PATH-003 Saved directory grants require identity records.
 AJ-PATH-004 Directory identity drift refuses access.
 AJ-ENV-001 Environment approvals store names only.
 AJ-ENV-002 Missing approved host variables fail closed.
+AJ-SSH-001 Selected-key SSH never shares private key files or the host agent.
+AJ-SSH-002 SSH destination limits are claimed only after host-key verification.
+AJ-SSH-003 A moved or changed selected key refuses launch.
+AJ-SSH-004 Selected-key SSH requires a separately approved Unrestricted network (OPEN) grant.

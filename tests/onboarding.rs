@@ -2,6 +2,7 @@ mod common;
 
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 
 #[test]
@@ -14,7 +15,6 @@ fn noninteractive_configure_fails_without_writing_policy() {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&project).unwrap();
     fs::create_dir_all(&home).unwrap();
-
     let output = Command::new(common::ai_jail())
         .args(["configure", "claude"])
         .current_dir(&project)
@@ -94,6 +94,38 @@ fn scripted_pty(
     if label == "pty-utf8-tab" {
         fs::create_dir_all(root.join("share-café")).unwrap();
     }
+    if label == "pty-restricted-ssh" {
+        let ssh = home.join(".ssh");
+        let tools = root.join("ssh-tools");
+        fs::create_dir_all(&ssh).unwrap();
+        fs::create_dir_all(&tools).unwrap();
+        fs::write(ssh.join("id_test"), "private test fixture").unwrap();
+        fs::write(
+            ssh.join("id_test.pub"),
+            "ssh-ed25519 AAAATEST alice@example\n",
+        )
+        .unwrap();
+        fs::write(ssh.join("known_hosts"), "github.com ssh-ed25519 AAAAHOST\n")
+            .unwrap();
+        fs::write(
+            tools.join("ssh-keygen"),
+            "#!/bin/sh\nprintf '256 SHA256:EXAMPLE alice@example (ED25519)\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            tools.join("ssh-keygen"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        for name in ["ssh-agent", "ssh-add", "ssh"] {
+            fs::write(tools.join(name), "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(
+                tools.join(name),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+    }
 
     let pty = nix::pty::openpty(None, None).unwrap();
     let slave_fd = pty.slave.as_raw_fd();
@@ -105,6 +137,9 @@ fn scripted_pty(
         .env("XDG_CONFIG_HOME", &xdg)
         .env("NO_COLOR", "")
         .env("TERM", term);
+    if label == "pty-restricted-ssh" {
+        command.env("AI_JAIL_TEST_SSH_TOOL_DIR", root.join("ssh-tools"));
+    }
     for (name, value) in extra_env {
         command.env(name, value);
     }
@@ -226,6 +261,49 @@ fn scripted_pty_environment_checklist_never_displays_or_saves_values() {
     let policy = fs::read_to_string(policy_path).unwrap();
     assert!(policy.contains("CUSTOM_MODE"));
     assert!(!policy.contains("secret-value-that-must-never-appear"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn scripted_pty_adds_removes_constrains_and_saves_restricted_ssh() {
+    let input = b"ka\n1\nkr\n1\nka\n1\nkh\ngit@github.com\n6OPEN\nsOPEN\ny\n";
+    let (root, xdg, transcript) =
+        scripted_pty("pty-restricted-ssh", input, &[], "xterm", 0, None);
+    let root_text = root.to_string_lossy();
+    let mut normalized = transcript
+        .replace('\r', "")
+        .replace(root_text.as_ref(), "<ROOT>");
+    if let Some(start) = normalized.find("projects/project-")
+        && let Some(relative_end) = normalized[start..].find(".toml")
+    {
+        let end = start + relative_end + ".toml".len();
+        normalized.replace_range(start..end, "projects/<POLICY>.toml");
+    }
+    let begin = normalized
+        .find("AJ-SSH-TRANSCRIPT-BEGIN")
+        .expect("production transcript begin marker");
+    let end_marker = "AJ-SSH-TRANSCRIPT-END selected-key SSH interaction";
+    let end = normalized[begin..]
+        .find(end_marker)
+        .map(|offset| begin + offset + end_marker.len())
+        .expect("production transcript end marker");
+    let security_transcript = format!("{}\n", &normalized[begin..end]);
+    let fixture = include_str!("fixtures/onboarding/pty-restricted-ssh.txt");
+    assert_eq!(security_transcript, fixture);
+    let fenced = format!("```text\n{fixture}```");
+    assert!(include_str!("../docs/USER_GUIDE.md").contains(&fenced));
+    let policy_path = fs::read_dir(xdg.join("ai-jail/projects"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let policy = fs::read_to_string(policy_path).unwrap();
+    assert!(policy.contains("restricted_ssh"));
+    assert!(policy.contains("git@github.com"));
+    assert!(policy.contains("network = true"));
+    assert!(!policy.contains("private test fixture"));
     let _ = fs::remove_dir_all(root);
 }
 

@@ -125,7 +125,8 @@ OPTIONS:
     --no-toolchains / --toolchains Disable/enable dev-toolchain cache
                                    persistence (rust/cargo, go, node, …;
                                    default: on; Linux)
-    --ssh / --no-ssh               Share ~/.ssh read-only + forward SSH_AUTH_SOCK (default: off)
+    --ssh / --no-ssh               OPEN: share ~/.ssh + ambient SSH agent (default: off)
+                                     Use `configure` for selected-key SSH
     --pictures / --no-pictures     Share ~/Pictures read-only (default: off)
     --browser[=PROFILE]            Use browser isolation profile (hard | soft; default hard)
     --no-browser                   Disable browser auto-detection/profile
@@ -245,6 +246,9 @@ pub struct CliArgs {
     /// Internal: apply Landlock and exec remaining command.
     /// Used as a wrapper inside the bwrap sandbox.
     pub landlock_exec: bool,
+    /// Internal: wait for the supervisor's one-byte execution gate before
+    /// replacing this process with `command`.
+    pub supervised_exec_fd: Option<i32>,
     /// Internal: run the in-sandbox proxy bridge (filtered egress),
     /// as (loopback port, outer proxy's Unix socket path). Spawned by
     /// the --landlock-exec wrapper before it restricts itself.
@@ -617,6 +621,13 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 args.status_bar = Some(false);
             }
             Long("landlock-exec") => args.landlock_exec = true,
+            Long("supervised-exec-fd") => {
+                let value = parser.value().map_err(|e| e.to_string())?;
+                args.supervised_exec_fd =
+                    Some(value.to_string_lossy().parse().map_err(|_| {
+                        "invalid supervised execution fd".to_string()
+                    })?);
+            }
             Long("proxy-bridge") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
                 let port_text = val.to_string_lossy();
