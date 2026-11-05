@@ -8,6 +8,24 @@ server's numeric repository ID, and repeats that check before every launch.
 The feature does not replace the legacy `--github` switch. That switch still
 shares the active host `gh` credential and is accurately reported as **OPEN**.
 
+## Before setup
+
+Run setup from the checkout you want to bind. You need an account that can
+create or install the selected credential on that repository:
+
+- GitHub requires permission to create a GitHub App and install it on the
+  repository owner account. The user performs both steps in GitHub; ai-jail
+  does not request account-wide OAuth access.
+- GitLab requires permission to create a project access token. Availability
+  and the role you can assign depend on the GitLab plan and project settings.
+- Codeberg/Forgejo and Gitea require a server version whose published OpenAPI
+  schema exposes a repository selector for access tokens. ai-jail checks that
+  schema during setup and refuses to claim scoping from a version string.
+
+No provider account is configured automatically. ai-jail validates the
+credential you create, stores it in the local owner-only configuration tree,
+and binds it to this checkout and the forge's immutable numeric repository ID.
+
 ## Security labels
 
 - **SCOPED · SHORT-LIVED:** a GitHub App installation token, narrowed to the
@@ -149,9 +167,10 @@ $ ai-jail forge remove
 ```
 
 Rotation repeats setup and atomically replaces the stored credential. Removal
-deletes both the project binding and its separate credential file. Persistent
-tokens must also be revoked in the forge UI if immediate server-side revocation
-is required.
+deletes both the project binding and its separate credential file. This stops
+ai-jail from injecting it on later launches, but it does not contact the
+provider to revoke a persistent token. Revoke that token in the forge UI when
+you need immediate server-side invalidation.
 
 ## Provenance and drift controls
 
@@ -166,8 +185,8 @@ Security claims were derived from these provider sources (checked 2026-11-05):
 - [GitHub installation access tokens](https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app)
 - [GitHub installation repository selection](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app)
 - [GitLab project access tokens](https://docs.gitlab.com/user/project/settings/project_access_tokens/)
-- [Forgejo API usage and token scopes](https://forgejo.org/docs/latest/user/api-usage/)
-- [Gitea API usage](https://docs.gitea.com/development/api-usage)
+- [Forgejo API usage and token scopes](https://forgejo.org/docs/latest/user/api/usage/)
+- [Gitea API usage](https://docs.gitea.com/development/api-usage/)
 
 When any linked provider contract or the named source modules change, update
 this guide and its simulated output in the same change.

@@ -50,7 +50,7 @@ OPTIONS:
     --audio / --no-audio           Enable/disable host audio passthrough
                                    (PulseAudio/PipeWire sockets + /dev/snd;
                                    Linux only; default: off)
-    --github / --no-github         Share gh config read-only and the active
+    --github / --no-github         OPEN: share gh config read-only and the active
                                    github.com token from host gh (including
                                    keyring storage); default: off
     --aws / --no-aws               Enable/disable read-only ~/.aws mount
@@ -98,11 +98,12 @@ OPTIONS:
     --agent-state / --no-agent-state
                                     Enable/disable mounting the agent's own state
                                     dirs (~/.claude, ~/.codex, ~/.claude.json, ...;
-                                    default: on; off under --lockdown; project
-                                    .ai-jail can only disable)
+                                    fresh known-harness profiles: off until approved;
+                                    off under
+                                    --lockdown; repository policy cannot enable)
     --env <NAME[=VALUE]>            Pass environment variable NAME (value copied from
                                     the host) or NAME=VALUE into the sandbox
-                                    (repeatable; not persisted to .ai-jail).
+                                    (repeatable; literal values are not persisted).
                                     A literal NAME=VALUE is visible on ai-jail's
                                     own argv before launch. Use --env NAME or
                                     --env-from-file to avoid that exposure;
@@ -123,7 +124,7 @@ OPTIONS:
                                     check (default: off)
     --audit-log / --no-audit-log    Enable/disable the launch audit log at
                                     ~/.local/share/ai-jail/history.jsonl
-                                    (default: off; project .ai-jail cannot enable)
+                                    (default: off; repository policy cannot enable)
     --audit-show                   Show the local audit log and exit
     --audit-verify                 Verify the audit log's hash chain and exit
     --worktree / --no-worktree     Enable/disable linked Git worktree metadata passthrough
@@ -137,9 +138,9 @@ OPTIONS:
     --browser[=PROFILE]            Use browser isolation profile (hard | soft; default hard)
     --no-browser                   Disable browser auto-detection/profile
     --save-config / --no-save-config
-                                   Enable/disable automatic per-project config writes (default: on)
+                                   Enable/disable external per-project policy writes (default: on)
     --hide-config / --no-hide-config
-                                   Mask the project .ai-jail file from the agent (default: on)
+                                   Mask the legacy .ai-jail name from the agent (default: on)
     -s, --status-bar[=STYLE]       Set status line theme (pastel | dark | light; default pastel)
                                    Pastel picks a random pastel palette per session
     --no-status-bar                Disable persistent status line
@@ -166,7 +167,7 @@ OPTIONS:
                                    127.0.0.1:PORT (Linux; repeatable; cannot combine with
                                    --network; every host process on loopback can reach it)
     --claude-dir <PATH>            Use PATH as Claude config dir (sets CLAUDE_CONFIG_DIR)
-    --clean                        Ignore project .ai-jail config, start fresh
+    --clean                        Ignore saved and legacy project policy, start fresh
     --dry-run                      Print the sandbox command without executing
     --init                         Create/update external per-project config and exit
     --bootstrap                    Generate smart permission configs for AI tools

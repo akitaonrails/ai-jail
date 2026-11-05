@@ -13,9 +13,10 @@ VM. Its job is to be **developer-friendly**: it defends against a
 trusted-but-fallible agent's mistakes, not against a motivated attacker
 actively trying to escape.
 
-Concretely, that means your dev tools and the invoked agent's own
-credentials are available **by default** — which is explicitly not a
-lockdown-secure posture — with flags to progressively turn capabilities off.
+Concretely, the first run for a known harness now reviews host access before
+anything is saved. Dev tools, harness login state, and network access are
+separate choices. A saved grant is convenient, but it is not a
+lockdown-secure posture; anything inside the jail can use the granted resource.
 The goal is to prevent _accidents_: an LLM running a mistyped command that
 deletes unrelated important files outside the project, for example. With the
 project directory as the blast radius, you can confidently turn on "YOLO
@@ -76,15 +77,23 @@ supported; use WSL2 and the Linux backend inside it.
 
 ```bash
 cd ~/Projects/my-app
-ai-jail claude                 # Claude's credential state mounted, pre-authenticated
+ai-jail claude                   # first run: review access, then launch
 ai-jail --no-agent-state claude  # isolated, logged-out run instead
 ai-jail --dry-run claude
 ```
 
-The project directory is writable by default; host capabilities are not. The
-first ordinary run may create `.ai-jail`; `--dry-run` never writes it. Existing
-unreadable or invalid project/global configuration fails closed rather than
-launching with a weakened policy. Bootstrap output is always mode `0600`.
+The first `ai-jail claude` in a project opens a checklist when a terminal is
+attached. Every optional grant starts unchecked. The saved policy lives under
+`$XDG_CONFIG_HOME/ai-jail/projects` (normally
+`~/.config/ai-jail/projects`), outside the checkout. Use
+`ai-jail configure claude` to review it later. The project directory remains
+writable by default.
+
+A first run without a terminal uses restricted defaults once and saves
+nothing. `ai-jail configure` also requires a terminal and changes nothing when
+run non-interactively. `--dry-run` never migrates or writes configuration.
+Unreadable or invalid trusted configuration fails closed. See the
+[onboarding guide](docs/USER_GUIDE.md) for the tested prompt transcripts.
 
 ## Secure defaults
 
@@ -125,27 +134,29 @@ A custom Devin `--config` file outside the visible paths requires an explicit
 ai-jail devin --permission-mode dangerous
 ```
 
-### On by default
+### Baseline and approved profile access
 
 - **Private home** — the agent gets a fresh tmpfs `$HOME`, not your host
   home.
-- **Agent/harness auth (`agent_state`)** — the invoked harness's own
+- **Approved agent/harness auth (`agent_state`):** when selected during
+  setup (or enabled explicitly), the invoked harness's own
   credential/state dir (for example `~/.claude`, `~/.codex`,
   `~/.kimi`, `~/.gemini`, `~/.kiro`) is mounted **read-write** so it starts
   pre-authenticated instead of asking you to log in every session; its
   known API-key env var (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
   `GEMINI_API_KEY`/`GOOGLE_API_KEY`, `XAI_API_KEY`, `MOONSHOT_API_KEY`) is
-  also copied from the host when set. This is the trade-off for being
-  developer-friendly: anything running in the sandbox can use those
-  credentials for the life of the launch. `--no-agent-state` opts out for
-  an isolated, logged-out run.
-- **Dev toolchains (`--toolchains`)** — persistent, jail-owned dependency
+  also copied from the host when set. Anything running in the sandbox can use
+  those credentials for the life of the launch. Fresh project profiles leave
+  this unchecked until you approve it. `--no-agent-state` forces an isolated,
+  logged-out run.
+- **Approved dev toolchains (`--toolchains`):** persistent, jail-owned dependency
   caches (cargo/npm/go/maven/...), the Rust toolchain mapped read-only,
   and, when the network posture is otherwise unset, filtered egress to
   package registries so a fresh `npm install`/`cargo build`/`go get` works
-  out of the box — see [Dev toolchains](#dev-toolchains).
-- **mise integration** — the project's language versions are activated
-  automatically when mise is on `$PATH` — see
+  after you select dependency tools during setup. Fresh profiles leave this
+  unchecked. See [Dev toolchains](#dev-toolchains).
+- **Approved mise integration:** the project's language versions are activated
+  when the dependency-tool grant is active and mise is on `$PATH`. See
   [mise integration](#mise-integration).
 - **Project directory** — read-write by default; `/tmp` inside the sandbox
   is writable (and discarded on exit).
@@ -159,10 +170,13 @@ SSH agent/key sharing, Pictures, linked Git worktree metadata,
 credential flags (`--github`, `--aws`, `--kube`, `--gcloud`,
 `--docker-config`) — see [Tool credentials](#tool-credentials). Mounting
 agent state or any of these exposes that material to everything running in
-the sandbox, which is exactly why each one that isn't a default-on
-dev-ergonomics capability stays an explicit opt-in. Use `--no-private-home`
+the sandbox, which is why the first-run review keeps them as separate choices.
+Use `--no-private-home`
 only when deliberately granting broad host-home access; `--map` and
 `--rw-map` remain explicit, narrow alternatives.
+
+Fresh known-harness profiles also leave agent state, dependency tools, and
+their filtered egress unchecked until the first-run review enables them.
 
 | Flag pair                                                | Effect and security consequence                                                                                                                                                                                                                                                                                                                                         |
 | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -174,7 +188,7 @@ only when deliberately granting broad host-home access; `--map` and
 | `--kvm` / `--no-kvm`                                     | Enables/disables `/dev/kvm` (Linux only) for hardware-accelerated VMs; exposes the host kernel's KVM ioctl interface. No `/dev/net/tun` or vhost devices; guests get only the sandbox's network.                                                                                                                                                                        |
 | `--host-shm` / `--no-host-shm`                           | Enables/disables host `/dev/shm`; enabling it opens host cross-process IPC.                                                                                                                                                                                                                                                                                             |
 | `--terminal-passthrough` / `--no-terminal-passthrough`   | Enables/disables raw terminal forwarding. Output is filtered through a VT parser by default (window titles still pass, as printable text only); raw forwarding exposes terminal clipboard, query, and parser surface.                                                                                                                                                   |
-| `--agent-state` / `--no-agent-state`                     | On by default. Mounts the invoked command's credential state read-write (for example `~/.claude`, `~/.codex`) and copies its known API-key env var from the host when set, so it starts pre-authenticated. `--no-agent-state` gives an isolated, logged-out run instead; lets anything in the sandbox use those credentials while enabled; disabled under `--lockdown`. |
+| `--agent-state` / `--no-agent-state`                     | Fresh project profiles leave this unchecked. When approved or passed explicitly, mounts the invoked command's credential state read-write (for example `~/.claude`, `~/.codex`) and copies its known API-key environment variable when set. Anything in the jail can use those credentials. `--no-agent-state` forces an isolated, logged-out run; `--lockdown` disables the grant. |
 | `--inherit-env` / `--no-inherit-env`                     | Default is a minimal environment allowlist. `--inherit-env` passes the full parent environment, secrets included.                                                                                                                                                                                                                                                       |
 | `--update-check` / `--no-update-check`                   | Enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active (default off; all other launches make no network requests).                                                                                                                                                                               |
 | `--macos-host-ipc` / `--no-macos-host-ipc`               | Enables/disables macOS Mach, IOKit, and host IPC exposure.                                                                                                                                                                                                                                                                                                              |
@@ -185,8 +199,8 @@ only when deliberately granting broad host-home access; `--map` and
 | `--allow-loopback-connect` / `--no-allow-loopback-connect` | **OPEN, macOS only.** Allows outbound connections to ALL services on the host loopback interface, on every port. Off by default, trusted config/CLI only, and disabled by `--lockdown`. On Linux it is accepted for cross-platform config compatibility but has no effect. Prefer `--forward-port PORT` when one known service is sufficient. |
 | `--worktree` / `--no-worktree`                           | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only.                                                                                                                                                                          |
 | `--private-home` / `--no-private-home`                   | Enables/disables the default private home. Disabling it is broad host-home access.                                                                                                                                                                                                                                                                                      |
-| `--toolchains` / `--no-toolchains`                       | On by default (Linux only; issue #148). Persists dependency caches (cargo/npm/go/maven/...) in a jail-owned store and maps Rust's toolchain binaries read-only; when the network posture is otherwise unset, also default-allows filtered egress to package registries. `--no-toolchains` disables both; disabled under `--lockdown`; no effect on macOS.               |
-| `--github` / `--no-github`                               | Shares gh configuration read-only and the active github.com token from the host. Off by default; sandboxed programs can act with that token.                                                                                                                                                                                                                            |
+| `--toolchains` / `--no-toolchains`                       | Fresh profiles leave this unchecked (Linux only; issue #148). When approved, persists dependency caches (cargo/npm/go/maven/...) in a jail-owned store and maps toolchain binaries read-only; when network posture is otherwise unset, it also allows filtered egress to package registries. `--no-toolchains` disables both; `--lockdown` disables the grant; no effect on macOS. |
+| `--github` / `--no-github`                               | **OPEN.** Shares gh configuration read-only and the active github.com token from the host. Off by default; sandboxed programs can act with the token's complete authority. Prefer repository-scoped `ai-jail forge setup`. |
 | `--aws` / `--no-aws`                                     | Enables/disables read-only `~/.aws`. Off by default; anything in the sandbox can then act as you on AWS.                                                                                                                                                                                                                                                                |
 | `--kube` / `--no-kube`                                   | Enables/disables read-only `~/.kube`. Off by default; anything in the sandbox can then act as you against your clusters.                                                                                                                                                                                                                                                |
 | `--gcloud` / `--no-gcloud`                               | Enables/disables read-only `~/.config/gcloud`. Off by default; anything in the sandbox can then act as you on GCP.                                                                                                                                                                                                                                                      |
@@ -201,9 +215,9 @@ real path is bind-mounted read-only.
 
 ### Turning it down
 
-The default posture is developer-friendly: your tools and the invoked
-harness's credentials are on, the project directory is read-write, and
-filtered registry egress gets dependency installs working out of the box.
+The saved posture can be developer-friendly: the project directory is
+read-write, and you can approve harness state, toolchains, and filtered egress
+for later launches.
 From there you can turn individual knobs down, or jump straight to the
 strictest mode:
 
@@ -224,7 +238,7 @@ strictest mode:
   posture, but it is still not a VM — see
   [Platform and threat model](#platform-and-threat-model).
 
-`--allow-host HOST` (repeatable, or `allow_hosts = [...]` in `.ai-jail`)
+`--allow-host HOST` (repeatable, or `allow_hosts = [...]` in trusted config)
 enables filtered egress instead: the sandbox keeps no route off the host
 except a built-in CONNECT proxy that dials exactly the listed hosts — an
 entry matches the host itself and its subdomains. On Linux the fence is a
@@ -233,18 +247,21 @@ bridge; on macOS it is a seatbelt endpoint rule allowing outbound only to
 the proxy's loopback port. It is TCP/CONNECT-only:
 no UDP, and no working DNS inside the sandbox on Linux (on macOS the system
 resolver is not fenced). It cannot combine with `--network` or `--browser`,
-and a project `.ai-jail` may only shrink the list, never grow it.
+Legacy repository `.ai-jail` policy may only shrink the list during migration,
+never grow it.
 
 Private, ULA, and carrier-grade NAT answers stay blocked by default even for
 an allowed hostname. For a self-hosted service, use the narrower trusted grant
 `--allow-private-host gitlab.example.com` (or
-`allow_private_hosts = ["gitlab.example.com"]` in the global config). It also
+`allow_private_hosts = ["gitlab.example.com"]` in
+`~/.config/ai-jail/config.toml`). It also
 allows the host and its subdomains through filtered egress, but only relaxes
 those private address classes; loopback, link-local, multicast, unspecified,
-and cloud-metadata addresses remain blocked. A project `.ai-jail` cannot add
-this capability.
+and cloud-metadata addresses remain blocked. Repository policy cannot add this
+capability.
 
-On Linux, `--prompt-hosts` (or `prompt_hosts = true` in the global config)
+On Linux, `--prompt-hosts` (or `prompt_hosts = true` in
+`~/.config/ai-jail/config.toml`)
 turns a refusal into a question: when the sandbox CONNECTs to a host outside
 the allowlist, ai-jail shows a desktop notification (`notify-send`, from a
 root-owned system directory) with **Allow** and **Deny** buttons and holds the
@@ -257,13 +274,13 @@ connection dials exactly those answers. When some resolve to private, ULA, or
 carrier-grade NAT addresses, the notification flags an **internal** host and
 lists them; approving it opens those classes for that host for the session,
 like `--allow-private-host`. Loopback, link-local, multicast, unspecified, and
-cloud-metadata answers are refused without asking. A project `.ai-jail` cannot
+cloud-metadata answers are refused without asking. Repository policy cannot
 enable it, and `--lockdown` disables it.
 
 ### Phantom credentials: `--secret KEY=host`
 
 With filtered egress on, `--secret ANTHROPIC_API_KEY=api.anthropic.com`
-(repeatable, or `secret_hosts = { ... }` in the global config) keeps the real
+(repeatable, or `secret_hosts = { ... }` in trusted global config) keeps the real
 value out of the sandbox: the child env carries an `AIJAIL-PHANTOM-…`
 placeholder, and the egress proxy swaps in the real value only for requests
 terminating at the bound host. The key must already be passed via `--env` or
@@ -279,7 +296,7 @@ as before, with no substitution.
 Without `--network` the sandbox has its own loopback, so services listening
 on the host's `127.0.0.1` — a local MCP server, an editor's IDE socket, a
 dev database — are unreachable. `--forward-port 49374` (repeatable, or
-`forward_ports = [...]` in the global config) relays exactly that port: the
+`forward_ports = [...]` in trusted global config) relays exactly that port: the
 supervisor connects a per-launch Unix socket to the host's
 `127.0.0.1:49374` (falling back to `[::1]:49374`, for services bound to
 `localhost` over IPv6 only), and an in-sandbox bridge listens on the
@@ -303,7 +320,8 @@ cannot be enumerated, `--allow-loopback-connect` permits every host loopback
 port on macOS. This is **OPEN** access: ALL host services that trust a local
 caller become reachable. Interactive setup requires typing `OPEN`, and trusted
 per-project policy may save it only after that approval. A repository-local
-`.ai-jail` cannot enable it. It is off by default and disabled by `--lockdown`.
+legacy file cannot enable it during migration. It is off by default and
+disabled by `--lockdown`.
 Prefer the fixed-port `--forward-port PORT` grant whenever possible. The flag is
 accepted on Linux for portable profiles but does not widen Linux access.
 
@@ -324,10 +342,10 @@ can forward a port like any other launch.
 
 A forwarded port is trusted in full: there is no allowlist, inspection or
 audit record on it, so the agent can do whatever the service behind it
-accepts. At most 256 relays run at once. Only the CLI and global config can
-open a forward: a project `.ai-jail` cannot, unless the global config lists
-it under `trust_project_config`. Forwards are never written into a project
-file by auto-save or `--init`.
+accepts. At most 256 relays run at once. Only the CLI and trusted global
+config can open a forward. The legacy `trust_project_config` exception applies
+only during a pre-migration compatibility read. `--init` does not turn a
+repository request into a grant.
 
 ### Sandbox web UIs from the host: `--publish-port PORT`
 
@@ -356,12 +374,12 @@ bridge cannot come up. The host-side socket is removed on exit.
 
 The rules match `--forward-port`. It cannot combine with `--network`, where
 the sandbox already shares the host's loopback. Ports below 1024 are refused.
-A port cannot be both forwarded and published. Only the CLI and global config
-(including `[commands.<name>]` tables) can publish a port: a project
-`.ai-jail` cannot, unless the global config lists it under
-`trust_project_config`. Published ports are never written into a project file
-by auto-save or `--init`. It is refused on macOS, where Seatbelt shares the
-host's network stack.
+A port cannot be both forwarded and published. Only the CLI and trusted global
+config (including `[commands.<name>]` tables) can publish a port. The legacy
+`trust_project_config` exception applies only during a pre-migration
+compatibility read. `--init` does not promote a repository request into a
+grant. Publishing is refused on macOS, where Seatbelt shares the host's
+network stack.
 
 `--allow-tcp-port` remains accepted for backward compatibility, but launch
 fails closed because UDP cannot be securely constrained through this option —
@@ -436,8 +454,8 @@ and registry defaults while a non-empty allow-list keeps egress filtered rather
 than fully offline). `--network` and `--lockdown` keep their existing behavior.
 
 `--no-toolchains` (or `no_toolchains = true`) disables both the cache maps
-and the registry default together. The untrusted project `.ai-jail` may only
-disable it, never enable it, and `--lockdown` disables it outright.
+and the registry default together. Repository constraints may disable it but
+cannot enable it, and `--lockdown` disables it outright.
 
 ### Tool credentials
 
@@ -447,14 +465,14 @@ the checkout, bound to the forge's numeric repository ID, and injected only for
 the launch. See the [repository-scoped forge guide](docs/FORGE_AUTH.md) for the
 provider setup, exact security labels, simulated prompts, rotation, and removal.
 
-Five flags share one external tool's host credentials with the sandbox, each
+Five legacy flags share one external tool's host credentials with the sandbox, each
 off by default: `--github` (GitHub CLI configuration and active token), `--aws`
 (`~/.aws`), `--kube` (`~/.kube`), `--gcloud` (`~/.config/gcloud`), and
-`--docker-config` (`~/.docker/config.json`). Each is monotonic — the
-untrusted project `.ai-jail` may only disable one, never enable it — and all
-five are disabled under `--lockdown`.
+`--docker-config` (`~/.docker/config.json`). Repository constraints may disable
+one but cannot enable it, and all five are disabled under `--lockdown`.
 
-`--github` mounts the effective GitHub CLI configuration directory read-only:
+`--github` is OPEN. It mounts the effective GitHub CLI configuration directory
+read-only:
 `GH_CONFIG_DIR` if set, otherwise `$XDG_CONFIG_HOME/gh` if set, otherwise
 `~/.config/gh`. It also forwards the active `github.com` account's token from
 the host `gh` command, including tokens kept in the system keyring. Existing
@@ -498,25 +516,31 @@ there. Programs inside the sandbox can read forwarded environment values. For
 a secret bound to one HTTP host, `--secret KEY=host` (filtered egress) keeps the
 real value outside the sandbox and substitutes it through the egress proxy.
 
-The same thing is available from trusted config as `env_pass`, so you do not
-have to repeat `--env` on every launch:
+The checklist's environment picker is the safer persistent form. It lists
+names from the current host environment without displaying their values. The
+saved profile contains names only and reads each current value again at launch.
+Every non-baseline name requires typing `OPEN`; if an approved name is later
+missing, launch fails closed until you restore it or remove the approval with
+`configure`.
+
+Manual trusted config also accepts `env_pass`:
 
 ```toml
-# ~/.ai-jail
+# ~/.config/ai-jail/config.toml
 env_pass = ["CI", "API_BASE=https://internal.example"]
 
 [commands.claude]
 env_pass = ["ANTHROPIC_BASE_URL"]
 ```
 
-`env_pass` is a trusted-layer field: it is read from the global config and its
-`[commands.<name>]` tables, and ignored in a project `.ai-jail`, since a
-repository must not be able to pull variables out of your shell. It is also
-never written back to disk, because `NAME=VALUE` entries can carry secrets.
+`env_pass` is read from the trusted global config and its
+`[commands.<name>]` tables. Repository policy cannot pull variables out of
+your shell. The onboarding picker persists approved names separately and never
+saves their values.
 
 ### Credential hygiene: `--env-from-file`
 
-For API keys and similar secrets, keep them out of every `.ai-jail` file:
+For API keys and similar secrets, keep values out of every policy file:
 pass them from the host environment via `--env NAME`, or from a 0600 file
 via `--env-from-file PATH` (repeatable; also `env_from_file` in the global
 config). Each file must be user-owned, a regular file (never a symlink),
@@ -570,10 +594,12 @@ The project directory is writable by default, so secrets inside it are
 readable by the agent unless you mask or deny them:
 
 ```toml
-# .ai-jail (project config — untrusted, but tightening like this is honored)
-mask = [".env", ".env.*", "*.pem"]
-deny_paths = ["secrets/"]
+ai-jail --mask '.env' --mask '.env.*' --mask '*.pem' \
+  --deny-path secrets/ --init
 ```
+
+This writes project constraints to the trusted external policy store. Quote
+globs so ai-jail receives the pattern instead of your shell expanding it.
 
 - `--mask PATH|GLOB` replaces matching project paths with empty placeholders:
   the agent sees the path exists but gets no content.
@@ -628,22 +654,29 @@ selected native `.app` bundle is made readable, not all of `/Applications`.
 
 ## Configuration
 
-Two config files plus CLI flags, in increasing authority:
+Current policy lives outside the repository:
 
-1. `./.ai-jail` (project) — untrusted, monotonic policy: it may tighten the
-   sandbox but can never enable capabilities, outside maps, ports,
-   `claude_dir`, or exceptions. It is masked from the sandbox by default, so
-   the agent sees an empty file rather than your policy. Add `.ai-jail` to
-   `.gitignore` and leave it uncommitted if you would rather the agent not
-   notice it at all: `git status` inside the sandbox is then completely
-   clean. A _committed_ `.ai-jail` always shows as modified there, because
-   masking replaces its contents — git has to report something either way.
-   To let specific checkouts ship their own capability opt-ins, list their
-   parent directory under `trust_project_config` in the global config (see
-   below).
-2. `~/.ai-jail` (global, trusted) — a base table plus optional
-   `[commands.<name>]` tables keyed by the first word of the command.
-3. CLI flags — highest authority.
+1. `$XDG_CONFIG_HOME/ai-jail/config.toml` (normally
+   `~/.config/ai-jail/config.toml`) is trusted global policy. It has a base
+   table and optional `[commands.<name>]` tables.
+2. `$XDG_CONFIG_HOME/ai-jail/projects/<identity>.toml` is the trusted policy
+   for one canonical project path. `configure` and `--init` manage it. The
+   store is owner-only and hidden from the jail; directory approvals also
+   record filesystem identity and are rechecked before launch.
+3. CLI flags have the highest authority for the current invocation.
+
+Repository-local `.ai-jail` and `~/.ai-jail` files are legacy migration
+inputs. On the next writable launch, ai-jail verifies the external destination
+before deleting the old file. A legacy global file keeps its settings. A
+repository file is treated as untrusted: only restrictions are imported;
+commands, maps, credentials, network grants, and other access requests require
+fresh approval. Migration notices are printed after the child exits and name
+the new file. If `.ai-jail` was tracked, its deletion remains visible in
+`git status`; restoring the file does not add authority to an existing
+external profile.
+
+Read-only commands such as `status` and `--dry-run` do not migrate. They retain
+a compatibility read path until a writable launch can complete the move.
 
 A `[commands.<name>]` table merges over the global base: scalar fields it sets
 override the base (status-bar fields stay from the base), list fields (maps,
@@ -659,19 +692,18 @@ Common fields: `command`, `rw_maps`, `ro_maps`, `overlay_maps`, `mask`,
 `private_home`, `lockdown`, `browser_profile`, `claude_dir`, `allow_tcp_ports`,
 `status_bar_style`.
 
-Global config only: `env_pass` (see Environment policy above) and
-`trust_project_config`, which lists directories whose project
-`.ai-jail` may enable capabilities rather than only tighten, for teams that
-ship per-repository policy:
+Global config also accepts `env_pass` (see Environment policy above) and the
+legacy `trust_project_config` field. The latter affects only a legacy
+repository `.ai-jail` while it is waiting to migrate:
 
 ```toml
-# ~/.ai-jail
+# ~/.config/ai-jail/config.toml
 trust_project_config = ["~/work/repos"]
 ```
 
-Everything at or beneath a listed directory is trusted, including repositories
-cloned there later, so keep the list narrow. A project file that sets this
-itself is ignored.
+Everything at or beneath a listed directory is trusted during that compatibility
+read, including repositories cloned there later, so keep the list narrow. A
+repository file cannot confer this trust on itself.
 
 Legacy polarity warning: older boolean fields keep their inverted `no_*`
 names (`no_gpu`, `no_docker`, `no_display`, `no_worktree`, `no_mise`,
@@ -706,7 +738,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
                                 lockdown always blocks network)
 --docker / --no-docker          Docker socket (root-equivalent; off by default)
 --systemd-user / --no-systemd-user  host user manager access (off by default)
---ssh / --no-ssh                read-only SSH/agent sharing (off by default)
+--ssh / --no-ssh                OPEN: full ~/.ssh and ambient-agent sharing (off by default)
 --claude-dir PATH               explicit Claude state directory
 --browser[=hard|soft]           isolated browser profile (needs --network --display)
 --dry-run                       print the backend invocation
@@ -742,8 +774,8 @@ dir (`~/.local/share/mise`, honoring `MISE_DATA_DIR`), the mise config dir
 (`~/.config/mise`, honoring `MISE_CONFIG_DIR`), and the `mise` binary's
 directory **read-only automatically**, so an agent gets the project's real
 toolchain out of the box. Only existing directories are mapped, so a host
-without mise is unchanged, and the derived paths are never written into a
-saved `.ai-jail`.
+without mise is unchanged, and the derived paths are never written into saved
+project policy.
 
 `--no-mise` (or `no_mise = true`) and `--lockdown` opt out — both already
 disable mise activation, so neither maps these paths. You can still add extra

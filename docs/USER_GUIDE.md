@@ -1,8 +1,9 @@
 # ai-jail onboarding guide
 
 `ai-jail` reviews host access the first time a known harness runs in a
-project. The saved policy lives under `~/.config/ai-jail/projects`, outside
-the checkout. Repository files cannot add grants.
+project. The saved policy lives under `$XDG_CONFIG_HOME/ai-jail/projects`
+(normally `~/.config/ai-jail/projects`), outside the checkout. Repository
+files cannot add grants.
 
 Repository-scoped GitHub, GitLab, Codeberg/Forgejo, and Gitea credentials use
 the separate [`ai-jail forge` step-by-step guide](FORGE_AUTH.md). It includes
@@ -206,7 +207,9 @@ compatibility modes. They are always listed under `OPEN`.
 Press `k` to add or remove file-backed identities. ai-jail discovers only
 regular, non-symlinked key pairs. It displays and saves the public SHA-256
 fingerprint, comment, path, and file identity. It never saves or mounts private
-key contents.
+key contents. On Linux and macOS it uses the system OpenSSH `ssh-agent`,
+`ssh-add`, `ssh-keygen`, and `ssh` tools from trusted system paths. The menu is
+the add/remove interface; it does not alter the user's ambient agent.
 
 ```text
 AJ-SSH-TRANSCRIPT-BEGIN selected-key SSH interaction
@@ -245,7 +248,8 @@ contains only the selected identities. Without this separate approval, launch
 stops with `AJ-SSH-004`.
 
 Git is forced to use the generated SSH config. For a direct command, use the
-two launch-scoped variables exactly:
+two launch-scoped variables exactly. This syntax is also required for direct
+SSH on macOS:
 
 ```sh
 "$AI_JAIL_SSH" -F "$AI_JAIL_SSH_CONFIG" git@github.com
@@ -256,6 +260,9 @@ killed and its generated public files are removed on normal exit or launch
 failure. SIGINT, SIGTERM, and SIGHUP set launch cancellation before forwarding
 to the supervised child; startup observes cancellation, reaps the temporary
 agent, removes its runtime directory, and does not start the sandbox command.
+An uncatchable supervisor termination such as `SIGKILL` cannot promise immediate
+cleanup. The key lifetime passed to `ssh-add` remains the upper bound on a
+surviving temporary agent's key use.
 Ambient `SSH_AUTH_SOCK`, `GIT_SSH`, and
 `GIT_SSH_COMMAND` values are removed.
 Identities that exist only in the ambient agent cannot be copied selectively;
@@ -462,6 +469,8 @@ AJ-SSH-TRANSCRIPT-END selected-key SSH interaction
 
 ## Migration and reapproval
 
+<!-- provenance: src/config_store.rs migrate_global, migrate_project, dropped_capability_requests; tests/config_migration.rs repository_policy_migrates_only_monotonic_restrictions, migration_warning_inventory_includes_authority_categories, restored_legacy_files_are_idempotent_and_never_add_grants -->
+
 ```text
 ✓ AJ-MIG-002 IMPORTED RESTRICTIONS to ~/.config/ai-jail/projects/PROJECT.toml.
 ⚠ AJ-MIG-003 REAPPROVAL REQUIRED; these access requests were NOT IMPORTED:
@@ -474,10 +483,21 @@ AJ-CHOICE-001 Access choices
 ```
 
 Migration imports repository restrictions, not grants. A migrated broad
-request remains off until it is selected and confirmed again. After the child
-exits, ai-jail reports the external policy path and whether the legacy file
-was removed. If the old file was tracked, review `git status`; restoring it
-does not grant access.
+request remains off until it is selected and confirmed again. A legacy
+`command` is also not imported from an untrusted repository file.
+
+`~/.ai-jail` is a separate trusted-global migration. Its settings move to
+`~/.config/ai-jail/config.toml` (or the equivalent `$XDG_CONFIG_HOME` path).
+When ai-jail finishes, `AJ-MIG-001` reports that move; `AJ-MIG-002` reports the
+project policy path, and `AJ-MIG-003` lists grants that need reapproval. The
+legacy source is removed only after the external file is written, parsed, and
+verified. If migration cannot prove that sequence, it fails closed and retains
+the source.
+
+If the repository file was tracked, its deletion appears in `git status`.
+ai-jail does not edit the Git index. Restoring `.ai-jail` does not grant access
+when the external project profile exists; remove it from version control once
+the team has reviewed the migration.
 
 ## Automation and non-interactive runs
 
@@ -617,7 +637,7 @@ AJ-SAVE-001 Save this project profile? [y/N/b] [OK] AJ-SAVE-001 Configuration sa
 ```
 # Dynamic localhost services on macOS
 
-<!-- provenance: src/onboarding.rs open_grant("loopback-connect"), render_menu; src/sandbox/seatbelt.rs push_network_section -->
+<!-- provenance: src/onboarding.rs open_grant("loopback-connect"), render_menu; src/sandbox/seatbelt.rs push_network_section; tests: sandbox::seatbelt::tests::loopback_connect_is_explicit_and_scoped_to_localhost, sandbox::seatbelt::tests::loopback_connect_is_dropped_under_lockdown, tests/port_forward_macos.rs::loopback_connect_reaches_a_dynamic_host_port -->
 
 Use a fixed `--forward-port PORT` whenever you know the port. If a macOS tool
 uses unpredictable localhost ports, interactive setup offers:

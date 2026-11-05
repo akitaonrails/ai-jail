@@ -2,9 +2,9 @@
 
 ## What This Project Is
 
-A Rust CLI tool that wraps bubblewrap (`bwrap`) to sandbox AI coding agents (Claude Code, GPT Codex, OpenCode, Crush). It replaces a bash script with config persistence (`.ai-jail` TOML), proper signal handling, and a developer-friendly CLI.
+A Rust CLI tool that wraps bubblewrap (`bwrap`) to sandbox AI coding agents (Claude Code, GPT Codex, OpenCode, Crush). Trusted policy is stored under `$XDG_CONFIG_HOME/ai-jail`, outside the checkout; legacy `.ai-jail` TOML files are migration inputs.
 
-ai-jail is a developer-friendly accident guard, not a hard-security or malware/invasion boundary. It defends against a trusted-but-fallible agent's mistakes (a mistyped command that deletes files outside the project, a wayward script) so the project directory is a confident blast radius for "YOLO mode" auto-accept harnesses — it does not defend against a motivated attacker trying to escape the sandbox. That is why dev tools and the invoked agent's own credentials are on by default, with flags to progressively tighten; for genuinely hostile code or untrusted workloads, the answer is a disposable VM, not a stricter ai-jail flag. Keep this framing in mind when weighing a new default: tightening security at the cost of developer convenience is not automatically the right call here.
+ai-jail is a developer-friendly accident guard, not a hard-security or malware/invasion boundary. It defends against a trusted-but-fallible agent's mistakes (a mistyped command that deletes files outside the project, a wayward script) so the project directory is a confident blast radius for "YOLO mode" auto-accept harnesses. It does not defend against a motivated attacker trying to escape. Fresh project profiles review dev tools, harness credentials, and network access before saving grants. For hostile code or untrusted workloads, use a disposable VM.
 
 ## Project Structure
 
@@ -12,7 +12,8 @@ ai-jail is a developer-friendly accident guard, not a hard-security or malware/i
 src/
   main.rs         -- entry point, orchestration, TempFile RAII guard
   cli.rs          -- argument parsing with lexopt
-  config.rs       -- .ai-jail TOML config load/save/merge (project + global)
+  config.rs       -- config schema, legacy parsing, and policy merge
+  config_store.rs -- trusted external store and legacy migration
   sandbox/
     mod.rs        -- shared sandbox logic, mount lists, launch wrapper
     bwrap.rs      -- bwrap command builder + mount discovery (Linux)
@@ -31,9 +32,12 @@ src/
 
 ## Critical Rule: Backward Compatibility
 
-**Every new version MUST work with previously generated `.ai-jail` config files.**
+**Every new version MUST safely handle previously generated `.ai-jail` config files.**
 
-This is the single most important invariant of the project. Users generate `.ai-jail` files in their project directories and expect them to keep working after upgrading the binary.
+This is the single most important invariant of the project. v3 migrates a safe
+global legacy file intact and imports only monotonic restrictions from an
+untrusted repository file. Grants and commands require reapproval. A migration
+must durably verify its external destination before deleting the source.
 
 ### Config file rules
 
@@ -100,18 +104,18 @@ This is the single most important invariant of the project. Users generate `.ai-
     Notification lookup must not use untrusted `PATH`, and timeout, dismissal,
     missing helpers, malformed answers, and helper errors must fail closed.
 
-- Dev-toolchain cache persistence (`--toolchains`/`no_toolchains`, on by
-  default) and the opt-in read-only credential flags (`--github`, `--aws`,
+- Dev-toolchain cache persistence (`--toolchains`/`no_toolchains`) and the
+  opt-in read-only credential flags (`--github`, `--aws`,
   `--kube`, `--gcloud`, `--docker-config`) are monotonic capabilities: a
-  project `.ai-jail` may only disable them, never enable them, and all are
-  disabled under `--lockdown`.
-- Project `.ai-jail` is untrusted monotonic policy. It may tighten the effective
-  sandbox but cannot enable capabilities, outside maps, ports, `claude_dir`, or
-  exceptions. Capability opt-ins belong in global config or on the CLI.
-  The single exception is `trust_project_config` in the _global_ config, which
-  names directories whose project files are merged with trusted semantics. The
-  trust always originates in the trusted layer: a project file that sets
-  `trust_project_config` itself is ignored and warned about.
+  repository policy may only disable them, never enable them, and all are
+  disabled under `--lockdown`. Fresh known-harness profiles start with optional
+  grants unchecked.
+- Current per-project policy is an owner-only external document with separate
+  grants and constraints. Legacy project `.ai-jail` is untrusted monotonic
+  migration input. It may tighten the sandbox but cannot import capabilities,
+  commands, outside maps, ports, `claude_dir`, or exceptions as authority.
+  `trust_project_config` exists only for the legacy compatibility read before
+  migration; trust must originate in the trusted global layer.
 - Existing malformed config, bootstrap/wrapper setup, and overlay setup must
   fail closed. Bootstrap files must remain mode `0600`.
 
@@ -125,7 +129,7 @@ There are regression tests in `src/config.rs` that parse old config file formats
 - **Minimal dependencies.** Current deps: `lexopt`, `serde`, `toml`, `serde_json`, `vt100`, `nix`, `landlock`, `seccompiler` (Linux). Do not add new crates without a strong justification.
 - **No clap.** We use `lexopt` for argument parsing to keep the binary small.
 - **Raw ANSI for colors.** No color crate — `output.rs` handles this with raw escape codes.
-- **Warn and skip, never crash.** Missing paths, unreadable dirs, and non-critical errors produce a warning and continue. Existing `.ai-jail` files that cannot be read or parsed are fatal because silently dropping sandbox policy would fail open. Other fatal errors include no bwrap and an unavailable current directory.
+- **Warn and skip, never crash.** Missing paths, unreadable dirs, and non-critical errors produce a warning and continue. Existing trusted policy or legacy migration input that cannot be read or parsed is fatal because silently dropping policy would fail open. Other fatal errors include no bwrap and an unavailable current directory.
 - **Signal safety.** The signal handler (`signals.rs`) must only use async-signal-safe operations. The current handler just calls `libc::kill` on the stored child PID.
 - **RAII for cleanup.** Temp files use a `Drop` guard, not manual cleanup.
 
@@ -156,7 +160,7 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 21. Project directory (pwd, rw or ro depending on mode)
 22. In-project agent-state mounts, then in-project user mounts (after the project bind; masks and deny overlays still follow both)
 23. In-project overlay maps (after the project bind)
-24. Mask overlays (`--mask` and hidden project `.ai-jail`)
+24. Mask overlays (`--mask` and the hidden legacy `.ai-jail` name)
 25. Deny overlays (`--deny-path`, mode-000 file/dir placeholders)
 26. Overlay storage hide (tmpfs over `<project>/.ai-jail-overlays`, last of the discovered groups)
 27. Landlock wrapper self-mount and filtered-egress proxy socket (emitted after all discovered groups so the `/tmp` tmpfs already exists: ai-jail itself read-only at `/tmp/.ai-jail-landlock`, and in filtered mode a writable bind of the outer proxy's Unix socket to `/tmp/.ai-jail-proxy.sock` — only the socket file, never its temp dir — and one writable bind per `--forward-port` of its host-side Unix socket to `/tmp/.ai-jail-forward.<port>.sock`, then one per `--publish-port` to `/tmp/.ai-jail-publish.<port>.sock`)
