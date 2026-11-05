@@ -52,6 +52,7 @@ impl TestTree {
     }
 
     fn run(&self, command: &[&str]) -> String {
+        let bwrap = std::env::var_os("BWRAP_BIN");
         let output = Command::new(common::ai_jail())
             .args([
                 "--exec",
@@ -63,6 +64,7 @@ impl TestTree {
             ])
             .args(command)
             .env_clear()
+            .envs(bwrap.map(|value| ("BWRAP_BIN", value)))
             .env("HOME", &self.home)
             .env("PATH", "/usr/bin:/bin")
             .current_dir(&self.project)

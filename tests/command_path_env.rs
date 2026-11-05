@@ -57,6 +57,7 @@ fn explicit_path_selects_the_requested_binary() {
         .unwrap();
 
     for from_file in [false, true] {
+        let bwrap = std::env::var_os("BWRAP_BIN");
         let mut command = Command::new(common::ai_jail());
         command.args([
             "--clean",
@@ -77,6 +78,7 @@ fn explicit_path_selects_the_requested_binary() {
             .arg("fixture-agent")
             .current_dir(&project)
             .env_clear()
+            .envs(bwrap.map(|value| ("BWRAP_BIN", value)))
             .env("HOME", &home)
             .env("PATH", &host_path)
             .output()
