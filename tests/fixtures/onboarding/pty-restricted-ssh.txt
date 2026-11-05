@@ -11,6 +11,7 @@ Key number, private-key path, or .pub path: AJ-CHOICE-001 Access choices
   k [x] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
@@ -31,6 +32,7 @@ Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: Key nu
   k [ ] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
@@ -50,6 +52,7 @@ Key number, private-key path, or .pub path: AJ-CHOICE-001 Access choices
   k [x] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
@@ -70,6 +73,7 @@ Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: Requir
   k [x] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
@@ -99,6 +103,7 @@ AJ-OPEN-001 Type OPEN to enable this exact grant: AJ-CHOICE-001 Access choices
   k [x] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [x] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel

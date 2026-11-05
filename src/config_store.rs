@@ -1146,6 +1146,7 @@ enum DirectionalAuthority {
     MacosTrustd,
     AllowPty,
     LoopbackListen,
+    LoopbackConnect,
     X11,
     HostShm,
     Terminal,
@@ -1270,6 +1271,11 @@ const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
         LoopbackListen,
         "loopback-listen"
     ),
+    directional_policy!(
+        "allow_loopback_connect",
+        LoopbackConnect,
+        "loopback-connect"
+    ),
     directional_policy!("x11", X11, "x11"),
     directional_policy!("host_shm", HostShm, "host-shm"),
     directional_policy!(
@@ -1350,6 +1356,10 @@ impl DirectionalAuthority {
             Self::LoopbackListen => {
                 c.allow_loopback_listen == Some(true)
                     && b.allow_loopback_listen != Some(true)
+            }
+            Self::LoopbackConnect => {
+                c.allow_loopback_connect == Some(true)
+                    && b.allow_loopback_connect != Some(true)
             }
             Self::X11 => c.x11 == Some(true) && b.x11 != Some(true),
             Self::HostShm => {
@@ -2182,6 +2192,7 @@ mod tests {
             macos_trustd: Some(false),
             allow_pty: Some(false),
             allow_loopback_listen: Some(false),
+            allow_loopback_connect: Some(false),
             x11: Some(false),
             host_shm: Some(false),
             terminal_passthrough: Some(false),
@@ -2223,6 +2234,7 @@ mod tests {
             macos_trustd: Some(true),
             allow_pty: Some(true),
             allow_loopback_listen: Some(true),
+            allow_loopback_connect: Some(true),
             x11: Some(true),
             host_shm: Some(true),
             terminal_passthrough: Some(true),

@@ -57,6 +57,27 @@ fn unforwarded_host_port_stays_unreachable() {
 }
 
 #[test]
+fn loopback_connect_reaches_a_dynamic_host_port() {
+    require_sandbox_exec!();
+    let port = http_fixture();
+    let output = run_in(None, &["--allow-loopback-connect"], &curl(port));
+    assert_eq!(assert_ok(&output), "ok");
+}
+
+#[test]
+fn loopback_connect_is_disabled_by_lockdown() {
+    require_sandbox_exec!();
+    let port = http_fixture();
+    let script = format!(
+        "curl -sS --max-time 3 http://127.0.0.1:{port}/ \
+         && echo LEAK || echo BLOCKED"
+    );
+    let output =
+        run_in(None, &["--lockdown", "--allow-loopback-connect"], &script);
+    assert_eq!(assert_ok(&output).trim(), "BLOCKED");
+}
+
+#[test]
 fn forward_port_reaches_a_host_service_listening_on_ipv6_only() {
     require_sandbox_exec!();
     // No relay, so no 127.0.0.1 -> ::1 fallback: dial ::1, which the

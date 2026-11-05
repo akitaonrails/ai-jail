@@ -182,6 +182,7 @@ only when deliberately granting broad host-home access; `--map` and
 | `--macos-trustd` / `--no-macos-trustd`                   | Enables/disables only macOS `trustd` lookup so TLS clients like `gh` can verify certificates, without `--macos-host-ipc`.                                                                                                                                                                                                                                               |
 | `--allow-pty` / `--no-allow-pty`                         | Allows opening PTY slave nodes allocated at runtime on macOS, for tools that spawn their own pseudo-terminals (`expect`, terminal multiplexers, `xcodebuild` driving an iOS Simulator). Grants every `/dev/ttys*`, so off by default and dropped under `--lockdown`; still far narrower than the `rw_maps = ["/dev"]` workaround. No effect on Linux (issue #209).      |
 | `--allow-loopback-listen` / `--no-allow-loopback-listen` | Allows binding and listening on loopback under filtered egress on macOS, for tools that start a local `127.0.0.1` server, without dropping egress filtering the way `--network` would. Off by default, dropped under `--lockdown`. No effect on Linux (issue #213).                                                                                                     |
+| `--allow-loopback-connect` / `--no-allow-loopback-connect` | **OPEN, macOS only.** Allows outbound connections to ALL services on the host loopback interface, on every port. Off by default, trusted config/CLI only, and disabled by `--lockdown`. On Linux it is accepted for cross-platform config compatibility but has no effect. Prefer `--forward-port PORT` when one known service is sufficient. |
 | `--worktree` / `--no-worktree`                           | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only.                                                                                                                                                                          |
 | `--private-home` / `--no-private-home`                   | Enables/disables the default private home. Disabling it is broad host-home access.                                                                                                                                                                                                                                                                                      |
 | `--toolchains` / `--no-toolchains`                       | On by default (Linux only; issue #148). Persists dependency caches (cargo/npm/go/maven/...) in a jail-owned store and maps Rust's toolchain binaries read-only; when the network posture is otherwise unset, also default-allows filtered egress to package registries. `--no-toolchains` disables both; disabled under `--lockdown`; no effect on macOS.               |
@@ -297,13 +298,22 @@ without a relay there is no `127.0.0.1` to `::1` fallback: dial the address
 the service listens on. The port rules are the same as on Linux, so one
 global entry works on both.
 
+For the exceptional case where the required localhost ports are dynamic or
+cannot be enumerated, `--allow-loopback-connect` permits every host loopback
+port on macOS. This is **OPEN** access: ALL host services that trust a local
+caller become reachable. Interactive setup requires typing `OPEN`, and trusted
+per-project policy may save it only after that approval. A repository-local
+`.ai-jail` cannot enable it. It is off by default and disabled by `--lockdown`.
+Prefer the fixed-port `--forward-port PORT` grant whenever possible. The flag is
+accepted on Linux for portable profiles but does not widen Linux access.
+
 On Linux, filtered egress always sets `no_proxy`/`NO_PROXY` to
 `127.0.0.1,localhost,::1`, so an application's own loopback client/server
 traffic does not hit the CONNECT proxy; the private network namespace still
 keeps host loopback unreachable. On macOS, where loopback is shared with the
-host, that exemption is added only when `--forward-port` names a port and the
-Seatbelt profile permits that exact endpoint. Unforwarded host ports stay
-closed on both platforms.
+host, that exemption is added when `--forward-port` names a port or when the
+broad `--allow-loopback-connect` grant is active. Without the broad grant,
+unforwarded host ports stay closed on both platforms.
 
 It cannot combine with `--network`, where the host loopback is already
 reachable, and it is refused outside Linux and macOS — so a `forward_ports`
@@ -637,12 +647,15 @@ Two config files plus CLI flags, in increasing authority:
 
 A `[commands.<name>]` table merges over the global base: scalar fields it sets
 override the base (status-bar fields stay from the base), list fields (maps,
-masks) append.
+masks) append. Its `command` is only a fallback when no positional command was
+given. A positional `COMMAND [ARGS...]` always wins; if an applied command
+table contains a different nonempty `command`, ai-jail warns once for that
+table without printing either command's arguments.
 
 Common fields: `command`, `rw_maps`, `ro_maps`, `overlay_maps`, `mask`,
 `deny_paths`, `mask_exceptions`, `deny_path_exceptions`, `hide_dotdirs`,
 `network`, `x11`, `host_shm`, `terminal_passthrough`, `macos_host_ipc`,
-`macos_chromium`, `macos_trustd`, `systemd_user`, `kvm`, `ssh`, `pictures`,
+`macos_chromium`, `macos_trustd`, `allow_loopback_connect`, `systemd_user`, `kvm`, `ssh`, `pictures`,
 `private_home`, `lockdown`, `browser_profile`, `claude_dir`, `allow_tcp_ports`,
 `status_bar_style`.
 
@@ -681,6 +694,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --agent-state / --no-agent-state  mount the command's credential state (default on)
 --env NAME[=VALUE]              forward or set an environment variable (repeatable)
 --forward-port PORT             relay host 127.0.0.1:PORT into the sandbox (Linux and macOS, repeatable)
+--allow-loopback-connect        OPEN: reach ALL host loopback services (macOS only; default off)
 --publish-port PORT             expose the sandbox's 127.0.0.1:PORT on the host's 127.0.0.1:PORT (Linux, repeatable)
 --allow-private-host HOST       allow one named host to resolve to private/ULA/CGNAT addresses (repeatable)
 --prompt-hosts / --no-prompt-hosts  ask via a desktop notification before refusing an unlisted host (Linux, default off)

@@ -92,6 +92,7 @@ pub(crate) struct Selection {
     pub ssh: bool,
     pub github: bool,
     pub unrestricted_network: bool,
+    pub loopback_connect: bool,
     pub ro_dirs: Vec<PathBuf>,
     pub rw_dirs: Vec<PathBuf>,
     pub env_names: Vec<String>,
@@ -109,6 +110,7 @@ impl Selection {
             ssh: config.ssh_enabled(),
             github: config.github_enabled(),
             unrestricted_network: config.network == Some(true),
+            loopback_connect: config.allow_loopback_connect_enabled(),
             ro_dirs: config.ro_maps.clone(),
             rw_dirs: config.rw_maps.clone(),
             env_names: Vec::new(),
@@ -132,6 +134,7 @@ impl Selection {
             ssh: config.ssh == Some(true),
             github: config.github == Some(true),
             unrestricted_network: config.network == Some(true),
+            loopback_connect: config.allow_loopback_connect == Some(true),
             ro_dirs: config.ro_maps.clone(),
             rw_dirs: config.rw_maps.clone(),
             env_names: approved_env_names.to_vec(),
@@ -149,6 +152,7 @@ impl Selection {
             ssh: Some(self.ssh),
             github: Some(self.github),
             network: self.unrestricted_network.then_some(true),
+            allow_loopback_connect: self.loopback_connect.then_some(true),
             allow_hosts: if self.api_access {
                 api_hosts(harness)
                     .iter()
@@ -462,6 +466,19 @@ fn open_grant(kind: &str, harness: &str, saved: Option<bool>) -> GrantSpec {
             authority: Some("Every permission granted to the active github.com token".into()),
             risk: Risk::Open,
         },
+        "loopback-connect" => GrantSpec {
+            resource: "Every service listening on the host loopback interface".into(),
+            access: "Connect to every localhost TCP service from the macOS jail".into(),
+            process,
+            duration: duration(saved),
+            scope: "ALL host loopback services on every port".into(),
+            limits: "macOS only; does not permit non-loopback destinations".into(),
+            default: "No host loopback service is reachable except a specifically forwarded port".into(),
+            consequence: "Jailed processes can access unauthenticated or locally trusted host services".into(),
+            remote: Some("localhost on the host, all ports".into()),
+            authority: Some("Every service that trusts localhost callers".into()),
+            risk: Risk::Open,
+        },
         _ => GrantSpec {
             resource: "The host's reachable network".into(),
             access: "Connect using any protocol and destination permitted by the host".into(),
@@ -650,6 +667,11 @@ pub(crate) fn run(
                 "network",
                 harness,
             )?,
+            "7" => toggle_open(
+                &mut selection.loopback_connect,
+                "loopback-connect",
+                harness,
+            )?,
             "r" => {
                 if let Err(error) =
                     add_directory(&mut selection, false, harness, project)
@@ -750,7 +772,7 @@ pub(crate) fn run(
             }
             "q" => return Ok(Outcome::Cancel),
             "b" => continue,
-            _ => eprintln!("Choose 1-6, e, r, w, d, s, or q."),
+            _ => eprintln!("Choose 1-7, e, r, w, d, s, or q."),
         }
     }
 }
@@ -813,6 +835,11 @@ fn run_sequential(
             "unrestricted network",
             &mut selection.unrestricted_network,
             "network",
+        ),
+        (
+            "all host loopback services",
+            &mut selection.loopback_connect,
+            "loopback-connect",
         ),
     ] {
         let Some(review) =
@@ -959,6 +986,10 @@ fn render_menu(selection: &Selection) {
     eprintln!(
         "  6 [{}] Unrestricted network                OPEN",
         mark(selection.unrestricted_network)
+    );
+    eprintln!(
+        "  7 [{}] All host loopback services          OPEN (macOS)",
+        mark(selection.loopback_connect)
     );
     eprintln!("  r Add read-only directory   w Add read/write directory");
     eprintln!("  e Environment variables (names only; values stay hidden)");
@@ -1764,6 +1795,7 @@ pub(crate) fn render_summary(
         (selection.ssh, "ssh"),
         (selection.github, "github"),
         (selection.unrestricted_network, "network"),
+        (selection.loopback_connect, "loopback-connect"),
     ] {
         if enabled {
             any = true;
@@ -2004,6 +2036,10 @@ pub(crate) fn render_effective_access(
         "ALLOWED: sandbox loopback listeners; bind local ports; sandbox loopback only; jailed services can accept local connections",
     );
     authority(
+        config.allow_loopback_connect_enabled(),
+        "OPEN: every host loopback service; connect to localhost on every port; ALL services that trust local callers become reachable",
+    );
+    authority(
         config.update_check_enabled(),
         "ALLOWED: GitHub release endpoint; outbound version check; ai-jail release metadata; launch contacts GitHub",
     );
@@ -2228,6 +2264,7 @@ fn effective_has_open_authority(
         || config.terminal_passthrough_enabled()
         || config.macos_host_ipc_enabled()
         || config.allow_pty_enabled()
+        || config.allow_loopback_connect_enabled()
         || !config.allow_private_hosts.is_empty()
         || config.env_pass.iter().any(|entry| open_env_entry(entry));
     if direct {
@@ -2380,7 +2417,7 @@ mod tests {
 
     #[test]
     fn open_grants_are_classified_open() {
-        for kind in ["ssh", "github", "network"] {
+        for kind in ["ssh", "github", "network", "loopback-connect"] {
             assert_eq!(open_grant(kind, "claude", None).risk, Risk::Open);
         }
     }

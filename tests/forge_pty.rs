@@ -154,7 +154,7 @@ fn actual_cli_forge_workflow_matches_documented_transcript() {
         &[
             ("comma-separated): ", b"read_repository\n"),
             ("or `never`): ", b"2027-01-31\n"),
-            ("Repository token: ", b"first-hidden-token\n"),
+            ("Repository token:", b"first-hidden-token\n"),
             ("Type OPEN to save this authority:", b"OPEN\n"),
         ],
         0,
@@ -166,7 +166,7 @@ fn actual_cli_forge_workflow_matches_documented_transcript() {
         &[
             ("comma-separated): ", b"read_repository,write_repository\n"),
             ("or `never`): ", b"2027-06-30\n"),
-            ("Repository token: ", b"rotated-hidden-token\n"),
+            ("Repository token:", b"rotated-hidden-token\n"),
             ("Type OPEN to save this authority:", b"OPEN\n"),
         ],
         0,
@@ -207,7 +207,7 @@ fn hidden_token_cancel_restores_terminal_echo() {
             &[
                 ("comma-separated): ", b"read_repository\n"),
                 ("or `never`): ", b"never\n"),
-                ("Repository token: ", cancel),
+                ("Repository token:", cancel),
             ],
             1,
         );

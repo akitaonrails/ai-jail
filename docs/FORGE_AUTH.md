@@ -82,7 +82,7 @@ AJ-FORGE-001: GitLab project token access for https://gitlab.example / owner/rep
 Create a repository-specific token in the forge UI, limited to this repository and the operations you need. The value is hidden and stored outside the project. It remains valid until its server expiry or revocation.
 Token scopes shown by the forge (comma-separated): read_repository
 Token expiry shown by the forge (YYYY-MM-DD or `never`): 2027-01-31
-Repository token: 
+Repository token:
 ✗ AJ-FORGE-OPEN-001 OPEN: ai-jail cannot prove that this persistent token lacks access outside owner/repo. Type OPEN to save this authority:
 OPEN
 ✓ AJ-FORGE-SAVE-001 Forge access saved outside the checkout
@@ -98,7 +98,7 @@ AJ-FORGE-001: GitLab project token access for https://gitlab.example / owner/rep
 Create a repository-specific token in the forge UI, limited to this repository and the operations you need. The value is hidden and stored outside the project. It remains valid until its server expiry or revocation.
 Token scopes shown by the forge (comma-separated): read_repository,write_repository
 Token expiry shown by the forge (YYYY-MM-DD or `never`): 2027-06-30
-Repository token: 
+Repository token:
 ✗ AJ-FORGE-OPEN-001 OPEN: ai-jail cannot prove that this persistent token lacks access outside owner/repo. Type OPEN to save this authority:
 OPEN
 ✓ AJ-FORGE-SAVE-001 Forge access saved outside the checkout

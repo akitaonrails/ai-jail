@@ -88,6 +88,9 @@ OPTIONS:
                                     Allow binding/listening on loopback while
                                     egress stays filtered on macOS (default: off,
                                     macOS only)
+    --allow-loopback-connect / --no-allow-loopback-connect
+                                    Allow outbound connections to every host
+                                    loopback service on macOS (OPEN; default: off)
     --x11 / --no-x11               Enable/disable X11 socket passthrough (default: off)
     --host-shm / --no-host-shm     Enable/disable host shared-memory passthrough (default: off)
     --terminal-passthrough / --no-terminal-passthrough
@@ -207,6 +210,7 @@ pub struct CliArgs {
     pub macos_trustd: Option<bool>,
     pub allow_pty: Option<bool>,
     pub allow_loopback_listen: Option<bool>,
+    pub allow_loopback_connect: Option<bool>,
     pub x11: Option<bool>,
     pub host_shm: Option<bool>,
     pub terminal_passthrough: Option<bool>,
@@ -516,6 +520,12 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 s @ ("allow-loopback-listen" | "no-allow-loopback-listen"),
             ) => {
                 args.allow_loopback_listen = Some(s == "allow-loopback-listen");
+            }
+            Long(
+                s @ ("allow-loopback-connect" | "no-allow-loopback-connect"),
+            ) => {
+                args.allow_loopback_connect =
+                    Some(s == "allow-loopback-connect");
             }
             Long(s @ ("x11" | "no-x11")) => {
                 args.x11 = Some(s == "x11");
@@ -915,6 +925,8 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-allow-pty",
     "--allow-loopback-listen",
     "--no-allow-loopback-listen",
+    "--allow-loopback-connect",
+    "--no-allow-loopback-connect",
     "--no-gpu",
     "--gpu",
     "--no-docker",
@@ -1049,6 +1061,7 @@ mod tests {
             "macos-trustd",
             "allow-pty",
             "allow-loopback-listen",
+            "allow-loopback-connect",
             "gpu",
             "docker",
             "tailscale",
@@ -1457,6 +1470,24 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.allow_loopback_listen, Some(false));
+    }
+
+    #[test]
+    fn parse_allow_loopback_connect_last_wins() {
+        let args = parse_test(&[
+            "--no-allow-loopback-connect",
+            "--allow-loopback-connect",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.allow_loopback_connect, Some(true));
+        let args = parse_test(&[
+            "--allow-loopback-connect",
+            "--no-allow-loopback-connect",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.allow_loopback_connect, Some(false));
     }
 
     #[test]

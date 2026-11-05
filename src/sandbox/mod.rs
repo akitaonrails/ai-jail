@@ -1700,6 +1700,12 @@ pub fn platform_notes(config: &Config) {
     for warning in devin_xdg_warnings(config) {
         output::warn(&warning);
     }
+    #[cfg(target_os = "linux")]
+    if config.allow_loopback_connect == Some(true) {
+        output::info(
+            "--allow-loopback-connect has no effect on Linux; use --forward-port PORT for a host service.",
+        );
+    }
     #[cfg(target_os = "macos")]
     {
         seatbelt::platform_notes(config);

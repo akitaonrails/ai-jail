@@ -52,8 +52,13 @@ impl TestTree {
     }
 
     fn run(&self, command: &[&str]) -> String {
+        let output = self.run_output(command);
+        common::assert_ok(&output)
+    }
+
+    fn run_output(&self, command: &[&str]) -> std::process::Output {
         let bwrap = std::env::var_os("BWRAP_BIN");
-        let output = Command::new(common::ai_jail())
+        Command::new(common::ai_jail())
             .args([
                 "--exec",
                 "--no-save-config",
@@ -69,8 +74,7 @@ impl TestTree {
             .env("PATH", "/usr/bin:/bin")
             .current_dir(&self.project)
             .output()
-            .unwrap();
-        common::assert_ok(&output)
+            .unwrap()
     }
 }
 
@@ -141,4 +145,23 @@ fn cli_command_keeps_its_global_command_preferences() {
         tree.run(&["/bin/sh", "-c", "printf '%s' \"$COMMAND_PREFERENCE\""]),
         "CLI"
     );
+}
+
+#[test]
+fn different_table_command_warns_without_printing_arguments() {
+    if !sandbox_available() {
+        return;
+    }
+    let tree = TestTree::new("warning", false, false);
+    std::fs::write(
+        tree.home.join(".ai-jail"),
+        "[commands.\"/usr/bin/printf\"]\ncommand = [\"ignored\", \"TABLE_SECRET\"]\n",
+    )
+    .unwrap();
+    let output = tree.run_output(&["/usr/bin/printf", "CLI_SECRET"]);
+    assert_eq!(common::assert_ok(&output), "CLI_SECRET");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[commands./usr/bin/printf] command ignored"));
+    assert!(!stderr.contains("CLI_SECRET"), "{stderr}");
+    assert!(!stderr.contains("TABLE_SECRET"), "{stderr}");
 }

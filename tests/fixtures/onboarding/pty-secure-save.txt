@@ -15,6 +15,7 @@ AJ-CHOICE-001 Access choices
   k [ ] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
@@ -42,6 +43,7 @@ AJ-GRANT-001 Enable this grant? [y/N] AJ-CHOICE-001 Access choices
   k [ ] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel

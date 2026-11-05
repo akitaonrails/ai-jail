@@ -1247,16 +1247,23 @@ fn run(
     } else {
         &legacy_project
     };
-    let global = if store.global.exists() {
-        config::global_config_for_command(
+    let global_selection = if store.global.exists() {
+        config::global_config_for_command_report(
             config_store::load_global(&store)?,
             &cli,
             global_command_selector,
         )
     } else {
         // Read-only compatibility path. Writable modes migrated this above.
-        config::load_global_for_command(&cli, global_command_selector)?
+        config::load_global_for_command_report(&cli, global_command_selector)?
     };
+    for table in &global_selection.ignored_command_tables {
+        output::security_warn(&format!(
+            "[commands.{}] command ignored because a positional command was supplied; its other settings still apply",
+            table
+        ));
+    }
+    let global = global_selection.config;
     let onboarding_complete = stored_project.onboarding_complete;
     let global_for_onboarding = global.clone();
     let trusted = config::merge_trusted_project(global, stored_project.grants);

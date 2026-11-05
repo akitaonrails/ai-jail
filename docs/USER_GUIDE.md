@@ -56,6 +56,7 @@ AJ-CHOICE-001 Access choices
   k [ ] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
@@ -277,6 +278,7 @@ Key number, private-key path, or .pub path: AJ-CHOICE-001 Access choices
   k [x] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
@@ -297,6 +299,7 @@ Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: Key nu
   k [ ] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
@@ -316,6 +319,7 @@ Key number, private-key path, or .pub path: AJ-CHOICE-001 Access choices
   k [x] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
@@ -336,6 +340,7 @@ Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: Requir
   k [x] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
@@ -365,6 +370,7 @@ AJ-OPEN-001 Type OPEN to enable this exact grant: AJ-CHOICE-001 Access choices
   k [x] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [x] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
@@ -513,6 +519,7 @@ AJ-CHOICE-001 Access choices
   k [ ] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
@@ -540,6 +547,7 @@ AJ-GRANT-001 Enable this grant? [y/N] AJ-CHOICE-001 Access choices
   k [ ] Selected SSH keys (fresh agent)
   5 [ ] Full host GitHub token              OPEN
   6 [ ] Unrestricted network                OPEN
+  7 [ ] All host loopback services          OPEN (macOS)
   r Add read-only directory   w Add read/write directory
   e Environment variables (names only; values stay hidden)
   d Remove directory          s Review summary   q Cancel
@@ -607,3 +615,19 @@ AJ-SAVE-001 Save this project profile? [y/N/b] [OK] AJ-SAVE-001 Configuration sa
   Project policy: <ROOT>/xdg/ai-jail/projects/<POLICY>.toml
   The project cannot edit or enable this policy from inside the jail.
 ```
+# Dynamic localhost services on macOS
+
+<!-- provenance: src/onboarding.rs open_grant("loopback-connect"), render_menu; src/sandbox/seatbelt.rs push_network_section -->
+
+Use a fixed `--forward-port PORT` whenever you know the port. If a macOS tool
+uses unpredictable localhost ports, interactive setup offers:
+
+```text
+  7 [ ] All host loopback services          OPEN (macOS)
+```
+
+Selecting it shows that **ALL host loopback services on every port** become
+reachable. To enable and save it, type the exact word `OPEN`; `open`, `yes`,
+or pressing Enter leaves it disabled. The final access review labels the grant
+OPEN again before saving. `--lockdown` disables it. On Linux the setting is
+accepted for shared configuration but has no effect.

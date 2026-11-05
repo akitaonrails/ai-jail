@@ -617,7 +617,7 @@ fn setup(
             );
             io::stderr().flush().ok();
             let expires_at = parse_expiry(&read_visible_line()?)?;
-            let token = read_secret("Repository token: ")?;
+            let token = read_secret("Repository token:")?;
             if token.is_empty() || token.len() > 8192 {
                 return Err("Forge token is empty or too large".into());
             }

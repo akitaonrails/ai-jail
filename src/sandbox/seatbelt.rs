@@ -263,9 +263,11 @@ fn apply_child_env(
     if config.network_mode() == crate::config::NetworkMode::Filtered
         && let Some(port) = proxy_port
     {
-        for (key, value) in
-            crate::proxy::env_vars(port, config.forward_ports(), false)
-        {
+        for (key, value) in crate::proxy::env_vars(
+            port,
+            config.forward_ports(),
+            config.allow_loopback_connect_enabled(),
+        ) {
             cmd.env(key, value);
         }
     }
@@ -798,6 +800,15 @@ fn push_network_section(
             }
         }
         _ => {}
+    }
+    // This explicit host-loopback grant is independent of general egress.
+    // It must still work when the rest of the jail is offline.
+    if config.allow_loopback_connect_enabled() {
+        profile
+            .push_str("; Host loopback connect (--allow-loopback-connect)\n");
+        profile.push_str(
+            "(allow network-outbound (remote ip \"localhost:*\"))\n\n",
+        );
     }
     push_forward_ports_section(profile, config);
 }
@@ -2509,6 +2520,68 @@ mod tests {
     }
 
     #[test]
+    fn loopback_connect_is_explicit_and_scoped_to_localhost() {
+        let base = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..Config::default()
+        };
+        let without = generate_sbpl_profile_filtered(
+            &base,
+            Path::new("/tmp/test-project"),
+            15919,
+        );
+        assert!(!without.contains("localhost:*"));
+
+        let config = Config {
+            allow_loopback_connect: Some(true),
+            ..base
+        };
+        let profile = generate_sbpl_profile_filtered(
+            &config,
+            Path::new("/tmp/test-project"),
+            15919,
+        );
+        assert!(
+            profile.contains(
+                "(allow network-outbound (remote ip \"localhost:*\"))"
+            )
+        );
+        assert!(!profile.contains("(allow network-outbound)\n"));
+
+        let offline = Config {
+            allow_loopback_connect: Some(true),
+            network: Some(false),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile_filtered(
+            &offline,
+            Path::new("/tmp/test-project"),
+            15919,
+        );
+        assert!(
+            profile.contains(
+                "(allow network-outbound (remote ip \"localhost:*\"))"
+            )
+        );
+    }
+
+    #[test]
+    fn loopback_connect_is_dropped_under_lockdown() {
+        let config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            allow_loopback_connect: Some(true),
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile_filtered(
+            &config,
+            Path::new("/tmp/test-project"),
+            15919,
+        );
+        assert!(!profile.contains("localhost:*"));
+    }
+
+    #[test]
     fn loopback_listen_profile_compiles() {
         if !Path::new("/usr/bin/sandbox-exec").is_file() {
             return;
@@ -2693,6 +2766,36 @@ mod tests {
         assert_eq!(
             get("http_proxy"),
             Some(std::ffi::OsStr::new("http://127.0.0.1:15919"))
+        );
+    }
+
+    #[test]
+    fn build_child_env_loopback_connect_exempts_loopback_from_proxy() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let config = Config {
+            command: vec!["bash".into()],
+            no_mise: Some(true),
+            allow_hosts: vec!["api.anthropic.com".into()],
+            allow_loopback_connect: Some(true),
+            ..Config::default()
+        };
+        let cmd = build(
+            &config,
+            Path::new("/tmp/test-project"),
+            false,
+            None,
+            Some(15919),
+        )
+        .unwrap();
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        let loopback = std::ffi::OsStr::new("127.0.0.1,localhost,::1");
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("no_proxy")).copied().flatten(),
+            Some(loopback)
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("NO_PROXY")).copied().flatten(),
+            Some(loopback)
         );
     }
 

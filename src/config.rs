@@ -253,6 +253,11 @@ pub struct Config {
     /// `--lockdown` (issue #213).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_loopback_listen: Option<bool>,
+    /// Allow a macOS sandbox to connect to any service bound on the host's
+    /// loopback interface. This is broader than `forward_ports`, so it is an
+    /// explicit trusted capability, off by default and removed by lockdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_loopback_connect: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x11: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -470,6 +475,9 @@ impl Config {
     }
     pub fn allow_loopback_listen_enabled(&self) -> bool {
         self.allow_loopback_listen == Some(true)
+    }
+    pub fn allow_loopback_connect_enabled(&self) -> bool {
+        self.allow_loopback_connect == Some(true) && !self.lockdown_enabled()
     }
     pub fn mise_enabled(&self) -> bool {
         self.no_mise != Some(true)
@@ -1059,23 +1067,26 @@ pub fn load() -> Result<Config, String> {
 /// `[commands.<name>]` table when present. Only a CLI command can select a
 /// command table; otherwise the global base command is used. Project config is
 /// untrusted and may select what runs, but cannot activate global policy.
-pub fn load_global_for_command(
-    cli: &CliArgs,
-    project: &Config,
-) -> Result<Config, String> {
-    match global_config_path() {
-        Some(p) => load_global_for_command_from_path(&p, cli, project),
-        None => Ok(Config::default()),
-    }
+#[derive(Debug)]
+pub(crate) struct GlobalCommandSelection {
+    pub config: Config,
+    pub ignored_command_tables: Vec<String>,
 }
 
-fn load_global_for_command_from_path(
-    path: &Path,
+pub(crate) fn load_global_for_command_report(
     cli: &CliArgs,
     project: &Config,
-) -> Result<Config, String> {
-    let global = load_global_from_path(path)?;
-    Ok(global_config_for_command(global, cli, project))
+) -> Result<GlobalCommandSelection, String> {
+    match global_config_path() {
+        Some(path) => {
+            let global = load_global_from_path(&path)?;
+            Ok(global_config_for_command_report(global, cli, project))
+        }
+        None => Ok(GlobalCommandSelection {
+            config: Config::default(),
+            ignored_command_tables: Vec::new(),
+        }),
+    }
 }
 
 pub(crate) fn global_config_for_command(
@@ -1083,6 +1094,14 @@ pub(crate) fn global_config_for_command(
     cli: &CliArgs,
     _project: &Config,
 ) -> Config {
+    global_config_for_command_report(global, cli, _project).config
+}
+
+pub(crate) fn global_config_for_command_report(
+    global: GlobalConfig,
+    cli: &CliArgs,
+    _project: &Config,
+) -> GlobalCommandSelection {
     let selected_command = if !cli.command.is_empty() {
         cli.command.clone()
     } else {
@@ -1090,20 +1109,36 @@ pub(crate) fn global_config_for_command(
     };
 
     let GlobalConfig { mut base, commands } = global;
-    if let Some(name) = selected_command.first()
-        && let Some(command_config) = commands.get(name)
-    {
-        base = merge_trusted(base, command_config.clone());
+    let mut ignored_command_tables = Vec::new();
+    let mut apply = |name: &str, base: &mut Config| {
+        let Some(command_config) = commands.get(name) else {
+            return;
+        };
+        if !cli.command.is_empty()
+            && !command_config.command.is_empty()
+            && command_config.command != cli.command
+        {
+            ignored_command_tables.push(output::escape_control_bytes(name));
+        }
+        *base = merge_trusted(base.clone(), command_config.clone());
+    };
+    if let Some(name) = selected_command.first() {
+        apply(name, &mut base);
     }
     // `ai-memory run` is both a wrapper invocation and a harness launch.
     // Preserve an existing [commands.ai-memory] layer, then let the selected
     // harness add/override its own global preferences.
     if let Some(harness) = command::managed_harness(&selected_command)
-        && let Some(command_config) = commands.get(harness.name)
+        && selected_command
+            .first()
+            .is_none_or(|name| name != harness.name)
     {
-        base = merge_trusted(base, command_config.clone());
+        apply(harness.name, &mut base);
     }
-    base
+    GlobalCommandSelection {
+        config: base,
+        ignored_command_tables,
+    }
 }
 
 /// Merge two trusted configuration layers, such as global base and a global
@@ -1159,6 +1194,7 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(macos_trustd);
     take!(allow_pty);
     take!(allow_loopback_listen);
+    take!(allow_loopback_connect);
     take!(x11);
     take!(host_shm);
     take!(terminal_passthrough);
@@ -1525,6 +1561,9 @@ pub fn merge_with_global_report(
     monotonic!(allow_pty, |config: &Config| config.allow_pty_enabled());
     monotonic!(allow_loopback_listen, |config: &Config| config
         .allow_loopback_listen_enabled());
+    monotonic!(allow_loopback_connect, |config: &Config| config
+        .allow_loopback_connect
+        == Some(true));
     monotonic!(x11, |config: &Config| config.x11_enabled());
     monotonic!(host_shm, |config: &Config| config.host_shm_enabled());
     monotonic!(terminal_passthrough, |config: &Config| {
@@ -2132,6 +2171,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     direct!(macos_trustd);
     direct!(allow_pty);
     direct!(allow_loopback_listen);
+    direct!(allow_loopback_connect);
     direct!(x11);
     direct!(host_shm);
     direct!(terminal_passthrough);
@@ -2320,6 +2360,10 @@ pub fn display_status(config: &Config, stored_path: Option<&Path>) {
     print_opt_in_enabled("  macOS trustd", config.macos_trustd);
     print_opt_in_enabled("  Allow PTY", config.allow_pty);
     print_opt_in_enabled("  Loopback listen", config.allow_loopback_listen);
+    print_opt_in_enabled(
+        "  Loopback connect (OPEN)",
+        config.allow_loopback_connect,
+    );
     print_opt_in_enabled("  X11", config.x11);
     print_opt_in_enabled("  Host shared memory", config.host_shm);
     print_opt_in_enabled("  Terminal passthrough", config.terminal_passthrough);
@@ -2776,6 +2820,51 @@ mod tests {
                 .unwrap()
                 .contains("allow_loopback_listen = true")
         );
+    }
+
+    #[test]
+    fn allow_loopback_connect_is_trusted_only_and_lockdown_disables_it() {
+        let project = Config {
+            allow_loopback_connect: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(!merged.allow_loopback_connect_enabled());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| { warning.contains("allow_loopback_connect") })
+        );
+
+        let enabled = Config {
+            allow_loopback_connect: Some(true),
+            ..Config::default()
+        };
+        assert!(enabled.allow_loopback_connect_enabled());
+        assert!(
+            serialize_config(&enabled)
+                .unwrap()
+                .contains("allow_loopback_connect = true")
+        );
+        let locked = Config {
+            allow_loopback_connect: Some(true),
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        assert!(!locked.allow_loopback_connect_enabled());
+    }
+
+    #[test]
+    fn previous_config_without_loopback_connect_keeps_it_disabled() {
+        let parsed =
+            parse_toml("command = ['claude']\nallow_loopback_listen = true\n")
+                .unwrap();
+        assert_eq!(parsed.allow_loopback_connect, None);
+        assert!(!parsed.allow_loopback_connect_enabled());
     }
 
     #[test]
@@ -4174,6 +4263,7 @@ no_gpu = true
             macos_trustd: None,
             allow_pty: None,
             allow_loopback_listen: None,
+            allow_loopback_connect: Some(true),
             x11: Some(true),
             host_shm: Some(true),
             terminal_passthrough: Some(true),
@@ -4521,6 +4611,7 @@ tailscale = true
             macos_trustd: None,
             allow_pty: None,
             allow_loopback_listen: None,
+            allow_loopback_connect: None,
             no_worktree: Some(true),
             no_mise: Some(true),
             no_save_config: Some(true),
@@ -4996,6 +5087,89 @@ tailscale = false
         assert_eq!(selected.no_gpu, Some(true));
         assert_eq!(selected.no_docker, Some(true));
         assert_eq!(selected.tailscale, Some(false));
+    }
+
+    #[test]
+    fn positional_command_reports_each_different_applied_table_command() {
+        let global = parse_global_toml(
+            r#"
+[commands.ai-memory]
+command = ["ignored-wrapper", "secret"]
+no_docker = true
+
+[commands.codex]
+command = ["ignored-harness", "secret"]
+tailscale = true
+"#,
+        )
+        .unwrap();
+        let cli = CliArgs {
+            command: vec!["ai-memory".into(), "run".into(), "codex".into()],
+            ..CliArgs::default()
+        };
+        let selected =
+            global_config_for_command_report(global, &cli, &Config::default());
+        assert_eq!(selected.ignored_command_tables, ["ai-memory", "codex"]);
+        assert_eq!(selected.config.command, vec!["ignored-harness", "secret"]);
+    }
+
+    #[test]
+    fn command_warning_report_omits_fallback_preference_and_redundancy() {
+        let global = parse_global_toml(
+            r#"
+[commands.claude]
+command = ["claude", "--safe"]
+
+[commands.codex]
+no_gpu = true
+"#,
+        )
+        .unwrap();
+        let cli = CliArgs {
+            command: vec!["claude".into(), "--safe".into()],
+            ..CliArgs::default()
+        };
+        let selected =
+            global_config_for_command_report(global, &cli, &Config::default());
+        assert!(selected.ignored_command_tables.is_empty());
+
+        let global = parse_global_toml(
+            "command = ['claude']\n[commands.claude]\ncommand = ['fallback']",
+        )
+        .unwrap();
+        let selected = global_config_for_command_report(
+            global,
+            &CliArgs::default(),
+            &Config::default(),
+        );
+        assert!(selected.ignored_command_tables.is_empty());
+    }
+
+    #[test]
+    fn command_warning_report_escapes_hostile_table_name() {
+        let hostile = "claude\u{1b}]0;owned\u{7}";
+        let global = GlobalConfig {
+            commands: [(
+                hostile.to_string(),
+                Config {
+                    command: vec!["ignored".into()],
+                    ..Config::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..GlobalConfig::default()
+        };
+        let cli = CliArgs {
+            command: vec![hostile.to_string()],
+            ..CliArgs::default()
+        };
+        let selected =
+            global_config_for_command_report(global, &cli, &Config::default());
+        assert_eq!(selected.ignored_command_tables.len(), 1);
+        assert!(!selected.ignored_command_tables[0].contains('\u{1b}'));
+        assert!(!selected.ignored_command_tables[0].contains('\u{7}'));
+        assert_eq!(selected.ignored_command_tables[0], "claude?]0;owned?");
     }
 
     #[test]
@@ -7430,6 +7604,7 @@ hide_dotdirs = [".my_secrets"]
             macos_trustd: None,
             allow_pty: None,
             allow_loopback_listen: None,
+            allow_loopback_connect: None,
             x11: None,
             host_shm: None,
             terminal_passthrough: None,
