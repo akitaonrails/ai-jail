@@ -35,16 +35,16 @@ $ ai-jail capabilities --json
 
 These are contract requirements, not implementation suggestions:
 
-| Assurance | Enforced behavior |
-| --- | --- |
-| Requests are not grants | Pending, changed, or denied requests cannot widen the effective configuration and stop non-interactive launch with exit 3. |
-| Identity cannot be disguised | Explicit harness declarations override inference, but a contradiction with a known executable is refused. |
-| Repository input is untrusted | A request manifest must be a guarded host file outside the checkout; symlinks, hard links, foreign ownership, and group/world writes are refused. |
-| Secrets stay supervisor-side | Status, errors, profiles, manifests, argv, and the sandbox never receive the secret value. Only the approved plain-HTTP host substitution sees it. |
-| OPEN authority is named OPEN | Private hosts, unrestricted network, full SSH, full GitHub credentials, and inherited host environment are reported under `grants.open`; interactive onboarding requires the final `OPEN` confirmation. |
-| Saved approval is exact | Requester, kind, normalized value, host, port, and writable mode are compared. Any change is pending again. |
-| Read-only means read-only | `status --json` never prompts, migrates, or saves policy. |
-| Unsupported assurance is explicit | `features.inside_marker` remains false until every supported backend can provide the documented guarantee. |
+| Assurance                         | Enforced behavior                                                                                                                                                                                       |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Requests are not grants           | Pending, changed, or denied requests cannot widen the effective configuration and stop non-interactive launch with exit 3.                                                                              |
+| Identity cannot be disguised      | Explicit harness declarations override inference, but a contradiction with a known executable is refused.                                                                                               |
+| Repository input is untrusted     | A request manifest must be a guarded host file outside the checkout; symlinks, hard links, foreign ownership, and group/world writes are refused.                                                       |
+| Secrets stay supervisor-side      | Status, errors, profiles, manifests, argv, and the sandbox never receive the secret value. Only the approved plain-HTTP host substitution sees it.                                                      |
+| OPEN authority is named OPEN      | Private hosts, unrestricted network, full SSH, full GitHub credentials, and inherited host environment are reported under `grants.open`; interactive onboarding requires the final `OPEN` confirmation. |
+| Saved approval is exact           | Requester, kind, normalized value, host, port, and writable mode are compared. Any change is pending again.                                                                                             |
+| Read-only means read-only         | `status --json` never prompts, migrates, or saves policy.                                                                                                                                               |
+| Unsupported assurance is explicit | `features.inside_marker` remains false until every supported backend can provide the documented guarantee.                                                                                              |
 
 `tests/wrapper_contract.rs` exercises the process-level contract, including
 non-disclosure and unsafe manifest paths. Unit tests in `src/integration.rs`

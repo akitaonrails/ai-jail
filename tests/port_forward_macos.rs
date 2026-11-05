@@ -121,6 +121,10 @@ fn project_config_cannot_open_a_forward() {
     let xdg = state.join("xdg");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&xdg).unwrap();
+    // macOS spells its temporary root through /var -> /private/var. Trusted
+    // configuration rejects symlink components, so pass physical paths.
+    let home = std::fs::canonicalize(home).unwrap();
+    let xdg = std::fs::canonicalize(xdg).unwrap();
     let script = format!(
         "curl -sS --max-time 3 http://127.0.0.1:{port}/ \
          && echo LEAK || echo BLOCKED"
