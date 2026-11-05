@@ -2443,7 +2443,10 @@ mod tests {
             assert!(rendered.contains(safe), "missing {safe}: {rendered}");
         }
         for secret in ["old-secret", "new-secret", "--token"] {
-            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+            assert!(
+                !rendered.contains(secret),
+                "sanitized capability description exposed sensitive input"
+            );
         }
     }
 

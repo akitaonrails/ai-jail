@@ -175,7 +175,21 @@ pub fn curl(port: u16) -> String {
 /// project `.ai-jail` applies. The caller's proxy env is removed so only
 /// ai-jail's own proxy settings can reach the sandbox.
 pub fn run_in(dir: Option<&Path>, flags: &[&str], script: &str) -> Output {
+    static NEXT_RUN: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
     let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
+    let run_id = NEXT_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_base = std::env::temp_dir()
+        .canonicalize()
+        .expect("failed to resolve system temp directory");
+    let private_root = temp_base.join(format!(
+        "ai-jail-sandbox-run-{}-{run_id}",
+        std::process::id()
+    ));
+    let home = private_root.join("home");
+    let xdg = private_root.join("xdg");
+    std::fs::create_dir_all(&home).expect("failed to create test HOME");
+    std::fs::create_dir_all(&xdg).expect("failed to create test config home");
     let mut command = Command::new(ai_jail());
     command.args(["--no-status-bar", "--exec", "--no-save-config"]);
     if dir.is_none() {
@@ -185,8 +199,10 @@ pub fn run_in(dir: Option<&Path>, flags: &[&str], script: &str) -> Output {
     if let Some(dir) = dir {
         command.current_dir(dir);
     }
-    command
+    let output = command
         .args(["bash", "-c", script])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
         .env_remove("http_proxy")
         .env_remove("https_proxy")
         .env_remove("all_proxy")
@@ -196,7 +212,9 @@ pub fn run_in(dir: Option<&Path>, flags: &[&str], script: &str) -> Output {
         .env_remove("no_proxy")
         .env_remove("NO_PROXY")
         .output()
-        .expect("failed to spawn ai-jail")
+        .expect("failed to spawn ai-jail");
+    let _ = std::fs::remove_dir_all(&private_root);
+    output
 }
 
 /// A private audit-log fixture: a temp root with a `home/` whose
