@@ -14,6 +14,9 @@ COMMANDS (positional):
                                             Known AI tool presets
     status                                 Show current effective config
     configure HARNESS                      Review and save project access
+    forge setup PROVIDER ORIGIN OWNER/REPO [--allow-private]
+                                            Configure repository-scoped forge access
+    forge status | forge remove             Inspect or remove forge access
     Any other string                       Passed through as the command
 
 OPTIONS:
@@ -243,6 +246,7 @@ pub struct CliArgs {
     pub verbose: bool,
     pub status: bool,
     pub configure: Option<String>,
+    pub forge: Option<ForgeCommand>,
     /// Internal: apply Landlock and exec remaining command.
     /// Used as a wrapper inside the bwrap sandbox.
     pub landlock_exec: bool,
@@ -264,6 +268,18 @@ pub struct CliArgs {
     pub landlock_rw_paths: Vec<PathBuf>,
     /// Internal: opaque read-only mount destinations for Landlock.
     pub landlock_ro_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForgeCommand {
+    Setup {
+        provider: String,
+        origin: String,
+        repository: String,
+        allow_private: bool,
+    },
+    Remove,
+    Status,
 }
 
 pub fn parse() -> Result<CliArgs, String> {
@@ -701,6 +717,96 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 let s = val.to_string_lossy().into_owned();
                 if s == "status" {
                     args.status = true;
+                } else if s == "forge" && args.command.is_empty() {
+                    let action = parser
+                        .value()
+                        .map_err(|_| {
+                            "forge requires setup, status, or remove"
+                                .to_string()
+                        })?
+                        .to_string_lossy()
+                        .into_owned();
+                    args.forge = Some(match action.as_str() {
+                        "status" => {
+                            if parser
+                                .next()
+                                .map_err(|e| e.to_string())?
+                                .is_some()
+                            {
+                                return Err(
+                                    "forge status accepts no arguments".into(),
+                                );
+                            }
+                            ForgeCommand::Status
+                        }
+                        "remove" => {
+                            if parser
+                                .next()
+                                .map_err(|e| e.to_string())?
+                                .is_some()
+                            {
+                                return Err(
+                                    "forge remove accepts no arguments".into(),
+                                );
+                            }
+                            ForgeCommand::Remove
+                        }
+                        "setup" => {
+                            let provider = parser
+                                .value()
+                                .map_err(|_| {
+                                    "forge setup requires PROVIDER".to_string()
+                                })?
+                                .to_string_lossy()
+                                .into_owned();
+                            let origin = parser
+                                .value()
+                                .map_err(|_| {
+                                    "forge setup requires ORIGIN".to_string()
+                                })?
+                                .to_string_lossy()
+                                .into_owned();
+                            let repository = parser
+                                .value()
+                                .map_err(|_| {
+                                    "forge setup requires OWNER/REPO"
+                                        .to_string()
+                                })?
+                                .to_string_lossy()
+                                .into_owned();
+                            let mut allow_private = false;
+                            if let Some(next) =
+                                parser.next().map_err(|e| e.to_string())?
+                            {
+                                match next {
+                                    lexopt::Arg::Long("allow-private") => allow_private = true,
+                                    _ => return Err("forge setup accepts only --allow-private after OWNER/REPO".into()),
+                                }
+                            }
+                            if parser
+                                .next()
+                                .map_err(|e| e.to_string())?
+                                .is_some()
+                            {
+                                return Err(
+                                    "forge setup received too many arguments"
+                                        .into(),
+                                );
+                            }
+                            ForgeCommand::Setup {
+                                provider,
+                                origin,
+                                repository,
+                                allow_private,
+                            }
+                        }
+                        _ => {
+                            return Err(
+                                "forge requires setup, status, or remove"
+                                    .into(),
+                            );
+                        }
+                    });
                 } else if s == "configure" && args.command.is_empty() {
                     let harness = parser
                         .value()
@@ -1034,6 +1140,42 @@ mod tests {
         let args = parse_test(&["configure", "claude"]).unwrap();
         assert_eq!(args.configure.as_deref(), Some("claude"));
         assert_eq!(args.command, vec!["claude"]);
+    }
+
+    #[test]
+    fn parse_forge_setup_and_private_acknowledgement() {
+        let args = parse_test(&[
+            "forge",
+            "setup",
+            "gitlab",
+            "https://gitlab.example",
+            "owner/repo",
+            "--allow-private",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.forge,
+            Some(ForgeCommand::Setup {
+                provider: "gitlab".into(),
+                origin: "https://gitlab.example".into(),
+                repository: "owner/repo".into(),
+                allow_private: true,
+            })
+        );
+        assert!(args.command.is_empty());
+    }
+
+    #[test]
+    fn parse_forge_status_and_remove() {
+        assert_eq!(
+            parse_test(&["forge", "status"]).unwrap().forge,
+            Some(ForgeCommand::Status)
+        );
+        assert_eq!(
+            parse_test(&["forge", "remove"]).unwrap().forge,
+            Some(ForgeCommand::Remove)
+        );
+        assert!(parse_test(&["forge", "status", "extra"]).is_err());
     }
 
     #[test]

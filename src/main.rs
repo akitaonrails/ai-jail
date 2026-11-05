@@ -10,6 +10,7 @@ mod codex_ps;
 mod command;
 mod config;
 mod config_store;
+mod forge_auth;
 mod fsutil;
 mod github_auth;
 mod onboarding;
@@ -545,6 +546,7 @@ pub(crate) struct FinalizedLaunch {
 struct LaunchRunner {
     finalized: FinalizedLaunch,
     restricted_ssh: Option<ssh_restricted::Runtime>,
+    forge: Option<forge_auth::Runtime>,
 }
 
 impl LaunchRunner {
@@ -552,6 +554,7 @@ impl LaunchRunner {
         Self {
             finalized,
             restricted_ssh: None,
+            forge: None,
         }
     }
 
@@ -584,6 +587,20 @@ impl LaunchRunner {
         }
         Ok(())
     }
+
+    fn attach_forge(
+        &mut self,
+        store: &config_store::StorePaths,
+    ) -> Result<(), String> {
+        if self.finalized.config.lockdown_enabled() {
+            return Ok(());
+        }
+        if let Some(runtime) = forge_auth::prepare(store)? {
+            runtime.apply(&mut self.finalized.config);
+            self.forge = Some(runtime);
+        }
+        Ok(())
+    }
 }
 
 /// Apply every host-derived launch mutation exactly once. The returned config
@@ -604,6 +621,9 @@ pub(crate) fn finalize_launch_config_with_ssh(
     dry_run: bool,
     restricted_ssh: Option<ssh_restricted::Policy>,
 ) -> Result<FinalizedLaunch, String> {
+    if config.lockdown_enabled() {
+        forge_auth::strip_runtime(&mut config);
+    }
     if config.mise_enabled() && !config.lockdown_enabled() {
         for dir in sandbox::mise_auto_map_dirs() {
             if !config.ro_maps.contains(&dir) && !config.rw_maps.contains(&dir)
@@ -1183,6 +1203,9 @@ fn run(
         return Ok(2);
     }
     let store = config_store::StorePaths::discover(&invocation_cwd)?;
+    if let Some(command) = &cli.forge {
+        return forge_auth::run_command(command, &store);
+    }
     let migration_writes_allowed =
         !cli.dry_run && cli.save_config != Some(false) && !cli.status;
     if migration_writes_allowed && store.available {
@@ -1554,20 +1577,6 @@ fn run(
         signals::abort_if_cancelled()?;
     }
     let config = launch_runner.config();
-    if let Some((harness, saved, approved_env_names)) =
-        final_access_render.take()
-    {
-        eprintln!(
-            "{}",
-            onboarding::render_effective_access(
-                config,
-                &invocation_cwd,
-                &harness,
-                saved,
-                &approved_env_names,
-            )?
-        );
-    }
     // Check sandbox tool is available
     sandbox::check()?;
 
@@ -1703,11 +1712,12 @@ fn run(
         && !skip_project_auto_save
         && should_auto_save_project_config(&cli, config)
     {
-        let to_save = config::project_config_for_auto_save(
+        let mut to_save = config::project_config_for_auto_save(
             &cli,
             project_config,
             &invocation_cwd,
         );
+        forge_auth::strip_runtime(&mut to_save);
         config_store::save_project_constraints(&store, to_save)?;
     }
 
@@ -1723,6 +1733,31 @@ fn run(
         )?;
         output::dry_run_line(&formatted);
         return Ok(0);
+    }
+
+    // Forge credentials are the final host-derived launch authority. Load and
+    // verify them only after every read-only/nonlaunch exit and after the dry
+    // run has completed, then keep the revocation guard alive with the runner.
+    if !cli.clean {
+        launch_runner.attach_forge(&store)?;
+    }
+    let config = launch_runner.config();
+    if let Some((harness, saved, approved_env_names)) =
+        final_access_render.take()
+    {
+        eprintln!(
+            "{}",
+            onboarding::render_effective_access(
+                config,
+                &invocation_cwd,
+                &harness,
+                saved,
+                &approved_env_names,
+            )?
+        );
+    }
+    if let Some(runtime) = &launch_runner.forge {
+        eprintln!("{}", runtime.summary_line());
     }
 
     // A real host inode gives bwrap a race-resistant mountpoint for the

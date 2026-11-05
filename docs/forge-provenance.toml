@@ -1,0 +1,19 @@
+schema_version = 1
+message_ids = [
+  "AJ-FORGE-001",
+  "AJ-FORGE-OPEN-001",
+  "AJ-FORGE-SAVE-001",
+  "AJ-FORGE-STATUS-001",
+  "AJ-FORGE-REMOVE-001",
+]
+enforced_by = ["src/forge_auth.rs", "src/main.rs::LaunchRunner::attach_forge"]
+verified_by = [
+  "forge_auth::tests::forge_documentation_and_provenance_do_not_drift",
+  "forge_auth::tests::git_helper_accepts_only_exact_repository_paths",
+  "forge_pty::actual_cli_forge_workflow_matches_documented_transcript",
+  "forge_pty::hidden_token_cancel_restores_terminal_echo",
+  "tests/forge_ordering.rs",
+]
+guide = "docs/FORGE_AUTH.md"
+transcript_fixture = "tests/fixtures/forge/workflow.txt"
+checked = "2026-11-05"

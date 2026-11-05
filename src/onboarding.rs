@@ -430,6 +430,7 @@ fn secret_env_name(name: &str) -> bool {
 fn open_env_entry(entry: &str) -> bool {
     entry != "MISE_NOT_FOUND_AUTO_INSTALL=false"
         && !crate::ssh_restricted::is_runtime_env(entry)
+        && !crate::forge_auth::is_runtime_env(entry)
 }
 
 fn open_grant(kind: &str, harness: &str, saved: Option<bool>) -> GrantSpec {
@@ -2095,8 +2096,37 @@ pub(crate) fn render_effective_access(
                 .env_pass
                 .iter()
                 .any(|entry| crate::ssh_restricted::is_runtime_env(entry));
-            let category = if name == "MISE_NOT_FOUND_AUTO_INSTALL"
+            let forge_runtime = config
+                .env_pass
+                .iter()
+                .any(|entry| crate::forge_auth::is_runtime_env(entry))
+                && matches!(
+                    name.as_str(),
+                    "AI_JAIL_FORGE_TOKEN"
+                        | "AI_JAIL_FORGE_ORIGIN"
+                        | "AI_JAIL_FORGE_REPOSITORY"
+                        | "AI_JAIL_FORGE_AUTHORITY"
+                        | "GH_TOKEN"
+                        | "GITLAB_TOKEN"
+                        | "GITEA_TOKEN"
+                        | "GIT_CONFIG_COUNT"
+                        | "GIT_CONFIG_KEY_0"
+                        | "GIT_CONFIG_VALUE_0"
+                        | "GIT_CONFIG_KEY_1"
+                        | "GIT_CONFIG_VALUE_1"
+                        | "GIT_CONFIG_KEY_2"
+                        | "GIT_CONFIG_VALUE_2"
+                );
+            let forge_open = forge_runtime
+                && config
+                    .env_pass
+                    .iter()
+                    .any(|entry| entry == "AI_JAIL_FORGE_AUTHORITY=OPEN");
+            let category = if forge_open {
+                "[ERROR] OPEN"
+            } else if name == "MISE_NOT_FOUND_AUTO_INSTALL"
                 || restricted_ssh_runtime
+                || forge_runtime
             {
                 "[WARN] ALLOWED"
             } else {
@@ -2104,6 +2134,10 @@ pub(crate) fn render_effective_access(
             };
             if restricted_ssh_runtime {
                 lines.push(format!("- {category}: generated launch-scoped SSH variable {name}; points only to the dedicated agent or generated strict SSH configuration; jailed descendants can use the selected-key authority"));
+            } else if forge_open {
+                lines.push(format!("- {category}: unverified persistent forge runtime variable {name}; value hidden; jailed descendants can use and copy it, and ai-jail cannot prove the token lacks authority outside the selected repository"));
+            } else if forge_runtime {
+                lines.push(format!("- {category}: repository-bound forge runtime variable {name}; value hidden; jailed descendants can use and copy the launch credential, whose server-side repository scope is the security boundary"));
             } else {
                 lines.push(format!("- {category}: host environment variable {name} (value hidden); every jailed descendant can read, use, and copy the current launch value; allowed network access can carry it outside the jail"));
             }

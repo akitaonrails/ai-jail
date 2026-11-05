@@ -431,6 +431,12 @@ disable it, never enable it, and `--lockdown` disables it outright.
 
 ### Tool credentials
 
+For repository-scoped GitHub App, GitLab, Codeberg/Forgejo, and supported Gitea
+credentials, use `ai-jail forge setup ...`. These credentials are stored outside
+the checkout, bound to the forge's numeric repository ID, and injected only for
+the launch. See the [repository-scoped forge guide](docs/FORGE_AUTH.md) for the
+provider setup, exact security labels, simulated prompts, rotation, and removal.
+
 Five flags share one external tool's host credentials with the sandbox, each
 off by default: `--github` (GitHub CLI configuration and active token), `--aws`
 (`~/.aws`), `--kube` (`~/.kube`), `--gcloud` (`~/.config/gcloud`), and

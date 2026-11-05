@@ -4,6 +4,11 @@
 project. The saved policy lives under `~/.config/ai-jail/projects`, outside
 the checkout. Repository files cannot add grants.
 
+Repository-scoped GitHub, GitLab, Codeberg/Forgejo, and Gitea credentials use
+the separate [`ai-jail forge` step-by-step guide](FORGE_AUTH.md). It includes
+complete simulated prompts, provider account setup, scope/lifetime labels,
+rotation, removal, and the distinction from the legacy OPEN `--github` option.
+
 ## Message contract
 
 The following block is rendered from the same message catalog as the CLI and

@@ -160,15 +160,7 @@ fn gh_auth_token_from(
     config_dir: &Path,
     timeout: Duration,
 ) -> Result<String, ()> {
-    let mut child = Command::new(executable)
-        .args(["auth", "token", "--hostname", "github.com"])
-        .env("GH_CONFIG_DIR", config_dir)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .stdout(Stdio::piped())
+    let mut child = gh_auth_command(executable, config_dir)
         .spawn()
         .map_err(|_| ())?;
 
@@ -244,6 +236,20 @@ fn gh_auth_token_from(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn gh_auth_command(executable: &Path, config_dir: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .args(["auth", "token", "--hostname", "github.com"])
+        .env("GH_CONFIG_DIR", config_dir)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped());
+    command
 }
 
 fn stop_child(child: &mut Child) {
@@ -525,46 +531,30 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
-    #[cfg(unix)]
     #[test]
     fn host_gh_lookup_selects_only_active_github_com_token() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::ffi::OsStr;
 
-        let script = std::env::temp_dir().join(format!(
-            "ai-jail-gh-args-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
-[ "$#" = 4 ] && [ "$1" = auth ] && [ "$2" = token ] &&
-    [ "$3" = --hostname ] && [ "$4" = github.com ] &&
-    [ "$GH_CONFIG_DIR" = /tmp/gh-config ] || exit 9
-printf 'ghp_synthetic_token\n'
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            &script,
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
-
-        // Generous timeout: this test exercises argv/env selection, not the
-        // timeout path, and a 1s budget flaked under heavy nix-build
-        // parallelism (the fake gh spawn missed the deadline -> Err).
-        let result = gh_auth_token_from(
-            &script,
+        let command = gh_auth_command(
+            Path::new("synthetic-gh"),
             Path::new("/tmp/gh-config"),
-            Duration::from_secs(10),
         );
-
-        std::fs::remove_file(&script).unwrap();
-        assert_eq!(result, Ok("ghp_synthetic_token\n".to_string()));
+        assert_eq!(command.get_program(), OsStr::new("synthetic-gh"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["auth", "token", "--hostname", "github.com"].map(OsStr::new)
+        );
+        let env = command.get_envs().collect::<Vec<_>>();
+        assert!(env.contains(&(
+            OsStr::new("GH_CONFIG_DIR"),
+            Some(OsStr::new("/tmp/gh-config"))
+        )));
+        assert!(env.contains(&(
+            OsStr::new("GH_PROMPT_DISABLED"),
+            Some(OsStr::new("1"))
+        )));
+        assert!(env.contains(&(OsStr::new("GH_TOKEN"), None)));
+        assert!(env.contains(&(OsStr::new("GITHUB_TOKEN"), None)));
     }
 
     #[cfg(unix)]
