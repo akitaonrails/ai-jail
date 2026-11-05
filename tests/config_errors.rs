@@ -39,6 +39,7 @@ impl TestTree {
             .args(args)
             .current_dir(&self.project)
             .env("HOME", &self.home)
+            .env_remove("XDG_CONFIG_HOME")
             .env_remove("AI_JAIL_QUIET")
             .output()
             .expect("failed to run ai-jail")
@@ -63,6 +64,7 @@ impl TestTree {
                 .args(args)
                 .current_dir(&self.project)
                 .env("HOME", &self.home)
+                .env_remove("XDG_CONFIG_HOME")
                 .env_remove("AI_JAIL_QUIET")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -164,10 +166,20 @@ fn clean_init_replaces_a_malformed_project_config() {
     assert!(output.status.success(), "clean init failed: {stderr:?}");
     let saved = std::fs::read_to_string(path).unwrap();
     assert!(
-        saved.contains("command = ["),
-        "unexpected config: {saved:?}"
+        saved.contains("command = [\"bash\""),
+        "legacy input should remain untouched: {saved:?}"
     );
-    assert!(saved.contains("\"/bin/true\""));
+    let projects = tree.home.join(".config/ai-jail/projects");
+    let stored = std::fs::read_to_string(
+        std::fs::read_dir(projects)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    assert!(stored.contains("schema_version = 1"));
 }
 
 #[test]

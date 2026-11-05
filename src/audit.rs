@@ -342,6 +342,9 @@ pub(crate) struct LaunchRecord<'a> {
     pub browser_profile: Option<&'a str>,
     pub project_config: bool,
     pub project_trusted: bool,
+    pub project_source: &'static str,
+    pub project_grants: bool,
+    pub project_constraints: bool,
     pub global_config: bool,
     pub exit_code: i32,
     pub duration: std::time::Duration,
@@ -635,6 +638,9 @@ pub(crate) fn launch_record(record: &LaunchRecord<'_>) -> serde_json::Value {
         "config": {
             "project": record.project_config,
             "project_trusted": record.project_trusted,
+            "project_source": record.project_source,
+            "project_grants": record.project_grants,
+            "project_constraints": record.project_constraints,
             "global": record.global_config,
         },
         "exit_code": record.exit_code,
@@ -855,6 +861,9 @@ mod tests {
             browser_profile: None,
             project_config: true,
             project_trusted: false,
+            project_source: "legacy_untrusted",
+            project_grants: false,
+            project_constraints: true,
             global_config: true,
             exit_code: 0,
             duration: std::time::Duration::from_millis(1500),
@@ -878,6 +887,9 @@ mod tests {
         assert_eq!(lines[0]["network"], "filtered");
         assert_eq!(lines[0]["exit_code"], 0);
         assert_eq!(lines[0]["duration_s"], 1.5);
+        assert_eq!(lines[0]["config"]["project_source"], "legacy_untrusted");
+        assert_eq!(lines[0]["config"]["project_grants"], false);
+        assert_eq!(lines[0]["config"]["project_constraints"], true);
         assert_eq!(lines[1]["type"], "connect");
         assert_eq!(lines[1]["host"], "api.anthropic.com");
         assert_eq!(lines[1]["verdict"], "allow");

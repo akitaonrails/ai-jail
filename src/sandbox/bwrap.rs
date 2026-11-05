@@ -71,6 +71,23 @@ enum Mount {
 }
 
 impl Mount {
+    #[cfg(not(test))]
+    fn host_exposures(&self) -> Vec<(&Path, &Path)> {
+        match self {
+            Mount::RoBind { src, dest }
+            | Mount::FileRoBind { src, dest }
+            | Mount::Bind { src, dest }
+            | Mount::DevBind { src, dest } => vec![(src, dest)],
+            Mount::Overlay {
+                lower,
+                upper,
+                work,
+                dest,
+            } => vec![(lower, dest), (upper, dest), (work, dest)],
+            _ => Vec::new(),
+        }
+    }
+
     fn dest(&self) -> &Path {
         match self {
             Mount::RoBind { dest, .. }
@@ -225,6 +242,17 @@ struct MountSet {
 }
 
 impl MountSet {
+    #[cfg(not(test))]
+    fn validate_trusted_store_exclusion(&self) -> Result<(), String> {
+        crate::config_store::validate_resolved_exposures(
+            self.ordered_mounts()
+                .into_iter()
+                .flatten()
+                .flat_map(Mount::host_exposures),
+            self.mask.iter().chain(self.deny.iter()).map(Mount::dest),
+        )
+    }
+
     fn landlock_map_mounts(&self) -> impl Iterator<Item = &Mount> {
         self.devin_state
             .iter()
@@ -1984,7 +2012,7 @@ fn discover_mounts_full(
     let (overlay_outside, overlay_inside) =
         split_by_project(overlay_mounts_v, project_dir);
 
-    Ok(MountSet {
+    let mounts = MountSet {
         base: discover_base(
             sources.hosts_mount,
             sources.resolv_mount,
@@ -2068,7 +2096,10 @@ fn discover_mounts_full(
         mask: mask_mounts,
         deny: deny_mounts,
         overlay_hide: overlay_hide_v,
-    })
+    };
+    #[cfg(not(test))]
+    mounts.validate_trusted_store_exclusion()?;
+    Ok(mounts)
 }
 
 /// Split mounts into (outside, inside) the project directory. A mount
@@ -2528,7 +2559,9 @@ fn build_mask_mounts(
         } else {
             project_dir.join(p)
         };
-        if !super::path_exists(&target) {
+        let migrated_legacy_name = target == project_dir.join(".ai-jail")
+            && crate::config_store::project_has_external_policy(project_dir);
+        if !super::path_exists(&target) && !migrated_legacy_name {
             // A skipped mask is a dropped confidentiality control, so it
             // must stay visible even under --exec quiet.
             output::security_warn(&format!(

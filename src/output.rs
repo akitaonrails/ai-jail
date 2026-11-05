@@ -14,7 +14,14 @@ pub fn is_quiet() -> bool {
 }
 
 fn is_tty() -> bool {
-    io::stderr().is_terminal()
+    colors_enabled(
+        io::stderr().is_terminal(),
+        std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+    )
+}
+
+fn colors_enabled(is_terminal: bool, no_color: bool) -> bool {
+    is_terminal && !no_color
 }
 
 const RESET: &str = "\x1b[0m";
@@ -87,6 +94,33 @@ pub fn ok(msg: &str) {
         );
     } else {
         let _ = writeln!(out, "✓ {}", escape_control_bytes(msg));
+    }
+}
+
+/// Security-sensitive migration result. Stable IDs make docs and support
+/// transcripts robust while the explanatory copy evolves.
+pub fn migration_notice(id: &str, msg: &str, warning: bool) {
+    let mut out = io::stderr().lock();
+    let rendered = render_migration_notice(id, msg, warning, is_tty());
+    let _ = writeln!(out, "{rendered}");
+}
+
+fn render_migration_notice(
+    id: &str,
+    msg: &str,
+    warning: bool,
+    ansi: bool,
+) -> String {
+    let id = escape_control_bytes(id);
+    let msg = escape_control_bytes(msg);
+    if warning && ansi {
+        format!("{BOLD}{YELLOW}⚠ {id}{RESET} {msg}")
+    } else if warning {
+        format!("⚠ {id} {msg}")
+    } else if ansi {
+        format!("{BOLD}{CYAN}✓ {id}{RESET} {msg}")
+    } else {
+        format!("✓ {id} {msg}")
     }
 }
 
@@ -210,6 +244,29 @@ mod tests {
         assert!(warning_should_emit(false));
         assert!(!warning_should_emit(true));
         set_quiet(false);
+    }
+
+    #[test]
+    fn no_color_disables_ansi_on_terminals() {
+        assert!(colors_enabled(true, false));
+        assert!(!colors_enabled(true, true));
+        assert!(!colors_enabled(false, false));
+    }
+
+    #[test]
+    fn migration_warning_has_exact_plain_and_ansi_rendering() {
+        assert_eq!(
+            render_migration_notice("AJ-MIG-003", "reapprove", true, false),
+            "⚠ AJ-MIG-003 reapprove"
+        );
+        assert_eq!(
+            render_migration_notice("AJ-MIG-003", "reapprove", true, true),
+            "\x1b[1m\x1b[33m⚠ AJ-MIG-003\x1b[0m reapprove"
+        );
+        assert!(
+            !render_migration_notice("AJ-MIG-003", "x", true, false)
+                .contains('✓')
+        );
     }
 
     #[test]

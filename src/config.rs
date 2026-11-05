@@ -143,7 +143,7 @@ fn transform_map_specs(
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
@@ -385,12 +385,12 @@ pub struct Config {
     pub audit_log: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct GlobalConfig {
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct GlobalConfig {
     #[serde(flatten)]
-    base: Config,
+    pub(crate) base: Config,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    commands: BTreeMap<String, Config>,
+    pub(crate) commands: BTreeMap<String, Config>,
 }
 
 /// Effective network posture of a launch (docs/connect-proxy-plan.md).
@@ -936,7 +936,9 @@ pub fn parse_toml(contents: &str) -> Result<Config, String> {
     toml::from_str(contents).map_err(|e| e.to_string())
 }
 
-fn parse_global_toml(contents: &str) -> Result<GlobalConfig, String> {
+pub(crate) fn parse_global_toml(
+    contents: &str,
+) -> Result<GlobalConfig, String> {
     toml::from_str(contents).map_err(|e| e.to_string())
 }
 
@@ -1076,7 +1078,7 @@ fn load_global_for_command_from_path(
     Ok(global_config_for_command(global, cli, project))
 }
 
-fn global_config_for_command(
+pub(crate) fn global_config_for_command(
     global: GlobalConfig,
     cli: &CliArgs,
     _project: &Config,
@@ -1667,6 +1669,7 @@ pub fn merge_with_global(global: Config, local: Config) -> Config {
 /// Save project-level config to `.ai-jail` in the current dir.
 /// User-level fields (status bar + resize redraw key) are excluded —
 /// they belong in the global `$HOME/.ai-jail`.
+#[allow(dead_code)]
 pub fn save(config: &Config) {
     save_project(config, true);
 }
@@ -1682,6 +1685,7 @@ pub fn save(config: &Config) {
 /// so a capability passed once on the CLI is not saved into a file that
 /// then ignores it, with a warning, on every later run. A project listed
 /// in the global `trust_project_config` is saved as is.
+#[allow(dead_code)]
 pub fn save_auto(config: &Config, project_trusted: bool, project_dir: &Path) {
     if project_trusted {
         save_project(config, false);
@@ -1694,10 +1698,35 @@ pub fn save_auto(config: &Config, project_trusted: bool, project_dir: &Path) {
 /// layer of [`merge_with_global_report`] over a default baseline. Using the
 /// merge itself keeps auto-save and loading from drifting apart when a
 /// capability is added.
+pub(crate) fn monotonic_project_constraints(
+    config: &Config,
+    project_dir: &Path,
+) -> Config {
+    let mut projected = merge_with_global_report(
+        Config::default(),
+        config.clone(),
+        project_dir,
+    )
+    .0;
+    // Command selection is execution policy rather than a restriction. It is
+    // deliberately not imported from repository-controlled legacy files.
+    projected.command.clear();
+    projected.no_save_config = None;
+    projected.no_hide_config = None;
+    projected.no_status_bar = None;
+    projected.status_bar_style = None;
+    projected.resize_redraw_key = None;
+    projected.update_check = None;
+    projected.audit_log = None;
+    projected
+}
+
+#[allow(dead_code)]
 fn untrusted_project_view(config: &Config, project_dir: &Path) -> Config {
     merge_with_global_report(Config::default(), config.clone(), project_dir).0
 }
 
+#[allow(dead_code)]
 fn save_project(config: &Config, write_when_empty: bool) {
     let mut local = config.clone();
     // Strip user-level fields from project config
@@ -1720,6 +1749,7 @@ fn save_project(config: &Config, write_when_empty: bool) {
 
 /// Whether a config serializes to no settings at all — only defaults, which
 /// are skipped on write, leaving a file of nothing but the header comment.
+#[allow(dead_code)]
 fn config_body_is_empty(config: &Config) -> bool {
     toml::to_string_pretty(config)
         .map(|body| body.trim().is_empty())
@@ -1728,6 +1758,7 @@ fn config_body_is_empty(config: &Config) -> bool {
 
 /// Persist user-level preferences (status bar) to `$HOME/.ai-jail`.
 /// Loads the existing global config first so other fields are kept.
+#[allow(dead_code)]
 pub fn save_global(config: &Config) -> Result<(), String> {
     if config.no_status_bar.is_none() && config.status_bar_style.is_none() {
         return Ok(());
@@ -1738,6 +1769,7 @@ pub fn save_global(config: &Config) -> Result<(), String> {
     save_global_to_path(&path, config)
 }
 
+#[allow(dead_code)]
 fn save_global_to_path(path: &Path, config: &Config) -> Result<(), String> {
     let mut global = load_global_from_path(path)?;
     if config.no_status_bar.is_some() {
@@ -1752,11 +1784,13 @@ fn save_global_to_path(path: &Path, config: &Config) -> Result<(), String> {
 
 /// Comment block written at the top of every saved `.ai-jail` file
 /// (project and global).
+#[allow(dead_code)]
 const CONFIG_FILE_HEADER: &str = "# ai-jail sandbox configuration\n\
                   # https://github.com/akitaonrails/ai-jail\n\
                   # Edit freely. Regenerate with: \
                   ai-jail --clean --init\n\n";
 
+#[allow(dead_code)]
 fn save_global_doc_to_path(path: &Path, global: &GlobalConfig) {
     let header = CONFIG_FILE_HEADER;
     // A trusted symlink is followed for writes too, so a stow-managed
@@ -1805,6 +1839,7 @@ fn save_global_doc_to_path(path: &Path, global: &GlobalConfig) {
     }
 }
 
+#[allow(dead_code)]
 fn save_to_path(path: &Path, config: &Config) {
     let header = CONFIG_FILE_HEADER;
     if let Err(e) = ensure_regular_target_or_absent(path) {
@@ -1833,6 +1868,7 @@ fn save_to_path(path: &Path, config: &Config) {
     }
 }
 
+#[allow(dead_code)]
 fn collapse_tilde_config(config: &mut Config) {
     transform_map_specs(&mut config.rw_maps, |path| collapse_tilde(&path));
     transform_map_specs(&mut config.ro_maps, |path| collapse_tilde(&path));
@@ -1846,10 +1882,12 @@ fn collapse_tilde_config(config: &mut Config) {
     }
 }
 
+#[allow(dead_code)]
 fn ensure_regular_target_or_absent(path: &Path) -> Result<(), String> {
     crate::fsutil::ensure_regular_file_or_absent(path)
 }
 
+#[allow(dead_code)]
 fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     crate::fsutil::write_atomic(path, contents, false, "ai-jail")
 }
@@ -1981,6 +2019,7 @@ pub fn absolutize_user_paths(config: &mut Config, cwd: &Path) {
 /// `~/...` notation across runs and stays portable across machines.
 /// Returns the path unchanged if `$HOME` is unset or the path is not
 /// a `$HOME` descendant.
+#[allow(dead_code)]
 pub fn collapse_tilde(path: &Path) -> PathBuf {
     let Ok(home) = std::env::var("HOME") else {
         return path.to_path_buf();
@@ -2004,6 +2043,7 @@ pub fn collapse_tilde(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+#[allow(dead_code)]
 fn collapse_tilde_vec(paths: &mut [PathBuf]) {
     for p in paths.iter_mut() {
         *p = collapse_tilde(p);
@@ -2241,8 +2281,11 @@ pub fn project_config_for_auto_save(
     to_save
 }
 
-pub fn display_status(config: &Config) {
-    let path = config_path();
+pub fn display_status(config: &Config, stored_path: Option<&Path>) {
+    let Some(path) = stored_path.map(Path::to_path_buf) else {
+        output::info("No contributing project policy.");
+        return;
+    };
     if !path.exists() {
         output::info("No .ai-jail config file found in current directory.");
         return;

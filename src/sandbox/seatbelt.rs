@@ -430,6 +430,15 @@ fn generate_sbpl_profile_for_tty(
     deny_paths.extend(explicit_deny_paths.clone());
     let writable_paths = macos_writable_paths(project_dir, config, lockdown);
     let atomic_paths = macos_atomic_write_paths(config);
+    let resolved_read_paths = macos_read_paths(config, project_dir);
+    crate::config_store::validate_resolved_exposures(
+        writable_paths
+            .iter()
+            .chain(atomic_paths.iter())
+            .chain(resolved_read_paths.iter())
+            .map(|path| (path.as_path(), path.as_path())),
+        deny_paths.iter().map(PathBuf::as_path),
+    )?;
     // Read-only intents need explicit write denies: SBPL is
     // last-match-wins, so an `--map` or `--overlay-map` path inside the
     // project would otherwise stay writable through the project-subtree
@@ -2804,6 +2813,41 @@ mod tests {
                 .contains(&format!("{}/.ai-jail", project.display()))
         );
         let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn mandatory_store_deny_is_emitted_after_ancestor_allows() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-seatbelt-store-order-{}",
+            std::process::id()
+        ));
+        let home = root.join("home");
+        let xdg = home.join(".config");
+        let store = xdg.join("ai-jail");
+        let project = root.join("project");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &xdg);
+        let config = Config {
+            rw_maps: vec![home.clone()],
+            mask_exceptions: vec![store.clone()],
+            private_home: Some(false),
+            ..Config::default()
+        };
+        let profile = generate_sbpl_profile(&config, &project);
+        let allow = profile
+            .find(&format!("(subpath \"{}\")", home.display()))
+            .expect("ancestor allow");
+        let deny = profile
+            .rfind(&format!("(subpath \"{}\")", store.display()))
+            .expect("mandatory store deny");
+        assert!(
+            deny > allow,
+            "mandatory trusted-store deny must win by appearing later"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

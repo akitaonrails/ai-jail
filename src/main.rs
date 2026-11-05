@@ -8,6 +8,7 @@ mod cli;
 mod codex_ps;
 mod command;
 mod config;
+mod config_store;
 mod fsutil;
 mod github_auth;
 mod output;
@@ -779,7 +780,52 @@ fn internal_mode_inherits_quiet(
     inherited_quiet && (landlock_exec || proxy_bridge)
 }
 
-fn run() -> Result<i32, String> {
+#[derive(Clone, Copy)]
+struct PolicyProvenance {
+    source: &'static str,
+    grants: bool,
+    constraints: bool,
+    trusted: bool,
+}
+
+fn policy_provenance(
+    external_present: bool,
+    external_grants: bool,
+    external_constraints: bool,
+    legacy_present: bool,
+    legacy_trusted: bool,
+) -> PolicyProvenance {
+    if external_present {
+        PolicyProvenance {
+            source: "external_store",
+            grants: external_grants,
+            constraints: external_constraints,
+            trusted: external_grants,
+        }
+    } else if legacy_present {
+        PolicyProvenance {
+            source: if legacy_trusted {
+                "legacy_trusted"
+            } else {
+                "legacy_untrusted"
+            },
+            grants: legacy_trusted,
+            constraints: !legacy_trusted,
+            trusted: legacy_trusted,
+        }
+    } else {
+        PolicyProvenance {
+            source: "none",
+            grants: false,
+            constraints: false,
+            trusted: false,
+        }
+    }
+}
+
+fn run(
+    migration_notices: &mut Vec<config_store::MigrationNotice>,
+) -> Result<i32, String> {
     let cli = cli::parse()?;
     validate_write_flags(&cli)?;
 
@@ -842,33 +888,73 @@ fn run() -> Result<i32, String> {
         return run_audit_verify(&cli);
     }
 
-    // Load local (./.ai-jail), then command-aware global ($HOME/.ai-jail), merge
-    let project_config = if cli.clean {
+    let invocation_cwd = std::env::current_dir()
+        .map_err(|e| format!("Cannot determine current directory: {e}"))?;
+    let store = config_store::StorePaths::discover(&invocation_cwd)?;
+    let migration_writes_allowed =
+        !cli.dry_run && cli.save_config != Some(false) && !cli.status;
+    if migration_writes_allowed && store.available {
+        config_store::migrate(&store, !cli.clean, migration_notices)?;
+    }
+
+    // New external policy has explicit provenance. Compatibility reads retain
+    // legacy behavior in read-only modes until a writable launch migrates it.
+    let stored_project = if cli.clean {
+        config_store::LoadedProject::default()
+    } else {
+        config_store::load_project(&store)?
+    };
+    let legacy_project = if cli.clean || stored_project.present {
         config::Config::default()
     } else {
         config::load()?
     };
-    let global = config::load_global_for_command(&cli, &project_config)?;
-    let baseline = config::merge(&cli, global);
-    let invocation_cwd = std::env::current_dir()
-        .map_err(|e| format!("Cannot determine current directory: {e}"))?;
-    // A project `.ai-jail` is untrusted monotonic policy unless the trusted
-    // global config lists this directory under `trust_project_config`, in
-    // which case it is merged with the same semantics as a global
-    // `[commands.<name>]` table and may enable capabilities.
-    let project_trusted = config::project_config_is_trusted(
-        &baseline.trust_project_config,
-        &invocation_cwd,
+    let using_external_project = stored_project.present;
+    let external_has_grants =
+        stored_project.grants != config::Config::default();
+    let external_has_constraints =
+        stored_project.constraints != config::Config::default();
+    let global_command_selector = if using_external_project {
+        &stored_project.grants
+    } else {
+        &legacy_project
+    };
+    let global = if store.global.exists() {
+        config::global_config_for_command(
+            config_store::load_global(&store)?,
+            &cli,
+            global_command_selector,
+        )
+    } else {
+        // Read-only compatibility path. Writable modes migrated this above.
+        config::load_global_for_command(&cli, global_command_selector)?
+    };
+    let trusted = config::merge_trusted_project(global, stored_project.grants);
+    let project_config = if using_external_project {
+        stored_project.constraints
+    } else {
+        legacy_project
+    };
+    let legacy_project_trusted = !using_external_project
+        && config::project_config_is_trusted(
+            &trusted.trust_project_config,
+            &invocation_cwd,
+        );
+    let provenance = policy_provenance(
+        using_external_project,
+        external_has_grants,
+        external_has_constraints,
+        !cli.clean
+            && !using_external_project
+            && invocation_cwd.join(".ai-jail").is_file(),
+        legacy_project_trusted,
     );
-    let (mut config, security_warnings) = if project_trusted {
-        if cli.verbose {
-            output::verbose(
-                "Project .ai-jail: trusted (listed in global trust_project_config)",
-            );
-        }
+    let project_trusted = provenance.trusted;
+    let baseline = config::merge(&cli, trusted);
+    let (mut config, security_warnings) = if legacy_project_trusted {
         (
             config::merge_trusted_project(baseline, project_config.clone()),
-            Vec::<String>::new(),
+            Vec::new(),
         )
     } else {
         config::merge_with_global_report(
@@ -877,6 +963,10 @@ fn run() -> Result<i32, String> {
             &invocation_cwd,
         )
     };
+    // A project `.ai-jail` is untrusted monotonic policy unless the trusted
+    // global config lists this directory under `trust_project_config`, in
+    // which case it is merged with the same semantics as a global
+    // `[commands.<name>]` table and may enable capabilities.
     // Whether the effective command is trusted for the browser-profile
     // lockdown decision below. It is adopted from the project file only when
     // the CLI gave none and the project supplied one; that command is trusted
@@ -884,7 +974,7 @@ fn run() -> Result<i32, String> {
     // downgrade).
     let command_from_untrusted_project = cli.command.is_empty()
         && !project_config.command.is_empty()
-        && !project_trusted;
+        && !legacy_project_trusted;
     // The trusted project merge may have replaced the baseline command.
     // Command precedence remains CLI > project > global in both trust modes.
     if !cli.command.is_empty() {
@@ -921,13 +1011,37 @@ fn run() -> Result<i32, String> {
 
     // Handle status command
     if cli.status {
-        config::display_status(&config);
+        output::status_header("Project policy source", provenance.source);
+        output::status_header(
+            "Project grants",
+            if provenance.grants { "yes" } else { "no" },
+        );
+        output::status_header(
+            "Project constraints",
+            if provenance.constraints { "yes" } else { "no" },
+        );
+        let legacy_status_path = invocation_cwd.join(".ai-jail");
+        let contributing_path = match provenance.source {
+            "external_store" => Some(store.project.as_path()),
+            "legacy_trusted" | "legacy_untrusted" => {
+                Some(legacy_status_path.as_path())
+            }
+            _ => None,
+        };
+        config::display_status(&config, contributing_path);
         return Ok(0);
     }
 
-    // Persist user-level preferences (status bar) to $HOME/.ai-jail
-    if should_save_global_preferences(&cli) {
-        config::save_global(&config)?;
+    // Persist user-level preferences in the external XDG config store.
+    if should_save_global_preferences(&cli) && store.available {
+        let mut global = config_store::load_global(&store)?;
+        if config.no_status_bar.is_some() {
+            global.base.no_status_bar = config.no_status_bar;
+        }
+        if config.status_bar_style.is_some() {
+            global.base.status_bar_style = config.status_bar_style.clone();
+        }
+        config_store::save_global_document(&store, &global)?;
     }
 
     // Handle --init: save config and exit.
@@ -939,12 +1053,15 @@ fn run() -> Result<i32, String> {
     // are also inert: a project .ai-jail cannot enable capabilities anyway
     // (issue #110).
     if cli.init {
-        config::save(&config::project_config_for_init(
-            &cli,
-            project_config.clone(),
-            &invocation_cwd,
-        ));
-        output::info("Config saved to .ai-jail");
+        config_store::save_project_constraints(
+            &store,
+            config::project_config_for_init(
+                &cli,
+                project_config.clone(),
+                &invocation_cwd,
+            ),
+        )?;
+        output::info(&format!("Config saved to {}", store.project.display()));
         return Ok(0);
     }
 
@@ -1265,13 +1382,13 @@ fn run() -> Result<i32, String> {
     // Save config in normal mode. In lockdown mode avoid host writes unless user
     // explicitly requested persistence via --init.
     //
-    if should_auto_save_project_config(&cli, &config) {
+    if store.available && should_auto_save_project_config(&cli, &config) {
         let to_save = config::project_config_for_auto_save(
             &cli,
             project_config,
             &invocation_cwd,
         );
-        config::save_auto(&to_save, project_trusted, &invocation_cwd);
+        config_store::save_project_constraints(&store, to_save)?;
     }
 
     // Handle dry run
@@ -1287,6 +1404,14 @@ fn run() -> Result<i32, String> {
         output::dry_run_line(&formatted);
         return Ok(0);
     }
+
+    // A real host inode gives bwrap a race-resistant mountpoint for the
+    // mandatory absent-file mask. Identity-checked RAII removes only the
+    // placeholder we created, never a replacement made concurrently. A hard
+    // crash may leave an empty 0600 file; it grants no authority and the next
+    // migration/launch treats it as recoverable masking debris.
+    let _legacy_mask_placeholder =
+        config_store::LegacyMaskPlaceholder::prepare(&store)?;
 
     // macOS has no private /tmp mount. Hard browser profiles therefore live
     // inside the launch's dedicated session scratch directory and must be
@@ -1490,11 +1615,16 @@ fn run() -> Result<i32, String> {
             kvm: config.kvm_enabled(),
             browser_profile: config.browser_profile.as_deref(),
             project_config: !cli.clean
-                && invocation_cwd.join(".ai-jail").is_file(),
+                && (store.project.is_file()
+                    || invocation_cwd.join(".ai-jail").is_file()),
             project_trusted,
-            global_config: audit_home
-                .as_ref()
-                .is_some_and(|home| home.join(".ai-jail").exists()),
+            project_source: provenance.source,
+            project_grants: provenance.grants,
+            project_constraints: provenance.constraints,
+            global_config: store.global.exists()
+                || audit_home
+                    .as_ref()
+                    .is_some_and(|home| home.join(".ai-jail").exists()),
             exit_code,
             duration: launch_start.elapsed(),
         }));
@@ -1516,7 +1646,12 @@ fn main() {
         std::process::exit(codex_ps::run());
     }
 
-    match run() {
+    let mut migration_notices = Vec::new();
+    let result = run(&mut migration_notices);
+    for notice in &migration_notices {
+        output::migration_notice(notice.id, &notice.text, notice.warning);
+    }
+    match result {
         Ok(code) => std::process::exit(code),
         Err(msg) => {
             output::error(&msg);
@@ -1532,15 +1667,58 @@ mod tests {
         command_needs_direct_tty, default_agent_api_egress_applies,
         default_registry_egress_applies, default_resize_redraw_key,
         exec_requires_terminal_passthrough, internal_mode_inherits_quiet,
-        prune_missing_path_entries, pty_proxy_active, resolve_browser_profile,
-        running_inside_multiplexer, should_auto_save_project_config,
-        should_check_update, should_save_global_preferences,
+        policy_provenance, prune_missing_path_entries, pty_proxy_active,
+        resolve_browser_profile, running_inside_multiplexer,
+        should_auto_save_project_config, should_check_update,
+        should_save_global_preferences,
         untrusted_project_command_carries_credentials, validate_network_flags,
         validate_write_flags,
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
     use crate::test_utils::{ENV_LOCK, EnvVarGuard};
+
+    #[test]
+    fn policy_provenance_matrix_is_consistent() {
+        let cases = [
+            (
+                (false, false, false, false, false),
+                ("none", false, false, false),
+            ),
+            (
+                (true, false, true, false, false),
+                ("external_store", false, true, false),
+            ),
+            (
+                (true, true, false, false, false),
+                ("external_store", true, false, true),
+            ),
+            (
+                (true, true, true, false, false),
+                ("external_store", true, true, true),
+            ),
+            (
+                (false, false, false, true, false),
+                ("legacy_untrusted", false, true, false),
+            ),
+            (
+                (false, false, false, true, true),
+                ("legacy_trusted", true, false, true),
+            ),
+        ];
+        for ((ep, eg, ec, lp, lt), expected) in cases {
+            let actual = policy_provenance(ep, eg, ec, lp, lt);
+            assert_eq!(
+                (
+                    actual.source,
+                    actual.grants,
+                    actual.constraints,
+                    actual.trusted
+                ),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn internal_modes_inherit_quiet_output() {

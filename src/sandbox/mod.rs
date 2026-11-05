@@ -467,11 +467,18 @@ pub(crate) fn effective_mask_patterns(
         project_dir,
     );
     let local_config = project_dir.join(".ai-jail");
-    if config.hide_config_enabled()
-        && path_exists(&local_config)
+    if (config.hide_config_enabled()
+        || crate::config_store::project_has_external_policy(project_dir))
         && !masks.contains(&local_config)
     {
         masks.push(local_config);
+    }
+    // Trusted policy must never enter a jail, including with
+    // --no-hide-config or a user mask exception.
+    if let Some(store) = crate::config_store::trusted_store_root()
+        && !masks.contains(&store)
+    {
+        masks.push(store);
     }
     masks
 }

@@ -12,7 +12,7 @@ COMMANDS (positional):
     gemini, claude, codex, opencode, crush, soulforge, grok, pi, jcode,
     kimi, kiro-cli, devin, bash
                                             Known AI tool presets
-    status                                 Show current .ai-jail config
+    status                                 Show current effective config
     Any other string                       Passed through as the command
 
 OPTIONS:
@@ -129,7 +129,7 @@ OPTIONS:
     --browser[=PROFILE]            Use browser isolation profile (hard | soft; default hard)
     --no-browser                   Disable browser auto-detection/profile
     --save-config / --no-save-config
-                                   Enable/disable automatic .ai-jail writes (default: on)
+                                   Enable/disable automatic per-project config writes (default: on)
     --hide-config / --no-hide-config
                                    Mask the project .ai-jail file from the agent (default: on)
     -s, --status-bar[=STYLE]       Set status line theme (pastel | dark | light; default pastel)
@@ -160,7 +160,7 @@ OPTIONS:
     --claude-dir <PATH>            Use PATH as Claude config dir (sets CLAUDE_CONFIG_DIR)
     --clean                        Ignore project .ai-jail config, start fresh
     --dry-run                      Print the sandbox command without executing
-    --init                         Create/update .ai-jail config and exit
+    --init                         Create/update external per-project config and exit
     --bootstrap                    Generate smart permission configs for AI tools
     -v, --verbose                  Show detailed mount info
     -h, --help                     Show help

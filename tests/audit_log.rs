@@ -162,6 +162,7 @@ fn missing_home_disables_audit_without_changing_child_exit() {
         ])
         .current_dir(&project)
         .env_remove("HOME")
+        .env_remove("XDG_CONFIG_HOME")
         .env_remove("AI_JAIL_QUIET")
         .output()
         .unwrap();
