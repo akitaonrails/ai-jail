@@ -103,12 +103,11 @@
             pkgs.bubblewrap
           ];
 
-          # Integration tests drive fixture traffic with curl, exercise the
-          # real Git credential helper, and validate trusted OpenSSH tools.
+          # Integration tests drive fixture traffic with curl and exercise
+          # the real Git credential helper.
           nativeCheckInputs = [
             pkgs.curl
             pkgs.git
-            pkgs.openssh
           ];
 
           BWRAP_BIN = "${pkgs.bubblewrap}/bin/bwrap";

@@ -1906,6 +1906,10 @@ fn sync_file(file: &File) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn canonical_temp_dir() -> PathBuf {
+        fs::canonicalize(std::env::temp_dir()).unwrap()
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct ExpectedStaticPolicy {
         field: &'static str,
@@ -2489,7 +2493,7 @@ mod tests {
 
     #[test]
     fn overlap_rejects_canonical_and_symlink_aliases() {
-        let root = std::env::temp_dir()
+        let root = canonical_temp_dir()
             .join(format!("ai-jail-overlap-{}", std::process::id()));
         let store = root.join("store");
         let alias = root.join("alias");
@@ -2520,7 +2524,7 @@ mod tests {
 
     #[test]
     fn project_document_round_trip_marks_onboarding_complete() {
-        let base = std::env::temp_dir()
+        let base = canonical_temp_dir()
             .join(format!("ai-jail-onboarding-store-{}", std::process::id()));
         let project = base.join("project");
         let root = base.join("config/ai-jail");
@@ -2568,7 +2572,7 @@ mod tests {
 
     #[test]
     fn saving_onboarding_grants_preserves_existing_constraints() {
-        let base = std::env::temp_dir().join(format!(
+        let base = canonical_temp_dir().join(format!(
             "ai-jail-save-grants-preserves-constraints-{}",
             std::process::id()
         ));
@@ -2634,7 +2638,7 @@ mod tests {
     fn directory_grant_identity_refuses_symlink_swap_and_disappearance() {
         use std::os::unix::fs::symlink;
 
-        let base = std::env::temp_dir().join(format!(
+        let base = canonical_temp_dir().join(format!(
             "ai-jail-onboarding-identity-{}",
             std::process::id()
         ));
@@ -2715,7 +2719,7 @@ mod tests {
 
     #[test]
     fn save_refuses_directory_swapped_after_preview_and_preserves_policy() {
-        let base = std::env::temp_dir().join(format!(
+        let base = canonical_temp_dir().join(format!(
             "ai-jail-save-directory-race-{}",
             std::process::id()
         ));
@@ -2769,9 +2773,10 @@ mod tests {
 
     #[test]
     fn directory_grant_identity_rejects_colon_and_non_utf8_paths() {
+        #[cfg(target_os = "linux")]
         use std::os::unix::ffi::OsStringExt;
 
-        let base = std::env::temp_dir()
+        let base = canonical_temp_dir()
             .join(format!("ai-jail-onboarding-path-{}", std::process::id()));
         let colon = base.join("bad:name");
         fs::create_dir_all(&colon).unwrap();
@@ -2787,17 +2792,20 @@ mod tests {
             error.contains("cannot change") || error.contains("cannot contain")
         );
 
-        let invalid = base.join(std::ffi::OsString::from_vec(vec![0xff]));
-        fs::create_dir_all(&invalid).unwrap();
-        let error = capture_directory_grants(
-            &Config {
-                ro_maps: vec![invalid],
-                ..Config::default()
-            },
-            &base.join("project"),
-        )
-        .unwrap_err();
-        assert!(error.contains("UTF-8"));
+        #[cfg(target_os = "linux")]
+        {
+            let invalid = base.join(std::ffi::OsString::from_vec(vec![0xff]));
+            fs::create_dir_all(&invalid).unwrap();
+            let error = capture_directory_grants(
+                &Config {
+                    ro_maps: vec![invalid],
+                    ..Config::default()
+                },
+                &base.join("project"),
+            )
+            .unwrap_err();
+            assert!(error.contains("UTF-8"));
+        }
         let _ = fs::remove_dir_all(base);
     }
 

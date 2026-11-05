@@ -1816,14 +1816,17 @@ mod tests {
     use super::*;
 
     fn test_store(name: &str) -> (PathBuf, StorePaths) {
-        let base = std::env::temp_dir().join(format!(
-            "ai-jail-forge-{name}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
+        let base =
+            fs::canonicalize(std::env::temp_dir())
                 .unwrap()
-                .as_nanos()
-        ));
+                .join(format!(
+                    "ai-jail-forge-{name}-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
         let project = base.join("project");
         fs::create_dir_all(&project).unwrap();
         fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();

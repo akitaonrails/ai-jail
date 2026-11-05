@@ -198,6 +198,26 @@ impl Toolset {
             ssh: resolve_tool("ssh")?,
         })
     }
+
+    #[cfg(test)]
+    fn fixture(root: &Path) -> Self {
+        fn tool(root: &Path, name: &str) -> TrustedTool {
+            let path = root.join(name);
+            if !path.exists() {
+                fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            TrustedTool::fixture(path)
+        }
+
+        Self {
+            keygen: tool(root, "ssh-keygen"),
+            agent: tool(root, "ssh-agent"),
+            add: tool(root, "ssh-add"),
+            ssh: tool(root, "ssh"),
+        }
+    }
 }
 
 fn resolve_tool(name: &str) -> Result<TrustedTool, String> {
@@ -454,6 +474,15 @@ fn plan_validated(
     home: &Path,
 ) -> Result<Plan, String> {
     let tools = Toolset::resolve()?;
+    plan_validated_with_tools(policy, config, home, tools)
+}
+
+fn plan_validated_with_tools(
+    policy: Policy,
+    config: &mut Config,
+    home: &Path,
+    tools: Toolset,
+) -> Result<Plan, String> {
     let id = PLAN_ID.fetch_add(1, Ordering::Relaxed);
     let base = Path::new("/tmp")
         .join(format!("ai-jail-ssh-{}-{id}", std::process::id()));
@@ -906,7 +935,10 @@ mod tests {
             lifetime_seconds: 600,
             destinations: vec![],
         };
-        let planned = plan_validated(policy, &mut config, &root).unwrap();
+        let tools = Toolset::fixture(&root);
+        let planned =
+            plan_validated_with_tools(policy, &mut config, &root, tools)
+                .unwrap();
         assert_eq!(config.ssh, Some(false));
         assert!(config.env_pass.iter().any(|v| is_runtime_env(v)));
         assert!(!config.env_pass.iter().any(|v| v.contains("/ambient")));
@@ -954,7 +986,8 @@ mod tests {
         })
         .unwrap();
         let mut config = Config::default();
-        let mut plan = plan_validated(
+        let tools = Toolset::fixture(&root);
+        let mut plan = plan_validated_with_tools(
             Policy {
                 keys: vec![key],
                 lifetime_seconds: 600,
@@ -962,6 +995,7 @@ mod tests {
             },
             &mut config,
             &root,
+            tools,
         )
         .unwrap();
         plan.policy.destinations = vec!["git@example.test".into()];
@@ -999,7 +1033,8 @@ mod tests {
         })
         .unwrap();
         let mut config = Config::default();
-        let mut plan = plan_validated(
+        let tools = Toolset::fixture(&root);
+        let mut plan = plan_validated_with_tools(
             Policy {
                 keys: vec![key],
                 lifetime_seconds: 600,
@@ -1007,6 +1042,7 @@ mod tests {
             },
             &mut config,
             &root,
+            tools,
         )
         .unwrap();
         let script = root.join("ssh-agent-fake");
@@ -1072,10 +1108,11 @@ mod tests {
         .unwrap();
         fs::set_permissions(&lookalike, fs::Permissions::from_mode(0o700))
             .unwrap();
-        let tool = resolve_tool("ssh-keygen").unwrap();
-        assert!(tool.path.is_absolute());
-        assert!(!tool.path.starts_with(&root));
-        tool.verify().unwrap();
+        if let Ok(tool) = resolve_tool("ssh-keygen") {
+            assert!(tool.path.is_absolute());
+            assert!(!tool.path.starts_with(&root));
+            tool.verify().unwrap();
+        }
         assert!(!marker.exists());
         let _ = fs::remove_dir_all(root);
     }

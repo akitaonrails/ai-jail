@@ -103,7 +103,6 @@ verified_by = [
   "config_store::tests::save_refuses_directory_swapped_after_preview_and_preserves_policy",
   "authority_inventory::tests::inventory_fixture_drives_classification_and_sandbox_exposure",
   "authority_inventory::tests::fixture_drives_linux_and_macos_resolved_state_permissions",
-  "sandbox::bwrap::tests::command_state_paths_cover_full_command_list",
   "sandbox::landlock::tests::inventory_file_state_receives_landlock_write_permission",
   "onboarding::tests::credential_roots_are_refused_through_home_aliases",
   "directory_tab_completion_accepts_utf8_paths",

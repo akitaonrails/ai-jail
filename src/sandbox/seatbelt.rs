@@ -2906,10 +2906,13 @@ mod tests {
     #[test]
     fn mandatory_store_deny_is_emitted_after_ancestor_allows() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let root = std::env::temp_dir().join(format!(
-            "ai-jail-seatbelt-store-order-{}",
-            std::process::id()
-        ));
+        let root =
+            std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!(
+                    "ai-jail-seatbelt-store-order-{}",
+                    std::process::id()
+                ));
         let home = root.join("home");
         let xdg = home.join(".config");
         let store = xdg.join("ai-jail");
