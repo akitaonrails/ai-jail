@@ -239,6 +239,7 @@ pub(crate) fn resolve_harness_state(
         .collect()
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn state_hide_scope(authority: &AuthorityPath) -> &str {
     match authority.exposure {
         ExposureMode::HarnessState {

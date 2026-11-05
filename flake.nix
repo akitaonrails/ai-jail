@@ -103,9 +103,13 @@
             pkgs.bubblewrap
           ];
 
-          # curl is required by tests/filtered_egress.rs to drive fixture
-          # traffic through the proxy bridge during checkPhase.
-          nativeCheckInputs = [ pkgs.curl ];
+          # Integration tests drive fixture traffic with curl, exercise the
+          # real Git credential helper, and validate trusted OpenSSH tools.
+          nativeCheckInputs = [
+            pkgs.curl
+            pkgs.git
+            pkgs.openssh
+          ];
 
           BWRAP_BIN = "${pkgs.bubblewrap}/bin/bwrap";
 
