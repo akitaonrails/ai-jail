@@ -19,7 +19,7 @@ optdepends=(
 options=('!debug' '!lto')
 conflicts=('ai-jail-bin')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('fef1e60b75f24f6f39560b72a50b075af62ccad2005da27bc73cb4aa9a723c7a')
+sha256sums=('2430d712db6ba1f5901c37f24bf2e11048b67abf6ef4c9d8c3816021e6805f91')
 
 prepare() {
     cd "$pkgname-$pkgver"
