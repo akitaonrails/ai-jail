@@ -109,7 +109,7 @@ pub fn build(
         None
     };
     let profile =
-        build_profile(config, project_dir, verbose, sandbox_tty, proxy_port);
+        build_profile(config, project_dir, verbose, sandbox_tty, proxy_port)?;
     let launch = super::build_launch_command(config);
 
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
@@ -278,9 +278,10 @@ pub fn dry_run(
     project_dir: &Path,
     verbose: bool,
     proxy_port: Option<u16>,
-) -> String {
+) -> Result<String, String> {
     // No PTY exists for a dry run, so no terminal ioctl rule is emitted.
-    let profile = build_profile(config, project_dir, verbose, None, proxy_port);
+    let profile =
+        build_profile(config, project_dir, verbose, None, proxy_port)?;
     let launch = super::build_launch_command(config);
 
     let mut command_line = String::from("sandbox-exec -p '<profile>' -- ");
@@ -290,7 +291,7 @@ pub fn dry_run(
         command_line.push_str(&super::quote_shell_arg(arg));
     }
 
-    format_dry_run_macos(&command_line, &profile)
+    Ok(format_dry_run_macos(&command_line, &profile))
 }
 
 fn build_profile(
@@ -299,13 +300,13 @@ fn build_profile(
     verbose: bool,
     sandbox_tty: Option<&Path>,
     proxy_port: Option<u16>,
-) -> String {
+) -> Result<String, String> {
     let profile = generate_sbpl_profile_for_tty(
         config,
         project_dir,
         sandbox_tty,
         proxy_port,
-    );
+    )?;
 
     if verbose {
         output::verbose("SBPL profile:");
@@ -314,7 +315,7 @@ fn build_profile(
         }
     }
 
-    profile
+    Ok(profile)
 }
 
 fn canonicalize_or_keep(p: &Path) -> PathBuf {
@@ -370,7 +371,7 @@ fn sbpl_path(p: &Path) -> String {
 /// PTY; see [`generate_sbpl_profile_for_tty`].
 #[cfg(test)]
 fn generate_sbpl_profile(config: &Config, project_dir: &Path) -> String {
-    generate_sbpl_profile_for_tty(config, project_dir, None, None)
+    generate_sbpl_profile_for_tty(config, project_dir, None, None).unwrap()
 }
 
 /// Profile for a filtered-egress launch whose outer proxy listens on
@@ -382,6 +383,7 @@ fn generate_sbpl_profile_filtered(
     proxy_port: u16,
 ) -> String {
     generate_sbpl_profile_for_tty(config, project_dir, None, Some(proxy_port))
+        .unwrap()
 }
 
 fn generate_sbpl_profile_for_tty(
@@ -389,7 +391,7 @@ fn generate_sbpl_profile_for_tty(
     project_dir: &Path,
     sandbox_tty: Option<&Path>,
     proxy_port: Option<u16>,
-) -> String {
+) -> Result<String, String> {
     let lockdown = config.lockdown_enabled();
     let exempt = super::dotdir_exemptions(config);
     let agent_state = agent_state_paths(config);
@@ -503,7 +505,7 @@ fn generate_sbpl_profile_for_tty(
         &devin_installation_paths,
     );
 
-    profile
+    Ok(profile)
 }
 
 /// Let Claude use the macOS Keychain services for its OAuth credential.
@@ -3122,7 +3124,7 @@ mod tests {
             ..Config::default()
         };
         let project = PathBuf::from("/tmp/test-project");
-        let output = dry_run(&config, &project, false, None);
+        let output = dry_run(&config, &project, false, None).unwrap();
         assert!(output.contains("sandbox-exec"));
         assert!(output.contains("SBPL profile"));
     }
@@ -3661,7 +3663,8 @@ mod tests {
             &PathBuf::from("/tmp/test-project"),
             Some(&tty),
             None,
-        );
+        )
+        .unwrap();
         assert!(
             profile.contains("(allow file-ioctl (literal \"/dev/ttys003\"))")
         );
@@ -3702,7 +3705,8 @@ mod tests {
             &PathBuf::from("/tmp/test-project"),
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(!profile.contains("(allow file-ioctl (literal \"/dev/ttys"));
         assert!(
             !profile
@@ -3729,7 +3733,8 @@ mod tests {
         let pty = crate::pty::open().expect("openpty");
         let tty = pty.slave_path().expect("ptsname");
         let profile =
-            generate_sbpl_profile_for_tty(&config, &project, Some(&tty), None);
+            generate_sbpl_profile_for_tty(&config, &project, Some(&tty), None)
+                .unwrap();
 
         let output = Command::new("/usr/bin/sandbox-exec")
             .arg("-p")

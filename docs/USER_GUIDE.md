@@ -635,6 +635,7 @@ AJ-SAVE-001 Save this project profile? [y/N/b] [OK] AJ-SAVE-001 Configuration sa
   Project policy: <ROOT>/xdg/ai-jail/projects/<POLICY>.toml
   The project cannot edit or enable this policy from inside the jail.
 ```
+
 # Dynamic localhost services on macOS
 
 <!-- provenance: src/onboarding.rs open_grant("loopback-connect"), render_menu; src/sandbox/seatbelt.rs push_network_section; tests: sandbox::seatbelt::tests::loopback_connect_is_explicit_and_scoped_to_localhost, sandbox::seatbelt::tests::loopback_connect_is_dropped_under_lockdown, tests/port_forward_macos.rs::loopback_connect_reaches_a_dynamic_host_port -->

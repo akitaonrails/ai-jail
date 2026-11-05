@@ -1850,12 +1850,12 @@ pub fn dry_run(
     {
         let _ = (guard, bridge_sockets);
         let prepared = prepare_seatbelt_config(config)?;
-        Ok(seatbelt::dry_run(
+        seatbelt::dry_run(
             &prepared,
             project_dir,
             verbose,
             proxy.map(|p| p.port()),
-        ))
+        )
     }
 }
 

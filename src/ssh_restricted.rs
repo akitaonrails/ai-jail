@@ -1077,7 +1077,7 @@ mod tests {
         assert!(!tool.path.starts_with(&root));
         tool.verify().unwrap();
         assert!(!marker.exists());
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1094,10 +1094,14 @@ mod tests {
         fs::remove_file(&path).unwrap();
         fs::write(&path, "fixture two").unwrap();
         assert!(tool.verify().is_err());
-        fs::remove_file(&path).unwrap();
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot remove drifted fixture: {error}"),
+        }
         std::os::unix::fs::symlink("target", &path).unwrap();
         assert!(tool.verify().is_err());
-        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
