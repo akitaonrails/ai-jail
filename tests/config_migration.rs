@@ -86,6 +86,17 @@ fn assert_ok(output: &Output) -> String {
     stderr
 }
 
+fn launch_sandbox_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        common::bwrap_available()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        common::sandbox_exec_available()
+    }
+}
+
 #[test]
 fn repository_policy_migrates_only_monotonic_restrictions() {
     let tree = Tree::new("projection");
@@ -226,22 +237,26 @@ fn clean_status_never_prints_ignored_external_config_path() {
 
 #[test]
 fn audit_provenance_uses_contributing_legacy_source_and_clean_ignores_it() {
+    if !launch_sandbox_available() {
+        eprintln!("SKIPPED: this environment cannot launch the sandbox");
+        return;
+    }
     let tree = Tree::new("legacy-provenance-audit");
     std::fs::write(tree.legacy_project(), "no_gpu=true\n").unwrap();
-    // Host networking keeps this audit-only launch runnable in Nix builders,
-    // where bubblewrap cannot create and configure a separate loopback device.
+    // Host networking avoids requiring a separate network namespace; these
+    // tests exercise audit provenance rather than the network boundary.
     assert_ok(&tree.run(&[
         "--no-save-config",
         "--audit-log",
         "--network",
         "--clean",
-        "/bin/true",
+        "true",
     ]));
     assert_ok(&tree.run(&[
         "--no-save-config",
         "--audit-log",
         "--network",
-        "/bin/true",
+        "true",
     ]));
     std::fs::write(
         tree.legacy_global(),
@@ -252,7 +267,7 @@ fn audit_provenance_uses_contributing_legacy_source_and_clean_ignores_it() {
         "--no-save-config",
         "--audit-log",
         "--network",
-        "/bin/true",
+        "true",
     ]));
     let log = std::fs::read_to_string(
         tree.home.join(".local/share/ai-jail/history.jsonl"),
@@ -282,16 +297,20 @@ fn audit_provenance_uses_contributing_legacy_source_and_clean_ignores_it() {
 
 #[test]
 fn audit_output_matrix_covers_external_constraints_grants_both_and_clean() {
+    if !launch_sandbox_available() {
+        eprintln!("SKIPPED: this environment cannot launch the sandbox");
+        return;
+    }
     let tree = Tree::new("external-provenance-audit");
     std::fs::write(tree.legacy_project(), "no_gpu=true\n").unwrap();
     assert_ok(&tree.run(&["--init", "/bin/true"]));
-    // See the Nix namespace rationale in the provenance test above.
+    // See the network-namespace rationale in the provenance test above.
     let record = |tree: &Tree| {
         assert_ok(&tree.run(&[
             "--no-save-config",
             "--audit-log",
             "--network",
-            "/bin/true",
+            "true",
         ]));
         let log = std::fs::read_to_string(
             tree.home.join(".local/share/ai-jail/history.jsonl"),
@@ -332,7 +351,7 @@ fn audit_output_matrix_covers_external_constraints_grants_both_and_clean() {
         "--audit-log",
         "--network",
         "--clean",
-        "/bin/true",
+        "true",
     ]));
     let log = std::fs::read_to_string(
         tree.home.join(".local/share/ai-jail/history.jsonl"),
