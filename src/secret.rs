@@ -15,6 +15,7 @@
 /// One bound secret: the env var `key`, the `placeholder` the sandbox
 /// sees, the `real` value that never leaves the supervisor, and the
 /// allowlisted `host` whose terminated requests may carry it.
+#[derive(Clone)]
 pub(crate) struct SecretBinding {
     pub key: String,
     pub placeholder: String,

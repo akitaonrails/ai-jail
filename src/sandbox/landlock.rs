@@ -668,22 +668,40 @@ fn collect_normal_paths_with_mounted_paths(
         rw.push(dot_local);
     }
 
-    // $HOME/.claude.json: read-write — Claude Code stores its
-    // auth token and settings here. Must be writable so the
-    // agent can update its own config during bootstrap.
-    // Command-specific agent state is a trusted capability
-    // (bwrap only mounts the file with agent_state enabled) and a
-    // user hide of ".claude" wins over the capability.
-    let claude_json = home.join(".claude.json");
-    if !private_home
-        && config.agent_state_enabled()
-        && !super::is_dotdir_denied(".claude", &config.hide_dotdirs, &[])
-        && claude_json.is_file()
-    {
-        if verbose {
-            output::verbose("Landlock: ~/.claude.json rw");
+    // File-shaped harness state needs an explicit Landlock write allowance;
+    // directory state is already covered by the normal home rules.
+    if !private_home && config.agent_state_enabled() {
+        let harness = crate::command::effective_name(&config.command);
+        for state in harness.into_iter().flat_map(|harness| {
+            crate::authority_inventory::resolve_harness_state(
+                harness,
+                crate::authority_inventory::LocationBasis::Home,
+                crate::authority_inventory::Platform::Linux,
+                &home,
+            )
+        }) {
+            if !matches!(
+                state.authority.exposure,
+                crate::authority_inventory::ExposureMode::HarnessState {
+                    kind: crate::authority_inventory::StateKind::File,
+                    ..
+                }
+            ) || super::is_dotdir_denied(
+                crate::authority_inventory::state_hide_scope(state.authority),
+                &config.hide_dotdirs,
+                &[],
+            ) || !state.path.is_file()
+            {
+                continue;
+            }
+            if verbose {
+                output::verbose(&format!(
+                    "Landlock: {} rw",
+                    state.path.display()
+                ));
+            }
+            rw.push(state.path);
         }
-        rw.push(claude_json);
     }
 
     // claude_dir: read-write — custom directory for Claude Code
@@ -1214,6 +1232,48 @@ mod tests {
             ro.contains(&PathBuf::from("/")),
             "/ must be in ro list so bwrap can set up mount namespaces"
         );
+    }
+
+    #[test]
+    fn inventory_file_state_receives_landlock_write_permission() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "ai-jail-landlock-inventory-file-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let file_state = crate::authority_inventory::resolve_harness_state(
+            "claude",
+            crate::authority_inventory::LocationBasis::Home,
+            crate::authority_inventory::Platform::Linux,
+            &home,
+        )
+        .into_iter()
+        .find(|state| {
+            matches!(
+                state.authority.exposure,
+                crate::authority_inventory::ExposureMode::HarnessState {
+                    kind: crate::authority_inventory::StateKind::File,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+        std::fs::write(&file_state.path, b"{}").unwrap();
+        let config = Config {
+            command: vec!["claude".into()],
+            private_home: Some(false),
+            agent_state: Some(true),
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            ..Config::default()
+        };
+        let (_, writable) =
+            collect_normal_paths(&config, Path::new("/tmp/project"), false);
+        assert!(writable.contains(&file_state.path));
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

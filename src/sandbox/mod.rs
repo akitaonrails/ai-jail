@@ -860,14 +860,38 @@ fn devin_state_paths(config: &Config) -> Vec<PathBuf> {
 fn devin_candidate_paths(config: &Config) -> Vec<PathBuf> {
     let home = home_dir();
     let mut paths = Vec::new();
-    for (key, fallback, logical_top) in [
-        ("XDG_DATA_HOME", ".local/share", ".local"),
-        ("XDG_CONFIG_HOME", ".config", ".config"),
+    for (basis, key, fallback, logical_top) in [
+        (
+            crate::authority_inventory::LocationBasis::XdgData,
+            "XDG_DATA_HOME",
+            ".local/share",
+            ".local",
+        ),
+        (
+            crate::authority_inventory::LocationBasis::XdgConfig,
+            "XDG_CONFIG_HOME",
+            ".config",
+            ".config",
+        ),
     ] {
         let Some(base) = devin_xdg_home(config, key, fallback) else {
             continue;
         };
-        let path = base.join("devin");
+        let Some(state) = crate::authority_inventory::resolve_harness_state(
+            "devin",
+            basis,
+            if cfg!(target_os = "linux") {
+                crate::authority_inventory::Platform::Linux
+            } else {
+                crate::authority_inventory::Platform::Macos
+            },
+            &base,
+        )
+        .into_iter()
+        .next() else {
+            continue;
+        };
+        let path = state.path;
         let actual_top = path
             .strip_prefix(&home)
             .ok()

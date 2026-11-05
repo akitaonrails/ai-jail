@@ -58,8 +58,24 @@ pub(crate) struct ProjectPolicyDocument {
     pub(crate) grants: Config,
     #[serde(default)]
     pub(crate) constraints: Config,
+    #[serde(default)]
+    pub(crate) onboarding_complete: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) directory_grants: Vec<DirectoryGrantIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) approved_env_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) migration: Option<MigrationProvenance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectoryGrantIdentity {
+    pub(crate) path: PathBuf,
+    pub(crate) writable: bool,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) open_scope: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +90,8 @@ pub(crate) struct LoadedProject {
     pub(crate) grants: Config,
     pub(crate) constraints: Config,
     pub(crate) present: bool,
+    pub(crate) onboarding_complete: bool,
+    pub(crate) approved_env_names: Vec<String>,
 }
 
 pub(crate) struct StoreLock(File);
@@ -565,10 +583,18 @@ fn read_project(
             identity.canonical_path.display()
         ));
     }
+    let mut grants = doc.grants;
+    validate_directory_grants(
+        &mut grants,
+        &doc.directory_grants,
+        &identity.canonical_path,
+    )?;
     Ok(LoadedProject {
-        grants: doc.grants,
+        grants,
         constraints: doc.constraints,
         present: true,
+        onboarding_complete: doc.onboarding_complete,
+        approved_env_names: doc.approved_env_names,
     })
 }
 
@@ -914,6 +940,9 @@ fn migrate_project(
             project: identity,
             grants: Config::default(),
             constraints: Config::default(),
+            onboarding_complete: false,
+            directory_grants: Vec::new(),
+            approved_env_names: Vec::new(),
             migration: None,
         }
     };
@@ -934,6 +963,155 @@ fn migrate_project(
     quarantine_remove(&paths.legacy_project, &source)?;
     notices.push(project_notice(paths));
     push_reapproval_notice(notices, &dropped);
+    Ok(())
+}
+
+pub(crate) fn save_project_grants(
+    paths: &StorePaths,
+    mut grants: Config,
+    mut approved_env_names: Vec<String>,
+    approved_directory_grants: &[DirectoryGrantIdentity],
+) -> Result<(), String> {
+    let _lock = paths.prepare()?;
+    validate_directory_grants(
+        &mut grants,
+        approved_directory_grants,
+        &paths.canonical_project,
+    )?;
+    let identity = paths.identity();
+    let mut doc = if paths.project.exists() {
+        read_project_document(&paths.project, &identity)?
+    } else {
+        ProjectPolicyDocument {
+            schema_version: MIGRATION_VERSION,
+            project: identity,
+            grants: Config::default(),
+            constraints: Config::default(),
+            onboarding_complete: false,
+            directory_grants: Vec::new(),
+            approved_env_names: Vec::new(),
+            migration: None,
+        }
+    };
+    for name in &approved_env_names {
+        crate::onboarding::validate_env_name(name)?;
+    }
+    approved_env_names.sort();
+    approved_env_names.dedup();
+    // Environment approvals are persisted as names in the dedicated trusted
+    // field. Config.env_pass may contain literal assignments, so it must never
+    // be serialized as part of the project grants.
+    grants.env_pass.clear();
+    doc.directory_grants = approved_directory_grants.to_vec();
+    doc.grants = grants;
+    doc.approved_env_names = approved_env_names;
+    doc.onboarding_complete = true;
+    write_project_document(&paths.project, &doc)
+}
+
+pub(crate) fn capture_directory_grants(
+    grants: &Config,
+    project: &Path,
+) -> Result<Vec<DirectoryGrantIdentity>, String> {
+    let mut identities = Vec::new();
+    for (writable, paths) in [(false, &grants.ro_maps), (true, &grants.rw_maps)]
+    {
+        for encoded in paths {
+            let spec = config::MapSpec::parse(encoded)?;
+            spec.validate()?;
+            if spec.is_alternate() {
+                return Err("Onboarding directory grants cannot change the destination path".into());
+            }
+            let path = fs::canonicalize(&spec.source).map_err(|e| {
+                format!(
+                    "Directory grant {} is unavailable: {e}",
+                    spec.source.display()
+                )
+            })?;
+            if path.as_os_str().as_bytes().contains(&b':')
+                || path.to_str().is_none()
+            {
+                return Err("Directory grant paths must be UTF-8 and cannot contain ':'".into());
+            }
+            let metadata = fs::metadata(&path).map_err(|e| {
+                format!(
+                    "Cannot inspect directory grant {}: {e}",
+                    path.display()
+                )
+            })?;
+            if !metadata.is_dir() {
+                return Err(format!(
+                    "Directory grant {} is not a directory",
+                    path.display()
+                ));
+            }
+            reject_onboarding_credential_path(&path)?;
+            let open_scope = onboarding_path_is_broad(&path, project);
+            identities.push(DirectoryGrantIdentity {
+                path,
+                writable,
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                open_scope,
+            });
+        }
+    }
+    Ok(identities)
+}
+
+pub(crate) fn validate_directory_grants(
+    grants: &mut Config,
+    identities: &[DirectoryGrantIdentity],
+    project: &Path,
+) -> Result<(), String> {
+    if grants.ro_maps.is_empty() && grants.rw_maps.is_empty() {
+        return Ok(());
+    }
+    if identities.len() != grants.ro_maps.len() + grants.rw_maps.len() {
+        return Err(format!(
+            "{} Saved directory grants lack identity records; run `ai-jail configure HARNESS` again",
+            crate::onboarding::messages::PATH_IDENTITY_ID
+        ));
+    }
+    let expected =
+        capture_directory_grants(grants, project).map_err(|error| {
+            format!("{} {error}", crate::onboarding::messages::PATH_DRIFT_ID)
+        })?;
+    if expected != identities {
+        return Err(format!(
+            "{} A saved directory grant moved, disappeared, or changed identity; access was refused",
+            crate::onboarding::messages::PATH_DRIFT_ID
+        ));
+    }
+    grants.ro_maps = identities
+        .iter()
+        .filter(|item| !item.writable)
+        .map(|item| item.path.clone())
+        .collect();
+    grants.rw_maps = identities
+        .iter()
+        .filter(|item| item.writable)
+        .map(|item| item.path.clone())
+        .collect();
+    Ok(())
+}
+
+fn onboarding_path_is_broad(path: &Path, project: &Path) -> bool {
+    let home_is_path = std::env::var_os("HOME").is_some_and(|home| {
+        let configured = PathBuf::from(home);
+        let canonical = fs::canonicalize(&configured).unwrap_or(configured);
+        path == canonical
+    });
+    home_is_path || (project.starts_with(path) && path != project)
+}
+
+fn reject_onboarding_credential_path(path: &Path) -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "AJ-PATH-002 Cannot validate credential roots because HOME is not set".to_string())?;
+    if crate::authority_inventory::is_protected(path, &home)? {
+        return Err("AJ-PATH-002 A saved directory now resolves inside a credential root; access was refused".into());
+    }
     Ok(())
 }
 
@@ -1499,6 +1677,9 @@ pub(crate) fn save_project_constraints(
             project: identity,
             grants: Config::default(),
             constraints: Config::default(),
+            onboarding_complete: false,
+            directory_grants: Vec::new(),
+            approved_env_names: Vec::new(),
             migration: None,
         }
     };
@@ -2311,5 +2492,283 @@ mod tests {
         });
         assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_document_round_trip_marks_onboarding_complete() {
+        let base = std::env::temp_dir()
+            .join(format!("ai-jail-onboarding-store-{}", std::process::id()));
+        let project = base.join("project");
+        let root = base.join("config/ai-jail");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&project).unwrap();
+        let canonical_project = fs::canonicalize(&project).unwrap();
+        let identity = project_identity(&canonical_project);
+        let paths = StorePaths {
+            available: true,
+            root: root.clone(),
+            global: root.join("config.toml"),
+            global_provenance: root.join("global-migration.toml"),
+            project: root
+                .join("projects")
+                .join(format!("{}.toml", identity.key)),
+            legacy_global: base.join("home/.ai-jail"),
+            legacy_project: project.join(".ai-jail"),
+            canonical_project,
+        };
+        let grants = Config {
+            agent_state: Some(false),
+            github: Some(true),
+            ..Config::default()
+        };
+
+        save_project_grants(
+            &paths,
+            grants.clone(),
+            vec!["CUSTOM_MODE".into()],
+            &[],
+        )
+        .unwrap();
+        let loaded = load_project(&paths).unwrap();
+
+        assert!(loaded.present);
+        assert!(loaded.onboarding_complete);
+        assert_eq!(loaded.grants, grants);
+        assert_eq!(loaded.approved_env_names, vec!["CUSTOM_MODE"]);
+        let serialized = fs::read_to_string(&paths.project).unwrap();
+        assert!(serialized.contains("CUSTOM_MODE"));
+        assert!(!serialized.contains("secret-value"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn saving_onboarding_grants_preserves_existing_constraints() {
+        let base = std::env::temp_dir().join(format!(
+            "ai-jail-save-grants-preserves-constraints-{}",
+            std::process::id()
+        ));
+        let project = base.join("project");
+        let root = base.join("config/ai-jail");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&project).unwrap();
+        let canonical_project = fs::canonicalize(&project).unwrap();
+        let identity = project_identity(&canonical_project);
+        let paths = StorePaths {
+            available: true,
+            root: root.clone(),
+            global: root.join("config.toml"),
+            global_provenance: root.join("global-migration.toml"),
+            project: root
+                .join("projects")
+                .join(format!("{}.toml", identity.key)),
+            legacy_global: base.join("home/.ai-jail"),
+            legacy_project: project.join(".ai-jail"),
+            canonical_project,
+        };
+        let constraints = Config {
+            lockdown: Some(true),
+            mask: vec!["/host/private".into()],
+            ..Config::default()
+        };
+        save_project_constraints(&paths, constraints.clone()).unwrap();
+        save_project_grants(
+            &paths,
+            Config {
+                agent_state: Some(false),
+                ..Config::default()
+            },
+            Vec::new(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(load_project(&paths).unwrap().constraints, constraints);
+        let before = fs::read(&paths.project).unwrap();
+        let projects = paths.project.parent().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(projects, fs::Permissions::from_mode(0o500))
+            .unwrap();
+        let failed = save_project_grants(
+            &paths,
+            Config {
+                github: Some(true),
+                ..Config::default()
+            },
+            Vec::new(),
+            &[],
+        );
+        fs::set_permissions(projects, fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert!(failed.is_err());
+        assert_eq!(fs::read(&paths.project).unwrap(), before);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn directory_grant_identity_refuses_symlink_swap_and_disappearance() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!(
+            "ai-jail-onboarding-identity-{}",
+            std::process::id()
+        ));
+        let project = base.join("project");
+        let first = base.join("first");
+        let second = base.join("second");
+        let link = base.join("shared");
+        let root = base.join("config/ai-jail");
+        let _ = fs::remove_dir_all(&base);
+        for path in [&project, &first, &second] {
+            fs::create_dir_all(path).unwrap();
+        }
+        symlink(&first, &link).unwrap();
+        let canonical_project = fs::canonicalize(&project).unwrap();
+        let identity = project_identity(&canonical_project);
+        let paths = StorePaths {
+            available: true,
+            root: root.clone(),
+            global: root.join("config.toml"),
+            global_provenance: root.join("global-migration.toml"),
+            project: root
+                .join("projects")
+                .join(format!("{}.toml", identity.key)),
+            legacy_global: base.join("home/.ai-jail"),
+            legacy_project: project.join(".ai-jail"),
+            canonical_project,
+        };
+        let grants = Config {
+            ro_maps: vec![link.clone()],
+            ..Config::default()
+        };
+        let approved =
+            capture_directory_grants(&grants, &paths.canonical_project)
+                .unwrap();
+        save_project_grants(&paths, grants, Vec::new(), &approved).unwrap();
+        fs::remove_dir(&first).unwrap();
+        fs::rename(&second, &first).unwrap();
+        assert!(load_project(&paths).unwrap_err().contains("AJ-PATH-004"));
+
+        fs::remove_dir(&first).unwrap();
+        assert!(load_project(&paths).unwrap_err().contains("unavailable"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn launch_once_directory_identity_is_reverified_before_execution() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!(
+            "ai-jail-launch-once-directory-identity-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let project = base.join("project");
+        let approved = base.join("approved");
+        let replacement = base.join("replacement");
+        let link = base.join("shared");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&approved).unwrap();
+        fs::create_dir_all(&replacement).unwrap();
+        symlink(&approved, &link).unwrap();
+        let mut grants = Config {
+            ro_maps: vec![fs::canonicalize(&link).unwrap()],
+            ..Config::default()
+        };
+        let identities = capture_directory_grants(&grants, &project).unwrap();
+
+        fs::remove_dir(&approved).unwrap();
+        fs::rename(&replacement, &approved).unwrap();
+        let error =
+            validate_directory_grants(&mut grants, &identities, &project)
+                .unwrap_err();
+        assert!(error.contains(crate::onboarding::messages::PATH_DRIFT_ID));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn save_refuses_directory_swapped_after_preview_and_preserves_policy() {
+        let base = std::env::temp_dir().join(format!(
+            "ai-jail-save-directory-race-{}",
+            std::process::id()
+        ));
+        let project = base.join("project");
+        let approved = base.join("approved");
+        let replacement = base.join("replacement");
+        let root = base.join("config/ai-jail");
+        let _ = fs::remove_dir_all(&base);
+        for path in [&project, &approved, &replacement] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let canonical_project = fs::canonicalize(&project).unwrap();
+        let identity = project_identity(&canonical_project);
+        let paths = StorePaths {
+            available: true,
+            root: root.clone(),
+            global: root.join("config.toml"),
+            global_provenance: root.join("global-migration.toml"),
+            project: root
+                .join("projects")
+                .join(format!("{}.toml", identity.key)),
+            legacy_global: base.join("home/.ai-jail"),
+            legacy_project: project.join(".ai-jail"),
+            canonical_project,
+        };
+        save_project_grants(&paths, Config::default(), Vec::new(), &[])
+            .unwrap();
+        let before = fs::read(&paths.project).unwrap();
+        let grants = Config {
+            ro_maps: vec![approved.clone()],
+            ..Config::default()
+        };
+        let preview_identities =
+            capture_directory_grants(&grants, &project).unwrap();
+        fs::remove_dir(&approved).unwrap();
+        fs::rename(&replacement, &approved).unwrap();
+
+        let error = save_project_grants(
+            &paths,
+            grants,
+            Vec::new(),
+            &preview_identities,
+        )
+        .unwrap_err();
+        assert!(error.contains(crate::onboarding::messages::PATH_DRIFT_ID));
+        assert_eq!(fs::read(&paths.project).unwrap(), before);
+        assert!(load_project(&paths).unwrap().grants.ro_maps.is_empty());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn directory_grant_identity_rejects_colon_and_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let base = std::env::temp_dir()
+            .join(format!("ai-jail-onboarding-path-{}", std::process::id()));
+        let colon = base.join("bad:name");
+        fs::create_dir_all(&colon).unwrap();
+        let error = capture_directory_grants(
+            &Config {
+                ro_maps: vec![colon],
+                ..Config::default()
+            },
+            &base.join("project"),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("cannot change") || error.contains("cannot contain")
+        );
+
+        let invalid = base.join(std::ffi::OsString::from_vec(vec![0xff]));
+        fs::create_dir_all(&invalid).unwrap();
+        let error = capture_directory_grants(
+            &Config {
+                ro_maps: vec![invalid],
+                ..Config::default()
+            },
+            &base.join("project"),
+        )
+        .unwrap_err();
+        assert!(error.contains("UTF-8"));
+        let _ = fs::remove_dir_all(base);
     }
 }

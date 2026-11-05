@@ -1,0 +1,16 @@
+AJ-ONB-001 Configure a known harness for one canonical project.
+AJ-CHOICE-001 Every selection is off until the user enables it.
+AJ-GRANT-001 Every active grant names resource, access, process, duration, scope, limits, default, and consequence.
+AJ-OPEN-001 Broad access requires typing OPEN.
+AJ-SUM-001 Final output always contains RESTRICTED, ALLOWED, and OPEN.
+AJ-SAVE-001 Saved policy lives outside the project.
+AJ-CANCEL-001 Cancel writes no onboarding grants and starts nothing.
+AJ-NONTTY-001 Non-TTY first runs save no onboarding profile.
+AJ-NONTTY-002 Non-TTY configure changes nothing.
+AJ-FINAL-001 Complete effective access includes every contributing policy layer.
+AJ-PATH-001 Unsafe directory syntax is refused.
+AJ-PATH-002 Credential roots require their dedicated access choice.
+AJ-PATH-003 Saved directory grants require identity records.
+AJ-PATH-004 Directory identity drift refuses access.
+AJ-ENV-001 Environment approvals store names only.
+AJ-ENV-002 Missing approved host variables fail closed.

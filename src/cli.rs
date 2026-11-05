@@ -13,6 +13,7 @@ COMMANDS (positional):
     kimi, kiro-cli, devin, bash
                                             Known AI tool presets
     status                                 Show current effective config
+    configure HARNESS                      Review and save project access
     Any other string                       Passed through as the command
 
 OPTIONS:
@@ -240,6 +241,7 @@ pub struct CliArgs {
     pub bootstrap: bool,
     pub verbose: bool,
     pub status: bool,
+    pub configure: Option<String>,
     /// Internal: apply Landlock and exec remaining command.
     /// Used as a wrapper inside the bwrap sandbox.
     pub landlock_exec: bool,
@@ -688,6 +690,26 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 let s = val.to_string_lossy().into_owned();
                 if s == "status" {
                     args.status = true;
+                } else if s == "configure" && args.command.is_empty() {
+                    let harness = parser
+                        .value()
+                        .map_err(|_| {
+                            "configure requires a harness name".to_string()
+                        })?
+                        .to_string_lossy()
+                        .into_owned();
+                    if !crate::command::is_known_api_agent(&harness) {
+                        return Err(format!(
+                            "configure requires a known harness (got {harness:?})"
+                        ));
+                    }
+                    if parser.next().map_err(|e| e.to_string())?.is_some() {
+                        return Err(
+                            "configure accepts exactly one harness name".into(),
+                        );
+                    }
+                    args.configure = Some(harness.clone());
+                    args.command.push(harness);
                 } else {
                     args.command.push(s);
                     // Consume ALL remaining args as part of the command
@@ -994,6 +1016,27 @@ mod tests {
         let args = parse_test(&["status"]).unwrap();
         assert!(args.status);
         assert!(args.command.is_empty());
+    }
+
+    #[test]
+    fn parse_configure_known_harness() {
+        let args = parse_test(&["configure", "claude"]).unwrap();
+        assert_eq!(args.configure.as_deref(), Some("claude"));
+        assert_eq!(args.command, vec!["claude"]);
+    }
+
+    #[test]
+    fn configure_requires_one_known_harness() {
+        assert!(parse_test(&["configure"]).is_err());
+        assert!(parse_test(&["configure", "unknown"]).is_err());
+        assert!(parse_test(&["configure", "claude", "extra"]).is_err());
+    }
+
+    #[test]
+    fn separator_preserves_configure_as_a_child_command() {
+        let args = parse_test(&["--", "configure", "claude"]).unwrap();
+        assert_eq!(args.configure, None);
+        assert_eq!(args.command, vec!["configure", "claude"]);
     }
 
     // ── Flag parsing ───────────────────────────────────────────

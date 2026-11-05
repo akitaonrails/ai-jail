@@ -2253,11 +2253,14 @@ fn discover_home_dotfiles_full(
     if private_home {
         let home = super::home_dir();
         if agent_state {
-            for relative in command_state_paths(config) {
-                if state_path_hidden(relative, &config.hide_dotdirs) {
+            for state in command_state_paths(config) {
+                if state_path_hidden(
+                    state.authority.relative,
+                    &config.hide_dotdirs,
+                ) {
                     continue;
                 }
-                let path = home.join(relative);
+                let path = state.path;
                 if safe_state_dir(&path) {
                     mounts.push(Mount::Bind {
                         src: path.clone(),
@@ -2275,29 +2278,55 @@ fn discover_home_dotfiles_full(
                 });
             }
         }
-        let claude_json = home.join(".claude.json");
-        if agent_state
-            && !state_path_hidden(".claude", &config.hide_dotdirs)
-            && crate::command::effective_name(&config.command) == Some("claude")
-            && safe_state_file(&claude_json)
-        {
-            mounts.push(Mount::Bind {
-                src: claude_json.clone(),
-                dest: claude_json,
-            });
+        if agent_state {
+            for state in command_state_files(config) {
+                if state_path_hidden(
+                    crate::authority_inventory::state_hide_scope(
+                        state.authority,
+                    ),
+                    &config.hide_dotdirs,
+                ) {
+                    continue;
+                }
+                let path = state.path;
+                if safe_state_file(&path) {
+                    mounts.push(Mount::Bind {
+                        src: path.clone(),
+                        dest: path,
+                    });
+                }
+            }
         }
     } else if agent_state {
         // Non-private-home passthrough still gates the command-state
         // extras that the generic dotdir enumeration never mounts
         // (kimi's state dirs are in DOTDIR_DENY; .claude.json is a file).
-        if crate::command::effective_name(&config.command)
-            .is_some_and(|name| name.starts_with("kimi"))
-        {
-            for relative in [".kimi", ".kimi-code"] {
-                if state_path_hidden(relative, &config.hide_dotdirs) {
+        if let Some(name) = crate::command::effective_name(&config.command) {
+            for state in crate::authority_inventory::resolve_harness_state(
+                name,
+                crate::authority_inventory::LocationBasis::Home,
+                crate::authority_inventory::Platform::Linux,
+                &super::home_dir(),
+            )
+            .into_iter()
+            .filter(|entry| {
+                entry.authority.provider == "kimi"
+                    && matches!(
+                        entry.authority.exposure,
+                        crate::authority_inventory::ExposureMode::HarnessState {
+                            kind: crate::authority_inventory::StateKind::Directory,
+                            ..
+                        }
+                    )
+            })
+            {
+                if state_path_hidden(
+                    state.authority.relative,
+                    &config.hide_dotdirs,
+                ) {
                     continue;
                 }
-                let path = super::home_dir().join(relative);
+                let path = state.path;
                 if safe_state_dir(&path) {
                     mounts.push(Mount::Bind {
                         src: path.clone(),
@@ -2306,14 +2335,20 @@ fn discover_home_dotfiles_full(
                 }
             }
         }
-        let claude_json = super::home_dir().join(".claude.json");
-        if !state_path_hidden(".claude", &config.hide_dotdirs)
-            && safe_state_file(&claude_json)
-        {
-            mounts.push(Mount::Bind {
-                src: claude_json.clone(),
-                dest: claude_json,
-            });
+        for state in command_state_files(config) {
+            if state_path_hidden(
+                crate::authority_inventory::state_hide_scope(state.authority),
+                &config.hide_dotdirs,
+            ) {
+                continue;
+            }
+            let path = state.path;
+            if safe_state_file(&path) {
+                mounts.push(Mount::Bind {
+                    src: path.clone(),
+                    dest: path,
+                });
+            }
         }
     }
     if !private_home && config.docker_enabled() {
@@ -2448,39 +2483,42 @@ fn discover_devin_state_mounts(
     mounts
 }
 
-fn command_state_paths(config: &Config) -> &'static [&'static str] {
-    match crate::command::effective_name(&config.command) {
-        Some("claude") => &[".claude"],
-        Some("codex") => &[".codex"],
-        Some("opencode") => &[".config/opencode", ".local/share/opencode"],
-        Some("crush") => &[".crush", ".config/crush", ".local/share/crush"],
-        // kimi-cli stores its OAuth credentials and config in ~/.kimi
-        // (~/.kimi/credentials, ~/.kimi/config.toml). ~/.kimi-code is kept
-        // as a legacy alias for any older install that used it (#150).
-        Some(name) if name.starts_with("kimi") => &[".kimi", ".kimi-code"],
-        Some("gemini") => &[".gemini"],
-        // Antigravity stores its OAuth under ~/.gemini/antigravity-cli and
-        // shares ~/.gemini's Google OAuth, so its credential home is ~/.gemini.
-        Some("antigravity") => &[".gemini"],
-        Some("grok") => &[".grok"],
-        Some("jcode") => &[".jcode", ".config/jcode"],
-        Some("pi") => &[".pi", ".pi-lens"],
-        Some("aider") => &[".aider"],
-        Some("soulforge") => &[".soulforge"],
-        Some("omp") => &[".omp"],
-        // kiro-cli keeps agents, settings and sessions in ~/.kiro and its
-        // login (data.sqlite3) in the XDG data dir. The DOTDIR_RW and
-        // LOCAL_SHARE_RW entries from #73 only apply without private home,
-        // so under the default private home it started logged out.
-        Some("kiro-cli") => &[".kiro", ".local/share/kiro-cli"],
-        // prime-agent keeps auth, sessions, and the Continual
-        // Harness state under ~/.prime/agent (CONFIG_DIR_NAME in
-        // packages/coding-agent/src/config.ts). Deliberately not the
-        // whole ~/.prime: sibling config.json holds the prime CLI's
-        // compute/sandbox API key.
-        Some("prime-agent") => &[".prime/agent"],
-        _ => &[],
-    }
+fn command_state_paths(
+    config: &Config,
+) -> Vec<crate::authority_inventory::ResolvedStatePath> {
+    command_state_entries(
+        config,
+        crate::authority_inventory::StateKind::Directory,
+    )
+}
+
+fn command_state_files(
+    config: &Config,
+) -> Vec<crate::authority_inventory::ResolvedStatePath> {
+    command_state_entries(config, crate::authority_inventory::StateKind::File)
+}
+
+fn command_state_entries(
+    config: &Config,
+    wanted: crate::authority_inventory::StateKind,
+) -> Vec<crate::authority_inventory::ResolvedStatePath> {
+    let Some(harness) = crate::command::effective_name(&config.command) else {
+        return Vec::new();
+    };
+    crate::authority_inventory::resolve_harness_state(
+        harness,
+        crate::authority_inventory::LocationBasis::Home,
+        crate::authority_inventory::Platform::Linux,
+        &super::home_dir(),
+    )
+    .into_iter()
+    .filter_map(|entry| match entry.authority.exposure {
+        crate::authority_inventory::ExposureMode::HarnessState {
+            kind, ..
+        } if kind == wanted => Some(entry),
+        _ => None,
+    })
+    .collect()
 }
 
 /// User hide_dotdirs override for command agent-state mounts: hiding
@@ -7638,7 +7676,10 @@ mod tests {
             let mut config = minimal_test_config();
             config.command = vec![(*command).into()];
             assert_eq!(
-                command_state_paths(&config),
+                command_state_paths(&config)
+                    .iter()
+                    .map(|state| state.authority.relative)
+                    .collect::<Vec<_>>(),
                 *expected,
                 "state mapping mismatch for {command}"
             );

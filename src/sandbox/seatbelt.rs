@@ -1358,66 +1358,13 @@ fn macos_read_deny_paths(
 /// when agent-state passthrough is enabled. Returns an empty list
 /// otherwise — agent state never leaks in by default.
 ///
-/// Mirrors the command-state list the Linux backend mounts so both
-/// platforms expose identical agent state. Kept local to this file
-/// because the bwrap-side list is private to that module.
 fn agent_state_paths(config: &Config) -> Vec<PathBuf> {
     if !config.agent_state_enabled() {
         return Vec::new();
     }
     let home = super::home_dir();
     let mut paths: Vec<PathBuf> = Vec::new();
-    let mut push = |rel: &str| {
-        let path = home.join(rel);
-        if super::path_exists(&path) && !paths.contains(&path) {
-            paths.push(path);
-        }
-    };
     match crate::command::effective_name(&config.command) {
-        Some("claude") => {
-            push(".claude");
-            push(".claude.json");
-        }
-        Some("codex") => push(".codex"),
-        Some("opencode") => {
-            push(".config/opencode");
-            push(".local/share/opencode");
-        }
-        Some("crush") => {
-            push(".crush");
-            push(".config/crush");
-            push(".local/share/crush");
-        }
-        Some(name) if name.starts_with("kimi") => {
-            // kimi-cli keeps OAuth creds/config in ~/.kimi; ~/.kimi-code
-            // is a legacy alias kept for older installs (#150).
-            push(".kimi");
-            push(".kimi-code");
-        }
-        Some("gemini") => push(".gemini"),
-        Some("antigravity") => push(".gemini"),
-        Some("grok") => push(".grok"),
-        Some("jcode") => {
-            push(".jcode");
-            push(".config/jcode");
-        }
-        Some("pi") => {
-            push(".pi");
-            push(".pi-lens");
-        }
-        Some("aider") => push(".aider"),
-        Some("soulforge") => push(".soulforge"),
-        Some("omp") => push(".omp"),
-        // kiro-cli's login lives in its data dir, which on macOS is
-        // Application Support (bwrap mounts ~/.local/share/kiro-cli).
-        Some("kiro-cli") => {
-            push(".kiro");
-            push("Library/Application Support/kiro-cli");
-        }
-        // Mirrors the bwrap-side list: only ~/.prime/agent, never the
-        // whole ~/.prime (the prime compute CLI's API key lives in
-        // the sibling config.json).
-        Some("prime-agent") => push(".prime/agent"),
         Some("devin") => {
             let data_root =
                 super::devin_installation_dir(config).and_then(|versions| {
@@ -1433,6 +1380,33 @@ fn agent_state_paths(config: &Config) -> Vec<PathBuf> {
                 }
                 if super::path_exists(&path) && !paths.contains(&path) {
                     paths.push(path);
+                }
+            }
+        }
+        Some(harness) => {
+            for state in crate::authority_inventory::resolve_harness_state(
+                harness,
+                crate::authority_inventory::LocationBasis::Home,
+                crate::authority_inventory::Platform::Macos,
+                &home,
+            ) {
+                if super::path_exists(&state.path)
+                    && !paths.contains(&state.path)
+                {
+                    paths.push(state.path);
+                }
+            }
+            // macOS uses Application Support as the data location for Kiro.
+            for state in crate::authority_inventory::resolve_harness_state(
+                harness,
+                crate::authority_inventory::LocationBasis::XdgData,
+                crate::authority_inventory::Platform::Macos,
+                &home.join("Library/Application Support"),
+            ) {
+                if super::path_exists(&state.path)
+                    && !paths.contains(&state.path)
+                {
+                    paths.push(state.path);
                 }
             }
         }
@@ -1545,21 +1519,30 @@ fn macos_writable_paths(
 }
 
 fn macos_atomic_write_paths(config: &Config) -> Vec<PathBuf> {
-    // ~/.claude.json is command agent state; without the agent-state
-    // opt-in the file stays host-private (the earlier
-    // --no-private-home allowance was retired with that opt-in).
     if config.lockdown_enabled() || !config.agent_state_enabled() {
         return Vec::new();
     }
-    if crate::command::effective_name(&config.command) != Some("claude") {
+    let Some(harness) = crate::command::effective_name(&config.command) else {
         return Vec::new();
-    }
-    let claude_json = super::home_dir().join(".claude.json");
-    if claude_json.is_file() {
-        vec![claude_json]
-    } else {
-        Vec::new()
-    }
+    };
+    crate::authority_inventory::resolve_harness_state(
+        harness,
+        crate::authority_inventory::LocationBasis::Home,
+        crate::authority_inventory::Platform::Macos,
+        &super::home_dir(),
+    )
+    .into_iter()
+    .filter(|state| {
+        matches!(
+            state.authority.exposure,
+            crate::authority_inventory::ExposureMode::HarnessState {
+                kind: crate::authority_inventory::StateKind::File,
+                ..
+            }
+        ) && state.path.is_file()
+    })
+    .map(|state| state.path)
+    .collect()
 }
 
 fn macos_docker_socket() -> Option<PathBuf> {

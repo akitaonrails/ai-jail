@@ -16,7 +16,7 @@ pub fn is_quiet() -> bool {
 fn is_tty() -> bool {
     colors_enabled(
         io::stderr().is_terminal(),
-        std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+        std::env::var_os("NO_COLOR").is_some(),
     )
 }
 
@@ -162,12 +162,16 @@ pub fn dry_run_line(line: &str) {
 }
 
 /// Replace terminal control bytes in untrusted text with a visible-safe
-/// placeholder. Newlines, carriage returns, and tabs remain useful in normal
-/// diagnostics; all other C0 controls, DEL, and ESC are unsafe here.
+/// placeholder. This renderer is for values interpolated into one terminal
+/// line, so every control character, including line breaks and tabs, is unsafe.
 pub fn escape_control_bytes(s: &str) -> String {
     s.chars()
         .map(|ch| match ch {
-            '\n' | '\r' | '\t' | '\u{20}'..='\u{7e}' | '\u{80}'.. => ch,
+            '\u{2028}'
+            | '\u{2029}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}' => '?',
+            '\u{20}'..='\u{7e}' | '\u{a0}'.. => ch,
             _ => '?',
         })
         .collect()
@@ -235,6 +239,11 @@ mod tests {
         assert_eq!(
             escape_control_bytes("ok\x1b]52;secret\x07"),
             "ok?]52;secret?"
+        );
+        assert_eq!(escape_control_bytes("a\u{202e}b\u{2028}c"), "a?b?c");
+        assert_eq!(
+            escape_control_bytes("line\ncarriage\rtab\t\u{0085}end"),
+            "line?carriage?tab??end"
         );
     }
 

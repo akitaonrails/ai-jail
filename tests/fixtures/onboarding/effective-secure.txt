@@ -1,0 +1,20 @@
+AJ-FINAL-001 Complete effective access
+Recipient: claude and every child process it starts inside this jail
+Duration: While each jail runs; approval remains saved for this project
+Project: /home/alice/src/demo (read and write)
+Scope: global policy, proposed project grants, command-line grants, project constraints, and derived platform defaults
+Effective policy (every nondefault field):
+command = ["claude"]
+github = false
+no_mise = true
+no_toolchains = true
+ssh = false
+allow_hosts = ["api.anthropic.com"]
+agent_state = false
+Built-in environment names: PATH, HOME, TERM, LANG, SHELL, TMPDIR, COLORTERM, SSL_CERT_FILE, SSL_CERT_DIR, http_proxy, https_proxy, no_proxy, HTTP_PROXY, HTTPS_PROXY, NO_PROXY; prefixes: LC_, XDG_, TERM_PROGRAM
+Authority details (resource; access; scope/limits; consequence):
+- [WARN] ALLOWED: private persistent jail home; read and write; this harness profile only; state persists across launches
+- [WARN] ALLOWED: public hosts api.anthropic.com; filtered TCP connections; named hosts and subdomains with private/loopback resolution blocked; services can receive readable jail data
+Environment names: none beyond the built-in safe allowlist
+User-approved host environment names: none
+Limits: mandatory masks, platform support, and monotonic project restrictions still apply

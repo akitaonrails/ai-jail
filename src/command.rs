@@ -175,10 +175,8 @@ pub(crate) fn effective_name(command: &[String]) -> Option<&str> {
         })
 }
 
-/// Agents known to be network API clients. Kept in sync with the
-/// per-agent state-path tables in the sandbox backends
-/// (`bwrap::command_state_paths`, `seatbelt::agent_state_paths`) and Devin's
-/// XDG state helper; kimi binaries are matched by prefix like those tables do.
+/// Agents known to be network API clients. Harness-state authority lives in
+/// `authority_inventory`; this list only describes automatic API behavior.
 const KNOWN_API_AGENTS: &[&str] = &[
     "claude",
     "codex",

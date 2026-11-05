@@ -2,6 +2,7 @@
 compile_error!("ai-jail only supports Linux and macOS");
 
 mod audit;
+mod authority_inventory;
 mod bootstrap;
 mod cli;
 #[cfg(target_os = "macos")]
@@ -11,6 +12,7 @@ mod config;
 mod config_store;
 mod fsutil;
 mod github_auth;
+mod onboarding;
 mod output;
 mod proxy;
 mod pty;
@@ -528,6 +530,237 @@ fn toolchain_dest_already_mapped(config: &config::Config, spec: &str) -> bool {
         .any(|entry| dest(entry) == target)
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct FinalizedLaunch {
+    pub(crate) config: config::Config,
+    secrets: Vec<secret::SecretBinding>,
+    github_warning: Option<&'static str>,
+}
+
+/// Immutable owner of all post-finalization launch authority. Production and
+/// tests use these same final-consumer methods, so no code between preview and
+/// proxy/sandbox handoff can replace or mutate the finalized policy.
+struct LaunchRunner {
+    finalized: FinalizedLaunch,
+}
+
+impl LaunchRunner {
+    fn new(finalized: FinalizedLaunch) -> Self {
+        Self { finalized }
+    }
+
+    fn config(&self) -> &config::Config {
+        &self.finalized.config
+    }
+
+    fn github_warning(&self) -> Option<&'static str> {
+        self.finalized.github_warning
+    }
+
+    fn finish_proxy_config(
+        &self,
+        mut proxy_config: proxy::ProxyConfig,
+    ) -> proxy::ProxyConfig {
+        proxy_config.secrets = self.finalized.secrets.clone();
+        proxy_config
+    }
+
+    fn build_sandbox<R>(
+        &self,
+        builder: impl FnOnce(&config::Config) -> R,
+    ) -> R {
+        builder(&self.finalized.config)
+    }
+}
+
+/// Apply every host-derived launch mutation exactly once. The returned config
+/// is the immutable policy rendered to the user and later passed to sandbox
+/// execution; supervisor-only secrets stay beside it.
+pub(crate) fn finalize_launch_config(
+    mut config: config::Config,
+    project: &std::path::Path,
+    dry_run: bool,
+) -> Result<FinalizedLaunch, String> {
+    if config.mise_enabled() && !config.lockdown_enabled() {
+        for dir in sandbox::mise_auto_map_dirs() {
+            if !config.ro_maps.contains(&dir) && !config.rw_maps.contains(&dir)
+            {
+                config.ro_maps.push(dir);
+            }
+        }
+        if !config.env_pass.iter().any(|entry| {
+            entry == "MISE_NOT_FOUND_AUTO_INSTALL"
+                || entry.starts_with("MISE_NOT_FOUND_AUTO_INSTALL=")
+        }) {
+            config
+                .env_pass
+                .push("MISE_NOT_FOUND_AUTO_INSTALL=false".into());
+        }
+    }
+    if config.toolchains_enabled() && !config.lockdown_enabled() {
+        let maps = sandbox::toolchain_maps();
+        for spec in maps.ro {
+            if !toolchain_dest_already_mapped(&config, &spec) {
+                config.ro_maps.push(spec.into());
+            }
+        }
+        for spec in maps.rw {
+            if !toolchain_dest_already_mapped(&config, &spec) {
+                config.rw_maps.push(spec.into());
+            }
+        }
+    }
+    if default_agent_api_egress_applies(&config)
+        && sandbox::unprivileged_netns_available()
+    {
+        for host in command::default_egress_hosts(&config.command) {
+            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
+                config.allow_hosts.push((*host).into());
+            }
+        }
+    }
+    if default_registry_egress_applies(&config)
+        && sandbox::unprivileged_netns_available()
+    {
+        for host in sandbox::TOOLCHAIN_REGISTRY_HOSTS {
+            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
+                config.allow_hosts.push((*host).into());
+            }
+        }
+    }
+    if !config.lockdown_enabled() {
+        for path in sandbox::credential_ro_paths(&config) {
+            let spec = path.to_string_lossy().into_owned();
+            if !toolchain_dest_already_mapped(&config, &spec) {
+                config.ro_maps.push(path);
+            }
+        }
+    }
+    if config.agent_state_enabled()
+        && let Some(name) = command::effective_name(&config.command)
+    {
+        for var in command::harness_api_key_env(name) {
+            if std::env::var_os(var).is_some()
+                && !config.env_pass.iter().any(|entry| {
+                    entry == var || entry.starts_with(&format!("{var}="))
+                })
+            {
+                config.env_pass.push((*var).into());
+            }
+        }
+    }
+    if !config.env_from_file.is_empty() {
+        let mut entries =
+            config::load_env_files(&config.env_from_file, project)?;
+        entries.extend(config.env_pass);
+        config.env_pass = entries;
+    }
+    let github = github_auth::prepare(&mut config, project, dry_run);
+    if let Some(path) = github.config_dir.filter(|path| path.is_dir()) {
+        let spec = path.to_string_lossy().into_owned();
+        if !toolchain_dest_already_mapped(&config, &spec) {
+            config.ro_maps.push(path);
+        }
+    }
+    let secrets = prepare_secrets(&mut config)?;
+    Ok(FinalizedLaunch {
+        config,
+        secrets,
+        github_warning: github.warning,
+    })
+}
+
+fn build_onboarding_effective(
+    global: config::Config,
+    proposed: config::Config,
+    cli: &cli::CliArgs,
+    constraints: config::Config,
+    project: &std::path::Path,
+    trusted_constraints: bool,
+) -> Result<config::Config, String> {
+    let trusted = config::merge_trusted_project(global, proposed);
+    let baseline = config::merge(cli, trusted);
+    let mut effective = if trusted_constraints {
+        config::merge_trusted_project(baseline, constraints)
+    } else {
+        config::merge_with_global_report(baseline, constraints, project).0
+    };
+    if !cli.command.is_empty() {
+        effective.command = cli.command.clone();
+    }
+    config::absolutize_user_paths(&mut effective, project);
+    apply_browser_profile(&mut effective, true);
+    Ok(effective)
+}
+
+fn build_noninteractive_onboarding_effective(
+    global: &config::Config,
+    harness: &str,
+    cli: &cli::CliArgs,
+    constraints: config::Config,
+    project: &std::path::Path,
+) -> Result<config::Config, String> {
+    // Project the global layer through the same monotonic merge used for an
+    // untrusted project, then remove the few path/list fields whose presence
+    // itself grants authority. This retains lockdown, masks, deny paths, and
+    // every explicit disable while dropping host access.
+    let mut restrictions =
+        config::monotonic_project_constraints(global, project);
+    restrictions.command.clear();
+    restrictions.ro_maps.clear();
+    restrictions.rw_maps.clear();
+    restrictions.overlay_maps.clear();
+    restrictions.mask_exceptions.clear();
+    restrictions.deny_path_exceptions.clear();
+    restrictions.allow_hosts.clear();
+    restrictions.allow_private_hosts.clear();
+    restrictions.allow_tcp_ports.clear();
+    restrictions.forward_ports.clear();
+    restrictions.publish_ports.clear();
+    restrictions.claude_dir = None;
+    restrictions.env_pass.clear();
+    restrictions.env_from_file.clear();
+    restrictions.secret_hosts.clear();
+    restrictions.trust_project_config.clear();
+    restrictions.browser_profile = None;
+    let automatic_api =
+        restrictions.network != Some(false) && !restrictions.lockdown_enabled();
+    let mut safe_grants = onboarding::Selection {
+        api_access: automatic_api,
+        ..onboarding::Selection::default()
+    }
+    .grants(harness);
+    safe_grants.no_mise = Some(true);
+    build_onboarding_effective(
+        restrictions,
+        safe_grants,
+        cli,
+        constraints,
+        project,
+        false,
+    )
+}
+
+fn materialize_approved_env_names(
+    names: &[String],
+    allow_missing: bool,
+) -> Result<Vec<String>, String> {
+    let mut materialized = Vec::new();
+    for name in names {
+        onboarding::validate_env_name(name)?;
+        if std::env::var_os(name).is_some() {
+            materialized.push(name.clone());
+        } else if !allow_missing {
+            return Err(format!(
+                "{} Approved host environment variable {} is missing. Run `ai-jail configure HARNESS` to remove it or restore it before launch",
+                onboarding::messages::ENV_MISSING_ID,
+                output::escape_control_bytes(name)
+            ));
+        }
+    }
+    Ok(materialized)
+}
+
 fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     use std::os::unix::process::CommandExt;
 
@@ -721,6 +954,14 @@ fn validate_write_flags(cli: &cli::CliArgs) -> Result<(), String> {
     if cli.init && cli.save_config == Some(false) {
         return Err("--init conflicts with --no-save-config".into());
     }
+    if cli.configure.is_some()
+        && (cli.save_config == Some(false) || cli.dry_run || cli.init)
+    {
+        return Err(
+            "configure conflicts with --no-save-config, --dry-run, and --init"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -890,6 +1131,14 @@ fn run(
 
     let invocation_cwd = std::env::current_dir()
         .map_err(|e| format!("Cannot determine current directory: {e}"))?;
+    if cli.configure.is_some() && !onboarding::is_interactive() {
+        let harness = cli.configure.as_deref().unwrap_or("HARNESS");
+        output::error(&format!(
+            "{} `ai-jail configure {harness}` needs an interactive terminal. No configuration was changed.",
+            onboarding::messages::CONFIG_NON_TTY_ID
+        ));
+        return Ok(2);
+    }
     let store = config_store::StorePaths::discover(&invocation_cwd)?;
     let migration_writes_allowed =
         !cli.dry_run && cli.save_config != Some(false) && !cli.status;
@@ -899,11 +1148,18 @@ fn run(
 
     // New external policy has explicit provenance. Compatibility reads retain
     // legacy behavior in read-only modes until a writable launch migrates it.
-    let stored_project = if cli.clean {
+    let mut stored_project = if cli.clean {
         config_store::LoadedProject::default()
     } else {
         config_store::load_project(&store)?
     };
+    stored_project
+        .grants
+        .env_pass
+        .extend(materialize_approved_env_names(
+            &stored_project.approved_env_names,
+            cli.configure.is_some(),
+        )?);
     let legacy_project = if cli.clean || stored_project.present {
         config::Config::default()
     } else {
@@ -914,6 +1170,9 @@ fn run(
         stored_project.grants != config::Config::default();
     let external_has_constraints =
         stored_project.constraints != config::Config::default();
+    let stored_grants_for_onboarding = stored_project.grants.clone();
+    let stored_env_names_for_onboarding =
+        stored_project.approved_env_names.clone();
     let global_command_selector = if using_external_project {
         &stored_project.grants
     } else {
@@ -929,6 +1188,8 @@ fn run(
         // Read-only compatibility path. Writable modes migrated this above.
         config::load_global_for_command(&cli, global_command_selector)?
     };
+    let onboarding_complete = stored_project.onboarding_complete;
+    let global_for_onboarding = global.clone();
     let trusted = config::merge_trusted_project(global, stored_project.grants);
     let project_config = if using_external_project {
         stored_project.constraints
@@ -963,6 +1224,142 @@ fn run(
             &invocation_cwd,
         )
     };
+
+    let effective_harness = command::effective_name(&config.command)
+        .filter(|name| command::is_known_api_agent(name))
+        .map(str::to_string);
+    let configure_only = cli.configure.is_some();
+    let first_run = effective_harness.is_some()
+        && !onboarding_complete
+        && !cli.dry_run
+        && !cli.init
+        && !cli.bootstrap
+        && !cli.clean;
+    let mut prepared_launch: Option<FinalizedLaunch> = None;
+    let mut final_access_render: Option<(String, Option<bool>, Vec<String>)> =
+        None;
+    let mut skip_project_auto_save = first_run && !onboarding::is_interactive();
+    if configure_only || first_run {
+        let harness = effective_harness
+            .as_deref()
+            .ok_or_else(|| "configure requires a known harness".to_string())?;
+        if !onboarding::is_interactive() {
+            config = build_noninteractive_onboarding_effective(
+                &global_for_onboarding,
+                harness,
+                &cli,
+                project_config.clone(),
+                &invocation_cwd,
+            )?;
+            onboarding::secure_noninteractive(&mut config, &cli);
+            let selection = onboarding::Selection::from_config(&config);
+            onboarding::render_summary(
+                &selection,
+                harness,
+                &invocation_cwd,
+                false,
+            );
+            final_access_render =
+                Some((harness.to_string(), Some(false), Vec::new()));
+        } else {
+            let editor_config = if onboarding_complete {
+                stored_grants_for_onboarding.clone()
+            } else {
+                config::Config::default()
+            };
+            let outcome = onboarding::run(
+                harness,
+                &invocation_cwd,
+                &editor_config,
+                configure_only,
+                onboarding::EffectiveContext {
+                    global: &global_for_onboarding,
+                    cli: &cli,
+                    constraints: &project_config,
+                    trusted_constraints: legacy_project_trusted,
+                    approved_env_names: &stored_env_names_for_onboarding,
+                },
+            )?;
+            let (mut profile, save, launch) = match outcome {
+                onboarding::Outcome::SaveAndLaunch(profile) => {
+                    (profile, true, true)
+                }
+                onboarding::Outcome::LaunchOnce(profile) => {
+                    skip_project_auto_save = true;
+                    (profile, false, true)
+                }
+                onboarding::Outcome::SaveOnly(profile) => {
+                    (profile, true, false)
+                }
+                onboarding::Outcome::Cancel => {
+                    eprintln!(
+                        "{} {}",
+                        onboarding::messages::CANCEL_ID,
+                        onboarding::messages::CANCEL
+                    );
+                    return Ok(130);
+                }
+            };
+            if save {
+                config_store::save_project_grants(
+                    &store,
+                    profile.grants.clone(),
+                    profile.approved_env_names.clone(),
+                    &profile.directory_grants,
+                )?;
+                eprintln!(
+                    "[OK] {} Configuration saved\n  Project policy: {}\n  The project cannot edit or enable this policy from inside the jail.",
+                    onboarding::messages::SAVE_ID,
+                    onboarding::safe_path(&store.project)?
+                );
+            }
+            if !launch {
+                return Ok(0);
+            }
+            config_store::validate_directory_grants(
+                &mut profile.grants,
+                &profile.directory_grants,
+                &invocation_cwd,
+            )?;
+            materialize_approved_env_names(&profile.approved_env_names, false)?;
+            let finalized = profile.finalized.take().ok_or_else(|| {
+                "Onboarding launch was not finalized before confirmation"
+                    .to_string()
+            })?;
+            config = finalized.config.clone();
+            prepared_launch = Some(finalized);
+            final_access_render = Some((
+                harness.to_string(),
+                Some(save),
+                profile.approved_env_names,
+            ));
+        }
+    } else if onboarding_complete
+        && let Some(harness) = effective_harness.as_deref()
+        && !cli.dry_run
+        && !cli.init
+        && !cli.bootstrap
+    {
+        config = build_onboarding_effective(
+            global_for_onboarding,
+            stored_grants_for_onboarding,
+            &cli,
+            project_config.clone(),
+            &invocation_cwd,
+            legacy_project_trusted,
+        )?;
+        onboarding::render_summary(
+            &onboarding::Selection::from_config(&config),
+            harness,
+            &invocation_cwd,
+            true,
+        );
+        final_access_render = Some((
+            harness.to_string(),
+            Some(true),
+            stored_env_names_for_onboarding.clone(),
+        ));
+    }
     // A project `.ai-jail` is untrusted monotonic policy unless the trusted
     // global config lists this directory under `trust_project_config`, in
     // which case it is merged with the same semantics as a global
@@ -1071,191 +1468,43 @@ fn run(
         return Ok(0);
     }
 
-    // mise passthrough (issue #113): mise is enabled by default and already
-    // activated inside the sandbox, but the default private home maps only
-    // dotdirs, so mise's data/config dirs and the `mise` binary were never
-    // visible — activation found nothing and every mise-managed tool, the
-    // agent executable included, vanished from PATH. Map those paths
-    // read-only whenever mise is enabled; `--no-mise` and `--lockdown` opt out
-    // (they already disable mise activation). Added after the status/init/
-    // bootstrap early returns and the save paths so these derived,
-    // host-specific paths are never persisted into a saved `.ai-jail` nor
-    // shown as user maps in `ai-jail status`.
-    if config.mise_enabled() && !config.lockdown_enabled() {
-        for dir in sandbox::mise_auto_map_dirs() {
-            if !config.ro_maps.contains(&dir) && !config.rw_maps.contains(&dir)
-            {
-                config.ro_maps.push(dir);
-            }
-        }
-        // mise's data dir is mapped read-only above, so mise can never finish
-        // an auto-install of a declared-but-missing tool inside the jail — it
-        // only fails noisily ("Read-only file system") on every shim call.
-        // Disable the doomed attempt so a missing tool fails once, cleanly.
-        // A user's explicit --env for the same name still wins.
-        let var = "MISE_NOT_FOUND_AUTO_INSTALL";
-        let already = config
-            .env_pass
-            .iter()
-            .any(|e| e == var || e.starts_with(&format!("{var}=")));
-        if !already {
-            config.env_pass.push(format!("{var}=false"));
-        }
-    }
-
-    // Dev-toolchain cache persistence (Part A). On by default outside lockdown;
-    // `--no-toolchains` and the untrusted project `.ai-jail` can only disable
-    // it. Read-only toolchain binaries and a persistent jail-owned dependency
-    // cache are injected as maps so they flow through the same bwrap mount and
-    // Landlock rule path as every other map. Injected here, after the
-    // status/--init/bootstrap early returns and the save paths, so these
-    // derived, host-specific paths are never written into a saved `.ai-jail`
-    // nor shown as user maps in `ai-jail status`. A user's own explicit map for
-    // the same destination always wins.
-    if config.toolchains_enabled() && !config.lockdown_enabled() {
-        let maps = sandbox::toolchain_maps();
-        for spec in maps.ro {
-            if !toolchain_dest_already_mapped(&config, &spec) {
-                config.ro_maps.push(std::path::PathBuf::from(spec));
-            }
-        }
-        for spec in maps.rw {
-            if !toolchain_dest_already_mapped(&config, &spec) {
-                config.rw_maps.push(std::path::PathBuf::from(spec));
-            }
-        }
-    }
-
-    // Default-allow a known API agent's own functional hosts (filtered
-    // egress) when the user asserted no network posture (issue #156), so
-    // `ai-jail claude` / `ai-jail codex` reaches its model API out of the box
-    // without opening the whole network. Only the agent's canonical API hosts
-    // are added, and they are UNIONED with any explicit --allow-host list (like the
-    // registry hosts below) rather than suppressed by it — `--no-network
-    // --allow-host …` is the verbatim escape hatch. The sandbox stays
-    // deny-by-default. Gated on the same netns probe as registry egress (always
-    // available on macOS, where filtered egress is a seatbelt loopback rule).
-    if default_agent_api_egress_applies(&config)
-        && sandbox::unprivileged_netns_available()
-    {
-        for host in command::default_egress_hosts(&config.command) {
-            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
-                config.allow_hosts.push(host.to_string());
-            }
-        }
-    }
-
-    // Default-allow the package registries (filtered egress) so dependency
-    // fetches work without the user passing --allow-host. Deny-by-default still
-    // holds: only these hosts become reachable. An explicit --allow-host set is
-    // unioned with these. Gated on netns availability: filtered egress fences
-    // the sandbox in a private netns and fails closed, so where netns is
-    // unavailable the auto-default stays offline rather than breaking the launch
-    // (an explicit --allow-host keeps its fail-closed behavior).
-    if default_registry_egress_applies(&config)
-        && sandbox::unprivileged_netns_available()
-    {
-        for host in sandbox::TOOLCHAIN_REGISTRY_HOSTS {
-            if !config.allow_hosts.iter().any(|h| h == host) {
-                config.allow_hosts.push((*host).to_string());
-            }
-        }
-    }
-
-    // Capability gaps for known API-client agents (issue #131): warn at
-    // launch so an upgrade that flips a default does not fail silently. Done
-    // after the default egress policy above so an agent that just received its
-    // documented API host by default does not also draw a stale "network is
-    // off" / "API host not in allow_hosts" warning. `output::warn` respects
-    // --exec quiet mode like other non-security warnings; the launch itself is
-    // never blocked.
-    for warning in command::capability_gap_warnings(&config) {
-        output::warn(&warning);
-    }
-    if let Some(hint) = browser_display_hint(&config, host_has_display()) {
-        output::warn(hint);
-    }
-
-    // Opt-in, read-only credential passthrough (aws/kube/gcloud/
-    // docker_config): off by default, disabled under --lockdown. Injected
-    // here, after the status/--init/bootstrap early returns and the save
-    // paths, so these derived, host-specific paths are never written into
-    // a saved `.ai-jail` nor shown as user maps in `ai-jail status`. A
-    // user's own explicit map for the same destination always wins.
-    if !config.lockdown_enabled() {
-        for path in sandbox::credential_ro_paths(&config) {
-            let spec = path.to_string_lossy().into_owned();
-            if !toolchain_dest_already_mapped(&config, &spec) {
-                config.ro_maps.push(path);
-            }
-        }
-    }
-
-    // Pre-authenticate API-key harnesses: when agent state is on (the default,
-    // off under --lockdown), copy the invoked harness's well-known API-key env
-    // var from the host into the sandbox if it is set, so a harness that
-    // authenticates via a key (not an OAuth file) also starts authenticated.
-    // Injected after the save/--init/bootstrap returns so it is never persisted;
-    // an explicit --env for the same name already present wins.
-    if config.agent_state_enabled() {
-        let harness =
-            command::effective_name(&config.command).map(str::to_string);
-        if let Some(name) = harness {
-            for var in command::harness_api_key_env(&name) {
-                let already = config
-                    .env_pass
-                    .iter()
-                    .any(|e| e == var || e.starts_with(&format!("{var}=")));
-                if !already && std::env::var_os(var).is_some() {
-                    config.env_pass.push((*var).to_string());
-                }
-            }
-        }
-    }
-
-    // --env-from-file (phase 6 of docs/connect-proxy-plan.md): validated
-    // credential files. Entries apply exactly like --env, and on a
-    // conflict the --env entry wins (closest to the user), so the file
-    // entries come first; apply_env_pass replaces earlier values with
-    // later ones. Forced setenvs (the filtered-egress proxy vars) are
-    // applied after all of this and still win. This runs after the
-    // status/init/bootstrap early returns so secret values never reach
-    // `ai-jail status` output.
-    if !config.env_from_file.is_empty() {
-        let file_entries =
-            config::load_env_files(&config.env_from_file, &invocation_cwd)?;
-        let mut env_pass = file_entries;
-        env_pass.extend(config.env_pass.iter().cloned());
-        config.env_pass = env_pass;
-    }
-
-    // The GitHub config directory may live under GH_CONFIG_DIR or
-    // XDG_CONFIG_HOME, and its active token may live in the host keyring.
-    // Resolve both after --env-from-file is applied, but never fetch a token
-    // for dry-run. These derived values are used for this launch only.
-    let github =
-        github_auth::prepare(&mut config, &invocation_cwd, cli.dry_run);
-    if let Some(path) = github.config_dir.filter(|path| path.is_dir()) {
-        let spec = path.to_string_lossy().into_owned();
-        if !toolchain_dest_already_mapped(&config, &spec) {
-            config.ro_maps.push(path);
-        }
-    }
-    if let Some(warning) = github.warning {
+    let finalized = match prepared_launch.take() {
+        Some(finalized) => finalized,
+        None => finalize_launch_config(config, &invocation_cwd, cli.dry_run)?,
+    };
+    let launch_runner = LaunchRunner::new(finalized);
+    if let Some(warning) = launch_runner.github_warning() {
         output::warn(warning);
     }
-
-    // Phantom credentials (issue #135): each bound key's env_pass entry
-    // is rewritten to a placeholder the sandbox sees; the real value
-    // moves into a supervisor-side SecretBinding for the egress proxy.
-    // All violations hard-error here, before any sandbox starts.
-    let secrets = prepare_secrets(&mut config)?;
+    for warning in command::capability_gap_warnings(launch_runner.config()) {
+        output::warn(&warning);
+    }
+    if let Some(hint) =
+        browser_display_hint(launch_runner.config(), host_has_display())
+    {
+        output::warn(hint);
+    }
+    let config = launch_runner.config();
+    if let Some((harness, saved, approved_env_names)) =
+        final_access_render.take()
+    {
+        eprintln!(
+            "{}",
+            onboarding::render_effective_access(
+                config,
+                &invocation_cwd,
+                &harness,
+                saved,
+                &approved_env_names,
+            )?
+        );
+    }
 
     // Check sandbox tool is available
     sandbox::check()?;
 
     // Platform-specific info messages (e.g. no-op flags on macOS)
-    sandbox::platform_notes(&config);
+    sandbox::platform_notes(config);
 
     // Opt-in launch audit log (phase 5 of docs/connect-proxy-plan.md):
     // a supervisor-side JSONL file the sandbox never sees. Opened here
@@ -1305,8 +1554,8 @@ fn run(
         // The audit handle is supervisor-side; the sandbox never sees
         // the file it appends to.
         proxy_config.audit = audit_log.clone();
-        proxy_config.secrets = secrets;
-        proxy_config.prompt = host_prompt(&config);
+        proxy_config.prompt = host_prompt(config);
+        let proxy_config = launch_runner.finish_proxy_config(proxy_config);
         let socket = proxy::default_socket_path();
         let proxy = proxy::Proxy::start(proxy_config, Some(&socket))
             .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
@@ -1328,7 +1577,7 @@ fn run(
         proxy_config.allow_private_hosts =
             config.allow_private_hosts().to_vec();
         proxy_config.audit = audit_log.clone();
-        proxy_config.secrets = secrets;
+        let proxy_config = launch_runner.finish_proxy_config(proxy_config);
         let proxy = proxy::Proxy::start(proxy_config, None)
             .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
         Some(proxy)
@@ -1382,7 +1631,10 @@ fn run(
     // Save config in normal mode. In lockdown mode avoid host writes unless user
     // explicitly requested persistence via --init.
     //
-    if store.available && should_auto_save_project_config(&cli, &config) {
+    if store.available
+        && !skip_project_auto_save
+        && should_auto_save_project_config(&cli, config)
+    {
         let to_save = config::project_config_for_auto_save(
             &cli,
             project_config,
@@ -1395,7 +1647,7 @@ fn run(
     if cli.dry_run {
         let formatted = sandbox::dry_run(
             &guard,
-            &config,
+            config,
             &project_dir,
             cli.verbose,
             egress_proxy.as_ref(),
@@ -1417,7 +1669,7 @@ fn run(
     // inside the launch's dedicated session scratch directory and must be
     // removed when this supervisor exits. Linux hard profiles live in the
     // sandbox's tmpfs, so this guard is a no-op there.
-    let _browser_profile_guard = sandbox::browser_profile_guard(&config);
+    let _browser_profile_guard = sandbox::browser_profile_guard(config);
 
     output::info(&format!("Jail Active: {}", project_dir.display()));
 
@@ -1484,12 +1736,12 @@ fn run(
             &project_dir,
             &config.command,
             config.status_bar_style(),
-            &config,
+            config,
         );
     }
     // The update check only runs with the status bar active AND an
     // explicit opt-in (phones home to GitHub; default off).
-    if should_check_update(&config, use_status_bar) {
+    if should_check_update(config, use_status_bar) {
         statusbar::check_update_background();
     }
 
@@ -1502,21 +1754,23 @@ fn run(
     // known while the sandbox profile is still being generated.
     let pty = if use_pty { Some(pty::open()?) } else { None };
     let sandbox_tty = pty.as_ref().and_then(pty::Pty::slave_path);
-    let mut cmd = sandbox::build(
-        &guard,
-        &config,
-        &project_dir,
-        cli.verbose,
-        sandbox_tty.as_deref(),
-        egress_proxy.as_ref(),
-        &bridge_sockets,
-    )?;
+    let mut cmd = launch_runner.build_sandbox(|final_config| {
+        sandbox::build(
+            &guard,
+            final_config,
+            &project_dir,
+            cli.verbose,
+            sandbox_tty.as_deref(),
+            egress_proxy.as_ref(),
+            &bridge_sockets,
+        )
+    })?;
 
     // Apply NOFILE and CORE limits on the parent (inherited by child
     // across fork+exec). NPROC is applied inside the sandbox instead
     // — see run_landlock_exec() — to avoid EAGAIN during bwrap's
     // internal clone() calls for namespace creation.
-    sandbox::rlimits::apply(&config, cli.verbose);
+    sandbox::rlimits::apply(config, cli.verbose);
 
     let exit_code = if use_pty {
         let resize_redraw_key =
@@ -1562,7 +1816,7 @@ fn run(
             pty,
             &mut cmd,
             resize_redraw_key.as_deref(),
-            &config,
+            config,
             use_status_bar,
         ) {
             Ok(code) => {
@@ -1663,20 +1917,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_browser_profile, browser_display_hint, command_is_browser,
-        command_needs_direct_tty, default_agent_api_egress_applies,
-        default_registry_egress_applies, default_resize_redraw_key,
-        exec_requires_terminal_passthrough, internal_mode_inherits_quiet,
-        policy_provenance, prune_missing_path_entries, pty_proxy_active,
-        resolve_browser_profile, running_inside_multiplexer,
-        should_auto_save_project_config, should_check_update,
-        should_save_global_preferences,
+        LaunchRunner, apply_browser_profile, browser_display_hint,
+        build_noninteractive_onboarding_effective, build_onboarding_effective,
+        command_is_browser, command_needs_direct_tty,
+        default_agent_api_egress_applies, default_registry_egress_applies,
+        default_resize_redraw_key, exec_requires_terminal_passthrough,
+        finalize_launch_config, internal_mode_inherits_quiet,
+        materialize_approved_env_names, policy_provenance,
+        prune_missing_path_entries, pty_proxy_active, resolve_browser_profile,
+        running_inside_multiplexer, should_auto_save_project_config,
+        should_check_update, should_save_global_preferences,
         untrusted_project_command_carries_credentials, validate_network_flags,
         validate_write_flags,
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
+    use crate::onboarding::Selection;
     use crate::test_utils::{ENV_LOCK, EnvVarGuard};
+    use std::path::Path;
 
     #[test]
     fn policy_provenance_matrix_is_consistent() {
@@ -2469,6 +2727,250 @@ mod tests {
             ..CliArgs::default()
         };
         assert!(validate_write_flags(&cli).is_ok());
+    }
+
+    #[test]
+    fn configure_rejects_nonwriting_modes() {
+        for cli in [
+            CliArgs {
+                configure: Some("claude".into()),
+                save_config: Some(false),
+                ..CliArgs::default()
+            },
+            CliArgs {
+                configure: Some("claude".into()),
+                dry_run: true,
+                ..CliArgs::default()
+            },
+            CliArgs {
+                configure: Some("claude".into()),
+                init: true,
+                ..CliArgs::default()
+            },
+        ] {
+            assert!(validate_write_flags(&cli).is_err());
+        }
+    }
+
+    #[test]
+    fn noninteractive_onboarding_does_not_inherit_broad_global_access() {
+        let global = Config {
+            network: Some(true),
+            github: Some(true),
+            ssh: Some(true),
+            no_docker: Some(false),
+            inherit_env: Some(true),
+            lockdown: Some(true),
+            no_mise: Some(true),
+            mask: vec!["/host/restricted".into()],
+            deny_paths: vec!["/host/denied".into()],
+            ro_maps: vec!["/host/grant".into()],
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            command: vec!["claude".into()],
+            ..CliArgs::default()
+        };
+        let effective = build_noninteractive_onboarding_effective(
+            &global,
+            "claude",
+            &cli,
+            Config::default(),
+            Path::new("/project"),
+        )
+        .unwrap();
+
+        assert_ne!(effective.network, Some(true));
+        assert!(!effective.github_enabled());
+        assert!(!effective.ssh_enabled());
+        assert!(!effective.docker_enabled());
+        assert!(!effective.inherit_env_enabled());
+        assert!(effective.lockdown_enabled());
+        assert!(!effective.mise_enabled());
+        assert_eq!(
+            effective.mask,
+            vec![std::path::PathBuf::from("/host/restricted")]
+        );
+        assert_eq!(
+            effective.deny_paths,
+            vec![std::path::PathBuf::from("/host/denied")]
+        );
+        assert!(
+            !effective
+                .ro_maps
+                .contains(&std::path::PathBuf::from("/host/grant"))
+        );
+        assert!(
+            !effective
+                .allow_hosts
+                .iter()
+                .any(|h| h == "api.anthropic.com")
+        );
+    }
+
+    #[test]
+    fn noninteractive_offline_global_suppresses_automatic_api_host() {
+        for global in [
+            Config {
+                network: Some(false),
+                ..Config::default()
+            },
+            Config {
+                lockdown: Some(true),
+                ..Config::default()
+            },
+        ] {
+            let effective = build_noninteractive_onboarding_effective(
+                &global,
+                "claude",
+                &CliArgs {
+                    command: vec!["claude".into()],
+                    ..CliArgs::default()
+                },
+                Config::default(),
+                Path::new("/project"),
+            )
+            .unwrap();
+            assert!(
+                !effective
+                    .allow_hosts
+                    .iter()
+                    .any(|host| host == "api.anthropic.com")
+            );
+        }
+    }
+
+    #[test]
+    fn noninteractive_offline_global_keeps_explicit_cli_host_grant() {
+        let effective = build_noninteractive_onboarding_effective(
+            &Config {
+                network: Some(false),
+                ..Config::default()
+            },
+            "claude",
+            &CliArgs {
+                command: vec!["claude".into()],
+                allow_hosts: vec!["explicit.example".into()],
+                ..CliArgs::default()
+            },
+            Config::default(),
+            Path::new("/project"),
+        )
+        .unwrap();
+        assert_eq!(effective.network, Some(false));
+        assert_eq!(effective.allow_hosts, vec!["explicit.example"]);
+    }
+
+    #[test]
+    fn actual_sandbox_and_proxy_handoffs_receive_finalized_launch_unchanged() {
+        let global = Config {
+            github: Some(true),
+            no_mise: Some(true),
+            no_toolchains: Some(true),
+            allow_hosts: vec!["github.com".into()],
+            env_pass: vec![
+                "GH_CONFIG_DIR=/definitely/missing/gh".into(),
+                "TEST_TOKEN=super-secret-value".into(),
+            ],
+            secret_hosts: [("TEST_TOKEN".into(), "github.com".into())]
+                .into_iter()
+                .collect(),
+            ..Config::default()
+        };
+        let proposed = Selection {
+            api_access: true,
+            agent_state: true,
+            ..Selection::default()
+        }
+        .grants("claude");
+        let cli = CliArgs {
+            command: vec!["claude".into()],
+            ..CliArgs::default()
+        };
+        let base = build_onboarding_effective(
+            global,
+            proposed,
+            &cli,
+            Config::default(),
+            Path::new("/project"),
+            false,
+        )
+        .unwrap();
+        let finalized =
+            finalize_launch_config(base, Path::new("/project"), true).unwrap();
+        let expected_config = finalized.config.clone();
+        let expected_bindings = finalized
+            .secrets
+            .iter()
+            .map(|binding| {
+                (
+                    binding.key.clone(),
+                    binding.placeholder.clone(),
+                    binding.real.clone(),
+                    binding.host.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let launch_runner = LaunchRunner::new(finalized);
+        let config_received_by_sandbox =
+            launch_runner.build_sandbox(|config_at_build_boundary| {
+                config_at_build_boundary.clone()
+            });
+        let proxy_config = launch_runner.finish_proxy_config(
+            crate::proxy::ProxyConfig::new(vec!["github.com".into()]),
+        );
+        let bindings_received_by_proxy = proxy_config
+            .secrets
+            .iter()
+            .map(|binding| {
+                (
+                    binding.key.clone(),
+                    binding.placeholder.clone(),
+                    binding.real.clone(),
+                    binding.host.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(config_received_by_sandbox, expected_config);
+        assert_eq!(bindings_received_by_proxy, expected_bindings);
+        assert!(
+            launch_runner.config().env_pass.iter().any(|entry| {
+                entry.starts_with("TEST_TOKEN=AIJAIL-PHANTOM-")
+            })
+        );
+        assert!(
+            !launch_runner
+                .config()
+                .env_pass
+                .iter()
+                .any(|entry| entry.contains("super-secret-value"))
+        );
+        assert_eq!(bindings_received_by_proxy.len(), 1);
+        let rendered = crate::onboarding::render_effective_access(
+            launch_runner.config(),
+            Path::new("/project"),
+            "claude",
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(!rendered.contains("super-secret-value"));
+        assert!(rendered.contains("TEST_TOKEN"));
+    }
+
+    #[test]
+    fn missing_approved_environment_name_fails_closed_except_in_editor() {
+        let name = "AI_JAIL_DEFINITELY_MISSING_APPROVED_ENV_7F4B".to_string();
+        assert!(std::env::var_os(&name).is_none());
+        let error =
+            materialize_approved_env_names(std::slice::from_ref(&name), false)
+                .unwrap_err();
+        assert!(error.contains(crate::onboarding::messages::ENV_MISSING_ID));
+        assert!(
+            materialize_approved_env_names(&[name], true)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
