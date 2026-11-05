@@ -75,6 +75,7 @@ unsafe fn slave_stdio(fd: i32) -> Stdio {
     unsafe { Stdio::from_raw_fd(duplicated) }
 }
 
+#[cfg(feature = "test-hooks")]
 fn normalize_ssh_guest_paths(mut text: String) -> String {
     const PREFIX: &str = "/tmp/ai-jail-ssh-";
     let mut cursor = 0;
