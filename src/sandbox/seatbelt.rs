@@ -101,9 +101,7 @@ pub fn build(
     } else {
         None
     };
-    let codex_ps_shim = if !lockdown
-        && crate::command::effective_name(&config.command) == Some("codex")
-    {
+    let codex_ps_shim = if !lockdown && config.has_harness("codex") {
         Some(prepare_codex_ps_shim()?)
     } else {
         None
@@ -230,7 +228,7 @@ fn apply_child_env(
     // already choose a value through --env.
     let claude_agent_state = !config.lockdown_enabled()
         && config.agent_state_enabled()
-        && crate::command::effective_name(&config.command) == Some("claude");
+        && config.has_harness("claude");
     if claude_agent_state
         && !config.env_pass().iter().any(|entry| {
             crate::config::parse_env_entry(entry)
@@ -479,8 +477,7 @@ fn generate_sbpl_profile_for_tty(
     push_allow_pty_section(&mut profile, config);
     push_network_section(&mut profile, config, proxy_port);
     push_codex_control_socket_section(&mut profile, config);
-    let is_claude =
-        crate::command::effective_name(&config.command) == Some("claude");
+    let is_claude = config.has_harness("claude");
     push_file_read_section(
         &mut profile,
         config,
@@ -515,7 +512,7 @@ fn generate_sbpl_profile_for_tty(
 fn push_claude_keychain_section(profile: &mut String, config: &Config) {
     if config.lockdown_enabled()
         || !config.agent_state_enabled()
-        || crate::command::effective_name(&config.command) != Some("claude")
+        || !config.has_harness("claude")
     {
         return;
     }
@@ -842,7 +839,7 @@ fn push_forward_ports_section(profile: &mut String, config: &Config) {
 fn push_codex_control_socket_section(profile: &mut String, config: &Config) {
     if config.lockdown_enabled()
         || !config.agent_state_enabled()
-        || crate::command::effective_name(&config.command) != Some("codex")
+        || !config.has_harness("codex")
     {
         return;
     }
@@ -934,7 +931,7 @@ fn push_allow_pty_section(profile: &mut String, config: &Config) {
 fn push_codex_mach_section(profile: &mut String, config: &Config) {
     if config.lockdown_enabled()
         || !config.agent_state_enabled()
-        || crate::command::effective_name(&config.command) != Some("codex")
+        || !config.has_harness("codex")
     {
         return;
     }
@@ -1150,7 +1147,7 @@ fn push_file_write_section(
 /// the symlink would only protect the selected version, not replacement of
 /// the selector itself.
 fn devin_installation_write_denies(config: &Config) -> Vec<PathBuf> {
-    if crate::command::effective_name(&config.command) != Some("devin") {
+    if !config.has_harness("devin") {
         return Vec::new();
     }
     let Some(versions) = super::devin_installation_dir(config) else {
@@ -1377,8 +1374,8 @@ fn agent_state_paths(config: &Config) -> Vec<PathBuf> {
     }
     let home = super::home_dir();
     let mut paths: Vec<PathBuf> = Vec::new();
-    match crate::command::effective_name(&config.command) {
-        Some("devin") => {
+    for harness in config.effective_harnesses() {
+        if harness == "devin" {
             let data_root =
                 super::devin_installation_dir(config).and_then(|versions| {
                     versions.parent()?.parent().map(Path::to_path_buf)
@@ -1395,8 +1392,7 @@ fn agent_state_paths(config: &Config) -> Vec<PathBuf> {
                     paths.push(path);
                 }
             }
-        }
-        Some(harness) => {
+        } else {
             for state in crate::authority_inventory::resolve_harness_state(
                 harness,
                 crate::authority_inventory::LocationBasis::Home,
@@ -1423,7 +1419,6 @@ fn agent_state_paths(config: &Config) -> Vec<PathBuf> {
                 }
             }
         }
-        _ => {}
     }
     paths
 }
@@ -1535,27 +1530,28 @@ fn macos_atomic_write_paths(config: &Config) -> Vec<PathBuf> {
     if config.lockdown_enabled() || !config.agent_state_enabled() {
         return Vec::new();
     }
-    let Some(harness) = crate::command::effective_name(&config.command) else {
-        return Vec::new();
-    };
-    crate::authority_inventory::resolve_harness_state(
-        harness,
-        crate::authority_inventory::LocationBasis::Home,
-        crate::authority_inventory::Platform::Macos,
-        &super::home_dir(),
-    )
-    .into_iter()
-    .filter(|state| {
-        matches!(
-            state.authority.exposure,
-            crate::authority_inventory::ExposureMode::HarnessState {
-                kind: crate::authority_inventory::StateKind::File,
-                ..
-            }
-        ) && state.path.is_file()
-    })
-    .map(|state| state.path)
-    .collect()
+    config
+        .effective_harnesses()
+        .into_iter()
+        .flat_map(|harness| {
+            crate::authority_inventory::resolve_harness_state(
+                harness,
+                crate::authority_inventory::LocationBasis::Home,
+                crate::authority_inventory::Platform::Macos,
+                &super::home_dir(),
+            )
+        })
+        .filter(|state| {
+            matches!(
+                state.authority.exposure,
+                crate::authority_inventory::ExposureMode::HarnessState {
+                    kind: crate::authority_inventory::StateKind::File,
+                    ..
+                }
+            ) && state.path.is_file()
+        })
+        .map(|state| state.path)
+        .collect()
 }
 
 fn macos_docker_socket() -> Option<PathBuf> {
@@ -1581,7 +1577,7 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
     // symlink. Name its canonical target explicitly so Seatbelt can resolve
     // that symlink without exposing the rest of the installation directory.
     if !config.lockdown_enabled()
-        && crate::command::effective_name(&config.command) == Some("codex")
+        && config.has_harness("codex")
         && let Ok(executable) = std::env::current_exe()
     {
         push_unique(canonicalize_or_keep(&executable));
@@ -1636,7 +1632,7 @@ fn macos_read_paths(config: &Config, project_dir: &Path) -> Vec<PathBuf> {
     // Keychain daemon performs item access and writes through its XPC API.
     if !config.lockdown_enabled()
         && config.agent_state_enabled()
-        && crate::command::effective_name(&config.command) == Some("claude")
+        && config.has_harness("claude")
     {
         let keychain_db =
             super::home_dir().join("Library/Keychains/login.keychain-db");

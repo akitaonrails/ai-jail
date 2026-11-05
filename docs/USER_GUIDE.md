@@ -5,6 +5,12 @@ project. The saved policy lives under `$XDG_CONFIG_HOME/ai-jail/projects`
 (normally `~/.config/ai-jail/projects`), outside the checkout. Repository
 files cannot add grants.
 
+Host wrappers such as ai-memory should use the dedicated
+[wrapper integration contract](WRAPPER_INTEGRATION.md). It consolidates their
+requested access into this same review instead of presenting a second
+checklist. A wrapper request starts selected for review, remains deniable, and
+does not become authority until the user approves and saves it here.
+
 Repository-scoped GitHub, GitLab, Codeberg/Forgejo, and Gitea credentials use
 the separate [`ai-jail forge` step-by-step guide](FORGE_AUTH.md). It includes
 complete simulated prompts, provider account setup, scope/lifetime labels,

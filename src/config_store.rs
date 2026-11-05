@@ -66,6 +66,9 @@ pub(crate) struct ProjectPolicyDocument {
     pub(crate) directory_grants: Vec<DirectoryGrantIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) approved_env_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) approved_wrapper_requests:
+        Vec<crate::integration::RequestApproval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) restricted_ssh: Option<crate::ssh_restricted::Policy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,7 +99,10 @@ pub(crate) struct LoadedProject {
     pub(crate) present: bool,
     pub(crate) onboarding_complete: bool,
     pub(crate) approved_env_names: Vec<String>,
+    pub(crate) approved_wrapper_requests:
+        Vec<crate::integration::RequestApproval>,
     pub(crate) restricted_ssh: Option<crate::ssh_restricted::Policy>,
+    pub(crate) validation_blockers: Vec<String>,
 }
 
 pub(crate) struct StoreLock(File);
@@ -569,6 +575,7 @@ fn read_trusted_regular(path: &Path) -> Result<Option<Vec<u8>>, String> {
 fn read_project(
     path: &Path,
     identity: &ProjectIdentity,
+    collect_blockers: bool,
 ) -> Result<LoadedProject, String> {
     let Some(raw) = read_trusted_regular(path)? else {
         return Ok(LoadedProject::default());
@@ -592,18 +599,25 @@ fn read_project(
         ));
     }
     let mut grants = doc.grants;
-    validate_directory_grants(
+    let validation = validate_directory_grants(
         &mut grants,
         &doc.directory_grants,
         &identity.canonical_path,
-    )?;
+    );
+    let validation_blockers = match validation {
+        Ok(()) => Vec::new(),
+        Err(error) if collect_blockers => vec![error],
+        Err(error) => return Err(error),
+    };
     Ok(LoadedProject {
         grants,
         constraints: doc.constraints,
         present: true,
         onboarding_complete: doc.onboarding_complete,
         approved_env_names: doc.approved_env_names,
+        approved_wrapper_requests: doc.approved_wrapper_requests,
         restricted_ssh: doc.restricted_ssh,
+        validation_blockers,
     })
 }
 
@@ -613,7 +627,16 @@ pub(crate) fn load_project(
     if !validate_store_for_read(paths)? {
         return Ok(LoadedProject::default());
     }
-    read_project(&paths.project, &paths.identity())
+    read_project(&paths.project, &paths.identity(), false)
+}
+
+pub(crate) fn load_project_for_status(
+    paths: &StorePaths,
+) -> Result<LoadedProject, String> {
+    if !validate_store_for_read(paths)? {
+        return Ok(LoadedProject::default());
+    }
+    read_project(&paths.project, &paths.identity(), true)
 }
 
 pub(crate) fn load_global(paths: &StorePaths) -> Result<GlobalConfig, String> {
@@ -952,6 +975,7 @@ fn migrate_project(
             onboarding_complete: false,
             directory_grants: Vec::new(),
             approved_env_names: Vec::new(),
+            approved_wrapper_requests: Vec::new(),
             restricted_ssh: None,
             migration: None,
         }
@@ -980,6 +1004,7 @@ pub(crate) fn save_project_grants(
     paths: &StorePaths,
     mut grants: Config,
     mut approved_env_names: Vec<String>,
+    mut approved_wrapper_requests: Vec<crate::integration::RequestApproval>,
     approved_directory_grants: &[DirectoryGrantIdentity],
     restricted_ssh: Option<crate::ssh_restricted::Policy>,
 ) -> Result<(), String> {
@@ -1001,6 +1026,7 @@ pub(crate) fn save_project_grants(
             onboarding_complete: false,
             directory_grants: Vec::new(),
             approved_env_names: Vec::new(),
+            approved_wrapper_requests: Vec::new(),
             restricted_ssh: None,
             migration: None,
         }
@@ -1014,9 +1040,17 @@ pub(crate) fn save_project_grants(
     // field. Config.env_pass may contain literal assignments, so it must never
     // be serialized as part of the project grants.
     grants.env_pass.clear();
+    // Explicit wrapper identities are invocation-scoped. Persisting them as
+    // repository/profile policy would let stale launch context influence a
+    // later invocation and would also defeat round-trip verification because
+    // the field is intentionally skipped by serde.
+    grants.runtime_harnesses.clear();
     doc.directory_grants = approved_directory_grants.to_vec();
     doc.grants = grants;
     doc.approved_env_names = approved_env_names;
+    approved_wrapper_requests.sort();
+    approved_wrapper_requests.dedup();
+    doc.approved_wrapper_requests = approved_wrapper_requests;
     if let Some(policy) = &restricted_ssh {
         crate::ssh_restricted::validate_policy(policy)?;
     }
@@ -1245,6 +1279,7 @@ macro_rules! directional_policy {
 }
 
 const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
+    excluded_policy!("runtime_harnesses", Authority),
     static_policy!("command", Authority, Command),
     static_policy!("rw_maps", Authority, RwMaps),
     static_policy!("ro_maps", Authority, RoMaps),
@@ -1593,6 +1628,13 @@ fn dropped_capability_requests(
                         | StaticPolicyClass::Preference,
                         None,
                     ) => {}
+                    (StaticPolicyClass::Authority, None)
+                        if *field == "runtime_harnesses" =>
+                    {
+                        // Trusted wrapper identity is supplied by this
+                        // invocation and is never read from or migrated out
+                        // of repository policy.
+                    }
                     _ => unreachable!(
                         "CONFIG_FIELD_POLICY category/renderer mismatch"
                     ),
@@ -1706,6 +1748,7 @@ pub(crate) fn save_project_constraints(
             onboarding_complete: false,
             directory_grants: Vec::new(),
             approved_env_names: Vec::new(),
+            approved_wrapper_requests: Vec::new(),
             restricted_ssh: None,
             migration: None,
         }
@@ -1946,6 +1989,7 @@ mod tests {
     }
 
     const EXPECTED_STATIC_POLICY: &[ExpectedStaticPolicy] = &[
+        expected_excluded!("runtime_harnesses", Authority),
         expected_authority!("command", Authority, Command, ["command claude"]),
         expected_authority!(
             "rw_maps",
@@ -2049,6 +2093,9 @@ mod tests {
     fn config_with_only_static_field(field: &str) -> Config {
         let mut config = Config::default();
         match field {
+            "runtime_harnesses" => {
+                config.runtime_harnesses = vec!["claude".into()];
+            }
             "command" => {
                 config.command =
                     vec!["claude".into(), "--token=top-secret".into()];
@@ -2554,11 +2601,20 @@ mod tests {
             github: Some(true),
             ..Config::default()
         };
+        let wrapper_approval = crate::integration::RequestApproval {
+            requester: "ai-memory".into(),
+            kind: "env".into(),
+            value: "AI_MEMORY_SERVER_URL".into(),
+            host: None,
+            writable: None,
+            port: None,
+        };
 
         save_project_grants(
             &paths,
             grants.clone(),
             vec!["CUSTOM_MODE".into()],
+            vec![wrapper_approval.clone()],
             &[],
             None,
         )
@@ -2568,6 +2624,7 @@ mod tests {
         assert!(loaded.present);
         assert!(loaded.onboarding_complete);
         assert_eq!(loaded.grants, grants);
+        assert_eq!(loaded.approved_wrapper_requests, vec![wrapper_approval]);
         assert_eq!(loaded.approved_env_names, vec!["CUSTOM_MODE"]);
         let serialized = fs::read_to_string(&paths.project).unwrap();
         assert!(serialized.contains("CUSTOM_MODE"));
@@ -2612,6 +2669,7 @@ mod tests {
                 ..Config::default()
             },
             Vec::new(),
+            Vec::new(),
             &[],
             None,
         )
@@ -2628,6 +2686,7 @@ mod tests {
                 github: Some(true),
                 ..Config::default()
             },
+            Vec::new(),
             Vec::new(),
             &[],
             None,
@@ -2678,8 +2737,15 @@ mod tests {
         let approved =
             capture_directory_grants(&grants, &paths.canonical_project)
                 .unwrap();
-        save_project_grants(&paths, grants, Vec::new(), &approved, None)
-            .unwrap();
+        save_project_grants(
+            &paths,
+            grants,
+            Vec::new(),
+            Vec::new(),
+            &approved,
+            None,
+        )
+        .unwrap();
         fs::remove_dir(&first).unwrap();
         fs::rename(&second, &first).unwrap();
         assert!(load_project(&paths).unwrap_err().contains("AJ-PATH-004"));
@@ -2750,8 +2816,15 @@ mod tests {
             legacy_project: project.join(".ai-jail"),
             canonical_project,
         };
-        save_project_grants(&paths, Config::default(), Vec::new(), &[], None)
-            .unwrap();
+        save_project_grants(
+            &paths,
+            Config::default(),
+            Vec::new(),
+            Vec::new(),
+            &[],
+            None,
+        )
+        .unwrap();
         let before = fs::read(&paths.project).unwrap();
         let grants = Config {
             ro_maps: vec![approved.clone()],
@@ -2765,6 +2838,7 @@ mod tests {
         let error = save_project_grants(
             &paths,
             grants,
+            Vec::new(),
             Vec::new(),
             &preview_identities,
             None,
@@ -2827,6 +2901,7 @@ mod tests {
             onboarding_complete: true,
             directory_grants: Vec::new(),
             approved_env_names: Vec::new(),
+            approved_wrapper_requests: Vec::new(),
             restricted_ssh: Some(crate::ssh_restricted::Policy {
                 keys: vec![crate::ssh_restricted::KeyIdentity {
                     private_path: "/home/test/.ssh/id_test".into(),

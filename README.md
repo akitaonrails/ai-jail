@@ -95,6 +95,13 @@ run non-interactively. `--dry-run` never migrates or writes configuration.
 Unreadable or invalid trusted configuration fails closed. See the
 [onboarding guide](docs/USER_GUIDE.md) for the tested prompt transcripts.
 
+Tool and wrapper developers can integrate without scraping terminal output.
+The versioned [wrapper integration contract](docs/WRAPPER_INTEGRATION.md)
+documents capability discovery, explicit harness identity, request manifests,
+saved approvals, JSON status, exit codes, and the rules that keep a request
+from becoming a grant. It is the same public contract used by `ai-memory` and
+is available to any launcher or orchestration tool.
+
 ## Secure defaults
 
 "Secure defaults" here means defaults tuned to stop accidents, not defaults

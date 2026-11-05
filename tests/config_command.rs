@@ -119,7 +119,7 @@ fn cli_command_overrides_trusted_and_untrusted_project_commands() {
 }
 
 #[test]
-fn no_cli_command_keeps_project_then_global_fallbacks() {
+fn migrated_project_command_never_becomes_a_grant() {
     if !sandbox_available() {
         return;
     }
@@ -128,7 +128,7 @@ fn no_cli_command_keeps_project_then_global_fallbacks() {
             let tree = TestTree::new("fallback", trusted, project_command);
             assert_eq!(
                 tree.run(&[]),
-                if project_command { "PROJECT" } else { "GLOBAL" },
+                "GLOBAL",
                 "project trusted: {trusted}, command: {project_command}"
             );
         }

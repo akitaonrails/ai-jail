@@ -774,7 +774,7 @@ fn devin_xdg_home(
 /// Discovery and child environment preparation may resolve a base repeatedly.
 /// Report failures once per launch, from platform_notes, without global state.
 fn devin_xdg_warnings(config: &Config) -> Vec<String> {
-    if crate::command::effective_name(&config.command) != Some("devin")
+    if !config.has_harness("devin")
         || !config.agent_state_enabled()
         || config.browser_profile().is_some()
     {
@@ -795,7 +795,7 @@ fn devin_xdg_warnings(config: &Config) -> Vec<String> {
 /// Forward physical base paths so a private home need not expose the
 /// host's symlink aliases just to let Devin find its mounted state.
 fn devin_child_env(config: &Config) -> Vec<(String, String)> {
-    if crate::command::effective_name(&config.command) != Some("devin")
+    if !config.has_harness("devin")
         || config.lockdown_enabled()
         || config.browser_profile().is_some()
     {
@@ -848,7 +848,7 @@ fn devin_installation_dir(config: &Config) -> Option<PathBuf> {
 /// Candidates only: each backend preserves its own existing validation of
 /// missing paths and symlinks. Never create directories on the host.
 fn devin_state_paths(config: &Config) -> Vec<PathBuf> {
-    if crate::command::effective_name(&config.command) != Some("devin")
+    if !config.has_harness("devin")
         || !config.agent_state_enabled()
         || config.browser_profile().is_some()
     {
@@ -2813,6 +2813,7 @@ mod tests {
 
     #[test]
     fn mise_wrapper_preserves_jail_marker_for_managed_launchers() {
+        let _lock = ENV_LOCK.lock().unwrap();
         // Non-interactive Bash unsets an inherited PS1. Exercise the real
         // wrapper shell, including missing and failing mise activation.
         let resolve = |name: &str| {
@@ -2823,6 +2824,7 @@ mod tests {
             .find(|path| path.is_file())
             .unwrap_or_else(|| panic!("test command {name:?} not found"))
         };
+        let bash = resolve("bash");
         let printenv = resolve("printenv");
         let mise_paths = [
             resolve("true"),
@@ -2831,7 +2833,7 @@ mod tests {
         ];
         for mise in &mise_paths {
             for login in [false, true] {
-                let wrapped = mise_wrapper_command(
+                let mut wrapped = mise_wrapper_command(
                     mise,
                     LaunchCommand {
                         program: printenv.display().to_string(),
@@ -2839,6 +2841,10 @@ mod tests {
                     },
                     login,
                 );
+                // The production command intentionally relies on the jail's
+                // PATH. The test uses the already-resolved host Bash so a
+                // concurrent environment fixture cannot make it flaky.
+                wrapped.program = bash.display().to_string();
                 let output = std::process::Command::new(&wrapped.program)
                     .args(["--noprofile", "--norc"])
                     .args(&wrapped.args)

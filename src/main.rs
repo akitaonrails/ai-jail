@@ -13,6 +13,7 @@ mod config_store;
 mod forge_auth;
 mod fsutil;
 mod github_auth;
+mod integration;
 mod onboarding;
 mod output;
 mod proxy;
@@ -656,7 +657,10 @@ pub(crate) fn finalize_launch_config_with_ssh(
     if default_agent_api_egress_applies(&config)
         && sandbox::unprivileged_netns_available()
     {
-        for host in command::default_egress_hosts(&config.command) {
+        for host in command::default_egress_hosts_for(
+            &config.runtime_harnesses,
+            &config.command,
+        ) {
             if !config.allow_hosts.iter().any(|allowed| allowed == host) {
                 config.allow_hosts.push((*host).into());
             }
@@ -679,16 +683,21 @@ pub(crate) fn finalize_launch_config_with_ssh(
             }
         }
     }
-    if config.agent_state_enabled()
-        && let Some(name) = command::effective_name(&config.command)
-    {
-        for var in command::harness_api_key_env(name) {
-            if std::env::var_os(var).is_some()
-                && !config.env_pass.iter().any(|entry| {
-                    entry == var || entry.starts_with(&format!("{var}="))
-                })
-            {
-                config.env_pass.push((*var).into());
+    if config.agent_state_enabled() {
+        let harnesses: Vec<String> = config
+            .effective_harnesses()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for name in &harnesses {
+            for var in command::harness_api_key_env(name) {
+                if std::env::var_os(var).is_some()
+                    && !config.env_pass.iter().any(|entry| {
+                        entry == var || entry.starts_with(&format!("{var}="))
+                    })
+                {
+                    config.env_pass.push((*var).into());
+                }
             }
         }
     }
@@ -1128,6 +1137,17 @@ fn run(
     migration_notices: &mut Vec<config_store::MigrationNotice>,
 ) -> Result<i32, String> {
     let cli = cli::parse()?;
+    if cli.capabilities {
+        if !cli.json {
+            return Err("capabilities currently requires --json".into());
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&integration::Capabilities::current())
+                .map_err(|e| format!("Cannot serialize capabilities: {e}"))?
+        );
+        return Ok(0);
+    }
     if let Some(fd) = cli.supervised_exec_fd {
         return signals::run_supervised_exec(fd, &cli.command);
     }
@@ -1194,6 +1214,11 @@ fn run(
 
     let invocation_cwd = std::env::current_dir()
         .map_err(|e| format!("Cannot determine current directory: {e}"))?;
+    let wrapper_requests = integration::RequestSet::load(
+        &cli.request_files,
+        &cli.requests,
+        &invocation_cwd,
+    )?;
     if cli.configure.is_some() && !onboarding::is_interactive() {
         let harness = cli.configure.as_deref().unwrap_or("HARNESS");
         output::error(&format!(
@@ -1206,8 +1231,9 @@ fn run(
     if let Some(command) = &cli.forge {
         return forge_auth::run_command(command, &store);
     }
-    let migration_writes_allowed =
-        !cli.dry_run && cli.save_config != Some(false) && !cli.status;
+    // --no-save-config suppresses profile/constraint auto-save, not the
+    // security migration from repository-local policy into the trusted store.
+    let migration_writes_allowed = !cli.dry_run && !cli.status;
     if migration_writes_allowed && store.available {
         config_store::migrate(&store, !cli.clean, migration_notices)?;
     }
@@ -1216,16 +1242,27 @@ fn run(
     // legacy behavior in read-only modes until a writable launch migrates it.
     let mut stored_project = if cli.clean {
         config_store::LoadedProject::default()
+    } else if cli.status && cli.json {
+        config_store::load_project_for_status(&store)?
     } else {
         config_store::load_project(&store)?
     };
-    stored_project
-        .grants
-        .env_pass
-        .extend(materialize_approved_env_names(
-            &stored_project.approved_env_names,
-            cli.configure.is_some(),
-        )?);
+    let mut status_blockers: Vec<(String, String)> = stored_project
+        .validation_blockers
+        .iter()
+        .cloned()
+        .map(|message| ("directory_drift".into(), message))
+        .collect();
+    match materialize_approved_env_names(
+        &stored_project.approved_env_names,
+        cli.configure.is_some(),
+    ) {
+        Ok(env) => stored_project.grants.env_pass.extend(env),
+        Err(error) if cli.status && cli.json => {
+            status_blockers.push(("missing_approved_env".into(), error));
+        }
+        Err(error) => return Err(error),
+    }
     let legacy_project = if cli.clean || stored_project.present {
         config::Config::default()
     } else {
@@ -1240,6 +1277,8 @@ fn run(
     let stored_grants_for_onboarding = stored_project.grants.clone();
     let stored_env_names_for_onboarding =
         stored_project.approved_env_names.clone();
+    let stored_wrapper_approvals =
+        stored_project.approved_wrapper_requests.clone();
     let stored_ssh_for_onboarding = stored_project.restricted_ssh.clone();
     let stored_ssh_for_launch = stored_project.restricted_ssh.clone();
     let global_command_selector = if using_external_project {
@@ -1301,15 +1340,17 @@ fn run(
         )
     };
 
-    let effective_harness = command::effective_name(&config.command)
-        .filter(|name| command::is_known_api_agent(name))
-        .map(str::to_string);
+    let resolved_harnesses =
+        command::resolve_harnesses(&config.command, &cli.harnesses)?;
+    config.runtime_harnesses = resolved_harnesses.clone();
+    let effective_harness = resolved_harnesses.first().cloned();
     let configure_only = cli.configure.is_some();
     let first_run = effective_harness.is_some()
         && !onboarding_complete
         && !cli.dry_run
         && !cli.init
         && !cli.bootstrap
+        && !cli.status
         && !cli.clean;
     let mut prepared_launch: Option<FinalizedLaunch> = None;
     let mut final_access_render: Option<(String, Option<bool>, Vec<String>)> =
@@ -1320,6 +1361,21 @@ fn run(
             .as_deref()
             .ok_or_else(|| "configure requires a known harness".to_string())?;
         if !onboarding::is_interactive() {
+            if !wrapper_requests.items.is_empty() {
+                for request in
+                    wrapper_requests.pending(&stored_wrapper_approvals)
+                {
+                    output::error(&format!(
+                        "AJ-REQ-002 wrapper request from {} is not approved: {} {}",
+                        output::escape_control_bytes(
+                            &request.approval.requester
+                        ),
+                        output::escape_control_bytes(&request.approval.kind),
+                        output::escape_control_bytes(&request.approval.value)
+                    ));
+                }
+                return Ok(integration::EXIT_REQUIRED_GRANT);
+            }
             config = build_noninteractive_onboarding_effective(
                 &global_for_onboarding,
                 harness,
@@ -1355,6 +1411,8 @@ fn run(
                     trusted_constraints: legacy_project_trusted,
                     approved_env_names: &stored_env_names_for_onboarding,
                     restricted_ssh: stored_ssh_for_onboarding.as_ref(),
+                    requests: &wrapper_requests,
+                    approved_wrapper_requests: &stored_wrapper_approvals,
                 },
             )?;
             let (mut profile, save, launch) = match outcome {
@@ -1382,6 +1440,7 @@ fn run(
                     &store,
                     profile.grants.clone(),
                     profile.approved_env_names.clone(),
+                    profile.approved_wrapper_requests.clone(),
                     &profile.directory_grants,
                     profile.restricted_ssh.clone(),
                 )?;
@@ -1390,6 +1449,16 @@ fn run(
                     onboarding::messages::SAVE_ID,
                     onboarding::safe_path(&store.project)?
                 );
+            }
+            if launch
+                && !wrapper_requests
+                    .pending(&profile.approved_wrapper_requests)
+                    .is_empty()
+            {
+                output::error(
+                    "AJ-REQ-002 one or more wrapper requests were refused; the harness was not started",
+                );
+                return Ok(integration::EXIT_REQUIRED_GRANT);
             }
             if profile.ssh_transcript_started {
                 eprintln!("{}", onboarding::SSH_TRANSCRIPT_END);
@@ -1421,6 +1490,19 @@ fn run(
         && !cli.init
         && !cli.bootstrap
     {
+        let pending = wrapper_requests.pending(&stored_wrapper_approvals);
+        if !pending.is_empty() && !cli.status {
+            for request in pending {
+                output::error(&format!(
+                    "AJ-REQ-002 wrapper request from {} is not approved: {} {}. Review it with `ai-jail configure --harness {}`.",
+                    output::escape_control_bytes(&request.approval.requester),
+                    output::escape_control_bytes(&request.approval.kind),
+                    output::escape_control_bytes(&request.approval.value),
+                    effective_harness.as_deref().unwrap_or("HARNESS")
+                ));
+            }
+            return Ok(integration::EXIT_REQUIRED_GRANT);
+        }
         config = build_onboarding_effective(
             global_for_onboarding,
             stored_grants_for_onboarding,
@@ -1429,6 +1511,9 @@ fn run(
             &invocation_cwd,
             legacy_project_trusted,
         )?;
+        config.runtime_harnesses = resolved_harnesses.clone();
+        wrapper_requests
+            .apply_approved_runtime(&stored_wrapper_approvals, &mut config);
         let mut saved_selection = onboarding::Selection::from_config(&config);
         if cli.ssh != Some(false) && !config.lockdown_enabled() {
             saved_selection.restricted_ssh = stored_ssh_for_onboarding.clone();
@@ -1493,6 +1578,48 @@ fn run(
 
     // Handle status command
     if cli.status {
+        if cli.json {
+            if !onboarding_complete && !resolved_harnesses.is_empty() {
+                status_blockers.push((
+                    "onboarding_required".into(),
+                    "Interactive onboarding is required before launch".into(),
+                ));
+            }
+            if !wrapper_requests
+                .pending(&stored_wrapper_approvals)
+                .is_empty()
+            {
+                status_blockers.push((
+                    "required_grant_not_approved".into(),
+                    "One or more wrapper requests are pending approval".into(),
+                ));
+            }
+            if let Some(policy) = stored_ssh_for_onboarding.as_ref()
+                && let Err(error) = ssh_restricted::validate_policy(policy)
+            {
+                status_blockers.push(("changed_ssh_key".into(), error));
+            }
+            if let Err(error) = sandbox::check() {
+                status_blockers.push(("backend_unavailable".into(), error));
+            }
+            let report =
+                integration::StatusReport::build(integration::StatusInput {
+                    project: &invocation_cwd,
+                    profile_present: stored_project.present,
+                    onboarding_complete,
+                    harnesses: &resolved_harnesses,
+                    config: &config,
+                    requests: &wrapper_requests,
+                    approved: &stored_wrapper_approvals,
+                    blockers: status_blockers,
+                });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report)
+                    .map_err(|e| format!("Cannot serialize status: {e}"))?
+            );
+            return Ok(0);
+        }
         output::status_header("Project policy source", provenance.source);
         output::status_header(
             "Project grants",
@@ -2014,8 +2141,30 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(msg) => {
             output::error(&msg);
-            std::process::exit(1);
+            std::process::exit(error_exit_code(&msg));
         }
+    }
+}
+
+fn error_exit_code(message: &str) -> i32 {
+    if [
+        onboarding::messages::ENV_MISSING_ID,
+        onboarding::messages::PATH_DRIFT_ID,
+        onboarding::messages::PATH_IDENTITY_ID,
+        onboarding::messages::SSH_DRIFT_ID,
+    ]
+    .iter()
+    .any(|code| message.contains(code))
+    {
+        integration::EXIT_BLOCKED
+    } else if message.contains("bwrap (bubblewrap) not found")
+        || message.contains("Failed to execute bwrap")
+        || message.contains("bwrap found at")
+        || message.contains("sandbox-exec not found")
+    {
+        integration::EXIT_BACKEND_UNAVAILABLE
+    } else {
+        1
     }
 }
 
@@ -2026,12 +2175,13 @@ mod tests {
         build_noninteractive_onboarding_effective, build_onboarding_effective,
         command_is_browser, command_needs_direct_tty,
         default_agent_api_egress_applies, default_registry_egress_applies,
-        default_resize_redraw_key, exec_requires_terminal_passthrough,
-        finalize_launch_config, internal_mode_inherits_quiet,
-        materialize_approved_env_names, policy_provenance,
-        prune_missing_path_entries, pty_proxy_active, resolve_browser_profile,
-        running_inside_multiplexer, should_auto_save_project_config,
-        should_check_update, should_save_global_preferences,
+        default_resize_redraw_key, error_exit_code,
+        exec_requires_terminal_passthrough, finalize_launch_config,
+        internal_mode_inherits_quiet, materialize_approved_env_names,
+        policy_provenance, prune_missing_path_entries, pty_proxy_active,
+        resolve_browser_profile, running_inside_multiplexer,
+        should_auto_save_project_config, should_check_update,
+        should_save_global_preferences,
         untrusted_project_command_carries_credentials, validate_network_flags,
         validate_write_flags,
     };
@@ -3143,5 +3293,22 @@ mod tests {
         };
 
         assert!(!should_save_global_preferences(&cli));
+    }
+
+    #[test]
+    fn machine_exit_codes_classify_backend_and_saved_grant_failures() {
+        assert_eq!(
+            error_exit_code(
+                "bwrap (bubblewrap) not found in trusted locations"
+            ),
+            crate::integration::EXIT_BACKEND_UNAVAILABLE
+        );
+        assert_eq!(
+            error_exit_code(
+                "AJ-ENV-002 approved environment variable is missing"
+            ),
+            crate::integration::EXIT_BLOCKED
+        );
+        assert_eq!(error_exit_code("ordinary configuration error"), 1);
     }
 }

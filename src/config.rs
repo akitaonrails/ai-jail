@@ -145,6 +145,10 @@ fn transform_map_specs(
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
+    /// Explicit harness identities supplied by a trusted wrapper. Runtime
+    /// only: profiles store approvals, never wrapper invocation metadata.
+    #[serde(default, skip)]
+    pub runtime_harnesses: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -410,6 +414,21 @@ pub enum NetworkMode {
 }
 
 impl Config {
+    pub(crate) fn effective_harnesses(&self) -> Vec<&str> {
+        if self.runtime_harnesses.is_empty() {
+            crate::command::effective_name(&self.command)
+                .into_iter()
+                .collect()
+        } else {
+            self.runtime_harnesses.iter().map(String::as_str).collect()
+        }
+    }
+
+    pub(crate) fn has_harness(&self, name: &str) -> bool {
+        self.effective_harnesses()
+            .into_iter()
+            .any(|harness| harness == name)
+    }
     pub fn gpu_enabled(&self) -> bool {
         self.no_gpu == Some(false)
     }
@@ -3348,6 +3367,7 @@ env_pass = ["ANTHROPIC_API_KEY"]
     #[test]
     fn save_does_not_persist_env_pass() {
         let config = Config {
+            runtime_harnesses: Vec::new(),
             command: vec!["claude".into()],
             env_pass: vec!["ANTHROPIC_API_KEY=sk-secret".into()],
             trust_project_config: vec![],
@@ -4236,6 +4256,7 @@ no_gpu = true
     #[test]
     fn roundtrip_serialize_deserialize() {
         let config = Config {
+            runtime_harnesses: Vec::new(),
             command: vec!["claude".into()],
             rw_maps: vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
             ro_maps: vec![PathBuf::from("/opt/data")],
@@ -7577,6 +7598,7 @@ hide_dotdirs = [".my_secrets"]
         std::env::set_current_dir(&dir).unwrap();
 
         let config = Config {
+            runtime_harnesses: Vec::new(),
             command: vec!["codex".into()],
             rw_maps: vec![PathBuf::from("/tmp/shared")],
             ro_maps: vec![],

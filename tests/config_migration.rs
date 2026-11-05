@@ -98,6 +98,23 @@ fn launch_sandbox_available() -> bool {
 }
 
 #[test]
+fn no_save_config_still_performs_security_migration() {
+    if !launch_sandbox_available() {
+        eprintln!("SKIPPED: this environment cannot launch the sandbox");
+        return;
+    }
+    let tree = Tree::new("no-save-still-migrates");
+    std::fs::write(tree.legacy_project(), "no_gpu=true\n").unwrap();
+    let output =
+        tree.run(&["--no-save-config", "--network", "--exec", "--", "true"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!tree.legacy_project().exists());
+    assert!(tree.project_doc().is_file());
+    let stored = std::fs::read_to_string(tree.project_doc()).unwrap();
+    assert!(stored.contains("no_gpu = true"));
+}
+
+#[test]
 fn repository_policy_migrates_only_monotonic_restrictions() {
     let tree = Tree::new("projection");
     std::fs::write(
@@ -236,7 +253,7 @@ fn clean_status_never_prints_ignored_external_config_path() {
 }
 
 #[test]
-fn audit_provenance_uses_contributing_legacy_source_and_clean_ignores_it() {
+fn audit_provenance_uses_migrated_external_source_and_clean_ignores_it() {
     if !launch_sandbox_available() {
         eprintln!("SKIPPED: this environment cannot launch the sandbox");
         return;
@@ -281,8 +298,8 @@ fn audit_provenance_uses_contributing_legacy_source_and_clean_ignores_it() {
     assert_eq!(records.len(), 3, "unexpected launch record count");
     let expected = [
         ("none", false, false, false, false),
-        ("legacy_untrusted", true, false, false, true),
-        ("legacy_trusted", true, true, true, false),
+        ("external_store", true, false, false, true),
+        ("external_store", true, false, false, true),
     ];
     for (record, (source, project, trusted, grants, constraints)) in
         records.iter().zip(expected)

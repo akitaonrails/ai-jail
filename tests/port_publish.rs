@@ -168,11 +168,21 @@ fn project_config_cannot_publish_a_port() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(".ai-jail"), format!("publish_ports = [{port}]\n"))
         .unwrap();
+    let state = std::env::temp_dir().join(format!(
+        "ai-jail-publish-project-state.{}.{port}",
+        std::process::id()
+    ));
+    let home = state.join("home");
+    let xdg = state.join("xdg");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
     let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
     let child = Command::new(ai_jail())
         .args(["--no-status-bar", "--exec", "--no-save-config"])
         .args(["bash", "-c", "echo LAUNCHED; sleep 3"])
         .current_dir(&dir)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -182,11 +192,13 @@ fn project_config_cannot_publish_a_port() {
     let published = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok();
     let output = finish(child);
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!published, "a project .ai-jail published port {port}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("LAUNCHED"));
     assert!(
-        stderr.contains("publish_ports ignored"),
+        stderr.contains("AJ-MIG-003 REAPPROVAL REQUIRED")
+            && stderr.contains(&format!("publish-port {port}")),
         "missing warning: {stderr:?}"
     );
 }

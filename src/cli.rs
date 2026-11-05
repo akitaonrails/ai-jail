@@ -13,7 +13,10 @@ COMMANDS (positional):
     kimi, kiro-cli, devin, bash
                                             Known AI tool presets
     status                                 Show current effective config
+    capabilities --json                    Show the stable wrapper API
     configure HARNESS                      Review and save project access
+    configure --harness NAME [--request-file PATH]
+                                            Review wrapper requests and access
     forge setup PROVIDER ORIGIN OWNER/REPO [--allow-private]
                                             Configure repository-scoped forge access
     forge status | forge remove             Inspect or remove forge access
@@ -101,6 +104,12 @@ OPTIONS:
                                     fresh known-harness profiles: off until approved;
                                     off under
                                     --lockdown; repository policy cannot enable)
+    --harness <NAME>               Declare the effective harness explicitly
+                                   (repeatable; trusted wrapper integration)
+    --request-file <PATH>          Load a versioned wrapper request manifest
+                                   outside the project (repeatable)
+    --request <KIND=VALUE>         Add one wrapper request (repeatable)
+    --json                         Machine-readable output for status/capabilities
     --env <NAME[=VALUE]>            Pass environment variable NAME (value copied from
                                     the host) or NAME=VALUE into the sandbox
                                     (repeatable; literal values are not persisted).
@@ -138,7 +147,8 @@ OPTIONS:
     --browser[=PROFILE]            Use browser isolation profile (hard | soft; default hard)
     --no-browser                   Disable browser auto-detection/profile
     --save-config / --no-save-config
-                                   Enable/disable external per-project policy writes (default: on)
+                                   Enable/disable external profile/constraint auto-save (default: on;
+                                   legacy security migration still runs)
     --hide-config / --no-hide-config
                                    Mask the legacy .ai-jail name from the agent (default: on)
     -s, --status-bar[=STYLE]       Set status line theme (pastel | dark | light; default pastel)
@@ -232,6 +242,10 @@ pub struct CliArgs {
     pub publish_ports: Vec<u16>,
     pub claude_dir: Option<PathBuf>,
     pub agent_state: Option<bool>,
+    pub harnesses: Vec<String>,
+    pub request_files: Vec<PathBuf>,
+    pub requests: Vec<String>,
+    pub json: bool,
     pub inherit_env: Option<bool>,
     pub update_check: Option<bool>,
     pub audit_log: Option<bool>,
@@ -250,6 +264,7 @@ pub struct CliArgs {
     pub bootstrap: bool,
     pub verbose: bool,
     pub status: bool,
+    pub capabilities: bool,
     pub configure: Option<String>,
     pub forge: Option<ForgeCommand>,
     /// Internal: apply Landlock and exec remaining command.
@@ -540,6 +555,34 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long(s @ ("agent-state" | "no-agent-state")) => {
                 args.agent_state = Some(s == "agent-state");
             }
+            Long("harness") => {
+                let value = parser
+                    .value()
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .into_owned();
+                let value = validate_harness(&value)?;
+                if !args.harnesses.contains(&value) {
+                    args.harnesses.push(value);
+                }
+            }
+            Long("request-file") => {
+                let value: PathBuf =
+                    parser.value().map_err(|e| e.to_string())?.into();
+                args.request_files.push(value);
+            }
+            Long("request") => {
+                let value = parser
+                    .value()
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .into_owned();
+                if !value.contains('=') {
+                    return Err("--request requires KIND=VALUE".into());
+                }
+                args.requests.push(value);
+            }
+            Long("json") => args.json = true,
             Long(s @ ("inherit-env" | "no-inherit-env")) => {
                 args.inherit_env = Some(s == "inherit-env");
             }
@@ -728,6 +771,8 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 let s = val.to_string_lossy().into_owned();
                 if s == "status" {
                     args.status = true;
+                } else if s == "capabilities" && args.command.is_empty() {
+                    args.capabilities = true;
                 } else if s == "forge" && args.command.is_empty() {
                     let action = parser
                         .value()
@@ -819,25 +864,12 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                         }
                     });
                 } else if s == "configure" && args.command.is_empty() {
-                    let harness = parser
-                        .value()
-                        .map_err(|_| {
-                            "configure requires a harness name".to_string()
-                        })?
-                        .to_string_lossy()
-                        .into_owned();
-                    if !crate::command::is_known_api_agent(&harness) {
-                        return Err(format!(
-                            "configure requires a known harness (got {harness:?})"
-                        ));
-                    }
-                    if parser.next().map_err(|e| e.to_string())?.is_some() {
-                        return Err(
-                            "configure accepts exactly one harness name".into(),
-                        );
-                    }
-                    args.configure = Some(harness.clone());
-                    args.command.push(harness);
+                    let tail = parser
+                        .raw_args()
+                        .map_err(|e| e.to_string())?
+                        .collect::<Vec<_>>();
+                    parse_configure_tail(&mut args, tail)?;
+                    break;
                 } else {
                     args.command.push(s);
                     // Consume ALL remaining args as part of the command
@@ -881,7 +913,95 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
         );
     }
 
+    if args.json && !args.status && !args.capabilities {
+        return Err("--json is only valid with status or capabilities".into());
+    }
+    if args.capabilities
+        && (!args.command.is_empty()
+            || args.status
+            || args.configure.is_some()
+            || args.forge.is_some())
+    {
+        return Err(
+            "capabilities cannot be combined with another action".into()
+        );
+    }
+
     Ok(args)
+}
+
+fn validate_harness(value: &str) -> Result<String, String> {
+    crate::command::normalize_harness_name(value)
+        .map(str::to_string)
+        .ok_or_else(|| format!("unknown harness {value:?}"))
+}
+
+fn parse_configure_tail(
+    args: &mut CliArgs,
+    tail: Vec<std::ffi::OsString>,
+) -> Result<(), String> {
+    let mut index = 0;
+    let mut positional: Option<String> = None;
+    while index < tail.len() {
+        let value = tail[index].to_string_lossy().into_owned();
+        match value.as_str() {
+            "--harness" => {
+                index += 1;
+                let harness = tail
+                    .get(index)
+                    .ok_or_else(|| "--harness requires NAME".to_string())?
+                    .to_string_lossy()
+                    .into_owned();
+                let harness = validate_harness(&harness)?;
+                if !args.harnesses.contains(&harness) {
+                    args.harnesses.push(harness);
+                }
+            }
+            "--request-file" => {
+                index += 1;
+                let path = tail.get(index).ok_or_else(|| {
+                    "--request-file requires PATH".to_string()
+                })?;
+                args.request_files.push(PathBuf::from(path));
+            }
+            "--request" => {
+                index += 1;
+                let request = tail
+                    .get(index)
+                    .ok_or_else(|| "--request requires KIND=VALUE".to_string())?
+                    .to_string_lossy()
+                    .into_owned();
+                if !request.contains('=') {
+                    return Err("--request requires KIND=VALUE".into());
+                }
+                args.requests.push(request);
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown configure option: {value}"));
+            }
+            _ if positional.is_none() => {
+                positional = Some(validate_harness(&value)?);
+            }
+            _ => return Err("configure accepts one positional harness".into()),
+        }
+        index += 1;
+    }
+    if let Some(harness) = positional {
+        if !args.harnesses.is_empty() && !args.harnesses.contains(&harness) {
+            return Err(
+                "positional configure harness contradicts --harness".into()
+            );
+        }
+        if args.harnesses.is_empty() {
+            args.harnesses.push(harness);
+        }
+    }
+    let harness = args.harnesses.first().cloned().ok_or_else(|| {
+        "configure requires HARNESS or --harness NAME".to_string()
+    })?;
+    args.configure = Some(harness.clone());
+    args.command.push(harness);
+    Ok(())
 }
 
 /// Long flags that configure the sandbox itself (as opposed to the wrapped
@@ -892,6 +1012,10 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
 /// The conformance test `every_guarded_sandbox_flag_is_parseable` enforces
 /// that invariant.
 const SANDBOX_LONG_FLAGS: &[&str] = &[
+    "--harness",
+    "--request-file",
+    "--request",
+    "--json",
     "--private-home",
     "--no-private-home",
     "--lockdown",
@@ -2581,5 +2705,61 @@ mod tests {
     fn env_flag_after_command_is_rejected() {
         let error = parse_test(&["claude", "--env", "SECRET"]).unwrap_err();
         assert!(error.contains("flag --env after command"));
+    }
+
+    #[test]
+    fn parses_wrapper_contract_flags_before_separator() {
+        let args = parse_test(&[
+            "--harness",
+            "claude",
+            "--harness",
+            "codex",
+            "--request-file",
+            "/tmp/requests.json",
+            "--request",
+            "env=AI_MEMORY_SERVER_URL",
+            "--",
+            "ai-memory",
+            "run",
+            "--some-future-flag",
+            "x",
+            "claude",
+        ])
+        .unwrap();
+        assert_eq!(args.harnesses, vec!["claude", "codex"]);
+        assert_eq!(
+            args.request_files,
+            vec![PathBuf::from("/tmp/requests.json")]
+        );
+        assert_eq!(args.requests, vec!["env=AI_MEMORY_SERVER_URL"]);
+        assert_eq!(args.command.first().map(String::as_str), Some("ai-memory"));
+    }
+
+    #[test]
+    fn configure_accepts_harness_and_request_file_options() {
+        let args = parse_test(&[
+            "configure",
+            "--harness",
+            "claude",
+            "--request-file",
+            "/tmp/requests.json",
+        ])
+        .unwrap();
+        assert_eq!(args.configure.as_deref(), Some("claude"));
+        assert_eq!(args.harnesses, vec!["claude"]);
+        assert_eq!(
+            args.request_files,
+            vec![PathBuf::from("/tmp/requests.json")]
+        );
+    }
+
+    #[test]
+    fn parses_machine_readable_status_and_capabilities() {
+        let status =
+            parse_test(&["status", "--json", "--harness", "claude"]).unwrap();
+        assert!(status.status && status.json);
+        assert_eq!(status.harnesses, vec!["claude"]);
+        let capabilities = parse_test(&["capabilities", "--json"]).unwrap();
+        assert!(capabilities.capabilities && capabilities.json);
     }
 }

@@ -175,6 +175,70 @@ pub(crate) fn effective_name(command: &[String]) -> Option<&str> {
         })
 }
 
+/// Validate trusted wrapper declarations against any harness identity that
+/// can be established from the executable. Unknown wrapper flags do not take
+/// part in inference: that is the reason the explicit contract exists.
+pub(crate) fn resolve_harnesses(
+    command: &[String],
+    declared: &[String],
+) -> Result<Vec<String>, String> {
+    if declared.is_empty() {
+        return Ok(effective_name(command)
+            .filter(|name| is_known_api_agent(name))
+            .map(|name| vec![name.to_string()])
+            .unwrap_or_default());
+    }
+    let normalized: Vec<String> = declared
+        .iter()
+        .map(|name| {
+            normalize_harness_name(name)
+                .map(str::to_string)
+                .ok_or_else(|| format!("unknown harness {name:?}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let direct = basename(command)
+        .and_then(canonical_harness_name)
+        .filter(|name| is_known_api_agent(name));
+    let inferred = managed_harness(command).map(|harness| {
+        Path::new(harness.executable())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(normalize_harness_name)
+            .unwrap_or(harness.name)
+    });
+    if let Some(actual) = direct.or(inferred)
+        && !normalized.iter().any(|name| name == actual)
+    {
+        return Err(format!(
+            "--harness declaration contradicts executable harness {actual:?}"
+        ));
+    }
+    Ok(normalized)
+}
+
+pub(crate) fn default_egress_hosts_for(
+    harnesses: &[String],
+    command: &[String],
+) -> Vec<&'static str> {
+    let mut hosts = Vec::new();
+    let names: Vec<&str> = if harnesses.is_empty() {
+        effective_name(command).into_iter().collect()
+    } else {
+        harnesses.iter().map(String::as_str).collect()
+    };
+    for name in names {
+        if let Some(host) = api_host(name)
+            && !hosts.contains(&host)
+        {
+            hosts.push(host);
+        }
+        if name == "codex" && !hosts.contains(&"chatgpt.com") {
+            hosts.push("chatgpt.com");
+        }
+    }
+    hosts
+}
+
 /// Agents known to be network API clients. Harness-state authority lives in
 /// `authority_inventory`; this list only describes automatic API behavior.
 const KNOWN_API_AGENTS: &[&str] = &[
@@ -195,6 +259,11 @@ const KNOWN_API_AGENTS: &[&str] = &[
 
 pub(crate) fn is_known_api_agent(name: &str) -> bool {
     KNOWN_API_AGENTS.contains(&name) || name.starts_with("kimi")
+}
+
+pub(crate) fn normalize_harness_name(value: &str) -> Option<&str> {
+    canonical_harness_name(value)
+        .or_else(|| is_known_api_agent(value).then_some(value))
 }
 
 /// The hosted-API hostname an agent needs in filtered-egress mode, for
@@ -258,51 +327,51 @@ pub(crate) fn harness_api_key_env(name: &str) -> &'static [&'static str] {
 pub(crate) fn capability_gap_warnings(
     config: &crate::config::Config,
 ) -> Vec<String> {
-    let Some(name) = effective_name(&config.command) else {
-        return Vec::new();
-    };
-    if !is_known_api_agent(name) {
-        return Vec::new();
-    }
     let mut warnings = Vec::new();
     let filtered =
         matches!(config.network_mode(), crate::config::NetworkMode::Filtered);
-    if !config.lockdown_enabled() && !config.network_enabled() && !filtered {
-        warnings.push(format!(
-            "ai-jail: `{name}` is a network API client but network is off \
-             (default since v1.18.0) — set `network = true` or pass \
-             --network; see `ai-jail status`"
-        ));
-    }
-    if filtered
-        && let Some(host) = api_host(name)
-        && !config.host_is_allowlisted(host)
-    {
-        warnings.push(format!(
-            "ai-jail: filtered egress is on but `{name}`'s API host \
-             {host} is not in allow_hosts — add it there or pass \
-             --allow-host {host}; see `ai-jail status`"
-        ));
-    }
-    // Agent state is ON by default now, so no gap warning is needed: a plain
-    // `ai-jail <harness>` already mounts the harness's login/session data.
-    // `--no-agent-state` and `--lockdown` disable it deliberately, so nudging
-    // toward `--agent-state` there would just contradict the user's choice.
-    let opencode_service = config
-        .command
-        .windows(2)
-        .any(|args| args[0] == "serve" && args[1] == "--service");
-    if name == "opencode"
-        && !config.command.iter().any(|arg| arg == "--standalone")
-        && !opencode_service
-    {
-        warnings.push(
-            "ai-jail: opencode 2.x needs `--standalone` or a shared service; \
-             for pair/web, keep `ai-jail opencode serve --service` running in \
-             another terminal, then run the client in a second jail (issues \
-             #137, #176)"
-                .to_string(),
-        );
+    for name in config.effective_harnesses() {
+        if !is_known_api_agent(name) {
+            continue;
+        }
+        if !config.lockdown_enabled() && !config.network_enabled() && !filtered
+        {
+            warnings.push(format!(
+                "ai-jail: `{name}` is a network API client but network is off \
+                 (default since v1.18.0) — set `network = true` or pass \
+                 --network; see `ai-jail status`"
+            ));
+        }
+        if filtered
+            && let Some(host) = api_host(name)
+            && !config.host_is_allowlisted(host)
+        {
+            warnings.push(format!(
+                "ai-jail: filtered egress is on but `{name}`'s API host \
+                 {host} is not in allow_hosts — add it there or pass \
+                 --allow-host {host}; see `ai-jail status`"
+            ));
+        }
+        // Agent state is ON by default now, so no gap warning is needed: a plain
+        // `ai-jail <harness>` already mounts the harness's login/session data.
+        // `--no-agent-state` and `--lockdown` disable it deliberately, so nudging
+        // toward `--agent-state` there would just contradict the user's choice.
+        let opencode_service = config
+            .command
+            .windows(2)
+            .any(|args| args[0] == "serve" && args[1] == "--service");
+        if name == "opencode"
+            && !config.command.iter().any(|arg| arg == "--standalone")
+            && !opencode_service
+        {
+            warnings.push(
+                "ai-jail: opencode 2.x needs `--standalone` or a shared service; \
+                 for pair/web, keep `ai-jail opencode serve --service` running in \
+                 another terminal, then run the client in a second jail (issues \
+                 #137, #176)"
+                    .to_string(),
+            );
+        }
     }
     warnings
 }
@@ -700,5 +769,49 @@ mod tests {
         assert!(default_egress_hosts(&["opencode".into()]).is_empty());
         assert!(default_egress_hosts(&["kimi".into()]).is_empty());
         assert!(default_egress_hosts(&["bash".into()]).is_empty());
+    }
+
+    #[test]
+    fn explicit_harness_survives_unknown_wrapper_flags() {
+        let command =
+            args(&["ai-memory", "run", "--some-future-flag", "x", "claude"]);
+        assert_eq!(managed_harness(&command), None);
+        assert_eq!(
+            resolve_harnesses(&command, &["claude".into()]).unwrap(),
+            vec!["claude"]
+        );
+    }
+
+    #[test]
+    fn explicit_harness_rejects_known_contradiction() {
+        let command = args(&["codex"]);
+        let error =
+            resolve_harnesses(&command, &["claude".into()]).unwrap_err();
+        assert!(error.contains("contradicts"));
+    }
+
+    #[test]
+    fn explicit_harness_checks_wrapper_executable_override() {
+        let command = args(&[
+            "ai-memory",
+            "run",
+            "--executable",
+            "/usr/bin/codex",
+            "claude",
+        ]);
+        let error =
+            resolve_harnesses(&command, &["claude".into()]).unwrap_err();
+        assert!(error.contains("codex"));
+    }
+
+    #[test]
+    fn multiple_explicit_harnesses_union_api_hosts() {
+        assert_eq!(
+            default_egress_hosts_for(
+                &["claude".into(), "codex".into()],
+                &["ai-memory".into()]
+            ),
+            vec!["api.anthropic.com", "api.openai.com", "chatgpt.com"]
+        );
     }
 }

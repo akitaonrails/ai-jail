@@ -96,6 +96,9 @@ pub(crate) struct Selection {
     pub ro_dirs: Vec<PathBuf>,
     pub rw_dirs: Vec<PathBuf>,
     pub env_names: Vec<String>,
+    pub requested_hosts: Vec<String>,
+    pub requested_private_hosts: Vec<String>,
+    pub requested_secrets: std::collections::BTreeMap<String, String>,
     pub restricted_ssh: Option<crate::ssh_restricted::Policy>,
 }
 
@@ -114,6 +117,9 @@ impl Selection {
             ro_dirs: config.ro_maps.clone(),
             rw_dirs: config.rw_maps.clone(),
             env_names: Vec::new(),
+            requested_hosts: Vec::new(),
+            requested_private_hosts: Vec::new(),
+            requested_secrets: std::collections::BTreeMap::new(),
             restricted_ssh: None,
         }
     }
@@ -138,12 +144,35 @@ impl Selection {
             ro_dirs: config.ro_maps.clone(),
             rw_dirs: config.rw_maps.clone(),
             env_names: approved_env_names.to_vec(),
+            requested_hosts: config
+                .allow_hosts
+                .iter()
+                .filter(|host| !api_hosts(harness).contains(&host.as_str()))
+                .cloned()
+                .collect(),
+            requested_private_hosts: config.allow_private_hosts.clone(),
+            requested_secrets: config.secret_hosts.clone(),
             restricted_ssh: restricted_ssh.cloned(),
         }
     }
 
     pub(crate) fn grants(&self, harness: &str) -> Config {
+        self.grants_for(&[harness.to_string()])
+    }
+
+    pub(crate) fn grants_for(&self, harnesses: &[String]) -> Config {
+        let mut allow_hosts = self.requested_hosts.clone();
+        if self.api_access {
+            for harness in harnesses {
+                for host in api_hosts(harness) {
+                    if !allow_hosts.iter().any(|existing| existing == host) {
+                        allow_hosts.push((*host).into());
+                    }
+                }
+            }
+        }
         Config {
+            runtime_harnesses: harnesses.to_vec(),
             ro_maps: self.ro_dirs.clone(),
             rw_maps: self.rw_dirs.clone(),
             agent_state: Some(self.agent_state),
@@ -153,24 +182,24 @@ impl Selection {
             github: Some(self.github),
             network: self.unrestricted_network.then_some(true),
             allow_loopback_connect: self.loopback_connect.then_some(true),
-            allow_hosts: if self.api_access {
-                api_hosts(harness)
-                    .iter()
-                    .map(|host| (*host).into())
-                    .collect()
-            } else {
-                Vec::new()
-            },
+            allow_hosts,
+            allow_private_hosts: self.requested_private_hosts.clone(),
+            secret_hosts: self.requested_secrets.clone(),
             ..Config::default()
         }
     }
 
     fn profile(&self, harness: &str) -> ProposedProfile {
-        let mut grants = self.grants(harness);
+        self.profile_for(&[harness.to_string()])
+    }
+
+    fn profile_for(&self, harnesses: &[String]) -> ProposedProfile {
+        let mut grants = self.grants_for(harnesses);
         grants.env_pass = self.env_names.clone();
         ProposedProfile {
             grants,
             approved_env_names: self.env_names.clone(),
+            approved_wrapper_requests: Vec::new(),
             finalized: None,
             directory_grants: Vec::new(),
             restricted_ssh: self.restricted_ssh.clone(),
@@ -183,6 +212,8 @@ impl Selection {
 pub(crate) struct ProposedProfile {
     pub(crate) grants: Config,
     pub(crate) approved_env_names: Vec<String>,
+    pub(crate) approved_wrapper_requests:
+        Vec<crate::integration::RequestApproval>,
     pub(crate) finalized: Option<crate::FinalizedLaunch>,
     pub(crate) directory_grants:
         Vec<crate::config_store::DirectoryGrantIdentity>,
@@ -205,6 +236,9 @@ pub(crate) struct EffectiveContext<'a> {
     pub(crate) trusted_constraints: bool,
     pub(crate) approved_env_names: &'a [String],
     pub(crate) restricted_ssh: Option<&'a crate::ssh_restricted::Policy>,
+    pub(crate) requests: &'a crate::integration::RequestSet,
+    pub(crate) approved_wrapper_requests:
+        &'a [crate::integration::RequestApproval],
 }
 
 fn process_label(harness: &str) -> String {
@@ -618,6 +652,16 @@ pub(crate) fn run(
         effective.approved_env_names,
         effective.restricted_ssh,
     );
+    let harnesses = if effective.cli.harnesses.is_empty() {
+        vec![harness.to_string()]
+    } else {
+        effective.cli.harnesses.clone()
+    };
+    let approved_wrapper_requests = review_wrapper_requests(
+        &mut selection,
+        effective.requests,
+        effective.approved_wrapper_requests,
+    )?;
     eprintln!("\nConfigure {harness} for this project\n");
     eprintln!("Project: {}\n", safe_path(project)?);
     eprintln!("{} {}\n", messages::INTRO_ID, messages::INTRO);
@@ -694,7 +738,9 @@ pub(crate) fn run(
             "e" => edit_environment(&mut selection, harness)?,
             "s" | "" => {
                 render_summary(&selection, harness, project, true);
-                let mut proposed = selection.profile(harness);
+                let mut proposed = selection.profile_for(&harnesses);
+                proposed.approved_wrapper_requests =
+                    approved_wrapper_requests.clone();
                 proposed.directory_grants =
                     crate::config_store::capture_directory_grants(
                         &proposed.grants,
@@ -774,6 +820,107 @@ pub(crate) fn run(
             "b" => continue,
             _ => eprintln!("Choose 1-7, e, r, w, d, s, or q."),
         }
+    }
+}
+
+fn review_wrapper_requests(
+    selection: &mut Selection,
+    requests: &crate::integration::RequestSet,
+    existing: &[crate::integration::RequestApproval],
+) -> Result<Vec<crate::integration::RequestApproval>, String> {
+    let mut approved = existing.to_vec();
+    if requests.items.is_empty() {
+        return Ok(approved);
+    }
+    eprintln!("Wrapper requests (requests are not grants):");
+    for request in &requests.items {
+        let approval = &request.approval;
+        eprintln!(
+            "  requested by {}: {}",
+            escape_control_bytes(&approval.requester),
+            escape_control_bytes(&request.reason)
+        );
+        let resource = if approval.kind == "secret" {
+            format!(
+                "secret variable {} bound to {} (value stays hidden)",
+                escape_control_bytes(&approval.value),
+                escape_control_bytes(approval.host.as_deref().unwrap_or(""))
+            )
+        } else {
+            let value = match approval.port {
+                Some(port) => format!("{}:{port}", approval.value),
+                None => approval.value.clone(),
+            };
+            format!(
+                "{} {}",
+                escape_control_bytes(&approval.kind),
+                escape_control_bytes(&value)
+            )
+        };
+        eprintln!("  Resource: {resource}");
+        let was_approved = approved.contains(approval);
+        let answer = prompt(if was_approved {
+            "  Keep approved? [Y/n/q] "
+        } else {
+            "  Approve for this project profile? [Y/n/q] "
+        })?;
+        if answer.eq_ignore_ascii_case("q") {
+            return Err("Wrapper request review cancelled".into());
+        }
+        if answer.is_empty() || answer.eq_ignore_ascii_case("y") {
+            apply_wrapper_request(selection, approval)?;
+            if !approved.contains(approval) {
+                approved.push(approval.clone());
+            }
+        } else {
+            approved.retain(|saved| saved != approval);
+        }
+    }
+    eprintln!();
+    Ok(approved)
+}
+
+fn apply_wrapper_request(
+    selection: &mut Selection,
+    request: &crate::integration::RequestApproval,
+) -> Result<(), String> {
+    match request.kind.as_str() {
+        "host" => push_unique(&mut selection.requested_hosts, &request.value),
+        "private_host" => {
+            push_unique(&mut selection.requested_private_hosts, &request.value)
+        }
+        "env" => push_unique(&mut selection.env_names, &request.value),
+        "secret" => {
+            push_unique(&mut selection.env_names, &request.value);
+            selection.requested_secrets.insert(
+                request.value.clone(),
+                request
+                    .host
+                    .clone()
+                    .ok_or_else(|| "secret request has no host".to_string())?,
+            );
+        }
+        "agent_state" => selection.agent_state = true,
+        "map" => {
+            let path = PathBuf::from(&request.value);
+            if request.writable.unwrap_or(false) {
+                if !selection.rw_dirs.contains(&path) {
+                    selection.rw_dirs.push(path);
+                }
+            } else if !selection.ro_dirs.contains(&path) {
+                selection.ro_dirs.push(path);
+            }
+        }
+        kind => {
+            return Err(format!("Unsupported wrapper request kind {kind:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_string());
     }
 }
 
@@ -2413,6 +2560,36 @@ mod tests {
         assert!(!selection.github);
         assert!(selection.ro_dirs.is_empty());
         assert!(selection.rw_dirs.is_empty());
+    }
+
+    #[test]
+    fn wrapper_requests_become_explicit_profile_grants() {
+        let mut selection = Selection::default();
+        let private = crate::integration::RequestApproval {
+            requester: "ai-memory".into(),
+            kind: "private_host".into(),
+            value: "192.168.0.90".into(),
+            host: None,
+            writable: None,
+            port: Some(49374),
+        };
+        let secret = crate::integration::RequestApproval {
+            requester: "ai-memory".into(),
+            kind: "secret".into(),
+            value: "AI_MEMORY_AUTH_TOKEN".into(),
+            host: Some("192.168.0.90".into()),
+            writable: None,
+            port: None,
+        };
+        apply_wrapper_request(&mut selection, &private).unwrap();
+        apply_wrapper_request(&mut selection, &secret).unwrap();
+        let profile = selection.profile_for(&["claude".into()]);
+        assert_eq!(profile.grants.allow_private_hosts, ["192.168.0.90"]);
+        assert_eq!(
+            profile.grants.secret_hosts.get("AI_MEMORY_AUTH_TOKEN"),
+            Some(&"192.168.0.90".into())
+        );
+        assert_eq!(profile.approved_env_names, ["AI_MEMORY_AUTH_TOKEN"]);
     }
 
     #[test]

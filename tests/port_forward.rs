@@ -107,6 +107,7 @@ fn host_side_socket_is_removed_on_exit() {
 #[test]
 fn project_config_cannot_open_a_forward() {
     require_sandbox!();
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
     let port = http_fixture();
     let dir = std::env::temp_dir().join(format!(
         "ai-jail-forward-project.{}.{port}",
@@ -115,16 +116,41 @@ fn project_config_cannot_open_a_forward() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(".ai-jail"), format!("forward_ports = [{port}]\n"))
         .unwrap();
+    let state = std::env::temp_dir().join(format!(
+        "ai-jail-forward-project-state.{}.{port}",
+        std::process::id()
+    ));
+    let home = state.join("home");
+    let xdg = state.join("xdg");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
     let script = format!(
         "curl --noproxy '*' -sS --max-time 3 http://127.0.0.1:{port}/ \
          && echo LEAK || echo BLOCKED"
     );
-    let output = run_in(Some(&dir), &[], &script);
+    let output = Command::new(ai_jail())
+        .args(["--no-status-bar", "--exec", "--no-save-config"])
+        .args(["bash", "-c", &script])
+        .current_dir(&dir)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("no_proxy")
+        .env_remove("NO_PROXY")
+        .output()
+        .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(assert_ok(&output).trim(), "BLOCKED");
     assert!(
-        stderr.contains("forward_ports ignored"),
+        stderr.contains("AJ-MIG-003 REAPPROVAL REQUIRED")
+            && stderr.contains(&format!("forward-port {port}")),
         "missing warning: {stderr:?}"
     );
 }

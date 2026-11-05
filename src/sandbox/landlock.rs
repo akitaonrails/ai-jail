@@ -671,15 +671,19 @@ fn collect_normal_paths_with_mounted_paths(
     // File-shaped harness state needs an explicit Landlock write allowance;
     // directory state is already covered by the normal home rules.
     if !private_home && config.agent_state_enabled() {
-        let harness = crate::command::effective_name(&config.command);
-        for state in harness.into_iter().flat_map(|harness| {
-            crate::authority_inventory::resolve_harness_state(
-                harness,
-                crate::authority_inventory::LocationBasis::Home,
-                crate::authority_inventory::Platform::Linux,
-                &home,
-            )
-        }) {
+        for state in
+            config
+                .effective_harnesses()
+                .into_iter()
+                .flat_map(|harness| {
+                    crate::authority_inventory::resolve_harness_state(
+                        harness,
+                        crate::authority_inventory::LocationBasis::Home,
+                        crate::authority_inventory::Platform::Linux,
+                        &home,
+                    )
+                })
+        {
             if !matches!(
                 state.authority.exposure,
                 crate::authority_inventory::ExposureMode::HarnessState {

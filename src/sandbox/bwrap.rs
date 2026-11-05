@@ -2301,7 +2301,7 @@ fn discover_home_dotfiles_full(
         // Non-private-home passthrough still gates the command-state
         // extras that the generic dotdir enumeration never mounts
         // (kimi's state dirs are in DOTDIR_DENY; .claude.json is a file).
-        if let Some(name) = crate::command::effective_name(&config.command) {
+        for name in config.effective_harnesses() {
             for state in crate::authority_inventory::resolve_harness_state(
                 name,
                 crate::authority_inventory::LocationBasis::Home,
@@ -2383,7 +2383,7 @@ fn discover_devin_state_mounts(
     project_dir: &Path,
     verbose: bool,
 ) -> Vec<Mount> {
-    if crate::command::effective_name(&config.command) != Some("devin")
+    if !config.has_harness("devin")
         || config.lockdown_enabled()
         || config.browser_profile().is_some()
     {
@@ -2502,23 +2502,25 @@ fn command_state_entries(
     config: &Config,
     wanted: crate::authority_inventory::StateKind,
 ) -> Vec<crate::authority_inventory::ResolvedStatePath> {
-    let Some(harness) = crate::command::effective_name(&config.command) else {
-        return Vec::new();
-    };
-    crate::authority_inventory::resolve_harness_state(
-        harness,
-        crate::authority_inventory::LocationBasis::Home,
-        crate::authority_inventory::Platform::Linux,
-        &super::home_dir(),
-    )
-    .into_iter()
-    .filter_map(|entry| match entry.authority.exposure {
-        crate::authority_inventory::ExposureMode::HarnessState {
-            kind, ..
-        } if kind == wanted => Some(entry),
-        _ => None,
-    })
-    .collect()
+    config
+        .effective_harnesses()
+        .into_iter()
+        .flat_map(|harness| {
+            crate::authority_inventory::resolve_harness_state(
+                harness,
+                crate::authority_inventory::LocationBasis::Home,
+                crate::authority_inventory::Platform::Linux,
+                &super::home_dir(),
+            )
+        })
+        .filter_map(|entry| match entry.authority.exposure {
+            crate::authority_inventory::ExposureMode::HarnessState {
+                kind,
+                ..
+            } if kind == wanted => Some(entry),
+            _ => None,
+        })
+        .collect()
 }
 
 /// User hide_dotdirs override for command agent-state mounts: hiding
@@ -7684,6 +7686,19 @@ mod tests {
                 "state mapping mismatch for {command}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_multiple_harnesses_mount_each_state_root() {
+        let mut config = minimal_test_config();
+        config.command = vec!["ai-memory".into(), "run".into()];
+        config.runtime_harnesses = vec!["claude".into(), "codex".into()];
+        let paths = command_state_paths(&config)
+            .iter()
+            .map(|state| state.authority.relative)
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&".claude"));
+        assert!(paths.contains(&".codex"));
     }
 
     #[test]
