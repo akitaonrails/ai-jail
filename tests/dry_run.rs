@@ -98,10 +98,13 @@ fn macos_dry_run_does_not_create_profile_directories() {
             assert!(stdout.contains("/browsers/chromium"));
             assert!(stdout.contains("--user-data-dir="));
         } else if name == "browser-hard" {
-            assert!(stdout.contains(&format!(
-                "--user-data-dir={}/ai-jail-browser-chromium/data",
-                session.display()
-            )));
+            let state_suffix =
+                format!("ai-jail-{pid}/ai-jail-browser-chromium/data");
+            assert!(
+                stdout.contains("--user-data-dir=")
+                    && stdout.contains(&state_suffix),
+                "hard browser state is outside its session directory: {stdout}"
+            );
         }
     }
 }
