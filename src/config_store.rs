@@ -4,11 +4,13 @@ use crate::config::{self, Config, GlobalConfig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::{CString, OsStr};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{
+    DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+};
 use std::path::{Path, PathBuf};
 
 pub(crate) const MIGRATION_VERSION: u32 = 1;
@@ -449,7 +451,10 @@ fn secure_existing_dir(path: &Path) -> Result<(), String> {
 
 fn secure_dir(path: &Path) -> Result<(), String> {
     if !path.exists() {
-        fs::create_dir_all(path)
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
             .map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .map_err(|e| format!("Cannot secure {}: {e}", path.display()))?;
