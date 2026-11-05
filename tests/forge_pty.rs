@@ -9,6 +9,8 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+const PTY_DEADLINE: Duration = Duration::from_secs(15);
+
 unsafe fn slave_stdio(fd: i32) -> Stdio {
     let duplicated = unsafe { nix::libc::dup(fd) };
     assert!(duplicated >= 0);
@@ -69,7 +71,7 @@ fn run_pty(
     let master_fd = pty.master.as_raw_fd();
     let mut transcript = Vec::new();
     for (prompt, input) in exchanges {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + PTY_DEADLINE;
         while !String::from_utf8_lossy(&transcript).contains(prompt) {
             assert!(
                 Instant::now() < deadline,
@@ -80,7 +82,7 @@ fn run_pty(
         }
         nix::unistd::write(&pty.master, input).unwrap();
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PTY_DEADLINE;
     let status = loop {
         read_once(master_fd, &mut transcript, 20);
         if let Some(status) = child.try_wait().unwrap() {

@@ -869,6 +869,10 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    fn test_tmp() -> PathBuf {
+        fs::canonicalize("/tmp").unwrap()
+    }
+
     fn add_known_hosts(home: &Path) {
         fs::create_dir_all(home.join(".ssh")).unwrap();
         let path = home.join(".ssh/known_hosts");
@@ -878,8 +882,8 @@ mod tests {
 
     #[test]
     fn capture_refuses_linked_private_key_and_parses_fingerprint() {
-        let root = std::env::temp_dir()
-            .join(format!("ai-jail-ssh-key-{}", std::process::id()));
+        let root =
+            test_tmp().join(format!("ai-jail-ssh-key-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir(&root).unwrap();
         let private = root.join("id_test");
@@ -905,8 +909,8 @@ mod tests {
     #[test]
     fn plan_disables_ambient_ssh_and_maps_only_generated_resources() {
         let _env_lock = crate::test_utils::ENV_LOCK.lock().unwrap();
-        let root = std::env::temp_dir()
-            .join(format!("ai-jail-ssh-plan-{}", std::process::id()));
+        let root =
+            test_tmp().join(format!("ai-jail-ssh-plan-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir(&root).unwrap();
         let private = root.join("id_test");
@@ -958,7 +962,7 @@ mod tests {
 
     #[test]
     fn fake_ssh_add_receives_only_selected_key_lifetime_and_constraints() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_tmp().join(format!(
             "ai-jail-ssh-add-{}-{}",
             std::process::id(),
             PLAN_ID.fetch_add(1, Ordering::Relaxed)
@@ -1017,7 +1021,7 @@ mod tests {
 
     #[test]
     fn failed_fake_agent_start_removes_runtime_directory() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_tmp().join(format!(
             "ai-jail-ssh-agent-fail-{}-{}",
             std::process::id(),
             PLAN_ID.fetch_add(1, Ordering::Relaxed)
@@ -1058,7 +1062,7 @@ mod tests {
 
     #[test]
     fn fake_keygen_limits_known_hosts_copy_to_approved_destination() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_tmp().join(format!(
             "ai-jail-ssh-keygen-{}-{}",
             std::process::id(),
             PLAN_ID.fetch_add(1, Ordering::Relaxed)
@@ -1093,7 +1097,7 @@ mod tests {
 
     #[test]
     fn trusted_tool_resolution_ignores_a_path_lookalike() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_tmp().join(format!(
             "ai-jail-ssh-path-{}-{}",
             std::process::id(),
             PLAN_ID.fetch_add(1, Ordering::Relaxed)
@@ -1119,7 +1123,7 @@ mod tests {
 
     #[test]
     fn trusted_tool_revalidation_refuses_identity_drift_and_symlink_swap() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_tmp().join(format!(
             "ai-jail-ssh-tool-drift-{}-{}",
             std::process::id(),
             PLAN_ID.fetch_add(1, Ordering::Relaxed)
@@ -1143,7 +1147,7 @@ mod tests {
 
     #[test]
     fn presented_private_and_public_symlinks_are_refused_before_canonicalize() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_tmp().join(format!(
             "ai-jail-ssh-symlinks-{}-{}",
             std::process::id(),
             PLAN_ID.fetch_add(1, Ordering::Relaxed)
@@ -1208,7 +1212,7 @@ mod tests {
 
     #[test]
     fn runtime_drop_kills_child_and_removes_private_directory() {
-        let base = std::env::temp_dir().join(format!(
+        let base = test_tmp().join(format!(
             "ai-jail-ssh-runtime-drop-{}-{}",
             std::process::id(),
             PLAN_ID.fetch_add(1, Ordering::Relaxed)

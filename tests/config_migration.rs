@@ -228,19 +228,32 @@ fn clean_status_never_prints_ignored_external_config_path() {
 fn audit_provenance_uses_contributing_legacy_source_and_clean_ignores_it() {
     let tree = Tree::new("legacy-provenance-audit");
     std::fs::write(tree.legacy_project(), "no_gpu=true\n").unwrap();
+    // Host networking keeps this audit-only launch runnable in Nix builders,
+    // where bubblewrap cannot create and configure a separate loopback device.
     assert_ok(&tree.run(&[
         "--no-save-config",
         "--audit-log",
+        "--network",
         "--clean",
         "/bin/true",
     ]));
-    assert_ok(&tree.run(&["--no-save-config", "--audit-log", "/bin/true"]));
+    assert_ok(&tree.run(&[
+        "--no-save-config",
+        "--audit-log",
+        "--network",
+        "/bin/true",
+    ]));
     std::fs::write(
         tree.legacy_global(),
         format!("trust_project_config=['{}']\n", tree.project.display()),
     )
     .unwrap();
-    assert_ok(&tree.run(&["--no-save-config", "--audit-log", "/bin/true"]));
+    assert_ok(&tree.run(&[
+        "--no-save-config",
+        "--audit-log",
+        "--network",
+        "/bin/true",
+    ]));
     let log = std::fs::read_to_string(
         tree.home.join(".local/share/ai-jail/history.jsonl"),
     )
@@ -272,8 +285,14 @@ fn audit_output_matrix_covers_external_constraints_grants_both_and_clean() {
     let tree = Tree::new("external-provenance-audit");
     std::fs::write(tree.legacy_project(), "no_gpu=true\n").unwrap();
     assert_ok(&tree.run(&["--init", "/bin/true"]));
+    // See the Nix namespace rationale in the provenance test above.
     let record = |tree: &Tree| {
-        assert_ok(&tree.run(&["--no-save-config", "--audit-log", "/bin/true"]));
+        assert_ok(&tree.run(&[
+            "--no-save-config",
+            "--audit-log",
+            "--network",
+            "/bin/true",
+        ]));
         let log = std::fs::read_to_string(
             tree.home.join(".local/share/ai-jail/history.jsonl"),
         )
@@ -311,6 +330,7 @@ fn audit_output_matrix_covers_external_constraints_grants_both_and_clean() {
     assert_ok(&tree.run(&[
         "--no-save-config",
         "--audit-log",
+        "--network",
         "--clean",
         "/bin/true",
     ]));
