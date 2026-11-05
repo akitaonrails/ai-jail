@@ -97,7 +97,7 @@ fn run_pty(
         }
     };
     let mut termios = unsafe { std::mem::zeroed::<nix::libc::termios>() };
-    assert_eq!(unsafe { nix::libc::tcgetattr(slave_fd, &mut termios) }, 0);
+    assert_eq!(unsafe { nix::libc::tcgetattr(master_fd, &mut termios) }, 0);
     let echo = termios.c_lflag & nix::libc::ECHO != 0;
     assert_eq!(
         status.code(),
