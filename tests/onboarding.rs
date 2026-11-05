@@ -75,6 +75,41 @@ unsafe fn slave_stdio(fd: i32) -> Stdio {
     unsafe { Stdio::from_raw_fd(duplicated) }
 }
 
+fn normalize_ssh_guest_paths(mut text: String) -> String {
+    const PREFIX: &str = "/tmp/ai-jail-ssh-";
+    let mut cursor = 0;
+    while let Some(relative) = text[cursor..].find(PREFIX) {
+        let start = cursor + relative;
+        let dynamic_start = start + PREFIX.len();
+        let Some(slash) = text[dynamic_start..].find('/') else {
+            break;
+        };
+        let dynamic_end = dynamic_start + slash;
+        let dynamic = &text[dynamic_start..dynamic_end];
+        if !dynamic.is_empty()
+            && dynamic
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'-')
+        {
+            let (suffix, replacement) =
+                if text[dynamic_end..].starts_with("/public") {
+                    ("/public", "/tmp/ai-jail-ssh-public")
+                } else if text[dynamic_end..].starts_with("/agent.sock") {
+                    ("/agent.sock", "/tmp/ai-jail-ssh-agent.sock")
+                } else {
+                    cursor = dynamic_end + 1;
+                    continue;
+                };
+            let end = dynamic_end + suffix.len();
+            text.replace_range(start..end, replacement);
+            cursor = start + replacement.len();
+        } else {
+            cursor = dynamic_end + 1;
+        }
+    }
+    text
+}
+
 fn scripted_pty(
     label: &str,
     input: &[u8],
@@ -271,9 +306,11 @@ fn scripted_pty_adds_removes_constrains_and_saves_restricted_ssh() {
     let (root, xdg, transcript) =
         scripted_pty("pty-restricted-ssh", input, &[], "xterm", 0, None);
     let root_text = root.to_string_lossy();
-    let mut normalized = transcript
-        .replace('\r', "")
-        .replace(root_text.as_ref(), "<ROOT>");
+    let mut normalized = normalize_ssh_guest_paths(
+        transcript
+            .replace('\r', "")
+            .replace(root_text.as_ref(), "<ROOT>"),
+    );
     if let Some(start) = normalized.find("projects/project-")
         && let Some(relative_end) = normalized[start..].find(".toml")
     {
