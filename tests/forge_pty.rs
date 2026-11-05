@@ -139,9 +139,15 @@ fn actual_cli_forge_workflow_matches_documented_transcript() {
     let server = std::thread::spawn(move || {
         for expected in ["first-hidden-token", "rotated-hidden-token"] {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 8192];
-            let count = stream.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..count]);
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                assert!(request.len() < 8192, "oversized verification request");
+                let mut chunk = [0_u8; 1024];
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0, "truncated verification request");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let request = String::from_utf8_lossy(&request);
             assert!(
                 request.contains(&format!("Authorization: Bearer {expected}"))
             );

@@ -1630,8 +1630,6 @@ impl Drop for EchoGuard {
 }
 
 fn read_secret(prompt: &str) -> Result<Zeroizing<String>, String> {
-    eprint!("{prompt}");
-    io::stderr().flush().ok();
     let fd = io::stdin().as_raw_fd();
     let mut original = unsafe { std::mem::zeroed::<nix::libc::termios>() };
     if unsafe { nix::libc::tcgetattr(fd, &mut original) } != 0 {
@@ -1648,6 +1646,10 @@ fn read_secret(prompt: &str) -> Result<Zeroizing<String>, String> {
         return Err("Cannot disable terminal echo".into());
     }
     let _guard = EchoGuard { fd, original };
+    // Do not invite input until echo and signal-generating control bytes are
+    // disabled. A fast typist must never race the terminal-mode transition.
+    eprint!("{prompt}");
+    io::stderr().flush().ok();
     let mut bytes = Zeroizing::new(Vec::new());
     let mut input = io::stdin().lock();
     loop {
