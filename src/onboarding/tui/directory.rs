@@ -727,7 +727,10 @@ mod tests {
 
     #[test]
     fn long_selected_paths_keep_the_identifying_tail_visible() {
-        assert_eq!(visible_path_tail("/very/long/share-café", 11), "…share-café");
+        assert_eq!(
+            visible_path_tail("/very/long/share-café", 11),
+            "…share-café"
+        );
         assert_eq!(visible_path_tail("/short", 20), "/short");
     }
     use ratatui::Terminal;
