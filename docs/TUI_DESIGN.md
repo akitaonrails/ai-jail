@@ -135,7 +135,7 @@ The interface is dense, restrained, and optimized for careful review.
 - Scrollable complete effective access grouped as `RESTRICTED`, `ALLOWED`, and
   `OPEN`, followed by the exact effective policy and authority details.
 - The action bar always distinguishes `Save and launch`, `Launch once`, `Save
-  profile`, `Back`, and `Cancel` according to invocation mode.
+profile`, `Back`, and `Cancel` according to invocation mode.
 - If any OPEN authority remains, the final action opens the shared dialog and
   names the exact persistence and launch consequence. Cancel is the default.
 - Cancellation writes no onboarding grants and starts no harness. Terminal

@@ -2882,14 +2882,20 @@ mod tests {
     fn review_classifies_exact_forge_authority_and_gates_open() {
         let base = std::env::temp_dir()
             .join(format!("ai-jail-review-forge-{}", std::process::id()));
-        let project = base.join("project");
         let _ = std::fs::remove_dir_all(&base);
+        let project = base.join("project");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::set_permissions(
             &base,
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
         )
         .unwrap();
+        // Darwin's per-user temporary directory begins with `/var`, which is
+        // itself a symlink to `/private/var`. The trusted store correctly
+        // rejects symlinked ancestors, so exercise it through the canonical
+        // path on every platform.
+        let base = std::fs::canonicalize(base).unwrap();
+        let project = base.join("project");
         let store = review_store(&base, &project);
         let global = Config::default();
         let constraints = Config::default();
