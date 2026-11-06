@@ -62,6 +62,8 @@ The top row provides three starting points:
 - `Mostly open` enables unrestricted network, the full host GitHub token, the
   ambient SSH agent, and host loopback access. It is red, carries a warning,
   and requires an explicit in-TUI confirmation with Cancel focused by default.
+  Its unrestricted network already reaches the model API, so no filtered host
+  is saved alongside it.
 
 `Tab` and `Shift-Tab` move focus between the access list, `Always enforced`
 pane, and preset row. They skip the read-only CLI preview and never change a setting or start a

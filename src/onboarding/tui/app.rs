@@ -2278,6 +2278,18 @@ mod tests {
     }
 
     #[test]
+    fn mostly_open_preset_saves_a_launchable_network_policy() {
+        let mut selection = Selection::default();
+        let mut app = app(&mut selection);
+        app.apply_preset(AccessPreset::MostlyOpen);
+        assert_eq!(app.active_preset(), Some(AccessPreset::MostlyOpen));
+
+        let grants = selection.grants("claude");
+        assert!(grants.network_enabled());
+        assert!(!grants.has_filtered_hosts());
+    }
+
+    #[test]
     fn granular_change_is_reported_as_custom() {
         let mut selection = Selection {
             api_access: true,
