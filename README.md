@@ -101,7 +101,7 @@ harness-state grant includes a detected well-known API key for that harness.
 `ai-jail configure claude` to review it later. The project directory remains
 writable by default.
 
-![ai-jail onboarding showing presets, explicit OPEN/CLOSED states, and concise security details](docs/images/onboarding-overview.png)
+![ai-jail onboarding showing presets, explicit OPEN/CLOSED states, and concise security details](https://raw.githubusercontent.com/akitaonrails/ai-jail/master/docs/images/onboarding-overview.png)
 
 The main review distinguishes constrained access from OPEN host authority.
 Docker/Podman daemon control and unrestricted networking remain closed under
@@ -110,7 +110,7 @@ is not repository-scoped.
 
 | Environment variables | Additional directories |
 | --- | --- |
-| ![Searchable environment-variable selector showing names while keeping values hidden](docs/images/onboarding-environment-selector.png) | ![Directory browser showing read-only selections and the exact selected paths](docs/images/onboarding-directory-picker.png) |
+| ![Searchable environment-variable selector showing names while keeping values hidden](https://raw.githubusercontent.com/akitaonrails/ai-jail/master/docs/images/onboarding-environment-selector.png) | ![Directory browser showing read-only selections and the exact selected paths](https://raw.githubusercontent.com/akitaonrails/ai-jail/master/docs/images/onboarding-directory-picker.png) |
 | Search names and approve only the variables needed. Values never appear in the selector or saved policy. | Browse with `Enter`, select with `Space`, switch to the selected pane with `Tab`, and toggle read-only/read-write with `m`. |
 
 A first run without a terminal uses restricted defaults once and saves
