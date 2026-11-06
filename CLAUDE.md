@@ -128,6 +128,19 @@ must durably verify its external destination before deleting the source.
     Notification lookup must not use untrusted `PATH`, and timeout, dismissal,
     missing helpers, malformed answers, and helper errors must fail closed.
 
+- `project_strategy` (`basename` default, `repo-root`) is global-only: a
+  per-invocation flag or a project file must never select it, because it
+  decides which saved approval applies. Under `repo-root` only a validated
+  linked worktree root resolves to its main repository; the repository-authored
+  gitfile/commondir metadata goes through the GHSA-w976-gw52-hvx2 structural
+  validation. A refusal or a missing main checkout falls back to the launch
+  directory's own policy with a warning, and a bare repository keeps that
+  policy silently; no fallback ever widens access. Under `repo-root`, saving
+  constraints merges them into the shared document and never replaces it, and
+  a launch that ignores an existing per-directory document warns. Disclosure
+  (`AJ-PROJ-001`, the onboarding `Policy` line) and `status --json`
+  `project.policy_path` must stay in sync with this behavior.
+
 - Dev-toolchain cache persistence (`--toolchains`/`no_toolchains`) and the
   opt-in read-only credential flags (`--github`, `--aws`,
   `--kube`, `--gcloud`, `--docker-config`) are monotonic capabilities: a

@@ -1265,6 +1265,19 @@ fn run(
         return Ok(2);
     }
     let store = config_store::StorePaths::discover(&invocation_cwd)?;
+    // The trusted global strategy may re-key a linked worktree onto its main
+    // checkout's policy. Resolve it before forge and migration use the store.
+    let strategy = config_store::load_project_strategy(&store)?;
+    let store = store.with_project_strategy(strategy)?;
+    if store.ignored_directory_policy().is_some() {
+        // Restrictions saved for this directory stop applying, so say so
+        // even under --exec quiet.
+        output::security_warn(&format!(
+            "project_strategy = repo-root: using the policy of {}; the saved policy for {} is ignored",
+            store.policy_root().display(),
+            store.canonical_project.display()
+        ));
+    }
     if let Some(command) = &cli.forge {
         return forge_auth::run_command(command, &store);
     }
@@ -1500,7 +1513,7 @@ fn run(
             config_store::validate_directory_grants(
                 &mut profile.grants,
                 &profile.directory_grants,
-                &invocation_cwd,
+                store.policy_root(),
             )?;
             materialize_approved_env_names(&profile.approved_env_names, false)?;
             let finalized = profile.finalized.take().ok_or_else(|| {
@@ -1636,6 +1649,7 @@ fn run(
             let report =
                 integration::StatusReport::build(integration::StatusInput {
                     project: &invocation_cwd,
+                    policy_path: store.policy_root(),
                     profile_present: stored_project.present,
                     onboarding_complete,
                     harnesses: &resolved_harnesses,

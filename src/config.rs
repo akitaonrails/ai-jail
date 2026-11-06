@@ -400,6 +400,30 @@ pub(crate) struct GlobalConfig {
     pub(crate) base: Config,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) commands: BTreeMap<String, Config>,
+    /// How a project is identified for saved policy. Global-only: it is
+    /// trusted and never read from a project `.ai-jail`.
+    #[serde(default, skip_serializing_if = "ProjectStrategy::is_basename")]
+    pub(crate) project_strategy: ProjectStrategy,
+}
+
+/// How the global config identifies a project.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ProjectStrategy {
+    /// Key by the launch directory's full canonical path: its sanitized
+    /// basename plus a hash of the path (default).
+    #[default]
+    Basename,
+    /// Key by the main repository root, shared by linked worktrees.
+    RepoRoot,
+}
+
+impl ProjectStrategy {
+    pub(crate) fn is_basename(&self) -> bool {
+        matches!(self, Self::Basename)
+    }
 }
 
 /// Effective network posture of a launch (docs/connect-proxy-plan.md).
@@ -1077,6 +1101,18 @@ fn load_global_from_path(path: &Path) -> Result<GlobalConfig, String> {
     )
 }
 
+/// Read `project_strategy` from the legacy `$HOME/.ai-jail`, defaulting
+/// to `Basename` when the file does not exist.
+pub(crate) fn load_legacy_global_project_strategy()
+-> Result<ProjectStrategy, String> {
+    match global_config_path() {
+        Some(path) if path.exists() => {
+            Ok(load_global_from_path(&path)?.project_strategy)
+        }
+        _ => Ok(ProjectStrategy::Basename),
+    }
+}
+
 /// Load project-level config from `.ai-jail` in the current dir.
 pub fn load() -> Result<Config, String> {
     load_from_path(&config_path())
@@ -1127,7 +1163,9 @@ pub(crate) fn global_config_for_command_report(
         global.base.command.clone()
     };
 
-    let GlobalConfig { mut base, commands } = global;
+    let GlobalConfig {
+        mut base, commands, ..
+    } = global;
     let mut ignored_command_tables = Vec::new();
     let mut apply = |name: &str, base: &mut Config| {
         let Some(command_config) = commands.get(name) else {
@@ -5169,6 +5207,39 @@ no_gpu = true
             &Config::default(),
         );
         assert!(selected.ignored_command_tables.is_empty());
+    }
+
+    #[test]
+    fn global_project_strategy_parses_repo_root() {
+        let g =
+            parse_global_toml("project_strategy = \"repo-root\"\n").unwrap();
+        assert_eq!(g.project_strategy, ProjectStrategy::RepoRoot);
+    }
+
+    #[test]
+    fn global_without_project_strategy_defaults_to_basename() {
+        let g = parse_global_toml("network = true\n").unwrap();
+        assert_eq!(g.project_strategy, ProjectStrategy::Basename);
+        assert_eq!(g.base.network, Some(true));
+    }
+
+    #[test]
+    fn unknown_project_strategy_is_a_parse_error() {
+        assert!(
+            parse_global_toml("project_strategy = \"repo_root\"\n").is_err()
+        );
+    }
+
+    #[test]
+    fn basename_strategy_is_not_serialized() {
+        let text = toml::to_string(&GlobalConfig::default()).unwrap();
+        assert!(!text.contains("project_strategy"), "{text}");
+    }
+
+    #[test]
+    fn project_level_project_strategy_is_ignored() {
+        let cfg = parse_toml("project_strategy = \"repo-root\"\n").unwrap();
+        assert_eq!(cfg, Config::default());
     }
 
     #[test]

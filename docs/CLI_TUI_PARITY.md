@@ -44,6 +44,14 @@ or integration rather than saved sandbox authority.
     `--no-audit-log`
 - Dependency-tools choice also controls mise activation: `--mise`, `--no-mise`
 
+## Config-only
+
+- Shared policy for linked worktrees: `project_strategy = "repo-root"` in the
+  global `config.toml`. It has no CLI flag, so that a per-invocation flag
+  cannot redirect which saved approval applies. Its effect is shown in the
+  onboarding header, in `status --json` as `project.policy_path`, and in a
+  launch warning when it overrides a directory's own saved policy.
+
 ## Advanced CLI-only policy
 
 - Filesystem overlays and exclusions: `--overlay-map`, `--hide-dotdir`,
