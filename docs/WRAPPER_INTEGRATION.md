@@ -164,6 +164,12 @@ and `blockers`. Stable blocker codes include `onboarding_required`,
 `changed_ssh_key`, and `backend_unavailable`. Status is read-only and never
 prompts.
 
+`project` carries `canonical_path`, the launch directory, and `policy_path`,
+the directory whose saved policy applies. They differ only when the trusted
+global setting `project_strategy = "repo-root"` resolves a linked worktree to
+its main repository, so wrappers should key saved-approval lookups on
+`policy_path`.
+
 ## Private HTTP secrets
 
 A `secret` request reuses phantom credentials. The sandbox receives a

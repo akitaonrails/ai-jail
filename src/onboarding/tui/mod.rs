@@ -23,6 +23,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub(super) struct RunOptions<'a> {
+    pub policy_root: Option<&'a Path>,
     pub configure_only: bool,
     pub recommended_baseline: bool,
     pub profile_path: &'a Path,
@@ -57,6 +58,7 @@ where
     app.set_recommended_baseline(options.recommended_baseline);
     app.set_project_path(&project_path);
     app.set_profile_path(options.profile_path);
+    app.policy_root = options.policy_root.map(safe_path).transpose()?;
     let mut session =
         TerminalSession::new().map_err(|error| error.to_string())?;
 

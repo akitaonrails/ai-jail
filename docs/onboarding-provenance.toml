@@ -209,3 +209,20 @@ verified_by = [
   "scripted_pty_configures_and_saves_destination_constrained_ssh",
 ]
 guide_sections = ["Selected-key SSH"]
+
+[[claim]]
+message_ids = ["AJ-PROJ-001"]
+policy = "onboarding.shared_policy_root_disclosure"
+enforced_by = [
+  "src/onboarding.rs::shared_policy_root",
+  "src/onboarding.rs::plain_header",
+  "src/onboarding/tui/view.rs::render",
+  "src/config_store.rs::StorePaths::policy_root",
+]
+verified_by = [
+  "onboarding::tui::view::tests::header_names_shared_policy_root_for_worktree",
+  "onboarding::tui::view::tests::header_omits_policy_line_for_basename",
+  "onboarding::tui::view::tests::header_keeps_policy_disclosure_at_80_columns",
+  "onboarding::tests::plain_header_names_shared_policy_root",
+]
+guide_sections = ["Linked worktrees"]

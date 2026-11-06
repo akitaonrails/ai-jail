@@ -153,6 +153,31 @@ resolved file is user-owned, is not group- or world-writable, and lies outside
 the project. Unsafe, unreadable, malformed, conflicting, or changed migration
 sources fail closed and remain in place.
 
+`project_strategy = "repo-root"` is likewise trusted global policy that a
+repository cannot set. It lets a linked worktree use its main repository's
+saved policy, which also shares forge bindings and credentials across its
+worktrees. The worktree's repository metadata is repository-authored, so it
+passes the same structural validation as other worktree metadata
+(GHSA-w976-gw52-hvx2) before it can select a policy. Refused metadata or a
+missing main checkout falls back to the launch directory's own policy with a
+warning, and a bare repository keeps it silently. None of these widens access.
+
+Structural validation does not mean the user authored that metadata. With
+`--worktree` the jailed agent can write the repository's common git
+directory, and an agent launched in a main checkout already has `.git/` inside
+its writable project. Such an agent can create
+`.git/worktrees/<name>/{gitdir,commondir}` and a matching `.git` gitfile in any
+directory it can write. Under `repo-root`, later launches in that directory
+then use this repository's saved policy and ignore the directory's own saved
+policy, including any restrictions saved only there. This grants nothing
+beyond what the agent already holds: it can only write where it already has
+write access, and the policy it selects is one the user approved for this
+repository. To keep the substitution visible, ai-jail prints one warning
+whenever a resolved repository policy overrides an existing per-directory
+policy document. Every checkout's automatic save merges restrictions into the
+shared document rather than replacing them, so a launch in one checkout cannot
+remove restrictions saved from another.
+
 Private home is on by default. ai-jail exposes only state needed by the
 invoked agent. The first-run developer preset visibly selects agent credential
 state; disabling it or passing `--no-agent-state` keeps the harness logged out.

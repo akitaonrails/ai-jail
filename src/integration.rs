@@ -88,6 +88,7 @@ pub(crate) struct StatusReport {
 
 pub(crate) struct StatusInput<'a> {
     pub(crate) project: &'a Path,
+    pub(crate) policy_path: &'a Path,
     pub(crate) profile_present: bool,
     pub(crate) onboarding_complete: bool,
     pub(crate) harnesses: &'a [String],
@@ -100,6 +101,7 @@ pub(crate) struct StatusInput<'a> {
 #[derive(Serialize)]
 struct StatusProject {
     canonical_path: String,
+    policy_path: String,
     profile_present: bool,
 }
 
@@ -184,6 +186,7 @@ impl StatusReport {
     pub(crate) fn build(input: StatusInput<'_>) -> Self {
         let StatusInput {
             project,
+            policy_path,
             profile_present,
             onboarding_complete,
             harnesses,
@@ -247,6 +250,7 @@ impl StatusReport {
             schema_version: SCHEMA_VERSION,
             project: StatusProject {
                 canonical_path: project.to_string_lossy().into_owned(),
+                policy_path: policy_path.to_string_lossy().into_owned(),
                 profile_present,
             },
             harnesses: harnesses
@@ -613,6 +617,7 @@ mod tests {
         };
         let report = StatusReport::build(StatusInput {
             project: Path::new("/project"),
+            policy_path: Path::new("/project"),
             profile_present: true,
             onboarding_complete: true,
             harnesses: &["claude".into()],

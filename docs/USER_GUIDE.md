@@ -455,6 +455,67 @@ changing configuration. Automation should pass every intended grant and
 restriction explicitly on each launch. Pending required wrapper requests fail
 with their distinct noninteractive exit code instead of becoming authority.
 
+## Linked worktrees
+
+By default the saved policy is keyed by the canonical path of the directory
+where you launch, so every linked Git worktree of one repository is onboarded
+separately. The trusted global setting `project_strategy = "repo-root"` makes a
+linked worktree use its main repository's saved policy instead:
+
+```toml
+# ~/.config/ai-jail/config.toml
+project_strategy = "repo-root"
+```
+
+When the setting applies, the header of the configure screen and of the
+plain-terminal fallback adds a `Policy` line that names the shared root and
+says it is shared with its linked worktrees. The line is absent when the policy
+belongs to the launch directory itself. The mounted project stays the launch
+directory; only the saved approval, identity, onboarding state, forge bindings,
+and directory grants are shared.
+
+- Only the root of a linked worktree resolves to the main repository.
+  Subdirectories of a worktree or of the main checkout keep their own policy.
+- ai-jail validates the worktree's repository metadata structurally. Metadata
+  it refuses falls back to the launch directory's own policy with a warning.
+- A main checkout that is missing on disk also falls back to the launch
+  directory's own policy with a warning.
+- A worktree of a bare repository keeps the launch directory's own policy
+  silently, because that is a normal layout and prints no warning. No fallback
+  widens access: each uses a policy that already belonged to that directory.
+- A store that sits inside the launch directory or the main checkout is
+  refused.
+- When a launch directory also has a saved policy of its own, the one the
+  default strategy would use, ai-jail prints one warning each time it runs
+  there:
+  `project_strategy = repo-root: using the policy of <root>; the saved policy
+  for <launch dir> is ignored`. Restrictions saved only in that per-directory
+  policy no longer apply there.
+- Every checkout adds to the shared document's restrictions. The automatic
+  save at launch and `--init` merge the restrictions they capture into the
+  document instead of replacing them, so a launch in one checkout cannot drop
+  a restriction saved from another. The trade-off: under `repo-root`,
+  re-running `--init` cannot remove a saved restriction. To remove one, edit
+  the shared document under `$XDG_CONFIG_HOME/ai-jail/projects/`, or delete
+  it and onboard again.
+- Absolute paths in a restriction stay as saved and name the checkout they
+  were saved from. A map such as `ro_maps = ["/src/repo/vendor"]` applies only
+  in the launch directory that contains it; other checkouts skip it with a
+  warning. Relative entries, such as masks and maps imported from a legacy
+  file, resolve against each launch directory.
+- A legacy repository `.ai-jail` found in a worktree contributes restrictions
+  to the shared document. Its relative paths stay relative and resolve against
+  each launch directory; only its absolute paths are tied to one checkout.
+- Forge bindings and credentials are shared by every worktree of the
+  repository, so authorizing one worktree authorizes all of them.
+- Forge entries saved for a single worktree before you enable `repo-root` are
+  no longer reachable from that worktree. Remove them with
+  `ai-jail forge remove` in that worktree before you enable the setting, or
+  delete them from the store.
+- `status --json` reports the policy location as `project.policy_path`.
+
+The setting is global only. A repository file cannot enable it.
+
 ## Migration and reapproval
 
 Legacy repository `.ai-jail` files contribute restrictions only. Commands,

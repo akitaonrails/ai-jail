@@ -770,6 +770,22 @@ Everything at or beneath a listed directory is trusted during that compatibility
 read, including repositories cloned there later, so keep the list narrow. A
 repository file cannot confer this trust on itself.
 
+`project_strategy` is also global only. The default, `"basename"`, keys a
+saved project policy on the launch directory. `"repo-root"` makes a linked Git
+worktree use its main repository's saved policy, so one onboarding covers every
+worktree. Only the root of a linked worktree resolves; subdirectories keep their
+own policy. Refused metadata or a missing main checkout falls back to the
+launch directory with a warning; a bare repository keeps the launch
+directory's policy silently. Restrictions saved from any checkout merge into
+the shared policy, so re-running `--init` does not remove one. A launch that
+ignores a directory's own saved policy says so with a warning. See
+[Linked worktrees](docs/USER_GUIDE.md#linked-worktrees).
+
+```toml
+# ~/.config/ai-jail/config.toml
+project_strategy = "repo-root"
+```
+
 Legacy polarity warning: older boolean fields keep their inverted `no_*`
 names (`no_gpu`, `no_docker`, `no_display`, `no_worktree`, `no_mise`,
 `no_landlock`, `no_seccomp`, `no_rlimits`, `no_save_config`, `no_hide_config`,

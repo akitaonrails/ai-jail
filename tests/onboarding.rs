@@ -142,6 +142,14 @@ fn scripted_pty_driver(
     if label == "pty-utf8-tab" {
         fs::create_dir_all(root.join("share-café")).unwrap();
     }
+    if matches!(label, "pty-repo-root" | "pty-repo-root-from-worktree") {
+        install_repo_root_worktree(&project, &xdg);
+    }
+    let cwd = if label == "pty-repo-root-from-worktree" {
+        repo_root_worktree(&fs::canonicalize(&project).unwrap())
+    } else {
+        project.clone()
+    };
     if label == "pty-restricted-ssh" {
         let ssh = home.join(".ssh");
         let tools = root.join("ssh-tools");
@@ -186,7 +194,7 @@ fn scripted_pty_driver(
     let mut command = Command::new(common::ai_jail());
     command
         .args(["configure", "claude"])
-        .current_dir(&project)
+        .current_dir(&cwd)
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &xdg)
         .env("NO_COLOR", "")
@@ -288,6 +296,46 @@ fn scripted_pty_driver(
     let transcript = String::from_utf8_lossy(&bytes);
     assert_eq!(status.code(), Some(expected_code), "{transcript}");
     (root, xdg, transcript.into_owned())
+}
+
+/// Turn `project` into a main checkout with a real `.git/` directory, add
+/// the sibling linked worktree `<root>/project__worktrees/feat-x` with the
+/// layout git writes, and select `project_strategy = "repo-root"` in the
+/// trusted global config.
+fn install_repo_root_worktree(
+    project: &std::path::Path,
+    xdg: &std::path::Path,
+) {
+    let project = fs::canonicalize(project).unwrap();
+    let worktree = repo_root_worktree(&project);
+    let git_dir = project.join(".git/worktrees/feat-x");
+    fs::create_dir_all(&worktree).unwrap();
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", git_dir.display()),
+    )
+    .unwrap();
+    fs::write(
+        git_dir.join("gitdir"),
+        format!("{}\n", worktree.join(".git").display()),
+    )
+    .unwrap();
+    fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+    let store = xdg.join("ai-jail");
+    fs::create_dir_all(&store).unwrap();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+    let global = store.join("config.toml");
+    fs::write(&global, "project_strategy = \"repo-root\"\n").unwrap();
+    fs::set_permissions(&global, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn repo_root_worktree(project: &std::path::Path) -> std::path::PathBuf {
+    project
+        .parent()
+        .unwrap()
+        .join("project__worktrees")
+        .join("feat-x")
 }
 
 fn install_forge_binding_without_credential(
@@ -599,6 +647,102 @@ fn scripted_pty_quit_with_changes_can_save_without_launching() {
         .path();
     let policy = fs::read_to_string(policy_path).unwrap();
     assert!(policy.contains("github = true"), "{policy}");
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Save the recommended baseline from the access overview.
+const SAVE_RECOMMENDED: [PtyStep<'static>; 2] = [
+    PtyStep {
+        wait_for: "AI-JAIL",
+        input: b"s",
+    },
+    PtyStep {
+        wait_for: "Save with OPEN GitHub",
+        input: b"\t\r",
+    },
+];
+
+fn repo_root_status(
+    root: &std::path::Path,
+    xdg: &std::path::Path,
+    cwd: &std::path::Path,
+) -> serde_json::Value {
+    let output = Command::new(common::ai_jail())
+        .args(["--harness", "claude", "status", "--json"])
+        .current_dir(cwd)
+        .env("HOME", root.join("home"))
+        .env("XDG_CONFIG_HOME", xdg)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["harnesses"][0]["onboarding_complete"], true,
+        "{value}"
+    );
+    assert_eq!(value["blockers"], serde_json::json!([]), "{value}");
+    assert_eq!(
+        value["project"]["canonical_path"],
+        cwd.to_str().unwrap(),
+        "{value}"
+    );
+    value
+}
+
+#[test]
+fn scripted_pty_repo_root_worktree_reuses_main_checkout_onboarding() {
+    let (root, xdg, transcript) =
+        scripted_pty_steps("pty-repo-root", &SAVE_RECOMMENDED, &[], "xterm", 0);
+    assert!(transcript.contains("Configuration saved"), "{transcript}");
+    assert!(!transcript.contains("AJ-"), "{transcript}");
+    let main = fs::canonicalize(root.join("project")).unwrap();
+    let worktree = repo_root_worktree(&main);
+
+    let value = repo_root_status(&root, &xdg, &worktree);
+    assert_eq!(
+        value["project"]["policy_path"],
+        main.to_str().unwrap(),
+        "{value}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn scripted_pty_repo_root_first_onboarding_in_worktree_saves_main_checkout_policy()
+ {
+    let (root, xdg, transcript) = scripted_pty_steps(
+        "pty-repo-root-from-worktree",
+        &SAVE_RECOMMENDED,
+        &[],
+        "xterm",
+        0,
+    );
+    assert!(transcript.contains("Configuration saved"), "{transcript}");
+    let main = fs::canonicalize(root.join("project")).unwrap();
+    let worktree = repo_root_worktree(&main);
+
+    // The only saved document belongs to the main checkout.
+    let docs: Vec<_> = fs::read_dir(xdg.join("ai-jail/projects"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(docs.len(), 1, "{docs:?}");
+    let doc = fs::read_to_string(&docs[0]).unwrap();
+    assert!(
+        doc.contains(&format!("canonical_path = {:?}", main.to_str().unwrap())),
+        "{doc}"
+    );
+    assert!(doc.contains("onboarding_complete = true"), "{doc}");
+    assert!(!doc.contains(worktree.to_str().unwrap()), "{doc}");
+
+    let value = repo_root_status(&root, &xdg, &main);
+    assert_eq!(
+        value["project"]["policy_path"],
+        main.to_str().unwrap(),
+        "{value}"
+    );
     let _ = fs::remove_dir_all(root);
 }
 
