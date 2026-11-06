@@ -1,660 +1,455 @@
 # ai-jail onboarding guide
 
-`ai-jail` reviews host access the first time a known harness runs in a
-project. The saved policy lives under `$XDG_CONFIG_HOME/ai-jail/projects`
-(normally `~/.config/ai-jail/projects`), outside the checkout. Repository
-files cannot add grants.
+The first run of a known harness opens one persistent terminal application for
+reviewing project access. It stays on the alternate screen while you inspect
+capabilities, choose directories and environment variables, configure selected
+SSH keys, decide wrapper requests, and review the complete effective policy.
+It does not interleave full-screen pages with printed prompts.
 
-Host wrappers such as ai-memory should use the dedicated
-[wrapper integration contract](WRAPPER_INTEGRATION.md). It consolidates their
-requested access into this same review instead of presenting a second
-checklist. A wrapper request starts selected for review, remains deniable, and
-does not become authority until the user approves and saves it here.
+The saved policy lives under `$XDG_CONFIG_HOME/ai-jail/projects` (normally
+`~/.config/ai-jail/projects`), outside the checkout. Repository files cannot
+add grants. The implementation contract and minimum terminal behavior are in
+[TUI_DESIGN.md](TUI_DESIGN.md).
+
+The examples below preserve the labels, states, and action keys checked by the
+renderer tests. Their line wrapping changes with terminal width.
 
 Repository-scoped GitHub, GitLab, Codeberg/Forgejo, and Gitea credentials use
-the separate [`ai-jail forge` step-by-step guide](FORGE_AUTH.md). It includes
-complete simulated prompts, provider account setup, scope/lifetime labels,
-rotation, removal, and the distinction from the legacy OPEN `--github` option.
+the separate [`ai-jail forge` guide](FORGE_AUTH.md). They are not configured by
+the onboarding capability list.
 
-## Message contract
+## What the screen shows
 
-The following block is rendered from the same message catalog as the CLI and
-checked byte-for-byte by the test suite.
+Every normal screen has four parts:
 
-```text
-AJ-ONB-001 Configure a known harness for one canonical project.
-AJ-CHOICE-001 Every selection is off until the user enables it.
-AJ-GRANT-001 Every active grant names resource, access, process, duration, scope, limits, default, and consequence.
-AJ-OPEN-001 Broad access requires typing OPEN.
-AJ-SUM-001 Final output always contains RESTRICTED, ALLOWED, and OPEN.
-AJ-SAVE-001 Saved policy lives outside the project.
-AJ-CANCEL-001 Cancel writes no onboarding grants and starts nothing.
-AJ-NONTTY-001 Non-TTY first runs save no onboarding profile.
-AJ-NONTTY-002 Non-TTY configure changes nothing.
-AJ-FINAL-001 Complete effective access includes every contributing policy layer.
-AJ-PATH-001 Unsafe directory syntax is refused.
-AJ-PATH-002 Credential roots require their dedicated access choice.
-AJ-PATH-003 Saved directory grants require identity records.
-AJ-PATH-004 Directory identity drift refuses access.
-AJ-ENV-001 Environment approvals store names only.
-AJ-ENV-002 Missing approved host variables fail closed.
-AJ-SSH-001 Selected-key SSH never shares private key files or the host agent.
-AJ-SSH-002 SSH destination limits are claimed only after host-key verification.
-AJ-SSH-003 A moved or changed selected key refuses launch.
-AJ-SSH-004 Selected-key SSH requires a separately approved Unrestricted network (OPEN) grant.
-```
+- The header names the harness, canonical project, and current editor.
+- The primary pane contains the capability list or editor. Checkboxes always
+  show state in text, so color is never the only signal.
+- The context pane describes the focused item: resource, access, process,
+  duration, scope, limits, default, consequence, and, where applicable, remote
+  service or authority.
+- The footer lists only keys that work on the current screen. Confirmation and
+  validation messages appear there without leaving the application.
 
-## Secure default
+## Access presets
 
-```text
-$ ai-jail claude
+The first incomplete onboarding starts with `For developers` applied. It
+enables the common access most developers need: the known harness's filtered
+model API destination, host harness login/state, filtered dependency tooling,
+and the active host GitHub token. Harness state also passes any detected,
+well-known API-key variable for that harness; the details name the variable,
+and its value is never displayed or saved. GitHub is explicitly marked OPEN:
+the jail gets every permission carried by the active `gh` token, not only
+access to the current repository. This preset does not enable unrestricted
+network, SSH, loopback, arbitrary environment variables, or extra directories.
 
-Configure claude for this project
-Project: /home/alice/src/demo
+The top row provides three starting points:
 
-AJ-ONB-001 ai-jail stores this approval outside the project. Files in this
-repository cannot add access on their own.
+- `Fully closed` removes every optional grant, including granular selections
+  and wrapper approvals.
+- `For developers` applies the first-run baseline described above. Its full
+  GitHub-token grant is OPEN and requires confirmation in the final review.
+- `Mostly open` enables unrestricted network, the full host GitHub token, the
+  ambient SSH agent, and host loopback access. It is red, carries a warning,
+  and requires an explicit in-TUI confirmation with Cancel focused by default.
 
-AJ-CHOICE-001 Access choices
-  1 [ ] Filtered model API access
-  2 [ ] Host harness login/state
-  3 [ ] Dependency tools and download hosts
-  4 [ ] Full host SSH access                 OPEN
-  k [ ] Selected SSH keys (fresh agent)
-  5 [ ] Full host GitHub token              OPEN
-  6 [ ] Unrestricted network                OPEN
-  7 [ ] All host loopback services          OPEN (macOS)
-  r Add read-only directory   w Add read/write directory
-  e Environment variables (names only; values stay hidden)
-  d Remove directory          s Review summary   q Cancel
+Press `Tab` or `Shift-Tab` to focus and move between presets. As focus moves,
+the checklist below changes immediately to show a `PREVIEW — not applied` of
+the preset. Previewing never changes the draft. Press `Enter` or `Space` to
+apply the focused preset; press `Down` or `Esc` to return unchanged. Changing
+any granular option makes the active label `Custom`. Arbitrary environment
+variables and extra directories are never guessed by a preset. The sole
+environment exception is a detected, well-known harness API key bundled with
+the explicitly visible harness-state grant.
 
-[OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
-[OK] Selected: filtered model API
+Reopening a completed profile starts from its saved choices and does not
+reapply the developer baseline. Noninteractive execution also remains
+restricted; these presets are an interactive onboarding convenience.
 
-Press Space
-AJ-GRANT-001 Enable this grant? [y/N] y
-
-Press s
-
-AJ-SUM-001 Final access for claude
-
-[LOCK] RESTRICTED
-  SSH       No key files, host agent socket, or SSH configuration
-  GitHub    No host gh configuration or token
-  Host home See the complete effective access below
-  Network   Every destination except the named API/dependency hosts
-
-[WARN] ALLOWED
-  /home/alice/src/demo: read and write for claude and its child processes
-  api.anthropic.com: filtered TCP access while this jail runs
-
-[ERROR] OPEN
-  None
-
-Save and launch [s], launch once [o], back [b], cancel [q]: s
-[OK] AJ-SAVE-001 Configuration saved
-```
-
-The live summary expands every `ALLOWED` entry into Resource, Access,
-Process, Duration, Scope, Limits, Default, and Consequence fields. Network and
-credential entries also show Remote or Authority where applicable.
-
-The confirmation screen then shows the complete effective policy after global
-settings, the proposed project grants, command-line flags, project
-restrictions, and platform defaults are combined. This fixture is rendered by
-the same code and checked byte-for-byte:
+At 96 columns or wider, the access list and its details sit side by side:
 
 ```text
-AJ-FINAL-001 Complete effective access
-Recipient: claude and every child process it starts inside this jail
-Duration: While each jail runs; approval remains saved for this project
-Project: /home/alice/src/demo (read and write)
-Scope: global policy, proposed project grants, command-line grants, project constraints, and derived platform defaults
-Effective policy (every nondefault field):
-command = ["claude"]
-github = false
-no_mise = true
-no_toolchains = true
-ssh = false
-allow_hosts = ["api.anthropic.com"]
-agent_state = false
-Built-in environment names: PATH, HOME, TERM, LANG, SHELL, TMPDIR, COLORTERM, SSL_CERT_FILE, SSL_CERT_DIR, http_proxy, https_proxy, no_proxy, HTTP_PROXY, HTTPS_PROXY, NO_PROXY; prefixes: LC_, XDG_, TERM_PROGRAM
-Authority details (resource; access; scope/limits; consequence):
-- [WARN] ALLOWED: private persistent jail home; read and write; this harness profile only; state persists across launches
-- [WARN] ALLOWED: public hosts api.anthropic.com; filtered TCP connections; named hosts and subdomains with private/loopback resolution blocked; services can receive readable jail data
-Environment names: none beyond the built-in safe allowlist
-User-approved host environment names: none
-Limits: mandatory masks, platform support, and monotonic project restrictions still apply
+Configure claude  •  project access
+Project  /home/alice/src/demo
+
+┌ Presets • Tab/Shift-Tab preview • Enter/Space apply ─────┐
+│   Fully closed    ✓ ⚠ For developers    ⚠ Mostly open   │
+└──────────────────────────────────────────────────────────┘
+┌ Access choices ───────────────────────────┐┌ Details — Filtered model API access ─┐
+│▶ 1 ✓ Filtered model API access            ││Allows                                 │
+│  2 ✓ Host harness login/state             ││claude and its children can connect    │
+│  3 ✓ Dependency tools and download hosts  ││only to api.anthropic.com.              │
+│  4 ○ Full host SSH access       ✓ CLOSED  ││                                       │
+│  k ○ Selected SSH keys (fresh agent)      ││Still blocked                          │
+│  5 ✓ Full host GitHub token       ! OPEN  ││Other hosts, private IPs, and localhost│
+│  c ○ Host container engine      ✓ CLOSED  ││Risk: API can receive readable data.   │
+│  6 ○ Network: unrestricted      ✓ CLOSED  ││                                       │
+│  a • Additional capabilities              ││                                       │
+└───────────────────────────────────────────┘└───────────────────────────────────────┘
+↑/↓ move  •  Space/Enter select  •  q cancel  •  Esc back
 ```
 
-## Add and remove directories
+On a narrower supported terminal, the same information is stacked. Nothing is
+removed; the detail pane moves below the list and becomes scrollable.
 
 ```text
-Press r
-Directory (Tab completes; absolute path or ~/...): ~/Documents/reference
-Entered:  ~/Documents/reference
-Resolved: /home/alice/Documents/reference
-
-Resource:    /home/alice/Documents/reference
-Access:      Read the complete directory tree; writes are denied
-Process:     claude and every child process it starts inside this jail
-Duration:    This jail run; saving keeps approval for later runs, while launch once does not
-Scope:       This resolved directory tree only
-Limits:      Contents can be copied into the project or sent to an allowed network destination
-Default:     Not shared
-Consequence: The harness can inspect these host files but cannot modify them through this grant
-
-Add this directory? [y/N] y
+┌ Access choices ──────────────────────────────────────────┐
+│▶ 1 [✓] Filtered model API access                         │
+│  2 [✓] Host harness login/state                          │
+│  3 [✓] Dependency tools and download hosts               │
+└──────────────────────────────────────────────────────────┘
+┌ Details — Filtered model API access • lines 1–6/9 ───────┐
+│Allows                                                     │
+│claude and its child processes can connect only to        │
+│api.anthropic.com and subdomains.                         │
+│Still blocked: other hosts, private IPs, and localhost.   │
+└──────────────────────────────────────────────────────────┘
 ```
 
-Use `w` for read/write access and `d` to remove a saved entry. Completion
-reads the filesystem directly; it never invokes a shell or expands variables
-or globs. Credential roots such as `~/.ssh`, host `gh` configuration, and the
-ai-jail policy store are refused. The filesystem root is also refused because
-the sandbox cannot enforce it as an extra map. Sharing the whole home
-directory or a broad project ancestor requires typing `OPEN`.
+The minimum TUI size is 64 columns by 30 rows. Below that size, ai-jail asks
+you to resize and retains working Back and Cancel actions. `NO_COLOR` removes
+color while preserving text labels, borders, focus, and checkbox state.
+
+## Capability review
+
+Arrow keys move the highlighted row. `Home`, `End`, `PageUp`, and `PageDown`
+navigate long lists and disclosures. `Space` or `Enter` opens the focused
+choice. An `ALLOWED` grant toggles immediately after its disclosure is visible.
+A disabled broad grant says `CLOSED`; selecting it opens a confirmation dialog
+with Cancel focused by default. No TUI action asks you to type `OPEN` or answer
+y/n.
+
+The broad compatibility choices remain clearly OPEN:
+
+- Full host SSH shares `~/.ssh` and the ambient agent.
+- Full host GitHub access shares the active host `gh` token.
+- Host container-engine access controls the selected Docker or Podman daemon.
+  It can mount host paths and is effectively the daemon owner's full authority.
+- Unrestricted network removes hostname filtering and destination audit
+  enforcement. Closing it does not necessarily mean offline: filtered model
+  APIs, dependency registries, and manually approved hosts can remain
+  reachable. `Fully closed` blocks every destination.
+- On macOS, all-host-loopback access reaches every service and port on host
+  loopback. Prefer `--forward-port PORT` when the port is known.
+
+Opening a detail page never enables a capability. Disabling an existing choice
+updates the checkbox immediately. `Esc` returns one level; `q` cancels setup
+when focus is not inside a text field.
+
+`Additional capabilities` keeps uncommon choices off the main checklist. It
+contains broad host-home access, lockdown, host services and devices, cloud and
+registry credential stores, full environment inheritance, worktree metadata,
+Pictures, local audit logging, and platform-specific compatibility grants.
+Only controls relevant to the current operating system are shown. No preset
+enables anything on this screen; every OPEN item uses the same confirmation
+dialog and remains visible in the final review.
+
+Pressing `Space` or `Enter` toggles an ALLOWED choice immediately. An OPEN
+choice uses the same dialog everywhere:
+
+```text
+┌ Open this boundary? ─────────────────────────────────────┐
+│ This removes an important isolation boundary.           │
+│                                                         │
+│  [ Cancel ]       [ Enable OPEN access ]                 │
+│                                                         │
+│ ←/→ or Tab choose  •  Enter select  •  Esc cancel       │
+└─────────────────────────────────────────────────────────┘
+```
+
+The list then changes from green `✓ CLOSED` to red `! OPEN`. Color reinforces
+the meaning; the symbol and text remain authoritative in monochrome terminals.
+
+## Directory browser
+
+Choose `r` for read-only access or `w` for read/write access. The browser
+starts at the canonical project parent (or the last directory visited), not at
+a credential directory.
+
+```text
+Directory access  READ-ONLY
+Location: /home/alice/Documents
+Filter: ref  •  hidden: hidden
+
+┌ Directories ───────────────────────┐┌ Security preview ───────────────────┐
+│> dir  reference                    ││Selected path                        │
+│  dir  reports                      ││/home/alice/Documents/reference      │
+│  dir  research                     ││                                    │
+│                                    ││Space reviews it for READ-ONLY access│
+└────────────────────────────────────┘└─────────────────────────────────────┘
+↑/↓ browse  •  Enter open  •  Space review  •  / filter  •  g go to path
+Backspace parent  •  . hidden  •  m mode  •  Esc back
+```
+
+On a narrow terminal, the directory list appears above the same scrollable
+security preview:
+
+```text
+┌ Directories ─────────────────────────────────────────────┐
+│> dir  reference                                         │
+└──────────────────────────────────────────────────────────┘
+┌ Security preview • lines 1–5/12 • PgUp/PgDn ─────────────┐
+│Selected path                                             │
+│/home/alice/Documents/reference                           │
+└──────────────────────────────────────────────────────────┘
+```
+
+`m` changes the proposed mode before approval. The preview shows both the path
+as entered and its resolved canonical destination. Press `Space` to add the
+highlighted directory. Ordinary narrow grants need no additional y/n prompt.
+A broad home or project-ancestor grant still requires reviewing the complete
+disclosure and selecting the OPEN action in the shared dialog.
+
+After the first selection, a `Selected directories` pane appears below the
+browser. Press `Tab` to move between panes. In the lower pane, highlight a
+grant and press `Space` to remove it immediately; when the final grant is
+removed, the pane closes and focus returns to the browser. Press `m` on a
+selected grant to toggle it between read-only and read/write. Expanding a broad
+grant to read/write still requires the explicit OPEN dialog choice.
+
+The chooser refuses filesystem root, credential roots such as `~/.ssh`, host
+`gh` configuration, and the ai-jail policy store. It also refuses unsafe
+symlinks, invalid UTF-8, and overlapping grants. Saved grants record filesystem
+identity, so a moved, replaced, or missing target fails closed on the next
+launch.
 
 ## Environment variables
 
-The safe baseline names shown in the complete summary are available without
-extra approval. Other host variables start off. Press `e` to filter the
-current host variable names. ai-jail never displays or saves their values.
-It stores an approved name and reads its current value again for each launch.
-Every non-baseline host variable requires `OPEN` because a harmless-looking
-name can still carry sensitive authority. If a saved name is missing later, the
-launch stops and tells you to restore it or remove it with `configure`.
-
-This name-only fixture is generated from the same grant renderer:
+The environment editor is a searchable multi-select list of names. Values are
+never loaded for rendering, displayed, logged, or written to the project
+profile.
 
 ```text
-AJ-ENV-001 Environment names only. Type to filter; arrows move; Space/Enter selects for approval; q/Esc returns. Values are never shown.
-  Filter: CUSTOM
-  > [ ] CUSTOM_MODE
+Environment variables
+Names only; values are hidden and never saved.
+Search: CUSTOM█
 
-AJ-GRANT-001
-Resource:    Host environment variable CUSTOM_MODE (value hidden)
-Access:      Read and use the current host value; the value is never displayed or saved by ai-jail
-Process:     claude and every child process it starts inside this jail
-Duration:    This jail run; saving keeps approval for later runs, while launch once does not
-Scope:       This exact variable name; the current value is read again for each launch
-Limits:      Every jailed descendant can read and copy the value; allowed network access can carry it outside the jail
-Default:     Arbitrary host variables are not shared; the documented safe baseline remains available
-Consequence: The harness and every child process can use or disclose the current value
-Authority:   The authority of an arbitrary host value cannot be verified from its name
-
-AJ-OPEN-001 Host variable CUSTOM_MODE has unverifiable authority. Type OPEN to approve its name: OPEN
+┌ Variable names ───────────────────┐┌ Security details ────────────────────┐
+│> ○ CUSTOM_MODE                    ││CUSTOM_MODE                           │
+│  ✓ CUSTOM_CACHE                   ││Every jailed descendant can read and │
+│                                   ││copy the current host value.          │
+└───────────────────────────────────┘└──────────────────────────────────────┘
+↑/↓ move  •  Space/Enter review or remove  •  / search
+Esc clears search or returns  •  values never appear in this screen
 ```
 
-## Broad legacy access
+At narrow widths, the variable list is stacked above `Security details`. The
+checked names and the complete scroll position remain visible; values still do
+not enter the display model.
 
 ```text
-Press 5
-
-AJ-OPEN-001 OPEN access removes an important boundary.
-
-Resource:    The effective host gh configuration and active github.com token
-Access:      Read configuration and use the token for GitHub API and Git HTTPS operations
-Process:     claude and every child process it starts inside this jail
-Duration:    This jail run; saving keeps approval for later runs, while launch once does not
-Scope:       Every repository and organization allowed by the active host token
-Limits:      Read-only configuration does not restrict use or copying of the token
-Default:     Not shared
-Consequence: Jailed processes can act with the host token's complete GitHub authority
-Authority:   Every permission granted to the active github.com token
-
-Type OPEN to enable this exact grant: OPEN
+┌ Variable names ──────────────────────────────────────────┐
+│> ○ CUSTOM_MODE                                           │
+│  ✓ CUSTOM_CACHE                                          │
+└──────────────────────────────────────────────────────────┘
+┌ Security details • lines 1–4/8 • PgUp/PgDn ──────────────┐
+│CUSTOM_MODE                                               │
+│Every jailed descendant can read and copy an approved     │
+│value.                                                     │
+└──────────────────────────────────────────────────────────┘
 ```
 
-Full SSH, the full host GitHub token, and unrestricted network are legacy
-compatibility modes. They are always listed under `OPEN`.
+Approving a new non-baseline name shows its complete disclosure, then the
+shared dialog because a variable's authority cannot be established from its
+name. Existing approvals are checked;
+pressing `Space` or `Enter` on one removes it from the draft. ai-jail stores
+only an approved name and reads its current host value for each launch. If the
+name is missing later, launch fails closed until you restore it or remove the
+approval with `configure`.
 
 ## Selected-key SSH
 
-Press `k` to add or remove file-backed identities. ai-jail discovers only
-regular, non-symlinked key pairs. It displays and saves the public SHA-256
-fingerprint, comment, path, and file identity. It never saves or mounts private
-key contents. On Linux and macOS it uses the system OpenSSH `ssh-agent`,
-`ssh-add`, `ssh-keygen`, and `ssh` tools from trusted system paths. The menu is
-the add/remove interface; it does not alter the user's ambient agent.
+Choose `k` to configure selected-key SSH. This uses a fresh agent for each
+launch and does not share private key files or the ambient host agent. ai-jail
+discovers regular, non-symlinked file-backed identities and displays only safe
+metadata: public path, SHA-256 fingerprint, and comment.
+
+Wide terminals use separate identity, selection, destination, and security
+panes. Narrow terminals stack the same panes vertically.
 
 ```text
-AJ-SSH-TRANSCRIPT-BEGIN selected-key SSH interaction
-AJ-SSH-001 Selected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared.
-Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: a
-Available file-backed identities:
-  1. /home/alice/.ssh/id_ed25519.pub  SHA256:EXAMPLE  alice@example
-Key number, private-key path, or .pub path: 1
+Selected SSH keys — fresh agent
+READY — selected-key SSH is destination constrained
 
-AJ-SSH-001 Selected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared.
-Selected identities:
-  1. /home/alice/.ssh/id_ed25519.pub  SHA256:EXAMPLE  alice@example
-Lifetime: 3600 seconds; destinations: not configured (launch and save are refused)
-Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: h
-Required destinations, comma-separated: git@github.com
-
-Resource:    Fresh SSH agent containing only SHA256:EXAMPLE
-Access:      Request signatures; private key files and the ambient agent stay outside the jail
-Duration:    Agent lives for this jail; loaded keys expire after 3600 seconds
-Scope:       AJ-SSH-002 Only verified destination constraints: git@github.com
-Limits:      Destination constraints depend on OpenSSH support and verified known_hosts entries; unrestricted network is separately OPEN; failure refuses launch
+┌ Available public identities ─────┐┌ Selected • lifetime 3600s (+/-) ─────┐
+│> [x] ~/.ssh/id_ed25519.pub        ││ [x] SHA256:EXAMPLE  alice@example     │
+│    SHA256:EXAMPLE alice@example   │└───────────────────────────────────────┘
+└───────────────────────────────────┘┌ Required destinations ────────────────┐
+                                    │> git@github.com                       │
+                                    └───────────────────────────────────────┘
+┌ Security detail • lines 1–8/10 ───────────────────────────────────────────┐
+│Private-key boundary: private keys never enter the jail                    │
+│Destinations: enforced and host-key verified                              │
+│Network prerequisite: unrestricted network is separately OPEN             │
+└───────────────────────────────────────────────────────────────────────────┘
+Tab changes pane  •  arrows move  •  Space selects/removes
+p path  •  a add destination  •  e edit  •  Del remove  •  +/- lifetime
 ```
 
-Choose `h` to add destination constraints. ai-jail copies only verified public
-host-key lines into a generated `known_hosts` file and uses OpenSSH's
-destination constraints. At least one destination is required. If `ssh-add`
-lacks destination constraints or a destination has no matching verified host
-key, launch and save stop. Host-key checking is always strict. ai-jail does not
-describe `known_hosts` as a limit on raw agent signing authority; the enforced
-boundary is OpenSSH's `ssh-add -h/-H` destination constraint.
+The narrow layout keeps the same four zones in order: available identities,
+selected identities, required destinations, and security detail. `Tab` moves
+between the first three panes; `PageUp` and `PageDown` scroll the disclosure.
 
-Native SSH does not travel through ai-jail's HTTP(S) filtered-egress proxy.
-Select `6 Unrestricted network` and type `OPEN` to use selected-key SSH. This
-opens network reachability, not extra key authority; the fresh agent still
-contains only the selected identities. Without this separate approval, launch
-stops with `AJ-SSH-004`.
+```text
+INCOMPLETE — launch and save are blocked
 
-Git is forced to use the generated SSH config. For a direct command, use the
-two launch-scoped variables exactly. This syntax is also required for direct
-SSH on macOS:
+┌ Available public identities ─────────────────────────────┐
+│> [ ] ~/.ssh/id_ed25519.pub                               │
+│    SHA256:EXAMPLE  alice@example                         │
+└──────────────────────────────────────────────────────────┘
+┌ Selected • lifetime 3600s (+/-) ─────────────────────────┐
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+┌ Required destinations ───────────────────────────────────┐
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+┌ Security detail • lines 1–4/10 • PgUp/PgDn ──────────────┐
+│Selected-key SSH access (ALLOWED)                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+`Space` selects or removes an identity immediately; there is no second y/n
+prompt. Its authority remains visible in the security-detail pane. Destination
+edits are validated in place. Save and launch remain unavailable
+until at least one identity and one enforced destination are present. ai-jail
+accepts a destination limit only when OpenSSH supports `ssh-add -h/-H` and a
+matching verified host key exists. Missing support, a missing host key, an
+unconstrained policy, or identity drift refuses the launch.
+
+Native SSH does not pass through ai-jail's HTTP CONNECT proxy. Selected-key SSH
+therefore also requires a separately reviewed Unrestricted network grant,
+classified OPEN. This opens reachability without adding identities to the fresh
+agent. Git uses the generated strict configuration. For direct SSH on Linux or
+macOS, use the launch-scoped variables:
 
 ```sh
 "$AI_JAIL_SSH" -F "$AI_JAIL_SSH_CONFIG" git@github.com
 ```
 
-Running plain `ssh` does not promise these restrictions. The temporary agent is
-killed and its generated public files are removed on normal exit or launch
-failure. SIGINT, SIGTERM, and SIGHUP set launch cancellation before forwarding
-to the supervised child; startup observes cancellation, reaps the temporary
-agent, removes its runtime directory, and does not start the sandbox command.
-An uncatchable supervisor termination such as `SIGKILL` cannot promise immediate
-cleanup. The key lifetime passed to `ssh-add` remains the upper bound on a
-surviving temporary agent's key use.
-Ambient `SSH_AUTH_SOCK`, `GIT_SSH`, and
-`GIT_SSH_COMMAND` values are removed.
-Identities that exist only in the ambient agent cannot be copied selectively;
-use a file-backed key or choose the legacy full SSH mode with `OPEN`.
+Plain `ssh` does not promise the selected-key restrictions. The temporary agent
+is killed and its generated public files are removed on normal exit, launch
+failure, and handled termination. `SIGKILL` cannot guarantee immediate
+cleanup; the configured `ssh-add` lifetime bounds use of keys left in a
+surviving temporary agent.
 
-The following normalized PTY transcript is the executable onboarding fixture.
-Only the temporary root and generated policy filename are replaced.
+## Wrapper-staged requests
+
+Wrappers such as ai-memory can stage access through the
+[wrapper integration contract](WRAPPER_INTEGRATION.md). Wrapper requests enter
+a separate review before the normal capability list. They are proposals, not
+authority.
 
 ```text
-AJ-SSH-TRANSCRIPT-BEGIN selected-key SSH interaction
+Wrapper-staged access requests
+APPROVE proposes the fully disclosed access; REJECT keeps it absent.
 
-AJ-SSH-001 Selected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared.
-Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: Available file-backed identities:
-  1. <ROOT>/home/.ssh/id_test.pub  SHA256:EXAMPLE  alice@example
-Key number, private-key path, or .pub path: AJ-CHOICE-001 Access choices
-  1 [ ] Filtered model API access
-  2 [ ] Host harness login/state
-  3 [ ] Dependency tools and download hosts
-  4 [ ] Full host SSH access                 OPEN
-  k [x] Selected SSH keys (fresh agent)
-  5 [ ] Full host GitHub token              OPEN
-  6 [ ] Unrestricted network                OPEN
-  7 [ ] All host loopback services          OPEN (macOS)
-  r Add read-only directory   w Add read/write directory
-  e Environment variables (names only; values stay hidden)
-  d Remove directory          s Review summary   q Cancel
-  Repository-scoped forge access is configured separately.
-
-[OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
-[OK] Selected: filtered model API
-
-AJ-SSH-001 Selected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared.
-Selected identities:
-  1. <ROOT>/home/.ssh/id_test.pub  SHA256:EXAMPLE  alice@example
-Lifetime: 3600 seconds; destinations: not configured (launch and save are refused)
-Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: Key number to remove: AJ-CHOICE-001 Access choices
-  1 [ ] Filtered model API access
-  2 [ ] Host harness login/state
-  3 [ ] Dependency tools and download hosts
-  4 [ ] Full host SSH access                 OPEN
-  k [ ] Selected SSH keys (fresh agent)
-  5 [ ] Full host GitHub token              OPEN
-  6 [ ] Unrestricted network                OPEN
-  7 [ ] All host loopback services          OPEN (macOS)
-  r Add read-only directory   w Add read/write directory
-  e Environment variables (names only; values stay hidden)
-  d Remove directory          s Review summary   q Cancel
-  Repository-scoped forge access is configured separately.
-
-[OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
-[OK] Selected: filtered model API
-
-AJ-SSH-001 Selected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared.
-Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: Available file-backed identities:
-  1. <ROOT>/home/.ssh/id_test.pub  SHA256:EXAMPLE  alice@example
-Key number, private-key path, or .pub path: AJ-CHOICE-001 Access choices
-  1 [ ] Filtered model API access
-  2 [ ] Host harness login/state
-  3 [ ] Dependency tools and download hosts
-  4 [ ] Full host SSH access                 OPEN
-  k [x] Selected SSH keys (fresh agent)
-  5 [ ] Full host GitHub token              OPEN
-  6 [ ] Unrestricted network                OPEN
-  7 [ ] All host loopback services          OPEN (macOS)
-  r Add read-only directory   w Add read/write directory
-  e Environment variables (names only; values stay hidden)
-  d Remove directory          s Review summary   q Cancel
-  Repository-scoped forge access is configured separately.
-
-[OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
-[OK] Selected: filtered model API
-
-AJ-SSH-001 Selected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared.
-Selected identities:
-  1. <ROOT>/home/.ssh/id_test.pub  SHA256:EXAMPLE  alice@example
-Lifetime: 3600 seconds; destinations: not configured (launch and save are refused)
-Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: Required destinations, comma-separated: AJ-CHOICE-001 Access choices
-  1 [ ] Filtered model API access
-  2 [ ] Host harness login/state
-  3 [ ] Dependency tools and download hosts
-  4 [ ] Full host SSH access                 OPEN
-  k [x] Selected SSH keys (fresh agent)
-  5 [ ] Full host GitHub token              OPEN
-  6 [ ] Unrestricted network                OPEN
-  7 [ ] All host loopback services          OPEN (macOS)
-  r Add read-only directory   w Add read/write directory
-  e Environment variables (names only; values stay hidden)
-  d Remove directory          s Review summary   q Cancel
-  Repository-scoped forge access is configured separately.
-
-[OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
-[OK] Selected: filtered model API
-
-AJ-OPEN-001 OPEN access removes an important boundary.
-
-AJ-GRANT-001
-Resource:    The host's reachable network
-Access:      Connect using any protocol and destination permitted by the host
-Process:     claude and every child process it starts inside this jail
-Duration:    This jail run; saving keeps approval for later runs, while launch once does not
-Scope:       Public, private, local-network, and other host-reachable services
-Limits:      Hostname filtering and destination audit enforcement no longer apply
-Default:     Filtered to explicitly allowed hosts
-Consequence: Any readable jail data can be sent to any reachable service
-Remote:      Any reachable service
-
-AJ-OPEN-001 Type OPEN to enable this exact grant: AJ-CHOICE-001 Access choices
-  1 [ ] Filtered model API access
-  2 [ ] Host harness login/state
-  3 [ ] Dependency tools and download hosts
-  4 [ ] Full host SSH access                 OPEN
-  k [x] Selected SSH keys (fresh agent)
-  5 [ ] Full host GitHub token              OPEN
-  6 [x] Unrestricted network                OPEN
-  7 [ ] All host loopback services          OPEN (macOS)
-  r Add read-only directory   w Add read/write directory
-  e Environment variables (names only; values stay hidden)
-  d Remove directory          s Review summary   q Cancel
-  Repository-scoped forge access is configured separately.
-
-[OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
-[OK] Selected: filtered model API
-
-AJ-SUM-001 Final access for claude
-
-[LOCK] RESTRICTED
-  GitHub    No host gh configuration or token
-  Host home See the complete effective access below
-  Network   All destinations are blocked
-
-[WARN] ALLOWED
-AJ-GRANT-001
-Resource:    <ROOT>/project
-Access:      Read and write the complete directory tree
-Process:     claude and every child process it starts inside this jail
-Duration:    While each jail runs; approval remains saved for this project
-Scope:       This canonical project path only
-Limits:      Readable project data can be sent to an allowed network destination
-Default:     Allowed because this is the working project
-Consequence: The harness can inspect, create, modify, rename, and delete project files
-
-
-AJ-GRANT-001
-Resource:    Fresh SSH agent containing only SHA256:EXAMPLE
-Access:      Request signatures; private key files and the ambient agent stay outside the jail
-Process:     claude and every child process it starts inside this jail
-Duration:    Agent lives for this jail; loaded keys expire after 3600 seconds; While each jail runs; approval remains saved for this project
-Scope:       AJ-SSH-002 Only verified destination constraints: git@github.com
-Limits:      Destination constraints depend on OpenSSH support and verified known_hosts entries; unrestricted network is separately OPEN; failure refuses launch
-Default:     Disabled until keys are selected in trusted configuration
-Consequence: The harness can authenticate as accounts accepted by the selected keys during this jail run
-Remote:      git@github.com
-Authority:   Only accounts accepted by the selected fingerprints
-
-
-[ERROR] OPEN
-
-AJ-GRANT-001
-Resource:    The host's reachable network
-Access:      Connect using any protocol and destination permitted by the host
-Process:     claude and every child process it starts inside this jail
-Duration:    While each jail runs; approval remains saved for this project
-Scope:       Public, private, local-network, and other host-reachable services
-Limits:      Hostname filtering and destination audit enforcement no longer apply
-Default:     Filtered to explicitly allowed hosts
-Consequence: Any readable jail data can be sent to any reachable service
-Remote:      Any reachable service
-
-
-AJ-FINAL-001 Complete effective access
-Recipient: claude and every child process it starts inside this jail
-Duration: This jail run; saving keeps approval for later runs, while launch once does not
-Project: <ROOT>/project (read and write)
-Scope: global policy, proposed project grants, command-line grants, project constraints, and derived platform defaults
-Effective policy (every nondefault field):
-command = ["claude"]
-rw_maps = ["<SSH-RUNTIME>/agent.sock:/tmp/ai-jail-ssh-agent.sock"]
-ro_maps = ["<SSH-RUNTIME>/public:/tmp/ai-jail-ssh-public"]
-github = false
-network = true
-no_mise = true
-no_toolchains = true
-ssh = false
-agent_state = false
-Built-in environment names: PATH, HOME, TERM, LANG, SHELL, TMPDIR, COLORTERM, SSL_CERT_FILE, SSL_CERT_DIR, http_proxy, https_proxy, no_proxy, HTTP_PROXY, HTTPS_PROXY, NO_PROXY; prefixes: LC_, XDG_, TERM_PROGRAM
-Authority details (resource; access; scope/limits; consequence):
-- [ERROR] OPEN: host network; unrestricted connections; every host-reachable destination and protocol; readable jail data can reach any service
-- [WARN] ALLOWED: launch-scoped selected-key SSH agent; request signatures without reading private keys or the ambient agent; selected identities and saved destination constraints; accepted accounts can be used during this jail run
-- [WARN] ALLOWED: private persistent jail home; read and write; this harness profile only; state persists across launches
-- [WARN] ALLOWED: read-only map <SSH-RUNTIME>/public:/tmp/ai-jail-ssh-public; mapped tree access; exact encoded source/destination; readable data can leave through allowed network access
-- [WARN] ALLOWED: read/write map <SSH-RUNTIME>/agent.sock:/tmp/ai-jail-ssh-agent.sock; mapped tree access; exact encoded source/destination; readable data can leave through allowed network access
-Environment names: AI_JAIL_SSH, AI_JAIL_SSH_CONFIG, GIT_SSH_COMMAND, SSH_AUTH_SOCK
-- [WARN] ALLOWED: generated launch-scoped SSH variable AI_JAIL_SSH; points only to the dedicated agent or generated strict SSH configuration; jailed descendants can use the selected-key authority
-- [WARN] ALLOWED: generated launch-scoped SSH variable AI_JAIL_SSH_CONFIG; points only to the dedicated agent or generated strict SSH configuration; jailed descendants can use the selected-key authority
-- [WARN] ALLOWED: generated launch-scoped SSH variable GIT_SSH_COMMAND; points only to the dedicated agent or generated strict SSH configuration; jailed descendants can use the selected-key authority
-- [WARN] ALLOWED: generated launch-scoped SSH variable SSH_AUTH_SOCK; points only to the dedicated agent or generated strict SSH configuration; jailed descendants can use the selected-key authority
-User-approved host environment names: none
-Limits: mandatory masks, platform support, and monotonic project restrictions still apply
-AJ-OPEN-001 Complete effective access contains OPEN authority. Type OPEN to continue: AJ-SAVE-001 Save this project profile? [y/N/b] [OK] AJ-SAVE-001 Configuration saved
-  Project policy: <ROOT>/xdg/ai-jail/projects/<POLICY>.toml
-  The project cannot edit or enable this policy from inside the jail.
-AJ-SSH-TRANSCRIPT-END selected-key SSH interaction
+┌ Requests ───────────────────────────┐┌ Complete disclosure ───────────────┐
+│>[UNDECIDED] host memory.example     ││Requested by: ai-memory             │
+│ [REJECT   ] env AI_MEMORY_SERVER_URL││Resource: host memory.example       │
+│ [APPROVE  ] agent_state true        ││Reason: memory capture and recall   │
+└─────────────────────────────────────┘└────────────────────────────────────┘
+a validate/approve  •  r reject  •  ↑/↓ move  •  PgUp/PgDn disclosure
 ```
+
+At narrow widths, `Requests` is stacked above `Complete disclosure`. The
+decision label remains attached to every request, and the disclosure title
+keeps its visible line range.
+
+Every request needs an explicit APPROVE or REJECT decision. Approval first
+loads the complete disclosure. Both `ALLOWED` and `OPEN` approval use the
+shared dialog, with Cancel focused by default. Previously approved wrapper-derived access is
+removed from the draft and reviewed again when requested. Revealing a
+disclosure or opening this screen approves nothing. If any request remains
+undecided, Enter does not continue.
+
+## Complete effective-access review
+
+The final screen recomputes the effective policy from global settings, the
+draft project profile, CLI grants, repository constraints, wrapper decisions,
+forge binding, and platform defaults. It groups the result as `RESTRICTED`,
+`ALLOWED`, `OPEN`, and `COMPLETE EFFECTIVE POLICY`.
+
+```text
+Complete effective access
+Review every contributing policy layer before choosing a final action.
+
+┌ Security review • lines 1–18/42 • PgUp/PgDn ─────────────────────────────┐
+│RESTRICTED                                                               │
+│  Full host SSH and host GitHub token                                    │
+│                                                                         │
+│ALLOWED                                                                  │
+│  Project read/write; filtered api.anthropic.com                         │
+│                                                                         │
+│OPEN                                                                     │
+│  Unrestricted network                                                   │
+│                                                                         │
+│COMPLETE EFFECTIVE POLICY                                                │
+│  Every nondefault field and authority consequence                       │
+└─────────────────────────────────────────────────────────────────────────┘
+PgUp/PgDn scroll  •  Home/End first/final line
+s save & launch  •  o launch once  •  b back  •  q cancel
+```
+
+The review uses one scrollable pane at every supported width. Narrow terminals
+wrap each authority entry and show the exact visible line range in the title;
+they do not omit a group or policy field.
+
+You must review through the final effective-access line before choosing an
+action. A normal first run offers:
+
+- `Save & Launch`: persist the profile and start one jail.
+- `Launch Once`: start one jail without saving the draft approvals.
+- `Back`: return to the checklist.
+- `Cancel`: save nothing and start no harness.
+
+`ai-jail configure HARNESS` replaces the first two actions with `Save Profile`,
+which persists the profile without launching a jail. If the effective result
+contains any OPEN authority, the chosen final action shows its consequence in
+the shared dialog. Cancelling returns to the review;
+it does not approve or perform the action.
+
+```text
+┌ Continue with OPEN authority? ───────────────────────────┐
+│ This saves the OPEN approvals and starts one jail now.  │
+│                                                         │
+│  [ Cancel ]       [ Save & launch ]                     │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Plain-terminal and noninteractive behavior
+
+`TERM=dumb` uses a sequential text fallback instead of the alternate-screen
+TUI. It covers the same decisions and security disclosures, and prints no
+internal provenance identifiers. The fallback is intended for real terminals
+that cannot support cursor addressing; it is not mixed into a Ratatui session.
+
+When no terminal is attached, a first run starts once with restricted defaults
+and saves no profile. Noninteractive `ai-jail configure HARNESS` exits without
+changing configuration. Automation should pass every intended grant and
+restriction explicitly on each launch. Pending required wrapper requests fail
+with their distinct noninteractive exit code instead of becoming authority.
 
 ## Migration and reapproval
 
-<!-- provenance: src/config_store.rs migrate_global, migrate_project, dropped_capability_requests; tests/config_migration.rs repository_policy_migrates_only_monotonic_restrictions, migration_warning_inventory_includes_authority_categories, restored_legacy_files_are_idempotent_and_never_add_grants -->
+Legacy repository `.ai-jail` files contribute restrictions only. Commands,
+outside maps, SSH, GitHub credentials, network access, and other grants are not
+imported. A migrated broad request remains disabled until it is selected and
+approved again. A legacy `~/.ai-jail` is migrated separately to
+`$XDG_CONFIG_HOME/ai-jail/config.toml` after the external copy is written,
+parsed, and verified.
 
-```text
-✓ AJ-MIG-002 IMPORTED RESTRICTIONS to ~/.config/ai-jail/projects/PROJECT.toml.
-⚠ AJ-MIG-003 REAPPROVAL REQUIRED; these access requests were NOT IMPORTED:
-full host SSH access, full host GitHub credentials, read/write host paths.
+When ai-jail finishes, its migration notices name the external destination and
+list requests that need reapproval. If the source was tracked, its deletion
+appears in `git status`; ai-jail does not edit the Git index. Restoring the
+repository file does not override an existing external project profile.
 
-AJ-CHOICE-001 Access choices
-  4 [ ] Full host SSH access                 OPEN
-  k [ ] Selected SSH keys (fresh agent)
-  5 [ ] Full host GitHub token              OPEN
-```
+## Documentation drift controls
 
-Migration imports repository restrictions, not grants. A migrated broad
-request remains off until it is selected and confirmed again. A legacy
-`command` is also not imported from an untrusted repository file.
-
-`~/.ai-jail` is a separate trusted-global migration. Its settings move to
-`~/.config/ai-jail/config.toml` (or the equivalent `$XDG_CONFIG_HOME` path).
-When ai-jail finishes, `AJ-MIG-001` reports that move; `AJ-MIG-002` reports the
-project policy path, and `AJ-MIG-003` lists grants that need reapproval. The
-legacy source is removed only after the external file is written, parsed, and
-verified. If migration cannot prove that sequence, it fails closed and retains
-the source.
-
-If the repository file was tracked, its deletion appears in `git status`.
-ai-jail does not edit the Git index. Restoring `.ai-jail` does not grant access
-when the external project profile exists; remove it from version control once
-the team has reviewed the migration.
-
-## Automation and non-interactive runs
-
-```text
-$ ai-jail claude </dev/null
-[WARN] AJ-NONTTY-001 Interactive setup skipped because no terminal is attached.
-  Running once with restricted defaults; no profile was saved.
-  Use `ai-jail configure claude` in a terminal to review or save access.
-
-$ ai-jail configure claude </dev/null
-[ERROR] AJ-NONTTY-002 `ai-jail configure claude` needs an interactive terminal.
-  No configuration was changed.
-```
-
-Automation should pass every intended grant or restriction explicitly on each
-launch. A non-interactive first run never imports pending grants, prompts, or
-saves a profile.
-
-## Verified keyboard transcript
-
-The PTY integration test produces this normalized transcript and compares it
-byte-for-byte before the guide can pass CI.
-
-```text
-1y
-sy
-
-Configure claude for this project
-
-Project: <ROOT>/project
-
-AJ-ONB-001 ai-jail stores this approval outside the project. Files in this repository cannot add access on their own.
-
-AJ-CHOICE-001 Access choices
-  1 [ ] Filtered model API access
-  2 [ ] Host harness login/state
-  3 [ ] Dependency tools and download hosts
-  4 [ ] Full host SSH access                 OPEN
-  k [ ] Selected SSH keys (fresh agent)
-  5 [ ] Full host GitHub token              OPEN
-  6 [ ] Unrestricted network                OPEN
-  7 [ ] All host loopback services          OPEN (macOS)
-  r Add read-only directory   w Add read/write directory
-  e Environment variables (names only; values stay hidden)
-  d Remove directory          s Review summary   q Cancel
-  Repository-scoped forge access is configured separately.
-
-[OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
-[OK] Selected: filtered model API
-
-AJ-GRANT-001
-Resource:    TCP connections to api.anthropic.com and their subdomains
-Access:      Connect to any requested TCP port through the filtered proxy
-Process:     claude and every child process it starts inside this jail
-Duration:    This jail run; saving keeps approval for later runs, while launch once does not
-Scope:       Public addresses for this hostname; private and loopback addresses stay blocked
-Limits:      TLS contents are opaque; allowed endpoints can receive readable jail data
-Default:     Allowed as the harness's functional API destination
-Consequence: The harness can send prompts and readable data to this API
-Remote:      Services operating under api.anthropic.com
-
-AJ-GRANT-001 Enable this grant? [y/N] AJ-CHOICE-001 Access choices
-  1 [x] Filtered model API access
-  2 [ ] Host harness login/state
-  3 [ ] Dependency tools and download hosts
-  4 [ ] Full host SSH access                 OPEN
-  k [ ] Selected SSH keys (fresh agent)
-  5 [ ] Full host GitHub token              OPEN
-  6 [ ] Unrestricted network                OPEN
-  7 [ ] All host loopback services          OPEN (macOS)
-  r Add read-only directory   w Add read/write directory
-  e Environment variables (names only; values stay hidden)
-  d Remove directory          s Review summary   q Cancel
-  Repository-scoped forge access is configured separately.
-
-[OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.
-[OK] Selected: filtered model API
-
-AJ-SUM-001 Final access for claude
-
-[LOCK] RESTRICTED
-  SSH       No key files, host agent socket, or SSH configuration
-  GitHub    No host gh configuration or token
-  Host home See the complete effective access below
-  Network   Every destination except the named API/dependency hosts
-
-[WARN] ALLOWED
-AJ-GRANT-001
-Resource:    <ROOT>/project
-Access:      Read and write the complete directory tree
-Process:     claude and every child process it starts inside this jail
-Duration:    While each jail runs; approval remains saved for this project
-Scope:       This canonical project path only
-Limits:      Readable project data can be sent to an allowed network destination
-Default:     Allowed because this is the working project
-Consequence: The harness can inspect, create, modify, rename, and delete project files
-
-
-AJ-GRANT-001
-Resource:    TCP connections to api.anthropic.com and their subdomains
-Access:      Connect to any requested TCP port through the filtered proxy
-Process:     claude and every child process it starts inside this jail
-Duration:    While each jail runs; approval remains saved for this project
-Scope:       Public addresses for this hostname; private and loopback addresses stay blocked
-Limits:      TLS contents are opaque; allowed endpoints can receive readable jail data
-Default:     Allowed as the harness's functional API destination
-Consequence: The harness can send prompts and readable data to this API
-Remote:      Services operating under api.anthropic.com
-
-
-[ERROR] OPEN
-  None
-
-AJ-FINAL-001 Complete effective access
-Recipient: claude and every child process it starts inside this jail
-Duration: This jail run; saving keeps approval for later runs, while launch once does not
-Project: <ROOT>/project (read and write)
-Scope: global policy, proposed project grants, command-line grants, project constraints, and derived platform defaults
-Effective policy (every nondefault field):
-command = ["claude"]
-github = false
-no_mise = true
-no_toolchains = true
-ssh = false
-allow_hosts = ["api.anthropic.com"]
-agent_state = false
-Built-in environment names: PATH, HOME, TERM, LANG, SHELL, TMPDIR, COLORTERM, SSL_CERT_FILE, SSL_CERT_DIR, http_proxy, https_proxy, no_proxy, HTTP_PROXY, HTTPS_PROXY, NO_PROXY; prefixes: LC_, XDG_, TERM_PROGRAM
-Authority details (resource; access; scope/limits; consequence):
-- [WARN] ALLOWED: private persistent jail home; read and write; this harness profile only; state persists across launches
-- [WARN] ALLOWED: public hosts api.anthropic.com; filtered TCP connections; named hosts and subdomains with private/loopback resolution blocked; services can receive readable jail data
-Environment names: none beyond the built-in safe allowlist
-User-approved host environment names: none
-Limits: mandatory masks, platform support, and monotonic project restrictions still apply
-AJ-SAVE-001 Save this project profile? [y/N/b] [OK] AJ-SAVE-001 Configuration saved
-  Project policy: <ROOT>/xdg/ai-jail/projects/<POLICY>.toml
-  The project cannot edit or enable this policy from inside the jail.
-```
-
-# Dynamic localhost services on macOS
-
-<!-- provenance: src/onboarding.rs open_grant("loopback-connect"), render_menu; src/sandbox/seatbelt.rs push_network_section; tests: sandbox::seatbelt::tests::loopback_connect_is_explicit_and_scoped_to_localhost, sandbox::seatbelt::tests::loopback_connect_is_dropped_under_lockdown, tests/port_forward_macos.rs::loopback_connect_reaches_a_dynamic_host_port -->
-
-Use a fixed `--forward-port PORT` whenever you know the port. If a macOS tool
-uses unpredictable localhost ports, interactive setup offers:
-
-```text
-  7 [ ] All host loopback services          OPEN (macOS)
-```
-
-Selecting it shows that **ALL host loopback services on every port** become
-reachable. To enable and save it, type the exact word `OPEN`; `open`, `yes`,
-or pressing Enter leaves it disabled. The final access review labels the grant
-OPEN again before saving. `--lockdown` disables it. On Linux the setting is
-accepted for shared configuration but has no effect.
+The screen sketches above are curated walkthroughs, not byte-for-byte terminal
+captures. Raw Ratatui output contains cursor movement, resize-dependent
+wrapping, and redraw sequences that are unsuitable as user documentation.
+Internal provenance IDs remain in
+[`onboarding-provenance.toml`](onboarding-provenance.toml), where each security
+claim maps to implementation and executable tests. Renderer tests cover wide,
+narrow, `NO_COLOR`, minimum-size, disclosure-scroll, and terminal-restoration
+behavior.

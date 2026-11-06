@@ -40,7 +40,10 @@ binary — it applies only if a `.app` bundle or pkg installer is ever shipped.
 Signatures must be verified by release administration until a trusted CI
 keyring is configured.
 
-## Current status (as of v1.18.0)
+## Signing rollout and current administration
+
+The signing controls below were introduced in the v1.18.x series and remain
+enforced by the current release workflow.
 
 Configured:
 

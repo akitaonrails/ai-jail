@@ -32,6 +32,8 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"
 vt100 = "0.16"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
 sha2 = "0.10"
 ring = "0.17"
 zeroize = "1"

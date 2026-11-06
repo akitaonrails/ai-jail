@@ -539,6 +539,41 @@ pub(crate) struct FinalizedLaunch {
     secrets: Vec<secret::SecretBinding>,
     github_warning: Option<&'static str>,
     restricted_ssh: Option<ssh_restricted::Plan>,
+    pub(crate) reviewed_forge: ReviewedForge,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ReviewedForge {
+    /// Legacy/non-onboarding launches did not present forge authority in a
+    /// review screen and retain the established attach behavior.
+    Unreviewed,
+    /// Onboarding reviewed the exact metadata snapshot, including absence.
+    Reviewed(Option<forge_auth::AuthorityPreview>),
+}
+
+impl ReviewedForge {
+    pub(crate) fn verify(
+        &self,
+        actual: Option<&forge_auth::Runtime>,
+    ) -> Result<(), String> {
+        match (self, actual) {
+            (Self::Unreviewed, _) | (Self::Reviewed(None), None) => Ok(()),
+            (Self::Reviewed(Some(expected)), Some(actual))
+                if expected.matches_runtime(actual) => Ok(()),
+            (Self::Reviewed(None), Some(_)) => Err(
+                "Forge authority appeared after final review; review access again before launch"
+                    .into(),
+            ),
+            (Self::Reviewed(Some(_)), None) => Err(
+                "Reviewed forge authority disappeared before launch; review access again"
+                    .into(),
+            ),
+            (Self::Reviewed(Some(_)), Some(_)) => Err(
+                "Forge authority changed after final review; review access again before launch"
+                    .into(),
+            ),
+        }
+    }
 }
 
 /// Immutable owner of all post-finalization launch authority. Production and
@@ -596,7 +631,9 @@ impl LaunchRunner {
         if self.finalized.config.lockdown_enabled() {
             return Ok(());
         }
-        if let Some(runtime) = forge_auth::prepare(store)? {
+        let runtime = forge_auth::prepare(store)?;
+        self.finalized.reviewed_forge.verify(runtime.as_ref())?;
+        if let Some(runtime) = runtime {
             runtime.apply(&mut self.finalized.config);
             self.forge = Some(runtime);
         }
@@ -736,6 +773,7 @@ pub(crate) fn finalize_launch_config_with_ssh(
         secrets,
         github_warning: github.warning,
         restricted_ssh,
+        reviewed_forge: ReviewedForge::Unreviewed,
     })
 }
 
@@ -1222,8 +1260,7 @@ fn run(
     if cli.configure.is_some() && !onboarding::is_interactive() {
         let harness = cli.configure.as_deref().unwrap_or("HARNESS");
         output::error(&format!(
-            "{} `ai-jail configure {harness}` needs an interactive terminal. No configuration was changed.",
-            onboarding::messages::CONFIG_NON_TTY_ID
+            "`ai-jail configure {harness}` needs an interactive terminal. No configuration was changed."
         ));
         return Ok(2);
     }
@@ -1366,7 +1403,7 @@ fn run(
                     wrapper_requests.pending(&stored_wrapper_approvals)
                 {
                     output::error(&format!(
-                        "AJ-REQ-002 wrapper request from {} is not approved: {} {}",
+                        "Wrapper request from {} is not approved: {} {}",
                         output::escape_control_bytes(
                             &request.approval.requester
                         ),
@@ -1404,6 +1441,7 @@ fn run(
                 &invocation_cwd,
                 &editor_config,
                 configure_only,
+                !onboarding_complete,
                 onboarding::EffectiveContext {
                     global: &global_for_onboarding,
                     cli: &cli,
@@ -1413,6 +1451,7 @@ fn run(
                     restricted_ssh: stored_ssh_for_onboarding.as_ref(),
                     requests: &wrapper_requests,
                     approved_wrapper_requests: &stored_wrapper_approvals,
+                    store: &store,
                 },
             )?;
             let (mut profile, save, launch) = match outcome {
@@ -1427,11 +1466,7 @@ fn run(
                     (profile, true, false)
                 }
                 onboarding::Outcome::Cancel => {
-                    eprintln!(
-                        "{} {}",
-                        onboarding::messages::CANCEL_ID,
-                        onboarding::messages::CANCEL
-                    );
+                    eprintln!("{}", onboarding::messages::CANCEL);
                     return Ok(130);
                 }
             };
@@ -1445,8 +1480,7 @@ fn run(
                     profile.restricted_ssh.clone(),
                 )?;
                 eprintln!(
-                    "[OK] {} Configuration saved\n  Project policy: {}\n  The project cannot edit or enable this policy from inside the jail.",
-                    onboarding::messages::SAVE_ID,
+                    "[OK] Configuration saved\n  Project policy: {}\n  The project cannot edit or enable this policy from inside the jail.",
                     onboarding::safe_path(&store.project)?
                 );
             }
@@ -1456,12 +1490,9 @@ fn run(
                     .is_empty()
             {
                 output::error(
-                    "AJ-REQ-002 one or more wrapper requests were refused; the harness was not started",
+                    "One or more wrapper requests were refused; the harness was not started",
                 );
                 return Ok(integration::EXIT_REQUIRED_GRANT);
-            }
-            if profile.ssh_transcript_started {
-                eprintln!("{}", onboarding::SSH_TRANSCRIPT_END);
             }
             if !launch {
                 return Ok(0);
@@ -1494,7 +1525,7 @@ fn run(
         if !pending.is_empty() && !cli.status {
             for request in pending {
                 output::error(&format!(
-                    "AJ-REQ-002 wrapper request from {} is not approved: {} {}. Review it with `ai-jail configure --harness {}`.",
+                    "Wrapper request from {} is not approved: {} {}. Review it with `ai-jail configure --harness {}`.",
                     output::escape_control_bytes(&request.approval.requester),
                     output::escape_control_bytes(&request.approval.kind),
                     output::escape_control_bytes(&request.approval.value),

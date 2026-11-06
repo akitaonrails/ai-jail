@@ -82,18 +82,46 @@ ai-jail --no-agent-state claude  # isolated, logged-out run instead
 ai-jail --dry-run claude
 ```
 
-The first `ai-jail claude` in a project opens a checklist when a terminal is
-attached. Every optional grant starts unchecked. The saved policy lives under
+The first `ai-jail claude` in a project opens one persistent terminal UI when
+a capable terminal is attached. Its access list, security details, directory
+browser, environment selector, selected-key SSH editor, and final review stay
+inside the same session. Wide terminals use split panes; narrow terminals
+stack the same information. First-time onboarding applies the constrained
+`For developers` preset: filtered model API access for the known harness,
+harness login/state, dependency tooling, and the active host GitHub token. The
+GitHub row is visibly OPEN because it carries every permission of that token,
+not only the current repository. The preset bar can live-preview
+`Fully closed`, `For developers`, or warning-marked `Mostly open` access before
+anything is applied; granular changes become `Custom`. No preset guesses
+arbitrary environment variables or extra directories; the visible
+harness-state grant includes a detected well-known API key for that harness.
+`Mostly open` requires an explicit dialog. The saved policy lives under
 `$XDG_CONFIG_HOME/ai-jail/projects` (normally
 `~/.config/ai-jail/projects`), outside the checkout. Use
 `ai-jail configure claude` to review it later. The project directory remains
 writable by default.
 
+![ai-jail onboarding showing presets, explicit OPEN/CLOSED states, and concise security details](docs/images/onboarding-overview.png)
+
+The main review distinguishes constrained access from OPEN host authority.
+Docker/Podman daemon control and unrestricted networking remain closed under
+`For developers`; the GitHub row is visibly OPEN because the legacy host token
+is not repository-scoped.
+
+| Environment variables | Additional directories |
+| --- | --- |
+| ![Searchable environment-variable selector showing names while keeping values hidden](docs/images/onboarding-environment-selector.png) | ![Directory browser showing read-only selections and the exact selected paths](docs/images/onboarding-directory-picker.png) |
+| Search names and approve only the variables needed. Values never appear in the selector or saved policy. | Browse with `Enter`, select with `Space`, switch to the selected pane with `Tab`, and toggle read-only/read-write with `m`. |
+
 A first run without a terminal uses restricted defaults once and saves
 nothing. `ai-jail configure` also requires a terminal and changes nothing when
 run non-interactively. `--dry-run` never migrates or writes configuration.
-Unreadable or invalid trusted configuration fails closed. See the
-[onboarding guide](docs/USER_GUIDE.md) for the tested prompt transcripts.
+Unreadable or invalid trusted configuration fails closed. `TERM=dumb` uses a
+sequential plain-terminal fallback with the same security decisions. See the
+[onboarding guide](docs/USER_GUIDE.md) for curated screen walkthroughs and the
+[TUI design contract](docs/TUI_DESIGN.md) for implementation invariants. The
+[CLI/TUI parity inventory](docs/CLI_TUI_PARITY.md) tracks which command-line
+capabilities are exposed interactively and blocks undocumented drift.
 
 Tool and wrapper developers can integrate without scraping terminal output.
 The versioned [wrapper integration contract](docs/WRAPPER_INTEGRATION.md)
@@ -153,15 +181,16 @@ ai-jail devin --permission-mode dangerous
   known API-key env var (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
   `GEMINI_API_KEY`/`GOOGLE_API_KEY`, `XAI_API_KEY`, `MOONSHOT_API_KEY`) is
   also copied from the host when set. Anything running in the sandbox can use
-  those credentials for the life of the launch. Fresh project profiles leave
-  this unchecked until you approve it. `--no-agent-state` forces an isolated,
-  logged-out run.
+  those credentials for the life of the launch. First-time interactive
+  onboarding preselects this as part of `For developers`; review or disable it
+  before saving if you want a logged-out jail. `--no-agent-state` forces an
+  isolated, logged-out run.
 - **Approved dev toolchains (`--toolchains`):** persistent, jail-owned dependency
   caches (cargo/npm/go/maven/...), the Rust toolchain mapped read-only,
   and, when the network posture is otherwise unset, filtered egress to
-  package registries so a fresh `npm install`/`cargo build`/`go get` works
-  after you select dependency tools during setup. Fresh profiles leave this
-  unchecked. See [Dev toolchains](#dev-toolchains).
+  package registries so a fresh `npm install`/`cargo build`/`go get` works.
+  First-time interactive onboarding preselects this as part of `For
+  developers`. See [Dev toolchains](#dev-toolchains).
 - **Approved mise integration:** the project's language versions are activated
   when the dependency-tool grant is active and mise is on `$PATH`. See
   [mise integration](#mise-integration).
@@ -173,17 +202,21 @@ ai-jail devin --permission-mode dangerous
 network, GPU, KVM, display (Wayland), X11, audio, host shared memory, raw
 terminal passthrough, the Docker socket, Tailscale, the systemd user bus,
 SSH agent/key sharing, Pictures, linked Git worktree metadata,
-`--inherit-env`, the update check, macOS host IPC, and the five opt-in
-credential flags (`--github`, `--aws`, `--kube`, `--gcloud`,
-`--docker-config`) — see [Tool credentials](#tool-credentials). Mounting
+`--inherit-env`, the update check, macOS host IPC, and four of the five
+legacy credential flags (`--aws`, `--kube`, `--gcloud`,
+`--docker-config`). The raw `--github` default is also off, but first-run
+`For developers` visibly preselects it as OPEN — see
+[Tool credentials](#tool-credentials). Mounting
 agent state or any of these exposes that material to everything running in
 the sandbox, which is why the first-run review keeps them as separate choices.
 Use `--no-private-home`
 only when deliberately granting broad host-home access; `--map` and
 `--rw-map` remain explicit, narrow alternatives.
 
-Fresh known-harness profiles also leave agent state, dependency tools, and
-their filtered egress unchecked until the first-run review enables them.
+Fresh known-harness profiles preselect agent state, dependency tools, and the
+known model API's filtered egress in the visible `For developers` preset. The
+full host GitHub token is also preselected and visibly OPEN; final confirmation
+is required. Completed profiles retain their saved choices.
 
 | Flag pair                                                  | Effect and security consequence                                                                                                                                                                                                                                                                                                                                                     |
 | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -207,7 +240,7 @@ their filtered egress unchecked until the first-run review enables them.
 | `--worktree` / `--no-worktree`                             | Enables/disables validated linked-worktree metadata. When enabled, the per-worktree git dir and the shared common dir are writable so the agent can commit; `--lockdown` keeps both read-only.                                                                                                                                                                                      |
 | `--private-home` / `--no-private-home`                     | Enables/disables the default private home. Disabling it is broad host-home access.                                                                                                                                                                                                                                                                                                  |
 | `--toolchains` / `--no-toolchains`                         | Fresh profiles leave this unchecked (Linux only; issue #148). When approved, persists dependency caches (cargo/npm/go/maven/...) in a jail-owned store and maps toolchain binaries read-only; when network posture is otherwise unset, it also allows filtered egress to package registries. `--no-toolchains` disables both; `--lockdown` disables the grant; no effect on macOS.  |
-| `--github` / `--no-github`                                 | **OPEN.** Shares gh configuration read-only and the active github.com token from the host. Off by default; sandboxed programs can act with the token's complete authority. Prefer repository-scoped `ai-jail forge setup`.                                                                                                                                                          |
+| `--github` / `--no-github`                                 | **OPEN.** Shares gh configuration read-only and the active github.com token from the host. The raw CLI/config baseline is off; first-run `For developers` preselects it visibly and requires final OPEN confirmation. Sandboxed programs can act with the token's complete authority. Prefer repository-scoped `ai-jail forge setup`.                                                                                                             |
 | `--aws` / `--no-aws`                                       | Enables/disables read-only `~/.aws`. Off by default; anything in the sandbox can then act as you on AWS.                                                                                                                                                                                                                                                                            |
 | `--kube` / `--no-kube`                                     | Enables/disables read-only `~/.kube`. Off by default; anything in the sandbox can then act as you against your clusters.                                                                                                                                                                                                                                                            |
 | `--gcloud` / `--no-gcloud`                                 | Enables/disables read-only `~/.config/gcloud`. Off by default; anything in the sandbox can then act as you on GCP.                                                                                                                                                                                                                                                                  |
@@ -325,8 +358,9 @@ global entry works on both.
 For the exceptional case where the required localhost ports are dynamic or
 cannot be enumerated, `--allow-loopback-connect` permits every host loopback
 port on macOS. This is **OPEN** access: ALL host services that trust a local
-caller become reachable. Interactive setup requires typing `OPEN`, and trusted
-per-project policy may save it only after that approval. A repository-local
+caller become reachable. Interactive setup shows an explicit OPEN confirmation
+dialog with Cancel focused, and trusted per-project policy may save it only
+after that approval. A repository-local
 legacy file cannot enable it during migration. It is off by default and
 disabled by `--lockdown`.
 Prefer the fixed-port `--forward-port PORT` grant whenever possible. The flag is
@@ -393,11 +427,17 @@ fails closed because UDP cannot be securely constrained through this option —
 use `--allow-host` for filtered egress instead.
 Use `--network` only when unrestricted network access is explicitly desired.
 
-`--docker` mounts an actual Unix Docker socket and is effectively host-root:
-the daemon can create host-mounted containers. `DOCKER_HOST` must identify an
-actual Unix socket; TCP/SSH endpoints are not mounted. `~/.docker` is not
-broadly mounted. `--systemd-user` exposes only explicit user-bus sockets, but
-can still ask the host user manager to run services.
+`--docker` mounts an actual Docker- or Podman-compatible Unix socket and grants
+the full authority of that daemon owner: the daemon can create host-mounted
+containers. The onboarding TUI exposes this as the closed-by-default `Host
+container engine` OPEN grant; no preset enables it. ai-jail checks
+`DOCKER_HOST`, Podman's `CONTAINER_HOST`, rootless sockets under
+`XDG_RUNTIME_DIR` and `/run/user/<uid>`, common Docker Desktop/Colima paths,
+then rootful Podman and Docker sockets. TCP/SSH endpoints are not mounted. The
+resolved endpoint is forwarded as both `DOCKER_HOST` and `CONTAINER_HOST`.
+`~/.docker` is not broadly mounted; registry credentials are a separate grant.
+`--systemd-user` exposes only explicit user-bus sockets, but can still ask the
+host user manager to run services.
 
 ### Dev toolchains
 
@@ -472,11 +512,13 @@ the checkout, bound to the forge's numeric repository ID, and injected only for
 the launch. See the [repository-scoped forge guide](docs/FORGE_AUTH.md) for the
 provider setup, exact security labels, simulated prompts, rotation, and removal.
 
-Five legacy flags share one external tool's host credentials with the sandbox, each
-off by default: `--github` (GitHub CLI configuration and active token), `--aws`
+Five legacy flags share one external tool's host credentials with the sandbox.
+Their raw CLI/config defaults are off: `--github` (GitHub CLI configuration and active token), `--aws`
 (`~/.aws`), `--kube` (`~/.kube`), `--gcloud` (`~/.config/gcloud`), and
 `--docker-config` (`~/.docker/config.json`). Repository constraints may disable
 one but cannot enable it, and all five are disabled under `--lockdown`.
+First-run interactive onboarding is the explicit exception: `For developers`
+preselects `--github`, marks it OPEN, and requires final confirmation.
 
 `--github` is OPEN. It mounts the effective GitHub CLI configuration directory
 read-only:
@@ -526,9 +568,10 @@ real value outside the sandbox and substitutes it through the egress proxy.
 The checklist's environment picker is the safer persistent form. It lists
 names from the current host environment without displaying their values. The
 saved profile contains names only and reads each current value again at launch.
-Every non-baseline name requires typing `OPEN`; if an approved name is later
-missing, launch fails closed until you restore it or remove the approval with
-`configure`.
+Every non-baseline name requires an explicit OPEN confirmation in the TUI; the
+dialog starts on Cancel and never displays the variable's value. If an approved
+name is later missing, launch fails closed until you restore it or remove the
+approval with `configure`.
 
 Manual trusted config also accepts `env_pass`:
 
@@ -743,7 +786,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
                                 (on Linux --network still overrides network
                                 isolation, subject to Landlock V4; macOS
                                 lockdown always blocks network)
---docker / --no-docker          Docker socket (root-equivalent; off by default)
+--docker / --no-docker          Docker/Podman daemon socket (daemon-owner authority; off by default)
 --systemd-user / --no-systemd-user  host user manager access (off by default)
 --ssh / --no-ssh                OPEN: full ~/.ssh and ambient-agent sharing (off by default)
 --claude-dir PATH               explicit Claude state directory

@@ -7,11 +7,17 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+mod tui;
+
+// Stable provenance identifiers stay available to contract tests and
+// documentation without leaking into the human-facing TUI.
+#[allow(dead_code)]
 pub(crate) mod messages {
     pub const INTRO_ID: &str = "AJ-ONB-001";
     pub const CHOICE_ID: &str = "AJ-CHOICE-001";
     pub const GRANT_ID: &str = "AJ-GRANT-001";
     pub const OPEN_ID: &str = "AJ-OPEN-001";
+    pub const PRESET_ID: &str = "AJ-PRESET-001";
     pub const SUMMARY_ID: &str = "AJ-SUM-001";
     pub const SAVE_ID: &str = "AJ-SAVE-001";
     pub const CANCEL_ID: &str = "AJ-CANCEL-001";
@@ -33,15 +39,159 @@ pub(crate) mod messages {
     pub const CANCEL: &str = "Onboarding cancelled. No onboarding grants were saved and the harness was not started. A completed legacy migration is not rolled back.";
 }
 
-pub(crate) const SSH_TRANSCRIPT_BEGIN: &str =
-    "AJ-SSH-TRANSCRIPT-BEGIN selected-key SSH interaction";
-pub(crate) const SSH_TRANSCRIPT_END: &str =
-    "AJ-SSH-TRANSCRIPT-END selected-key SSH interaction";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Risk {
     Allowed,
     Open,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AdditionalSelection {
+    /// The user reviewed this capability set, so disabled rows are explicit
+    /// constraints rather than absent preferences.
+    pub explicit: bool,
+    pub share_host_home: bool,
+    pub lockdown: bool,
+    pub systemd_user: bool,
+    pub gpu: bool,
+    pub tailscale: bool,
+    pub display: bool,
+    pub audio: bool,
+    pub kvm: bool,
+    pub x11: bool,
+    pub host_shm: bool,
+    pub terminal_passthrough: bool,
+    pub aws: bool,
+    pub kube: bool,
+    pub gcloud: bool,
+    pub docker_config: bool,
+    pub macos_host_ipc: bool,
+    pub macos_chromium: bool,
+    pub macos_trustd: bool,
+    pub allow_pty: bool,
+    pub allow_loopback_listen: bool,
+    pub inherit_env: bool,
+    pub worktree: bool,
+    pub pictures: bool,
+    pub audit_log: bool,
+}
+
+impl AdditionalSelection {
+    pub(crate) fn any_enabled(&self) -> bool {
+        self.share_host_home
+            || self.lockdown
+            || self.systemd_user
+            || self.gpu
+            || self.tailscale
+            || self.display
+            || self.audio
+            || self.kvm
+            || self.x11
+            || self.host_shm
+            || self.terminal_passthrough
+            || self.aws
+            || self.kube
+            || self.gcloud
+            || self.docker_config
+            || self.macos_host_ipc
+            || self.macos_chromium
+            || self.macos_trustd
+            || self.allow_pty
+            || self.allow_loopback_listen
+            || self.inherit_env
+            || self.worktree
+            || self.pictures
+            || self.audit_log
+    }
+
+    fn from_config(config: &Config) -> Self {
+        Self {
+            explicit: true,
+            share_host_home: !config.private_home_enabled(),
+            lockdown: config.lockdown_enabled(),
+            systemd_user: config.systemd_user_enabled(),
+            gpu: config.gpu_enabled(),
+            tailscale: config.tailscale_enabled(),
+            display: config.display_enabled(),
+            audio: config.audio_enabled(),
+            kvm: config.kvm_enabled(),
+            x11: config.x11_enabled(),
+            host_shm: config.host_shm_enabled(),
+            terminal_passthrough: config.terminal_passthrough_enabled(),
+            aws: config.aws_enabled(),
+            kube: config.kube_enabled(),
+            gcloud: config.gcloud_enabled(),
+            docker_config: config.docker_config_enabled(),
+            macos_host_ipc: config.macos_host_ipc_enabled(),
+            macos_chromium: config.macos_chromium_enabled(),
+            macos_trustd: config.macos_trustd_enabled(),
+            allow_pty: config.allow_pty_enabled(),
+            allow_loopback_listen: config.allow_loopback_listen_enabled(),
+            inherit_env: config.inherit_env_enabled(),
+            worktree: config.worktree_enabled(),
+            pictures: config.pictures_enabled(),
+            audit_log: config.audit_log_enabled(),
+        }
+    }
+
+    fn apply_to(&self, config: &mut Config) {
+        if self.explicit {
+            // A CLOSED reviewed choice must constrain a broader global policy
+            // rather than disappear as an unset field.
+            config.private_home = Some(!self.share_host_home);
+            config.lockdown = Some(self.lockdown);
+            config.systemd_user = Some(self.systemd_user);
+            config.no_gpu = Some(!self.gpu);
+            config.tailscale = Some(self.tailscale);
+            config.no_display = Some(!self.display);
+            config.audio = Some(self.audio);
+            config.kvm = Some(self.kvm);
+            config.x11 = Some(self.x11);
+            config.host_shm = Some(self.host_shm);
+            config.terminal_passthrough = Some(self.terminal_passthrough);
+            config.aws = Some(self.aws);
+            config.kube = Some(self.kube);
+            config.gcloud = Some(self.gcloud);
+            config.docker_config = Some(self.docker_config);
+            config.macos_host_ipc = Some(self.macos_host_ipc);
+            config.macos_chromium = Some(self.macos_chromium);
+            config.macos_trustd = Some(self.macos_trustd);
+            config.allow_pty = Some(self.allow_pty);
+            config.allow_loopback_listen = Some(self.allow_loopback_listen);
+            config.inherit_env = Some(self.inherit_env);
+            config.no_worktree = Some(!self.worktree);
+            config.pictures = Some(self.pictures);
+            config.audit_log = Some(self.audit_log);
+            return;
+        }
+        // Programmatic/default selections may still opt in without silently
+        // overriding unrelated restrictive global policy.
+        config.private_home = self.share_host_home.then_some(false);
+        config.lockdown = self.lockdown.then_some(true);
+        config.systemd_user = self.systemd_user.then_some(true);
+        config.no_gpu = self.gpu.then_some(false);
+        config.tailscale = self.tailscale.then_some(true);
+        config.no_display = self.display.then_some(false);
+        config.audio = self.audio.then_some(true);
+        config.kvm = self.kvm.then_some(true);
+        config.x11 = self.x11.then_some(true);
+        config.host_shm = self.host_shm.then_some(true);
+        config.terminal_passthrough = self.terminal_passthrough.then_some(true);
+        config.aws = self.aws.then_some(true);
+        config.kube = self.kube.then_some(true);
+        config.gcloud = self.gcloud.then_some(true);
+        config.docker_config = self.docker_config.then_some(true);
+        config.macos_host_ipc = self.macos_host_ipc.then_some(true);
+        config.macos_chromium = self.macos_chromium.then_some(true);
+        config.macos_trustd = self.macos_trustd.then_some(true);
+        config.allow_pty = self.allow_pty.then_some(true);
+        config.allow_loopback_listen =
+            self.allow_loopback_listen.then_some(true);
+        config.inherit_env = self.inherit_env.then_some(true);
+        config.no_worktree = self.worktree.then_some(false);
+        config.pictures = self.pictures.then_some(true);
+        config.audit_log = self.audit_log.then_some(true);
+    }
 }
 
 /// All authority disclosures use this type. A grant cannot be rendered
@@ -64,7 +214,7 @@ pub(crate) struct GrantSpec {
 impl GrantSpec {
     pub(crate) fn render(&self) -> String {
         let mut lines = vec![
-            messages::GRANT_ID.to_string(),
+            "Access grant".to_string(),
             format!("Resource:    {}", self.resource),
             format!("Access:      {}", self.access),
             format!("Process:     {}", self.process),
@@ -91,6 +241,7 @@ pub(crate) struct Selection {
     pub dependency_hosts: bool,
     pub ssh: bool,
     pub github: bool,
+    pub container_engine: bool,
     pub unrestricted_network: bool,
     pub loopback_connect: bool,
     pub ro_dirs: Vec<PathBuf>,
@@ -100,9 +251,17 @@ pub(crate) struct Selection {
     pub requested_private_hosts: Vec<String>,
     pub requested_secrets: std::collections::BTreeMap<String, String>,
     pub restricted_ssh: Option<crate::ssh_restricted::Policy>,
+    pub additional: AdditionalSelection,
 }
 
 impl Selection {
+    fn apply_recommended_developer_baseline(&mut self, harness: &str) {
+        self.api_access = !api_hosts(harness).is_empty();
+        self.agent_state = true;
+        self.dependency_hosts = true;
+        self.github = true;
+    }
+
     pub(crate) fn from_config(config: &Config) -> Self {
         Self {
             agent_state: config.agent_state_enabled(),
@@ -112,6 +271,7 @@ impl Selection {
             dependency_hosts: config.toolchains_enabled(),
             ssh: config.ssh_enabled(),
             github: config.github_enabled(),
+            container_engine: config.docker_enabled(),
             unrestricted_network: config.network == Some(true),
             loopback_connect: config.allow_loopback_connect_enabled(),
             ro_dirs: config.ro_maps.clone(),
@@ -121,6 +281,7 @@ impl Selection {
             requested_private_hosts: Vec::new(),
             requested_secrets: std::collections::BTreeMap::new(),
             restricted_ssh: None,
+            additional: AdditionalSelection::from_config(config),
         }
     }
 
@@ -139,6 +300,7 @@ impl Selection {
             dependency_hosts: config.no_toolchains == Some(false),
             ssh: config.ssh == Some(true),
             github: config.github == Some(true),
+            container_engine: config.no_docker == Some(false),
             unrestricted_network: config.network == Some(true),
             loopback_connect: config.allow_loopback_connect == Some(true),
             ro_dirs: config.ro_maps.clone(),
@@ -153,6 +315,7 @@ impl Selection {
             requested_private_hosts: config.allow_private_hosts.clone(),
             requested_secrets: config.secret_hosts.clone(),
             restricted_ssh: restricted_ssh.cloned(),
+            additional: AdditionalSelection::from_config(config),
         }
     }
 
@@ -171,7 +334,7 @@ impl Selection {
                 }
             }
         }
-        Config {
+        let mut grants = Config {
             runtime_harnesses: harnesses.to_vec(),
             ro_maps: self.ro_dirs.clone(),
             rw_maps: self.rw_dirs.clone(),
@@ -180,13 +343,16 @@ impl Selection {
             no_toolchains: Some(!self.dependency_hosts),
             ssh: Some(self.ssh),
             github: Some(self.github),
+            no_docker: Some(!self.container_engine),
             network: self.unrestricted_network.then_some(true),
             allow_loopback_connect: self.loopback_connect.then_some(true),
             allow_hosts,
             allow_private_hosts: self.requested_private_hosts.clone(),
             secret_hosts: self.requested_secrets.clone(),
             ..Config::default()
-        }
+        };
+        self.additional.apply_to(&mut grants);
+        grants
     }
 
     fn profile(&self, harness: &str) -> ProposedProfile {
@@ -203,7 +369,6 @@ impl Selection {
             finalized: None,
             directory_grants: Vec::new(),
             restricted_ssh: self.restricted_ssh.clone(),
-            ssh_transcript_started: false,
         }
     }
 }
@@ -218,7 +383,6 @@ pub(crate) struct ProposedProfile {
     pub(crate) directory_grants:
         Vec<crate::config_store::DirectoryGrantIdentity>,
     pub(crate) restricted_ssh: Option<crate::ssh_restricted::Policy>,
-    pub(crate) ssh_transcript_started: bool,
 }
 
 #[derive(Debug)]
@@ -239,18 +403,135 @@ pub(crate) struct EffectiveContext<'a> {
     pub(crate) requests: &'a crate::integration::RequestSet,
     pub(crate) approved_wrapper_requests:
         &'a [crate::integration::RequestApproval],
+    pub(crate) store: &'a crate::config_store::StorePaths,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReviewDisplay {
+    pub(crate) restricted: String,
+    pub(crate) allowed: String,
+    pub(crate) open: String,
+    pub(crate) effective_access: String,
+    pub(crate) has_open_authority: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReviewDraft {
+    pub(crate) profile: ProposedProfile,
+    pub(crate) display: ReviewDisplay,
+}
+
+pub(crate) fn prepare_review(
+    selection: &Selection,
+    harness: &str,
+    harnesses: &[String],
+    project: &Path,
+    approved_wrapper_requests: &[crate::integration::RequestApproval],
+    effective: &EffectiveContext<'_>,
+) -> Result<ReviewDraft, String> {
+    let mut proposed = selection.profile_for(harnesses);
+    proposed.approved_wrapper_requests = approved_wrapper_requests.to_vec();
+    proposed.directory_grants = crate::config_store::capture_directory_grants(
+        &proposed.grants,
+        project,
+    )?;
+    crate::materialize_approved_env_names(&proposed.approved_env_names, false)?;
+    let base = crate::build_onboarding_effective(
+        effective.global.clone(),
+        proposed.grants.clone(),
+        effective.cli,
+        effective.constraints.clone(),
+        project,
+        effective.trusted_constraints,
+    )?;
+    let mut finalized = crate::finalize_launch_config_with_ssh(
+        base,
+        project,
+        effective.cli.dry_run,
+        if effective.cli.ssh == Some(false) {
+            None
+        } else {
+            proposed.restricted_ssh.clone()
+        },
+    )?;
+    let forge_preview =
+        if effective.cli.clean || finalized.config.lockdown_enabled() {
+            None
+        } else {
+            crate::forge_auth::authority_preview(effective.store)?
+        };
+    finalized.reviewed_forge =
+        crate::ReviewedForge::Reviewed(forge_preview.clone());
+    let summary = summary_text(selection, harness, project, None);
+    let (_, grouped) =
+        summary.split_once("[LOCK] RESTRICTED\n").ok_or_else(|| {
+            "Cannot group restricted review disclosure".to_string()
+        })?;
+    let (restricted, grouped) = grouped
+        .split_once("\n[WARN] ALLOWED\n")
+        .ok_or_else(|| "Cannot group allowed review disclosure".to_string())?;
+    let (allowed, open) = grouped
+        .split_once("\n[ERROR] OPEN\n")
+        .ok_or_else(|| "Cannot group OPEN review disclosure".to_string())?;
+    let mut allowed = allowed.trim().to_string();
+    let mut open = open.trim().to_string();
+    let mut effective_access = render_effective_access(
+        &finalized.config,
+        project,
+        harness,
+        None,
+        &selection.env_names,
+    )?;
+    if let Some(preview) = &forge_preview {
+        let line = preview.summary_line();
+        if preview.is_open() {
+            if open == "None" {
+                open.clear();
+            }
+            if !open.is_empty() {
+                open.push('\n');
+            }
+            open.push_str(&line);
+        } else {
+            allowed.push_str(&format!("\n{line}"));
+        }
+        effective_access.push_str(&format!(
+            "\nForge authority reviewed before launch:\n{line}"
+        ));
+    }
+    let display = ReviewDisplay {
+        restricted: restricted.trim().into(),
+        allowed,
+        open,
+        effective_access,
+        has_open_authority: effective_has_open_authority(
+            &finalized.config,
+            project,
+        )? || forge_preview
+            .as_ref()
+            .is_some_and(|preview| preview.is_open()),
+    };
+    proposed.finalized = Some(finalized);
+    Ok(ReviewDraft {
+        profile: proposed,
+        display,
+    })
 }
 
 fn process_label(harness: &str) -> String {
     format!("{harness} and every child process it starts inside this jail")
 }
 
-fn project_grant(project: &Path, harness: &str, saved: bool) -> GrantSpec {
+fn project_grant(
+    project: &Path,
+    harness: &str,
+    saved: Option<bool>,
+) -> GrantSpec {
     GrantSpec {
         resource: safe_path(project).unwrap_or_else(|_| "[invalid path refused]".into()),
         access: "Read and write the complete directory tree".into(),
         process: process_label(harness),
-        duration: duration(Some(saved)),
+        duration: duration(saved),
         scope: "This canonical project path only".into(),
         limits: "Readable project data can be sent to an allowed network destination".into(),
         default: "Allowed because this is the working project".into(),
@@ -270,7 +551,7 @@ fn api_grant(harness: &str, hosts: &[&str], saved: Option<bool>) -> GrantSpec {
         duration: duration(saved),
         scope: "Public addresses for this hostname; private and loopback addresses stay blocked".into(),
         limits: "TLS contents are opaque; allowed endpoints can receive readable jail data".into(),
-        default: "Allowed as the harness's functional API destination".into(),
+        default: "Enabled by the first-run For developers preset for known harnesses".into(),
         consequence: "The harness can send prompts and readable data to this API".into(),
         remote: Some(format!("Services operating under {host_list}")),
         authority: None,
@@ -339,6 +620,122 @@ fn classified_directory_grant(
     grant
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DirectoryCandidate {
+    pub(crate) entered: String,
+    pub(crate) resolved: PathBuf,
+    pub(crate) write: bool,
+    pub(crate) grant: GrantSpec,
+}
+
+pub(crate) fn list_directory(
+    directory: &Path,
+) -> Result<(PathBuf, Vec<(PathBuf, String)>), String> {
+    let resolved = std::fs::canonicalize(directory).map_err(|error| {
+        format!(
+            "Cannot open directory {}: {error}",
+            safe_path(directory).unwrap_or_else(|_| "[unsafe path]".into())
+        )
+    })?;
+    if !resolved.is_dir() {
+        return Err(format!("{} is not a directory", safe_path(&resolved)?));
+    }
+    let resolved_label = safe_path(&resolved)?;
+    let mut entries = std::fs::read_dir(&resolved)
+        .map_err(|error| format!("Cannot read {resolved_label}: {error}"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            path.is_dir().then(|| {
+                let name =
+                    escape_control_bytes(&entry.file_name().to_string_lossy());
+                (path, name)
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.1.cmp(&right.1));
+    Ok((resolved, entries))
+}
+
+pub(crate) fn prepare_directory_candidate(
+    entered: &Path,
+    write: bool,
+    selection: &Selection,
+    harness: &str,
+    project: &Path,
+) -> Result<DirectoryCandidate, String> {
+    let entered_label = safe_path(entered)?;
+    let resolved = std::fs::canonicalize(entered).map_err(|error| {
+        format!("Cannot resolve directory {entered_label}: {error}")
+    })?;
+    if !resolved.is_dir() {
+        return Err(format!("{} is not a directory", safe_path(&resolved)?));
+    }
+    if resolved.as_os_str().as_bytes().contains(&b':') {
+        return Err(
+            "Directory paths containing ':' cannot be stored safely".into()
+        );
+    }
+    if resolved == Path::new("/") {
+        return Err(
+            "The sandbox cannot share the filesystem root. Choose a narrower directory"
+                .into(),
+        );
+    }
+    reject_credential_root(&resolved)?;
+    if selection
+        .ro_dirs
+        .iter()
+        .chain(&selection.rw_dirs)
+        .any(|path| {
+            path != &resolved
+                && (path.starts_with(&resolved) || resolved.starts_with(path))
+        })
+    {
+        return Err(
+            "Overlapping directory grants must be removed before changing scope"
+                .into(),
+        );
+    }
+    Ok(DirectoryCandidate {
+        entered: entered_label,
+        resolved: resolved.clone(),
+        write,
+        grant: classified_directory_grant(
+            &resolved, write, harness, project, None,
+        ),
+    })
+}
+
+pub(crate) fn apply_directory_candidate(
+    selection: &mut Selection,
+    candidate: &DirectoryCandidate,
+) {
+    selection.ro_dirs.retain(|path| path != &candidate.resolved);
+    selection.rw_dirs.retain(|path| path != &candidate.resolved);
+    if candidate.write {
+        selection.rw_dirs.push(candidate.resolved.clone());
+        selection.rw_dirs.sort();
+        selection.rw_dirs.dedup();
+    } else {
+        selection.ro_dirs.push(candidate.resolved.clone());
+        selection.ro_dirs.sort();
+        selection.ro_dirs.dedup();
+    }
+}
+
+pub(crate) fn remove_directory_grant(
+    selection: &mut Selection,
+    path: &Path,
+    write: bool,
+) {
+    if write {
+        selection.rw_dirs.retain(|candidate| candidate != path);
+    } else {
+        selection.ro_dirs.retain(|candidate| candidate != path);
+    }
+}
+
 fn state_grant(harness: &str, saved: Option<bool>) -> GrantSpec {
     let vars: Vec<&str> = crate::command::harness_api_key_env(harness)
         .iter()
@@ -372,7 +769,7 @@ fn state_grant(harness: &str, saved: Option<bool>) -> GrantSpec {
         duration: format!("{}; key values are never saved by ai-jail", duration(saved)),
         scope: "The command-specific state paths and detected well-known API-key variables".into(),
         limits: "Readable sessions or keys can be copied; writes can change host-side harness state".into(),
-        default: "Not shared by the onboarding secure default".into(),
+        default: "Enabled by the first-run For developers preset; Fully closed leaves it private".into(),
         consequence: "The harness starts with the host login and may modify its host-side state".into(),
         remote: None,
         authority: Some("The accounts and service limits carried by the exposed login or keys".into()),
@@ -391,7 +788,7 @@ fn dependency_grant(harness: &str, saved: Option<bool>) -> GrantSpec {
         duration: format!("{}; jail-owned caches persist across runs", duration(saved)),
         scope: "Jail-owned caches and the listed public hostnames plus their subdomains".into(),
         limits: "Downloaded packages execute inside the jail; allowed endpoints can receive readable jail data".into(),
-        default: "Disabled by the onboarding secure default".into(),
+        default: "Enabled by the first-run For developers preset; Fully closed disables it".into(),
         consequence: "Build tools can download dependencies without accessing the host's real caches".into(),
         remote: Some("Services operating under the listed dependency hosts".into()),
         authority: None,
@@ -430,8 +827,7 @@ pub(crate) fn validate_env_name(name: &str) -> Result<(), String> {
         || !bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
     {
         return Err(format!(
-            "{} Invalid environment variable name {}; assignments, NUL bytes, and non-portable names are refused",
-            messages::OPEN_ID,
+            "Invalid environment variable name {}; assignments, NUL bytes, and non-portable names are refused",
             escape_control_bytes(name)
         ));
     }
@@ -481,7 +877,7 @@ fn open_grant(kind: &str, harness: &str, saved: Option<bool>) -> GrantSpec {
             duration: duration(saved),
             scope: "Any reachable SSH destination and every identity exposed by the host agent".into(),
             limits: "Read-only private key files can still be copied; signatures are not destination-scoped".into(),
-            default: "Not shared".into(),
+            default: "Not shared unless explicitly selected; Mostly open enables it".into(),
             consequence: "Jailed processes may impersonate the host user to SSH services".into(),
             remote: None,
             authority: Some("Every account accepted by an exposed key".into()),
@@ -494,10 +890,23 @@ fn open_grant(kind: &str, harness: &str, saved: Option<bool>) -> GrantSpec {
             duration: duration(saved),
             scope: "Every repository and organization allowed by the active host token".into(),
             limits: "Read-only configuration does not restrict use or copying of the token".into(),
-            default: "Not shared".into(),
+            default: "Enabled by the first-run For developers preset; otherwise not shared unless explicitly selected".into(),
             consequence: "Jailed processes can act with the host token's complete GitHub authority".into(),
             remote: Some("github.com and api.github.com when network policy permits".into()),
             authority: Some("Every permission granted to the active github.com token".into()),
+            risk: Risk::Open,
+        },
+        "container-engine" => GrantSpec {
+            resource: "The host Docker or Podman daemon socket".into(),
+            access: "Send unrestricted container-engine API requests through the mounted Unix socket".into(),
+            process,
+            duration: duration(saved),
+            scope: "Every container, image, volume, network, and host path the selected daemon can access".into(),
+            limits: "Rootless engines reduce operating-system privilege but still expose that daemon user's files and services".into(),
+            default: "Closed; no container-engine socket is shared by any preset".into(),
+            consequence: "A jailed process can create privileged containers or mount host paths, bypassing the jail's filesystem boundary".into(),
+            remote: None,
+            authority: Some("Effectively the complete authority of the Docker or Podman daemon owner".into()),
             risk: Risk::Open,
         },
         "loopback-connect" => GrantSpec {
@@ -552,15 +961,12 @@ fn restricted_ssh_grant(
         ),
         scope: if constrained {
             format!(
-                "{} Only verified destination constraints: {}",
-                messages::SSH_SCOPE_ID,
+                "Only verified destination constraints: {}",
                 policy.destinations.join(", ")
             )
         } else {
-            format!(
-                "{} Incomplete: no destination constraint; launch and save are refused",
-                messages::SSH_SCOPE_ID
-            )
+            "Incomplete: no destination constraint; launch and save are refused"
+                .into()
         },
         limits: if constrained {
             "Destination constraints depend on OpenSSH support and verified known_hosts entries; unrestricted network is separately OPEN; failure refuses launch".into()
@@ -609,8 +1015,7 @@ pub(crate) fn secure_noninteractive(
 ) {
     apply_secure_defaults(config, cli);
     eprintln!(
-        "[WARN] {} Interactive setup skipped because no terminal is attached.\n  Running once with restricted defaults; no profile was saved.\n  Use `ai-jail configure {}` in a terminal to review or save access.",
-        messages::NON_TTY_ID,
+        "[WARN] Interactive setup skipped because no terminal is attached.\n  Running once with restricted defaults; no profile was saved.\n  Use `ai-jail configure {}` in a terminal to review or save access.",
         crate::command::effective_name(&config.command).unwrap_or("HARNESS")
     );
 }
@@ -633,206 +1038,106 @@ pub(crate) fn apply_secure_defaults(
     }
 }
 
+fn initial_selection(
+    existing: &Config,
+    harness: &str,
+    approved_env_names: &[String],
+    restricted_ssh: Option<&crate::ssh_restricted::Policy>,
+    use_recommended_defaults: bool,
+) -> Selection {
+    let mut selection = Selection::from_project_grants(
+        existing,
+        harness,
+        approved_env_names,
+        restricted_ssh,
+    );
+    if use_recommended_defaults {
+        selection.apply_recommended_developer_baseline(harness);
+    }
+    selection
+}
+
 pub(crate) fn run(
     harness: &str,
     project: &Path,
     existing: &Config,
     configure_only: bool,
+    use_recommended_defaults: bool,
     effective: EffectiveContext<'_>,
 ) -> Result<Outcome, String> {
     if !is_interactive() {
         return Err(format!(
-            "{} `ai-jail configure {harness}` needs an interactive terminal. No configuration was changed.",
-            messages::CONFIG_NON_TTY_ID
+            "`ai-jail configure {harness}` needs an interactive terminal. No configuration was changed."
         ));
     }
-    let mut selection = Selection::from_project_grants(
+    let mut selection = initial_selection(
         existing,
         harness,
         effective.approved_env_names,
         effective.restricted_ssh,
+        use_recommended_defaults,
     );
     let harnesses = if effective.cli.harnesses.is_empty() {
         vec![harness.to_string()]
     } else {
         effective.cli.harnesses.clone()
     };
-    let approved_wrapper_requests = review_wrapper_requests(
-        &mut selection,
-        effective.requests,
-        effective.approved_wrapper_requests,
-    )?;
     eprintln!("\nConfigure {harness} for this project\n");
     eprintln!("Project: {}\n", safe_path(project)?);
-    eprintln!("{} {}\n", messages::INTRO_ID, messages::INTRO);
+    eprintln!("{}\n", messages::INTRO);
     if std::env::var_os("TERM").is_some_and(|value| value == "dumb") {
+        let approved_wrapper_requests = review_wrapper_requests(
+            &mut selection,
+            effective.requests,
+            effective.approved_wrapper_requests,
+            harness,
+            project,
+        )?;
         return run_sequential(
             selection,
             harness,
             project,
             configure_only,
             &effective,
+            approved_wrapper_requests,
         );
     }
 
-    let mut ssh_transcript_started = false;
-    loop {
-        render_menu(&selection);
-        let answer = keyboard_choice()?;
-        match answer.trim() {
-            "1" => toggle_allowed(
-                &mut selection.api_access,
-                &api_grant(harness, api_hosts(harness), None),
-            )?,
-            "2" => toggle_allowed(
-                &mut selection.agent_state,
-                &state_grant(harness, None),
-            )?,
-            "3" => toggle_allowed(
-                &mut selection.dependency_hosts,
-                &dependency_grant(harness, None),
-            )?,
-            "4" => {
-                toggle_open(&mut selection.ssh, "ssh", harness)?;
-                if selection.ssh {
-                    selection.restricted_ssh = None;
-                }
-            }
-            "k" => {
-                if !ssh_transcript_started {
-                    eprintln!("{SSH_TRANSCRIPT_BEGIN}");
-                    ssh_transcript_started = true;
-                }
-                edit_restricted_ssh(&mut selection)?;
-            }
-            "5" => toggle_open(&mut selection.github, "github", harness)?,
-            "6" => toggle_open(
-                &mut selection.unrestricted_network,
-                "network",
-                harness,
-            )?,
-            "7" => toggle_open(
-                &mut selection.loopback_connect,
-                "loopback-connect",
-                harness,
-            )?,
-            "r" => {
-                if let Err(error) =
-                    add_directory(&mut selection, false, harness, project)
-                {
-                    eprintln!("[ERROR] {error}");
-                }
-            }
-            "w" => {
-                if let Err(error) =
-                    add_directory(&mut selection, true, harness, project)
-                {
-                    eprintln!("[ERROR] {error}");
-                }
-            }
-            "d" => {
-                if let Err(error) = remove_directory(&mut selection) {
-                    eprintln!("[ERROR] {error}");
-                }
-            }
-            "e" => edit_environment(&mut selection, harness)?,
-            "s" | "" => {
-                render_summary(&selection, harness, project, true);
-                let mut proposed = selection.profile_for(&harnesses);
-                proposed.approved_wrapper_requests =
-                    approved_wrapper_requests.clone();
-                proposed.directory_grants =
-                    crate::config_store::capture_directory_grants(
-                        &proposed.grants,
-                        project,
-                    )?;
-                crate::materialize_approved_env_names(
-                    &proposed.approved_env_names,
-                    false,
-                )?;
-                let base = crate::build_onboarding_effective(
-                    effective.global.clone(),
-                    proposed.grants.clone(),
-                    effective.cli,
-                    effective.constraints.clone(),
-                    project,
-                    effective.trusted_constraints,
-                )?;
-                let finalized = crate::finalize_launch_config_with_ssh(
-                    base,
-                    project,
-                    effective.cli.dry_run,
-                    if effective.cli.ssh == Some(false) {
-                        None
-                    } else {
-                        proposed.restricted_ssh.clone()
-                    },
-                )?;
-                eprintln!(
-                    "{}",
-                    render_effective_access(
-                        &finalized.config,
-                        project,
-                        harness,
-                        None,
-                        &selection.env_names,
-                    )?
-                );
-                if effective_has_open_authority(&finalized.config, project)?
-                    && !open_confirmation(&prompt(&format!(
-                        "{} Complete effective access contains OPEN authority. Type OPEN to continue: ",
-                        messages::OPEN_ID
-                    ))?)
-                {
-                    eprintln!(
-                        "[LOCK] Kept restricted. Review or remove the OPEN authority."
-                    );
-                    continue;
-                }
-                proposed.finalized = Some(finalized);
-                proposed.ssh_transcript_started = ssh_transcript_started;
-                let action = if configure_only {
-                    prompt(&format!(
-                        "{} Save this project profile? [y/N/b] ",
-                        messages::SAVE_ID
-                    ))?
-                } else {
-                    prompt(&format!(
-                        "{} Save and launch [s], launch once [o], back [b], cancel [q]: ",
-                        messages::SAVE_ID
-                    ))?
-                };
-                if configure_only && action.eq_ignore_ascii_case("y") {
-                    return Ok(Outcome::SaveOnly(proposed));
-                }
-                match action.trim() {
-                    "s" => {
-                        return Ok(Outcome::SaveAndLaunch(proposed));
-                    }
-                    "o" => {
-                        return Ok(Outcome::LaunchOnce(proposed));
-                    }
-                    "q" => return Ok(Outcome::Cancel),
-                    _ => continue,
-                }
-            }
-            "q" => return Ok(Outcome::Cancel),
-            "b" => continue,
-            _ => eprintln!("Choose 1-7, e, r, w, d, s, or q."),
-        }
-    }
+    tui::run_app(
+        &mut selection,
+        harness,
+        project,
+        effective.requests,
+        effective.approved_wrapper_requests,
+        tui::RunOptions {
+            configure_only,
+            recommended_baseline: use_recommended_defaults,
+        },
+        |current, approved| {
+            prepare_review(
+                current, harness, &harnesses, project, approved, &effective,
+            )
+        },
+    )
 }
 
 fn review_wrapper_requests(
     selection: &mut Selection,
     requests: &crate::integration::RequestSet,
     existing: &[crate::integration::RequestApproval],
+    harness: &str,
+    project: &Path,
 ) -> Result<Vec<crate::integration::RequestApproval>, String> {
-    let mut approved = existing.to_vec();
     if requests.items.is_empty() {
-        return Ok(approved);
+        return Ok(existing.to_vec());
     }
-    eprintln!("Wrapper requests (requests are not grants):");
+    for approval in existing {
+        revoke_wrapper_request(selection, approval);
+    }
+    let mut approved = Vec::new();
+    eprintln!(
+        "Wrapper-staged access requests. Prior wrapper-derived access was removed from this draft; approve each request again or re-enable overlapping manual access explicitly."
+    );
     for request in &requests.items {
         let approval = &request.approval;
         eprintln!(
@@ -858,64 +1163,231 @@ fn review_wrapper_requests(
             )
         };
         eprintln!("  Resource: {resource}");
-        let was_approved = approved.contains(approval);
-        let answer = prompt(if was_approved {
-            "  Keep approved? [Y/n/q] "
+        let prepared =
+            prepare_wrapper_request(approval, selection, harness, project)?;
+        eprintln!("{}\n", prepared.grant().render());
+        let accepted = if prepared.grant().risk == Risk::Open {
+            open_confirmation(&prompt(
+                "  Type OPEN exactly to approve this staged access: ",
+            )?)
         } else {
-            "  Approve for this project profile? [Y/n/q] "
-        })?;
-        if answer.eq_ignore_ascii_case("q") {
-            return Err("Wrapper request review cancelled".into());
-        }
-        if answer.is_empty() || answer.eq_ignore_ascii_case("y") {
-            apply_wrapper_request(selection, approval)?;
-            if !approved.contains(approval) {
-                approved.push(approval.clone());
+            let answer = prompt("  Approve this staged access? [y/N/q] ")?;
+            if answer.eq_ignore_ascii_case("q") {
+                return Err("Wrapper request review cancelled".into());
             }
-        } else {
-            approved.retain(|saved| saved != approval);
+            answer.eq_ignore_ascii_case("y")
+        };
+        if accepted {
+            apply_wrapper_request(selection, &prepared);
+            approved.push(approval.clone());
         }
     }
     eprintln!();
     Ok(approved)
 }
 
-fn apply_wrapper_request(
+#[derive(Clone, Debug)]
+pub(crate) enum PreparedWrapperRequest {
+    Direct {
+        approval: crate::integration::RequestApproval,
+        grant: GrantSpec,
+    },
+    Directory {
+        approval: crate::integration::RequestApproval,
+        candidate: DirectoryCandidate,
+    },
+}
+
+impl PreparedWrapperRequest {
+    pub(crate) fn grant(&self) -> &GrantSpec {
+        match self {
+            Self::Direct { grant, .. } => grant,
+            Self::Directory { candidate, .. } => &candidate.grant,
+        }
+    }
+
+    fn approval(&self) -> &crate::integration::RequestApproval {
+        match self {
+            Self::Direct { approval, .. }
+            | Self::Directory { approval, .. } => approval,
+        }
+    }
+}
+
+pub(crate) fn revoke_wrapper_request(
     selection: &mut Selection,
     request: &crate::integration::RequestApproval,
-) -> Result<(), String> {
+) {
+    match request.kind.as_str() {
+        "host" => selection
+            .requested_hosts
+            .retain(|value| value != &request.value),
+        "private_host" => selection
+            .requested_private_hosts
+            .retain(|value| value != &request.value),
+        "env" => remove_env_name(selection, &request.value),
+        "secret" => {
+            remove_env_name(selection, &request.value);
+            selection.requested_secrets.remove(&request.value);
+        }
+        "agent_state" => selection.agent_state = false,
+        "map" => {
+            let presented = PathBuf::from(&request.value);
+            let current = std::fs::canonicalize(&presented).ok();
+            let had_directory_authority =
+                !selection.ro_dirs.is_empty() || !selection.rw_dirs.is_empty();
+            let traverses_symlink = {
+                let mut prefix = PathBuf::new();
+                presented.components().any(|component| {
+                    prefix.push(component);
+                    std::fs::symlink_metadata(&prefix)
+                        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                })
+            };
+            if traverses_symlink && had_directory_authority {
+                selection.ro_dirs.clear();
+                selection.rw_dirs.clear();
+                return;
+            }
+            let matches_request = |candidate: &PathBuf| {
+                candidate == &presented
+                    || current
+                        .as_ref()
+                        .is_some_and(|resolved| candidate == resolved)
+            };
+            let matched = selection.ro_dirs.iter().any(matches_request)
+                || selection.rw_dirs.iter().any(matches_request);
+            if matched {
+                selection
+                    .ro_dirs
+                    .retain(|candidate| !matches_request(candidate));
+                selection
+                    .rw_dirs
+                    .retain(|candidate| !matches_request(candidate));
+            } else if had_directory_authority {
+                // Older approvals do not carry the canonical path that was
+                // actually persisted. If the presented path drifted or
+                // disappeared, retaining any additional map could preserve
+                // the wrapper-derived authority under an unmatchable name.
+                selection.ro_dirs.clear();
+                selection.rw_dirs.clear();
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn prepare_wrapper_request(
+    request: &crate::integration::RequestApproval,
+    selection: &Selection,
+    harness: &str,
+    project: &Path,
+) -> Result<PreparedWrapperRequest, String> {
+    let direct = |grant| PreparedWrapperRequest::Direct {
+        approval: request.clone(),
+        grant,
+    };
+    match request.kind.as_str() {
+        "host" | "private_host" => {
+            let private = request.kind == "private_host";
+            let port_note = request.port.map_or_else(
+                || "any requested TCP port".to_string(),
+                |port| format!(
+                    "any requested TCP port; the wrapper requested port {port}, but the saved host grant is not port-limited"
+                ),
+            );
+            Ok(direct(GrantSpec {
+                resource: format!(
+                    "TCP connections to {}",
+                    escape_control_bytes(&request.value)
+                ),
+                access: if private {
+                    "Connect through the filtered proxy, including private address ranges"
+                } else {
+                    "Connect through the filtered proxy; private and loopback addresses remain blocked"
+                }
+                .into(),
+                process: process_label(harness),
+                duration: duration(None),
+                scope: format!(
+                    "This exact normalized host; {port_note}"
+                ),
+                limits: if private {
+                    "Metadata, link-local, and loopback addresses remain blocked; the named host can still reach private services"
+                } else {
+                    "DNS is pinned by the filtered proxy and private address ranges remain blocked"
+                }
+                .into(),
+                default: "Not shared unless this staged request is approved".into(),
+                consequence: "Readable jail data can be sent to this destination".into(),
+                remote: Some(format!(
+                    "Services operating under {}",
+                    escape_control_bytes(&request.value)
+                )),
+                authority: private.then(|| {
+                    "Private-capable network access can reach services that are not public"
+                        .into()
+                }),
+                risk: if private { Risk::Open } else { Risk::Allowed },
+            }))
+        }
+        "env" => Ok(direct(prepare_env_candidate(&request.value, harness)?)),
+        "secret" => {
+            let mut grant = prepare_env_candidate(&request.value, harness)?;
+            let host = request
+                .host
+                .as_deref()
+                .ok_or_else(|| "secret request has no host".to_string())?;
+            grant.scope = format!(
+                "This exact variable name, bound to filtered destination {}",
+                escape_control_bytes(host)
+            );
+            grant.remote = Some(format!(
+                "Services operating under {}",
+                escape_control_bytes(host)
+            ));
+            Ok(direct(grant))
+        }
+        "agent_state" => Ok(direct(state_grant(harness, None))),
+        "map" => Ok(PreparedWrapperRequest::Directory {
+            approval: request.clone(),
+            candidate: prepare_directory_candidate(
+                Path::new(&request.value),
+                request.writable.unwrap_or(false),
+                selection,
+                harness,
+                project,
+            )?,
+        }),
+        kind => Err(format!("Unsupported wrapper request kind {kind:?}")),
+    }
+}
+
+pub(crate) fn apply_wrapper_request(
+    selection: &mut Selection,
+    prepared: &PreparedWrapperRequest,
+) {
+    if let PreparedWrapperRequest::Directory { candidate, .. } = prepared {
+        apply_directory_candidate(selection, candidate);
+        return;
+    }
+    let request = prepared.approval();
     match request.kind.as_str() {
         "host" => push_unique(&mut selection.requested_hosts, &request.value),
         "private_host" => {
             push_unique(&mut selection.requested_private_hosts, &request.value)
         }
-        "env" => push_unique(&mut selection.env_names, &request.value),
+        "env" => apply_env_name(selection, request.value.clone()),
         "secret" => {
-            push_unique(&mut selection.env_names, &request.value);
+            apply_env_name(selection, request.value.clone());
             selection.requested_secrets.insert(
                 request.value.clone(),
-                request
-                    .host
-                    .clone()
-                    .ok_or_else(|| "secret request has no host".to_string())?,
+                request.host.clone().expect("prepared secret has a host"),
             );
         }
         "agent_state" => selection.agent_state = true,
-        "map" => {
-            let path = PathBuf::from(&request.value);
-            if request.writable.unwrap_or(false) {
-                if !selection.rw_dirs.contains(&path) {
-                    selection.rw_dirs.push(path);
-                }
-            } else if !selection.ro_dirs.contains(&path) {
-                selection.ro_dirs.push(path);
-            }
-        }
-        kind => {
-            return Err(format!("Unsupported wrapper request kind {kind:?}"));
-        }
+        _ => unreachable!("prepared wrapper kind"),
     }
-    Ok(())
 }
 
 fn push_unique(values: &mut Vec<String>, value: &str) {
@@ -930,6 +1402,7 @@ fn run_sequential(
     project: &Path,
     configure_only: bool,
     effective: &EffectiveContext<'_>,
+    approved_wrapper_requests: Vec<crate::integration::RequestApproval>,
 ) -> Result<Outcome, String> {
     eprintln!(
         "Plain-terminal mode: each access choice is reviewed in order.\n"
@@ -979,6 +1452,11 @@ fn run_sequential(
         ("full host SSH", &mut selection.ssh, "ssh"),
         ("full host GitHub token", &mut selection.github, "github"),
         (
+            "host Docker/Podman daemon",
+            &mut selection.container_engine,
+            "container-engine",
+        ),
+        (
             "unrestricted network",
             &mut selection.unrestricted_network,
             "network",
@@ -1023,6 +1501,7 @@ fn run_sequential(
     }
     render_summary(&selection, harness, project, true);
     let mut proposed = selection.profile(harness);
+    proposed.approved_wrapper_requests = approved_wrapper_requests;
     proposed.directory_grants = crate::config_store::capture_directory_grants(
         &proposed.grants,
         project,
@@ -1057,31 +1536,23 @@ fn run_sequential(
         )?
     );
     if effective_has_open_authority(&finalized.config, project)?
-        && !open_confirmation(&prompt(&format!(
-            "{} Complete effective access contains OPEN authority. Type OPEN to continue: ",
-            messages::OPEN_ID
-        ))?)
+        && !open_confirmation(&prompt(
+            "Complete effective access contains OPEN authority. Type OPEN to continue: ",
+        )?)
     {
         return Ok(Outcome::Cancel);
     }
     proposed.finalized = Some(finalized);
     if configure_only {
-        return if prompt(&format!(
-            "{} Save this project profile? [y/N] ",
-            messages::SAVE_ID
-        ))?
-        .eq_ignore_ascii_case("y")
+        return if prompt("Save this project profile? [y/N] ")?
+            .eq_ignore_ascii_case("y")
         {
             Ok(Outcome::SaveOnly(proposed))
         } else {
             Ok(Outcome::Cancel)
         };
     }
-    match prompt(&format!(
-        "{} Save and launch [s], launch once [o], cancel [q]: ",
-        messages::SAVE_ID
-    ))?
-    .as_str()
+    match prompt("Save and launch [s], launch once [o], cancel [q]: ")?.as_str()
     {
         "s" => Ok(Outcome::SaveAndLaunch(proposed)),
         "o" => Ok(Outcome::LaunchOnce(proposed)),
@@ -1095,59 +1566,15 @@ fn toggle_allowed(value: &mut bool, grant: &GrantSpec) -> Result<(), String> {
         return Ok(());
     }
     eprintln!("\n{}\n", grant.render());
-    if prompt(&format!("{} Enable this grant? [y/N] ", messages::GRANT_ID))?
-        .eq_ignore_ascii_case("y")
-    {
+    if prompt("Enable this grant? [y/N] ")?.eq_ignore_ascii_case("y") {
         *value = true;
     }
     Ok(())
 }
 
-fn render_menu(selection: &Selection) {
-    let mark = |set| if set { 'x' } else { ' ' };
-    eprintln!("{} Access choices", messages::CHOICE_ID);
-    eprintln!(
-        "  1 [{}] Filtered model API access",
-        mark(selection.api_access)
-    );
-    eprintln!(
-        "  2 [{}] Host harness login/state",
-        mark(selection.agent_state)
-    );
-    eprintln!(
-        "  3 [{}] Dependency tools and download hosts",
-        mark(selection.dependency_hosts)
-    );
-    eprintln!(
-        "  4 [{}] Full host SSH access                 OPEN",
-        mark(selection.ssh)
-    );
-    eprintln!(
-        "  k [{}] Selected SSH keys (fresh agent)",
-        mark(selection.restricted_ssh.is_some())
-    );
-    eprintln!(
-        "  5 [{}] Full host GitHub token              OPEN",
-        mark(selection.github)
-    );
-    eprintln!(
-        "  6 [{}] Unrestricted network                OPEN",
-        mark(selection.unrestricted_network)
-    );
-    eprintln!(
-        "  7 [{}] All host loopback services          OPEN (macOS)",
-        mark(selection.loopback_connect)
-    );
-    eprintln!("  r Add read-only directory   w Add read/write directory");
-    eprintln!("  e Environment variables (names only; values stay hidden)");
-    eprintln!("  d Remove directory          s Review summary   q Cancel");
-    eprintln!("  Repository-scoped forge access is configured separately.\n");
-}
-
 fn edit_restricted_ssh(selection: &mut Selection) -> Result<(), String> {
     eprintln!(
-        "\n{} Selected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared.",
-        messages::SSH_ID
+        "\nSelected-key SSH uses a fresh agent for this jail. Private key files and the host agent are not shared."
     );
     if let Some(policy) = &selection.restricted_ssh {
         eprintln!("Selected identities:");
@@ -1243,11 +1670,33 @@ fn edit_restricted_ssh(selection: &mut Selection) -> Result<(), String> {
     Ok(())
 }
 
-fn discover_public_ssh_keys() -> Vec<crate::ssh_restricted::KeyIdentity> {
+pub(crate) fn discover_public_ssh_keys()
+-> Vec<crate::ssh_restricted::KeyIdentity> {
     let Some(home) = std::env::var_os("HOME") else {
         return Vec::new();
     };
     discover_public_ssh_keys_in(&PathBuf::from(home).join(".ssh"))
+}
+
+pub(crate) fn validate_ssh_destinations(
+    mut destinations: Vec<String>,
+) -> Result<Vec<String>, String> {
+    destinations.sort();
+    destinations.dedup();
+    for destination in &destinations {
+        crate::ssh_restricted::validate_destination(destination)?;
+    }
+    Ok(destinations)
+}
+
+pub(crate) fn validate_ssh_lifetime(seconds: u32) -> Result<u32, String> {
+    if !(60..=86_400).contains(&seconds) {
+        return Err(
+            "Restricted SSH lifetime must be between 60 and 86400 seconds"
+                .into(),
+        );
+    }
+    Ok(seconds)
 }
 
 fn discover_public_ssh_keys_in(
@@ -1275,15 +1724,9 @@ fn toggle_open(
         *value = false;
         return Ok(());
     }
-    eprintln!(
-        "\n{} OPEN access removes an important boundary.\n",
-        messages::OPEN_ID
-    );
+    eprintln!("\nOPEN access removes an important boundary.\n");
     eprintln!("{}\n", open_grant(kind, harness, None).render());
-    if open_confirmation(&prompt(&format!(
-        "{} Type OPEN to enable this exact grant: ",
-        messages::OPEN_ID
-    ))?) {
+    if open_confirmation(&prompt("Type OPEN to enable this exact grant: ")?) {
         *value = true;
     } else {
         eprintln!("Kept restricted.");
@@ -1359,65 +1802,10 @@ impl Drop for RawModeGuard {
     }
 }
 
-fn keyboard_choice() -> Result<String, String> {
-    const KEYS: [&str; 12] =
-        ["1", "2", "3", "4", "k", "5", "6", "e", "r", "w", "d", "s"];
-    const LABELS: [&str; 12] = [
-        "filtered model API",
-        "host harness state",
-        "dependency access",
-        "full SSH",
-        "selected-key SSH",
-        "full GitHub token",
-        "unrestricted network",
-        "environment variables",
-        "add read-only directory",
-        "add read/write directory",
-        "remove directory",
-        "review complete access",
-    ];
-    let _raw = RawModeGuard::enter()?;
-    let mut selected = 0usize;
-    eprintln!(
-        "[OK] Arrow keys move. Space or Enter selects. q cancels. Esc goes back.\r"
-    );
-    eprintln!("[OK] Selected: {}\r", LABELS[selected]);
-    loop {
-        let mut byte = [0u8; 1];
-        io::stdin()
-            .read_exact(&mut byte)
-            .map_err(|e| e.to_string())?;
-        match byte[0] {
-            b'q' => return Ok("q".into()),
-            b'\r' | b'\n' | b' ' => return Ok(KEYS[selected].into()),
-            0x1b => {
-                let Some(sequence) = escape_tail()? else {
-                    return Ok("b".into());
-                };
-                match sequence {
-                    [b'[', b'A'] => selected = selected.saturating_sub(1),
-                    [b'[', b'B'] => {
-                        selected = (selected + 1).min(KEYS.len() - 1)
-                    }
-                    _ => return Ok("b".into()),
-                }
-                eprintln!("[OK] Selected: {}\r", LABELS[selected]);
-            }
-            b'1'..=b'6' | b'k' | b'e' | b'r' | b'w' | b'd' | b's' => {
-                return Ok((byte[0] as char).to_string());
-            }
-            _ => {}
-        }
-    }
-}
-
 fn directory_prompt() -> Result<String, String> {
     let _raw = RawModeGuard::enter()?;
     let mut value = String::new();
-    eprint!(
-        "{} Directory (Tab completes; absolute path or ~/...): ",
-        messages::PATH_REFUSED_ID
-    );
+    eprint!("Directory (Tab completes; absolute path or ~/...): ");
     io::stderr().flush().map_err(|e| e.to_string())?;
     loop {
         let mut byte = [0u8; 1];
@@ -1443,8 +1831,7 @@ fn directory_prompt() -> Result<String, String> {
                 Ok(candidates) if candidates.len() == 1 => {
                     value = safe_path(&candidates[0])?;
                     eprint!(
-                        "\r\x1b[2K{} Directory (Tab completes; absolute path or ~/...): {}",
-                        messages::PATH_REFUSED_ID,
+                        "\r\x1b[2KDirectory (Tab completes; absolute path or ~/...): {}",
                         escape_control_bytes(&value)
                     );
                     io::stderr().flush().map_err(|e| e.to_string())?;
@@ -1455,8 +1842,7 @@ fn directory_prompt() -> Result<String, String> {
                         eprintln!("  {}\r", safe_path(&candidate)?);
                     }
                     eprint!(
-                        "{} Directory (Tab completes; absolute path or ~/...): {}",
-                        messages::PATH_REFUSED_ID,
+                        "Directory (Tab completes; absolute path or ~/...): {}",
                         escape_control_bytes(&value)
                     );
                     io::stderr().flush().map_err(|e| e.to_string())?;
@@ -1496,7 +1882,7 @@ fn directory_prompt() -> Result<String, String> {
     }
 }
 
-fn host_env_names(selection: &Selection) -> Vec<String> {
+pub(crate) fn environment_name_catalog(selection: &Selection) -> Vec<String> {
     let mut names = std::env::vars_os()
         .filter_map(|(name, _)| name.into_string().ok())
         .filter(|name| validate_env_name(name).is_ok())
@@ -1508,19 +1894,42 @@ fn host_env_names(selection: &Selection) -> Vec<String> {
     names
 }
 
+pub(crate) fn prepare_env_candidate(
+    name: &str,
+    harness: &str,
+) -> Result<GrantSpec, String> {
+    validate_env_name(name)?;
+    if std::env::var_os(name).is_none() {
+        return Err(format!(
+            "Host variable {} is not currently set; no approval was added",
+            escape_control_bytes(name)
+        ));
+    }
+    Ok(env_grant(name, harness))
+}
+
+pub(crate) fn apply_env_name(selection: &mut Selection, name: String) {
+    selection.env_names.push(name);
+    selection.env_names.sort();
+    selection.env_names.dedup();
+}
+
+pub(crate) fn remove_env_name(selection: &mut Selection, name: &str) {
+    selection.env_names.retain(|existing| existing != name);
+}
+
 fn choose_env_name(selection: &Selection) -> Result<Option<String>, String> {
     if std::env::var_os("TERM").is_some_and(|value| value == "dumb") {
-        let name = prompt(&format!(
-            "{} Environment variable name (value stays hidden; Enter returns): ",
-            messages::ENV_ID
-        ))?;
+        let name = prompt(
+            "Environment variable name (value stays hidden; Enter returns): ",
+        )?;
         if name.is_empty() || name == "q" {
             return Ok(None);
         }
         validate_env_name(&name)?;
         return Ok(Some(name));
     }
-    let all = host_env_names(selection);
+    let all = environment_name_catalog(selection);
     let _raw = RawModeGuard::enter()?;
     let mut filter = String::new();
     let mut selected = 0usize;
@@ -1534,8 +1943,7 @@ fn choose_env_name(selection: &Selection) -> Result<Option<String>, String> {
             .collect::<Vec<_>>();
         selected = selected.min(matches.len().saturating_sub(1));
         eprintln!(
-            "\r{} Environment names only. Type to filter; arrows move; Space/Enter selects for approval; q/Esc returns. Values are never shown.\r",
-            messages::ENV_ID
+            "\rEnvironment names only. Type to filter; arrows move; Space/Enter selects for approval; q/Esc returns. Values are never shown.\r"
         );
         eprintln!("  Filter: {}\r", escape_control_bytes(&filter));
         for (index, name) in matches.iter().take(12).enumerate() {
@@ -1593,16 +2001,14 @@ fn edit_environment(
     if selection.env_names.contains(&name) {
         selection.env_names.retain(|existing| existing != &name);
         eprintln!(
-            "[LOCK] {} Removed approval for {}",
-            messages::ENV_ID,
+            "[LOCK] Removed approval for {}",
             escape_control_bytes(&name)
         );
         return Ok(());
     }
     if std::env::var_os(&name).is_none() {
         return Err(format!(
-            "{} Host variable {} is not currently set; no approval was added",
-            messages::ENV_MISSING_ID,
+            "Host variable {} is not currently set; no approval was added",
             escape_control_bytes(&name)
         ));
     }
@@ -1610,16 +2016,11 @@ fn edit_environment(
     eprintln!("\n{}\n", grant.render());
     let approved = if grant.risk == Risk::Open {
         open_confirmation(&prompt(&format!(
-            "{} Host variable {} has unverifiable authority. Type OPEN to approve its name: ",
-            messages::OPEN_ID,
+            "Host variable {} has unverifiable authority. Type OPEN to approve its name: ",
             escape_control_bytes(&name)
         ))?)
     } else {
-        prompt(&format!(
-            "{} Approve this variable name? [y/N] ",
-            messages::ENV_ID
-        ))?
-        .eq_ignore_ascii_case("y")
+        prompt("Approve this variable name? [y/N] ")?.eq_ignore_ascii_case("y")
     };
     if approved {
         selection.env_names.push(name);
@@ -1635,10 +2036,7 @@ fn add_directory(
     project: &Path,
 ) -> Result<(), String> {
     let mut entered = if std::env::var_os("TERM").is_some_and(|v| v == "dumb") {
-        prompt(&format!(
-            "{} Directory (absolute path or ~/...): ",
-            messages::PATH_REFUSED_ID
-        ))?
+        prompt("Directory (absolute path or ~/...): ")?
     } else {
         directory_prompt()?
     };
@@ -1670,10 +2068,9 @@ fn add_directory(
         return Err(format!("{} is not a directory", safe_path(&resolved)?));
     }
     if resolved.as_os_str().as_bytes().contains(&b':') {
-        return Err(format!(
-            "{} Directory paths containing ':' cannot be stored safely",
-            messages::PATH_REFUSED_ID
-        ));
+        return Err(
+            "Directory paths containing ':' cannot be stored safely".into()
+        );
     }
     if resolved == Path::new("/") {
         return Err(
@@ -1701,27 +2098,17 @@ fn add_directory(
     let grant =
         classified_directory_grant(&resolved, write, harness, project, None);
     if grant.risk == Risk::Open {
-        eprintln!(
-            "{} OPEN: this path contains a broad host filesystem scope.",
-            messages::OPEN_ID
-        );
+        eprintln!("OPEN: this path contains a broad host filesystem scope.");
     }
     eprintln!("{}\n", grant.render());
     if grant.risk == Risk::Open
-        && !open_confirmation(&prompt(&format!(
-            "{} Type OPEN to add this path: ",
-            messages::OPEN_ID
-        ))?)
+        && !open_confirmation(&prompt("Type OPEN to add this path: ")?)
     {
         eprintln!("Kept restricted.");
         return Ok(());
     }
     if grant.risk == Risk::Allowed
-        && !prompt(&format!(
-            "{} Add this directory? [y/N] ",
-            messages::GRANT_ID
-        ))?
-        .eq_ignore_ascii_case("y")
+        && !prompt("Add this directory? [y/N] ")?.eq_ignore_ascii_case("y")
     {
         return Ok(());
     }
@@ -1735,6 +2122,7 @@ fn add_directory(
     Ok(())
 }
 
+#[allow(dead_code)] // Pure validation is retained for the upcoming TUI editor.
 fn remove_directory(selection: &mut Selection) -> Result<(), String> {
     let entries: Vec<(bool, PathBuf)> = selection
         .ro_dirs
@@ -1796,8 +2184,7 @@ fn reject_credential_root_for_home(
 ) -> Result<(), String> {
     if crate::authority_inventory::is_protected(path, home)? {
         return Err(format!(
-            "{} Refusing credential-bearing path {}; use its dedicated access choice",
-            messages::CREDENTIAL_PATH_ID,
+            "Refusing credential-bearing path {}; use its dedicated access choice",
             safe_path(path)?
         ));
     }
@@ -1856,87 +2243,112 @@ pub(crate) fn render_summary(
     project: &Path,
     saved: bool,
 ) {
-    eprintln!("\n{} Final access for {harness}\n", messages::SUMMARY_ID);
-    eprintln!("{}", category("RESTRICTED", "\x1b[32m", "[LOCK]"));
+    eprintln!("{}", summary_text(selection, harness, project, Some(saved)));
+}
+
+pub(crate) fn summary_text(
+    selection: &Selection,
+    harness: &str,
+    project: &Path,
+    saved: Option<bool>,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut output =
+        format!("\nFinal access for {harness}\n\n[LOCK] RESTRICTED\n");
     if !selection.ssh && selection.restricted_ssh.is_none() {
-        eprintln!(
+        writeln!(
+            output,
             "  SSH       No key files, host agent socket, or SSH configuration"
-        );
+        )
+        .expect("writing to String");
     }
     if selection
         .restricted_ssh
         .as_ref()
         .is_some_and(|policy| policy.destinations.is_empty())
     {
-        eprintln!(
+        writeln!(output,
             "  SSH       Selected identity is incomplete; add at least one verified destination before launch or save"
-        );
+        ).expect("writing to String");
     }
     if !selection.github {
-        eprintln!("  GitHub    No host gh configuration or token");
+        writeln!(output, "  GitHub    No host gh configuration or token")
+            .expect("writing to String");
     }
-    eprintln!("  Host home See the complete effective access below");
+    writeln!(
+        output,
+        "  Host home See the complete effective access below"
+    )
+    .expect("writing to String");
     if !selection.api_access && !selection.dependency_hosts {
-        eprintln!("  Network   All destinations are blocked");
+        writeln!(output, "  Network   All destinations are blocked")
+            .expect("writing to String");
     } else if !selection.unrestricted_network {
-        eprintln!(
+        writeln!(output,
             "  Network   Every destination except the named API/dependency hosts"
-        );
+        ).expect("writing to String");
     }
-    eprintln!(
-        "\n{}\n{}\n",
-        category("ALLOWED", "\x1b[33m", "[WARN]"),
+    write!(
+        output,
+        "\n[WARN] ALLOWED\n{}\n",
         project_grant(project, harness, saved).render()
-    );
+    )
+    .expect("writing to String");
     let hosts = api_hosts(harness);
     if selection.api_access && !hosts.is_empty() {
-        eprintln!("\n{}\n", api_grant(harness, hosts, Some(saved)).render());
+        write!(output, "\n{}\n", api_grant(harness, hosts, saved).render())
+            .expect("writing to String");
     }
     if selection.agent_state {
-        eprintln!("\n{}\n", state_grant(harness, Some(saved)).render());
+        write!(output, "\n{}\n", state_grant(harness, saved).render())
+            .expect("writing to String");
     }
     if selection.dependency_hosts {
-        eprintln!("\n{}\n", dependency_grant(harness, Some(saved)).render());
+        write!(output, "\n{}\n", dependency_grant(harness, saved).render())
+            .expect("writing to String");
     }
     if let Some(policy) = &selection.restricted_ssh
         && !policy.destinations.is_empty()
     {
-        eprintln!(
+        write!(
+            output,
             "\n{}\n",
-            restricted_ssh_grant(policy, harness, Some(saved)).render()
-        );
+            restricted_ssh_grant(policy, harness, saved).render()
+        )
+        .expect("writing to String");
     }
     for path in &selection.ro_dirs {
         if !broad_directory(path, project) {
-            eprintln!(
+            write!(
+                output,
                 "\n{}\n",
                 classified_directory_grant(
-                    path,
-                    false,
-                    harness,
-                    project,
-                    Some(saved),
+                    path, false, harness, project, saved,
                 )
                 .render()
-            );
+            )
+            .expect("writing to String");
         }
     }
     for path in &selection.rw_dirs {
         if !broad_directory(path, project) {
-            eprintln!(
+            write!(
+                output,
                 "\n{}\n",
                 classified_directory_grant(
                     path,
                     true,
                     harness,
                     project,
-                    Some(saved),
+                    saved,
                 )
                 .render()
-            );
+            )
+            .expect("writing to String");
         }
     }
-    eprintln!("\n{}", category("OPEN", "\x1b[31m", "[ERROR]"));
+    output.push_str("\n[ERROR] OPEN\n");
     let mut any = false;
     for (enabled, kind) in [
         (selection.ssh, "ssh"),
@@ -1946,10 +2358,8 @@ pub(crate) fn render_summary(
     ] {
         if enabled {
             any = true;
-            eprintln!(
-                "\n{}\n",
-                open_grant(kind, harness, Some(saved)).render()
-            );
+            write!(output, "\n{}\n", open_grant(kind, harness, saved).render())
+                .expect("writing to String");
         }
     }
     for (write, paths) in
@@ -1958,24 +2368,22 @@ pub(crate) fn render_summary(
         for path in paths {
             if broad_directory(path, project) {
                 any = true;
-                eprintln!(
+                write!(
+                    output,
                     "\n{}\n",
                     classified_directory_grant(
-                        path,
-                        write,
-                        harness,
-                        project,
-                        Some(saved),
+                        path, write, harness, project, saved,
                     )
                     .render()
-                );
+                )
+                .expect("writing to String");
             }
         }
     }
     if !any {
-        eprintln!("  None");
+        output.push_str("  None\n");
     }
-    eprintln!();
+    output
 }
 
 pub(crate) fn render_effective_access(
@@ -2043,7 +2451,7 @@ pub(crate) fn render_effective_access(
     let policy = toml::to_string(&safe_config)
         .map_err(|error| format!("Cannot render effective access: {error}"))?;
     let mut lines = vec![
-        format!("{} Complete effective access", messages::FINAL_ID),
+        "Complete effective access".into(),
         format!("Recipient: {}", escape_control_bytes(&process_label(harness))),
         format!("Duration: {}", duration(saved)),
         format!("Project: {project_label} (read and write)"),
@@ -2131,6 +2539,10 @@ pub(crate) fn render_effective_access(
         "Tailscale socket; use host tailnet control/data access; host tailnet identity; jailed processes can reach tailnet resources",
     );
     authority(
+        config.gpu_enabled(),
+        "host GPU devices; issue device and driver requests; GPU resources available to the host user; a large kernel/driver interface crosses the jail boundary",
+    );
+    authority(
         config.kvm_enabled(),
         "/dev/kvm; issue virtualization ioctls; host KVM device; jailed processes can run hardware-assisted virtual machines",
     );
@@ -2144,7 +2556,7 @@ pub(crate) fn render_effective_access(
     );
     authority(
         config.pictures_enabled(),
-        "host Pictures directory; read and write; complete Pictures tree; files can be copied, changed, or deleted",
+        "host Pictures directory; read only; complete Pictures tree; files can be inspected and copied but not changed through this grant",
     );
     authority(
         !config.private_home_enabled(),
@@ -2386,7 +2798,7 @@ fn sanitize_serialized_strings(value: &mut serde_json::Value) {
     }
 }
 
-fn effective_has_open_authority(
+pub(crate) fn effective_has_open_authority(
     config: &Config,
     project: &Path,
 ) -> Result<bool, String> {
@@ -2404,6 +2816,7 @@ fn effective_has_open_authority(
         || config.x11_enabled()
         || config.audio_enabled()
         || config.tailscale_enabled()
+        || config.gpu_enabled()
         || config.kvm_enabled()
         || config.host_shm_enabled()
         || config.systemd_user_enabled()
@@ -2438,61 +2851,151 @@ fn credential_authority_path(encoded: &Path) -> Result<bool, String> {
 }
 
 pub(crate) fn safe_path(path: &Path) -> Result<String, String> {
-    let value = path.to_str().ok_or_else(|| {
-        format!(
-            "{} Refusing a path that is not valid UTF-8",
-            messages::PATH_REFUSED_ID
-        )
-    })?;
+    let value = path
+        .to_str()
+        .ok_or_else(|| "Refusing a path that is not valid UTF-8".to_string())?;
     Ok(escape_control_bytes(value))
-}
-
-fn category(label: &str, color: &str, icon: &str) -> String {
-    let ansi = io::stderr().is_terminal()
-        && std::env::var_os("NO_COLOR").is_none()
-        && std::env::var_os("TERM").is_none_or(|value| value != "dumb");
-    if ansi {
-        format!("\x1b[1m{color}{icon} {label}\x1b[0m")
-    } else {
-        format!("{icon} {label}")
-    }
-}
-
-#[cfg(test)]
-fn source_linked_fixture() -> String {
-    format!(
-        "{} Configure a known harness for one canonical project.\n{} Every selection is off until the user enables it.\n{} Every active grant names resource, access, process, duration, scope, limits, default, and consequence.\n{} Broad access requires typing OPEN.\n{} Final output always contains RESTRICTED, ALLOWED, and OPEN.\n{} Saved policy lives outside the project.\n{} Cancel writes no onboarding grants and starts nothing.\n{} Non-TTY first runs save no onboarding profile.\n{} Non-TTY configure changes nothing.\n{} Complete effective access includes every contributing policy layer.\n{} Unsafe directory syntax is refused.\n{} Credential roots require their dedicated access choice.\n{} Saved directory grants require identity records.\n{} Directory identity drift refuses access.\n{} Environment approvals store names only.\n{} Missing approved host variables fail closed.\n{} Selected-key SSH never shares private key files or the host agent.\n{} SSH destination limits are claimed only after host-key verification.\n{} A moved or changed selected key refuses launch.\n{} Selected-key SSH requires a separately approved Unrestricted network (OPEN) grant.\n",
-        messages::INTRO_ID,
-        messages::CHOICE_ID,
-        messages::GRANT_ID,
-        messages::OPEN_ID,
-        messages::SUMMARY_ID,
-        messages::SAVE_ID,
-        messages::CANCEL_ID,
-        messages::NON_TTY_ID,
-        messages::CONFIG_NON_TTY_ID,
-        messages::FINAL_ID,
-        messages::PATH_REFUSED_ID,
-        messages::CREDENTIAL_PATH_ID,
-        messages::PATH_IDENTITY_ID,
-        messages::PATH_DRIFT_ID,
-        messages::ENV_ID,
-        messages::ENV_MISSING_ID,
-        messages::SSH_ID,
-        messages::SSH_SCOPE_ID,
-        messages::SSH_DRIFT_ID,
-        messages::SSH_NETWORK_ID,
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn review_store(
+        base: &Path,
+        project: &Path,
+    ) -> crate::config_store::StorePaths {
+        let root = base.join("store");
+        crate::config_store::StorePaths {
+            available: true,
+            global: root.join("config.toml"),
+            global_provenance: root.join("global-migration.toml"),
+            project: root.join("projects/project.toml"),
+            legacy_global: base.join("legacy-global"),
+            legacy_project: project.join(".ai-jail"),
+            canonical_project: std::fs::canonicalize(project).unwrap(),
+            root,
+        }
+    }
+
+    #[test]
+    fn review_classifies_exact_forge_authority_and_gates_open() {
+        let base = std::env::temp_dir()
+            .join(format!("ai-jail-review-forge-{}", std::process::id()));
+        let project = base.join("project");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::set_permissions(
+            &base,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+        let store = review_store(&base, &project);
+        let global = Config::default();
+        let constraints = Config::default();
+        let cli = crate::cli::CliArgs::default();
+        let requests = crate::integration::RequestSet::default();
+        let context = EffectiveContext {
+            global: &global,
+            cli: &cli,
+            constraints: &constraints,
+            trusted_constraints: false,
+            approved_env_names: &[],
+            restricted_ssh: None,
+            requests: &requests,
+            approved_wrapper_requests: &[],
+            store: &store,
+        };
+        let harnesses = vec!["claude".to_string()];
+
+        crate::forge_auth::install_test_binding_metadata(&store, false)
+            .unwrap();
+        let open = prepare_review(
+            &Selection::default(),
+            "claude",
+            &harnesses,
+            &project,
+            &[],
+            &context,
+        )
+        .unwrap();
+        assert!(open.display.has_open_authority);
+        assert!(open.display.open.contains("GitLab project token"));
+        assert!(open.display.effective_access.contains("[ERROR] OPEN"));
+
+        crate::forge_auth::install_test_binding_metadata(&store, true).unwrap();
+        let scoped = prepare_review(
+            &Selection::default(),
+            "claude",
+            &harnesses,
+            &project,
+            &[],
+            &context,
+        )
+        .unwrap();
+        assert!(!scoped.display.has_open_authority);
+        assert!(scoped.display.allowed.contains("GitHub App"));
+        assert!(scoped.display.effective_access.contains("[WARN] ALLOWED"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn review_preparation_recomputes_from_current_selection() {
+        let project = std::env::temp_dir()
+            .join(format!("ai-jail-review-recompute-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        let global = Config::default();
+        let constraints = Config::default();
+        let cli = crate::cli::CliArgs::default();
+        let requests = crate::integration::RequestSet::default();
+        let store =
+            crate::config_store::StorePaths::discover(&project).unwrap();
+        let context = EffectiveContext {
+            global: &global,
+            cli: &cli,
+            constraints: &constraints,
+            trusted_constraints: false,
+            approved_env_names: &[],
+            restricted_ssh: None,
+            requests: &requests,
+            approved_wrapper_requests: &[],
+            store: &store,
+        };
+        let harnesses = vec!["claude".to_string()];
+        let mut selection = Selection::default();
+        let first = prepare_review(
+            &selection,
+            "claude",
+            &harnesses,
+            &project,
+            &[],
+            &context,
+        )
+        .unwrap();
+        selection.github = true;
+        let second = prepare_review(
+            &selection,
+            "claude",
+            &harnesses,
+            &project,
+            &[],
+            &context,
+        )
+        .unwrap();
+
+        assert_eq!(first.profile.grants.github, Some(false));
+        assert_eq!(second.profile.grants.github, Some(true));
+        assert!(!first.display.open.contains("host gh configuration"));
+        assert!(second.display.open.contains("host gh configuration"));
+        assert!(second.display.has_open_authority);
+        std::fs::remove_dir_all(project).unwrap();
+    }
+
     #[test]
     fn grant_disclosure_contains_every_required_field() {
         let rendered =
-            project_grant(Path::new("/work"), "claude", true).render();
+            project_grant(Path::new("/work"), "claude", Some(true)).render();
         for field in [
             "Resource:",
             "Access:",
@@ -2542,11 +3045,15 @@ mod tests {
         assert_eq!(grants.no_toolchains, Some(true));
         assert_eq!(grants.ssh, Some(false));
         assert_eq!(grants.github, Some(false));
+        assert_eq!(grants.no_docker, Some(true));
         assert_eq!(grants.network, None);
+        assert!(grants.private_home.is_none());
+        assert!(grants.inherit_env.is_none());
+        assert!(grants.aws.is_none());
     }
 
     #[test]
-    fn first_run_project_selection_does_not_promote_defaults() {
+    fn empty_project_grants_stay_empty_until_baseline_is_explicitly_applied() {
         let selection = Selection::from_project_grants(
             &Config::default(),
             "claude",
@@ -2558,8 +3065,131 @@ mod tests {
         assert!(!selection.dependency_hosts);
         assert!(!selection.ssh);
         assert!(!selection.github);
+        assert!(!selection.container_engine);
+        assert!(selection.additional.explicit);
+        assert!(!selection.additional.any_enabled());
         assert!(selection.ro_dirs.is_empty());
         assert!(selection.rw_dirs.is_empty());
+    }
+
+    #[test]
+    fn recommended_developer_baseline_includes_visible_github_open_access() {
+        let mut selection = Selection::default();
+        selection.apply_recommended_developer_baseline("claude");
+
+        assert!(selection.api_access);
+        assert!(selection.agent_state);
+        assert!(selection.dependency_hosts);
+        assert!(!selection.ssh);
+        assert!(selection.github);
+        assert!(!selection.container_engine);
+        assert_eq!(selection.additional, AdditionalSelection::default());
+        assert!(!selection.unrestricted_network);
+        assert!(!selection.loopback_connect);
+        assert!(selection.ro_dirs.is_empty());
+        assert!(selection.rw_dirs.is_empty());
+        assert!(selection.env_names.is_empty());
+    }
+
+    #[test]
+    fn unknown_harness_baseline_does_not_invent_an_api_destination() {
+        let mut selection = Selection::default();
+        selection.apply_recommended_developer_baseline("custom-harness");
+
+        assert!(!selection.api_access);
+        assert!(selection.agent_state);
+        assert!(selection.dependency_hosts);
+        assert!(selection.github);
+        assert!(selection.requested_hosts.is_empty());
+    }
+
+    #[test]
+    fn tui_container_and_additional_choices_map_to_the_same_config_fields_as_cli()
+     {
+        let selection = Selection {
+            container_engine: true,
+            additional: AdditionalSelection {
+                share_host_home: true,
+                lockdown: true,
+                gpu: true,
+                aws: true,
+                inherit_env: true,
+                worktree: true,
+                audit_log: true,
+                ..AdditionalSelection::default()
+            },
+            ..Selection::default()
+        };
+        let grants = selection.grants("claude");
+
+        assert!(grants.docker_enabled());
+        assert!(!grants.private_home_enabled());
+        assert!(grants.lockdown_enabled());
+        assert!(grants.gpu_enabled());
+        assert!(grants.aws_enabled());
+        assert!(grants.inherit_env_enabled());
+        assert!(grants.worktree_enabled());
+        assert!(grants.audit_log_enabled());
+    }
+
+    #[test]
+    fn every_additional_tui_choice_round_trips_through_config() {
+        let all = AdditionalSelection {
+            explicit: true,
+            share_host_home: true,
+            lockdown: true,
+            systemd_user: true,
+            gpu: true,
+            tailscale: true,
+            display: true,
+            audio: true,
+            kvm: true,
+            x11: true,
+            host_shm: true,
+            terminal_passthrough: true,
+            aws: true,
+            kube: true,
+            gcloud: true,
+            docker_config: true,
+            macos_host_ipc: true,
+            macos_chromium: true,
+            macos_trustd: true,
+            allow_pty: true,
+            allow_loopback_listen: true,
+            inherit_env: true,
+            worktree: true,
+            pictures: true,
+            audit_log: true,
+        };
+        let mut config = Config::default();
+        all.apply_to(&mut config);
+        assert_eq!(AdditionalSelection::from_config(&config), all);
+
+        let none = AdditionalSelection {
+            explicit: true,
+            ..AdditionalSelection::default()
+        };
+        none.apply_to(&mut config);
+        assert_eq!(AdditionalSelection::from_config(&config), none);
+    }
+
+    #[test]
+    fn completed_onboarding_reopens_saved_choices_without_applying_baseline() {
+        let config = Config {
+            agent_state: Some(false),
+            no_toolchains: Some(true),
+            github: Some(true),
+            ..Config::default()
+        };
+        let approved_env = vec!["GH_TOKEN".to_string()];
+        let selection =
+            initial_selection(&config, "claude", &approved_env, None, false);
+
+        assert!(!selection.api_access);
+        assert!(!selection.agent_state);
+        assert!(!selection.dependency_hosts);
+        assert!(selection.github);
+        assert_eq!(selection.env_names, approved_env);
     }
 
     #[test]
@@ -2581,8 +3211,19 @@ mod tests {
             writable: None,
             port: None,
         };
-        apply_wrapper_request(&mut selection, &private).unwrap();
-        apply_wrapper_request(&mut selection, &secret).unwrap();
+        let private = prepare_wrapper_request(
+            &private,
+            &selection,
+            "claude",
+            Path::new("/work/project"),
+        )
+        .unwrap();
+        apply_wrapper_request(&mut selection, &private);
+        let secret = PreparedWrapperRequest::Direct {
+            grant: env_grant(&secret.value, "claude"),
+            approval: secret,
+        };
+        apply_wrapper_request(&mut selection, &secret);
         let profile = selection.profile_for(&["claude".into()]);
         assert_eq!(profile.grants.allow_private_hosts, ["192.168.0.90"]);
         assert_eq!(
@@ -2590,6 +3231,145 @@ mod tests {
             Some(&"192.168.0.90".into())
         );
         assert_eq!(profile.approved_env_names, ["AI_MEMORY_AUTH_TOKEN"]);
+    }
+
+    #[test]
+    fn wrapper_map_requests_cannot_bypass_root_or_overlap_checks() {
+        let root_request = crate::integration::RequestApproval {
+            requester: "wrapper".into(),
+            kind: "map".into(),
+            value: "/".into(),
+            host: None,
+            writable: Some(false),
+            port: None,
+        };
+        let root_error = prepare_wrapper_request(
+            &root_request,
+            &Selection::default(),
+            "claude",
+            Path::new("/work/project"),
+        )
+        .unwrap_err();
+        assert!(root_error.contains("filesystem root"), "{root_error}");
+
+        let base = std::env::temp_dir()
+            .join(format!("ai-jail-wrapper-overlap-{}", std::process::id()));
+        let parent = base.join("shared");
+        let child = parent.join("nested");
+        std::fs::create_dir_all(&child).unwrap();
+        let parent = std::fs::canonicalize(parent).unwrap();
+        let child = std::fs::canonicalize(child).unwrap();
+        let selection = Selection {
+            ro_dirs: vec![parent],
+            ..Selection::default()
+        };
+        let overlap_request = crate::integration::RequestApproval {
+            requester: "wrapper".into(),
+            kind: "map".into(),
+            value: child.to_string_lossy().into_owned(),
+            host: None,
+            writable: Some(true),
+            port: None,
+        };
+        let overlap_error = prepare_wrapper_request(
+            &overlap_request,
+            &selection,
+            "claude",
+            &base,
+        )
+        .unwrap_err();
+        assert!(overlap_error.contains("Overlapping"), "{overlap_error}");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn wrapper_map_revoke_matches_the_canonical_persisted_grant() {
+        let base = std::env::temp_dir().join(format!(
+            "ai-jail-wrapper-canonical-revoke-{}",
+            std::process::id()
+        ));
+        let lexical_parent = base.join("a");
+        let real = base.join("real");
+        std::fs::create_dir_all(&lexical_parent).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        let presented = lexical_parent.join("..").join("real");
+        let approval = crate::integration::RequestApproval {
+            requester: "wrapper".into(),
+            kind: "map".into(),
+            value: presented.to_string_lossy().into_owned(),
+            host: None,
+            writable: Some(false),
+            port: None,
+        };
+        let mut selection = Selection::default();
+        let prepared =
+            prepare_wrapper_request(&approval, &selection, "claude", &base)
+                .unwrap();
+        apply_wrapper_request(&mut selection, &prepared);
+        assert_eq!(
+            selection.ro_dirs,
+            vec![std::fs::canonicalize(&real).unwrap()]
+        );
+
+        revoke_wrapper_request(&mut selection, &approval);
+        assert!(selection.ro_dirs.is_empty());
+        assert!(selection.rw_dirs.is_empty());
+        let profile = selection.profile("claude");
+        assert!(profile.grants.ro_maps.is_empty());
+        assert!(profile.grants.rw_maps.is_empty());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn wrapper_map_revoke_fails_closed_after_symlink_drift_or_removal() {
+        for scenario in ["retarget", "remove"] {
+            let base = std::env::temp_dir().join(format!(
+                "ai-jail-wrapper-symlink-revoke-{scenario}-{}",
+                std::process::id()
+            ));
+            let original = base.join("original");
+            let replacement = base.join("replacement");
+            let unrelated = base.join("unrelated");
+            let link = base.join("selected");
+            std::fs::create_dir_all(&original).unwrap();
+            std::fs::create_dir_all(&replacement).unwrap();
+            std::fs::create_dir_all(&unrelated).unwrap();
+            std::os::unix::fs::symlink(&original, &link).unwrap();
+            let approval = crate::integration::RequestApproval {
+                requester: "wrapper".into(),
+                kind: "map".into(),
+                value: link.to_string_lossy().into_owned(),
+                host: None,
+                writable: Some(false),
+                port: None,
+            };
+            let mut selection = Selection::default();
+            let prepared =
+                prepare_wrapper_request(&approval, &selection, "claude", &base)
+                    .unwrap();
+            apply_wrapper_request(&mut selection, &prepared);
+            selection
+                .rw_dirs
+                .push(std::fs::canonicalize(&unrelated).unwrap());
+            if scenario == "retarget" {
+                selection
+                    .rw_dirs
+                    .push(std::fs::canonicalize(&replacement).unwrap());
+            }
+
+            std::fs::remove_file(&link).unwrap();
+            if scenario == "retarget" {
+                std::os::unix::fs::symlink(&replacement, &link).unwrap();
+            }
+            revoke_wrapper_request(&mut selection, &approval);
+
+            assert!(selection.ro_dirs.is_empty(), "scenario {scenario}");
+            assert!(selection.rw_dirs.is_empty(), "scenario {scenario}");
+            let profile = selection.profile("claude");
+            assert!(profile.grants.ro_maps.is_empty());
+            assert!(profile.grants.rw_maps.is_empty());
+            std::fs::remove_dir_all(base).unwrap();
+        }
     }
 
     #[test]
@@ -2619,25 +3399,22 @@ mod tests {
             restricted_ssh_grant(&policy, "claude", Some(true)).render();
         assert!(rendered.contains("SHA256:fixture"));
         assert!(rendered.contains("private key files"));
-        assert!(rendered.contains(messages::SSH_SCOPE_ID));
+        assert!(rendered.contains("Only verified destination constraints"));
         assert!(rendered.contains("github.com"));
     }
 
     #[test]
-    fn restricted_ssh_guide_fixture_matches_production_prompts() {
-        let fixture =
-            include_str!("../tests/fixtures/onboarding/pty-restricted-ssh.txt");
-        for prompt in [
-            "Add key [a], remove key [r], destinations [h], disable [d], back [Enter]: ",
-            "Key number, private-key path, or .pub path: ",
-            "Required destinations, comma-separated: ",
-        ] {
-            assert!(fixture.contains(prompt));
-            assert!(include_str!("../docs/USER_GUIDE.md").contains(prompt));
-        }
-        assert!(fixture.contains(messages::SSH_ID));
-        assert!(fixture.contains(messages::SSH_SCOPE_ID));
-        assert!(include_str!("../docs/USER_GUIDE.md").contains("AJ-SSH-004"));
+    fn restricted_ssh_design_and_provenance_are_linked() {
+        let design = include_str!("../docs/TUI_DESIGN.md");
+        assert!(design.contains("## Selected-key SSH editor"));
+        assert!(design.contains("Private-key contents and the ambient agent are never displayed or shared"));
+        let provenance = include_str!("../docs/onboarding-provenance.toml");
+        assert!(
+            provenance.contains(
+                "policy = \"onboarding.restricted_ssh_selected_keys\""
+            )
+        );
+        assert!(provenance.contains("onboarding::tui::ssh::tests::security_detail_names_every_selected_key_boundary"));
     }
 
     #[test]
@@ -2711,7 +3488,8 @@ mod tests {
         let canonical = std::fs::canonicalize(alias_home.join(".aws")).unwrap();
         let error = reject_credential_root_for_home(&canonical, &alias_home)
             .unwrap_err();
-        assert!(error.contains(messages::CREDENTIAL_PATH_ID));
+        assert!(error.contains("Refusing credential-bearing path"));
+        assert!(!error.contains("AJ-"));
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -2778,17 +3556,17 @@ mod tests {
     }
 
     #[test]
-    fn environment_approval_fixture_and_guide_cannot_drift() {
-        let rendered = format!(
-            "{} Environment names only. Type to filter; arrows move; Space/Enter selects for approval; q/Esc returns. Values are never shown.\n  Filter: CUSTOM\n  > [ ] CUSTOM_MODE\n\n{}\n\n{} Host variable CUSTOM_MODE has unverifiable authority. Type OPEN to approve its name: OPEN\n",
-            messages::ENV_ID,
-            env_grant("CUSTOM_MODE", "claude").render(),
-            messages::OPEN_ID,
+    fn environment_approval_design_and_provenance_are_linked() {
+        let design = include_str!("../docs/TUI_DESIGN.md");
+        assert!(design.contains("## Environment selector"));
+        assert!(design.contains("Values are never loaded for"));
+        assert!(design.contains("rendering, displayed, logged, or persisted"));
+        let provenance = include_str!("../docs/onboarding-provenance.toml");
+        assert!(
+            provenance
+                .contains("policy = \"onboarding.environment_name_approval\"")
         );
-        let fixture =
-            include_str!("../tests/fixtures/onboarding/env-approval.txt");
-        assert_eq!(rendered, fixture);
-        assert!(include_str!("../docs/USER_GUIDE.md").contains(fixture));
+        assert!(provenance.contains("onboarding::tui::environment::tests::model_and_rendering_never_need_environment_values"));
     }
 
     #[test]
@@ -2798,6 +3576,7 @@ mod tests {
             messages::CHOICE_ID,
             messages::GRANT_ID,
             messages::OPEN_ID,
+            messages::PRESET_ID,
             messages::SUMMARY_ID,
             messages::SAVE_ID,
             messages::CANCEL_ID,
@@ -2810,6 +3589,10 @@ mod tests {
             messages::PATH_DRIFT_ID,
             messages::ENV_ID,
             messages::ENV_MISSING_ID,
+            messages::SSH_ID,
+            messages::SSH_SCOPE_ID,
+            messages::SSH_DRIFT_ID,
+            messages::SSH_NETWORK_ID,
         ];
         let mut sorted = ids.to_vec();
         sorted.sort_unstable();
@@ -2824,18 +3607,8 @@ mod tests {
     }
 
     #[test]
-    fn source_catalog_fixture_and_guide_cannot_drift() {
-        let fixture = include_str!("../tests/fixtures/onboarding/catalog.txt");
-        assert_eq!(source_linked_fixture(), fixture);
-        let guide = include_str!("../docs/USER_GUIDE.md");
-        assert!(guide.contains(fixture));
+    fn internal_catalog_and_provenance_cannot_drift() {
         let provenance = include_str!("../docs/onboarding-provenance.toml");
-        for id in fixture
-            .lines()
-            .filter_map(|line| line.split_once(' ').map(|v| v.0))
-        {
-            assert!(provenance.contains(id), "missing provenance for {id}");
-        }
 
         let document: toml::Value = toml::from_str(provenance).unwrap();
         let claims = document["claim"].as_array().unwrap();
@@ -2848,10 +3621,29 @@ mod tests {
         let claimed_count = claimed_ids.len();
         claimed_ids.dedup();
         assert_eq!(claimed_ids.len(), claimed_count, "duplicate provenance ID");
-        let mut catalog_ids = fixture
-            .lines()
-            .map(|line| line.split_once(' ').unwrap().0)
-            .collect::<Vec<_>>();
+        let mut catalog_ids = vec![
+            messages::INTRO_ID,
+            messages::CHOICE_ID,
+            messages::GRANT_ID,
+            messages::OPEN_ID,
+            messages::PRESET_ID,
+            messages::SUMMARY_ID,
+            messages::SAVE_ID,
+            messages::CANCEL_ID,
+            messages::NON_TTY_ID,
+            messages::CONFIG_NON_TTY_ID,
+            messages::FINAL_ID,
+            messages::PATH_REFUSED_ID,
+            messages::CREDENTIAL_PATH_ID,
+            messages::PATH_IDENTITY_ID,
+            messages::PATH_DRIFT_ID,
+            messages::ENV_ID,
+            messages::ENV_MISSING_ID,
+            messages::SSH_ID,
+            messages::SSH_SCOPE_ID,
+            messages::SSH_DRIFT_ID,
+            messages::SSH_NETWORK_ID,
+        ];
         catalog_ids.sort_unstable();
         assert_eq!(claimed_ids, catalog_ids, "catalog/provenance ID drift");
 
@@ -2911,7 +3703,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_secure_fixture_and_guide_cannot_drift() {
+    fn effective_secure_review_matches_tui_design_contract() {
         let rendered = render_effective_access(
             &Config {
                 command: vec!["claude".into()],
@@ -2930,9 +3722,20 @@ mod tests {
         )
         .unwrap()
             + "\n";
-        let fixture =
-            include_str!("../tests/fixtures/onboarding/effective-secure.txt");
-        assert_eq!(rendered, fixture);
-        assert!(include_str!("../docs/USER_GUIDE.md").contains(fixture));
+        assert!(rendered.contains("Complete effective access"));
+        assert!(rendered.contains("github = false"));
+        assert!(rendered.contains("ssh = false"));
+        assert!(rendered.contains("[WARN] ALLOWED"));
+        let design = include_str!("../docs/TUI_DESIGN.md");
+        assert!(design.contains("## Final review"));
+        assert!(
+            design.contains("exact effective policy and authority details")
+        );
+        let provenance = include_str!("../docs/onboarding-provenance.toml");
+        assert!(
+            provenance
+                .contains("policy = \"onboarding.complete_effective_access\"")
+        );
+        assert!(provenance.contains("onboarding::tui::review::tests::action_is_blocked_until_final_disclosure_line_is_reviewed"));
     }
 }

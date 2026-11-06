@@ -253,6 +253,19 @@ fn apply_child_env(
 
     cmd.envs(super::devin_child_env(config));
 
+    // Match the Linux backend: when container-engine access is explicitly
+    // enabled, point both Docker-compatible and native Podman clients at the
+    // exact socket admitted by the Seatbelt profile. This is especially
+    // important for rootless Podman and Colima, whose sockets are not at the
+    // Docker default path.
+    if docker_active(config, config.lockdown_enabled())
+        && let Some(socket) = macos_docker_socket()
+    {
+        let endpoint = format!("unix://{}", socket.display());
+        cmd.env("DOCKER_HOST", &endpoint);
+        cmd.env("CONTAINER_HOST", endpoint);
+    }
+
     // Filtered egress: force the proxy env onto the child, pointing at
     // the outer proxy's loopback TCP port. Emitted after the env_pass
     // application above: Command::env replaces earlier values, so a
@@ -2824,6 +2837,42 @@ mod tests {
         let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert!(!env.contains_key(std::ffi::OsStr::new("http_proxy")));
         assert!(!env.contains_key(std::ffi::OsStr::new("ALL_PROXY")));
+    }
+
+    #[test]
+    fn build_child_env_points_container_clients_at_admitted_socket() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-seatbelt-container-env-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("podman.sock");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let endpoint = format!("unix://{}", socket.display());
+        let _docker_host = EnvVarGuard::set("DOCKER_HOST", &endpoint);
+        let _container_host = EnvVarGuard::remove("CONTAINER_HOST");
+        let config = Config {
+            command: vec!["bash".into()],
+            no_mise: Some(true),
+            no_docker: Some(false),
+            ..Config::default()
+        };
+
+        let cmd = build(&config, &root, false, None, None).unwrap();
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        let expected = std::ffi::OsStr::new(&endpoint);
+        for key in ["DOCKER_HOST", "CONTAINER_HOST"] {
+            assert_eq!(
+                env.get(std::ffi::OsStr::new(key)).copied().flatten(),
+                Some(expected),
+                "{key}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

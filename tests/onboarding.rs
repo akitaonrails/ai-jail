@@ -2,8 +2,22 @@ mod common;
 
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
+
+use sha2::{Digest, Sha256};
+
+struct PtyStep<'a> {
+    wait_for: &'a str,
+    input: &'a [u8],
+}
+
+enum PtyInput<'a> {
+    Immediate(&'a [u8]),
+    Split { input: &'a [u8], at: usize },
+    Steps(&'a [PtyStep<'a>]),
+}
 
 #[test]
 fn noninteractive_configure_fails_without_writing_policy() {
@@ -26,8 +40,8 @@ fn noninteractive_configure_fails_without_writing_policy() {
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("AJ-NONTTY-002"), "{stderr}");
     assert!(stderr.contains("No configuration was changed"), "{stderr}");
+    assert!(!stderr.contains("AJ-"), "{stderr}");
     assert!(!xdg.exists());
     let _ = fs::remove_dir_all(root);
 }
@@ -55,11 +69,8 @@ fn noninteractive_first_run_renders_complete_effective_access() {
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("AJ-NONTTY-001"), "{stderr}");
-    assert!(
-        stderr.contains("AJ-FINAL-001 Complete effective access"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("Complete effective access"), "{stderr}");
+    assert!(!stderr.contains("AJ-"), "{stderr}");
     assert!(stderr.contains("no_mise = true"), "{stderr}");
     assert!(stderr.contains("no_toolchains = true"), "{stderr}");
     let projects = xdg.join("ai-jail/projects");
@@ -75,42 +86,6 @@ unsafe fn slave_stdio(fd: i32) -> Stdio {
     unsafe { Stdio::from_raw_fd(duplicated) }
 }
 
-#[cfg(feature = "test-hooks")]
-fn normalize_ssh_guest_paths(mut text: String) -> String {
-    const PREFIX: &str = "/tmp/ai-jail-ssh-";
-    let mut cursor = 0;
-    while let Some(relative) = text[cursor..].find(PREFIX) {
-        let start = cursor + relative;
-        let dynamic_start = start + PREFIX.len();
-        let Some(slash) = text[dynamic_start..].find('/') else {
-            break;
-        };
-        let dynamic_end = dynamic_start + slash;
-        let dynamic = &text[dynamic_start..dynamic_end];
-        if !dynamic.is_empty()
-            && dynamic
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte == b'-')
-        {
-            let (suffix, replacement) =
-                if text[dynamic_end..].starts_with("/public") {
-                    ("/public", "/tmp/ai-jail-ssh-public")
-                } else if text[dynamic_end..].starts_with("/agent.sock") {
-                    ("/agent.sock", "/tmp/ai-jail-ssh-agent.sock")
-                } else {
-                    cursor = dynamic_end + 1;
-                    continue;
-                };
-            let end = dynamic_end + suffix.len();
-            text.replace_range(start..end, replacement);
-            cursor = start + replacement.len();
-        } else {
-            cursor = dynamic_end + 1;
-        }
-    }
-    text
-}
-
 fn scripted_pty(
     label: &str,
     input: &[u8],
@@ -118,6 +93,36 @@ fn scripted_pty(
     term: &str,
     expected_code: i32,
     delayed_split: Option<usize>,
+) -> (std::path::PathBuf, std::path::PathBuf, String) {
+    let input = match delayed_split {
+        Some(at) => PtyInput::Split { input, at },
+        None => PtyInput::Immediate(input),
+    };
+    scripted_pty_driver(label, input, extra_env, term, expected_code)
+}
+
+fn scripted_pty_steps(
+    label: &str,
+    steps: &[PtyStep<'_>],
+    extra_env: &[(&str, &str)],
+    term: &str,
+    expected_code: i32,
+) -> (std::path::PathBuf, std::path::PathBuf, String) {
+    scripted_pty_driver(
+        label,
+        PtyInput::Steps(steps),
+        extra_env,
+        term,
+        expected_code,
+    )
+}
+
+fn scripted_pty_driver(
+    label: &str,
+    input: PtyInput<'_>,
+    extra_env: &[(&str, &str)],
+    term: &str,
+    expected_code: i32,
 ) -> (std::path::PathBuf, std::path::PathBuf, String) {
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("onboarding-{label}-{}", std::process::id()));
@@ -127,6 +132,13 @@ fn scripted_pty(
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&project).unwrap();
     fs::create_dir_all(&home).unwrap();
+    if matches!(label, "pty-forge-open" | "pty-forge-allowed") {
+        install_forge_binding_without_credential(
+            &project,
+            &xdg,
+            label == "pty-forge-allowed",
+        );
+    }
     if label == "pty-utf8-tab" {
         fs::create_dir_all(root.join("share-café")).unwrap();
     }
@@ -163,7 +175,13 @@ fn scripted_pty(
         }
     }
 
-    let pty = nix::pty::openpty(None, None).unwrap();
+    let window = nix::pty::Winsize {
+        ws_row: 32,
+        ws_col: 120,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pty = nix::pty::openpty(Some(&window), None).unwrap();
     let slave_fd = pty.slave.as_raw_fd();
     let mut command = Command::new(common::ai_jail());
     command
@@ -172,7 +190,13 @@ fn scripted_pty(
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &xdg)
         .env("NO_COLOR", "")
-        .env("TERM", term);
+        .env("TERM", term)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("GOOGLE_API_KEY")
+        .env_remove("XAI_API_KEY")
+        .env_remove("MOONSHOT_API_KEY");
     if label == "pty-restricted-ssh" {
         command.env("AI_JAIL_TEST_SSH_TOOL_DIR", root.join("ssh-tools"));
     }
@@ -196,6 +220,8 @@ fn scripted_pty(
     drop(pty.slave);
     let reader_fd = unsafe { nix::libc::dup(pty.master.as_raw_fd()) };
     assert!(reader_fd >= 0);
+    let transcript = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reader_transcript = transcript.clone();
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader_done = done.clone();
     let reader = std::thread::spawn(move || {
@@ -204,7 +230,6 @@ fn scripted_pty(
         use std::sync::atomic::Ordering;
 
         let reader = unsafe { std::os::fd::OwnedFd::from_raw_fd(reader_fd) };
-        let mut bytes = Vec::new();
         let mut buffer = [0u8; 8192];
         loop {
             let borrowed =
@@ -219,17 +244,30 @@ fn scripted_pty(
             }
             match nix::unistd::read(reader.as_raw_fd(), &mut buffer) {
                 Ok(0) | Err(_) => break,
-                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                Ok(count) => reader_transcript
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&buffer[..count]),
             }
         }
-        bytes
     });
-    if let Some(split) = delayed_split {
-        nix::unistd::write(&pty.master, &input[..split]).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        nix::unistd::write(&pty.master, &input[split..]).unwrap();
-    } else {
-        nix::unistd::write(&pty.master, input).unwrap();
+    match input {
+        PtyInput::Immediate(input) => {
+            nix::unistd::write(&pty.master, input).unwrap();
+        }
+        PtyInput::Split { input, at } => {
+            nix::unistd::write(&pty.master, &input[..at]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            nix::unistd::write(&pty.master, &input[at..]).unwrap();
+        }
+        PtyInput::Steps(steps) => {
+            let mut cursor = 0;
+            for step in steps {
+                wait_for_transcript(&transcript, step.wait_for, cursor);
+                cursor = transcript.lock().unwrap().len();
+                nix::unistd::write(&pty.master, step.input).unwrap();
+            }
+        }
     }
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -245,52 +283,195 @@ fn scripted_pty(
     };
     done.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(pty.master);
-    let bytes = reader.join().unwrap();
+    reader.join().unwrap();
+    let bytes = transcript.lock().unwrap().clone();
     let transcript = String::from_utf8_lossy(&bytes);
     assert_eq!(status.code(), Some(expected_code), "{transcript}");
     (root, xdg, transcript.into_owned())
 }
 
+fn install_forge_binding_without_credential(
+    project: &std::path::Path,
+    xdg: &std::path::Path,
+    scope_verified: bool,
+) {
+    let canonical = fs::canonicalize(project).unwrap();
+    let digest =
+        format!("{:x}", Sha256::digest(canonical.as_os_str().as_bytes()));
+    let base = canonical
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap();
+    let project_key = format!("{base}-{}", &digest[..20]);
+    let store = xdg.join("ai-jail");
+    let forges = store.join("forges");
+    fs::create_dir_all(&forges).unwrap();
+    for directory in [&store, &forges] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .unwrap();
+    }
+    let repository = if scope_verified {
+        "owner/allowed-review"
+    } else {
+        "owner/open-review"
+    };
+    let binding = format!(
+        "schema_version = 1\nprovider = \"gitlab_project\"\nrepository_id = 42\nrepository = \"{repository}\"\ncredential_id = \"missing-review-only-credential\"\nallow_private = false\nscope_verified = {scope_verified}\nscopes = [\"read_repository\"]\nexpires_at = \"2099-01-01\"\nopen_approved = true\n\n[origin]\nhost = \"gitlab.example\"\nport = 443\ntest_http = false\n"
+    );
+    let binding_path = forges.join(format!("{project_key}.toml"));
+    fs::write(&binding_path, binding).unwrap();
+    fs::set_permissions(binding_path, fs::Permissions::from_mode(0o600))
+        .unwrap();
+}
+
+fn wait_for_transcript(
+    transcript: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    needle: &str,
+    after: usize,
+) -> usize {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let bytes = transcript.lock().unwrap();
+        let text = String::from_utf8_lossy(&bytes[after.min(bytes.len())..]);
+        if let Some(relative) = text.find(needle) {
+            return after + relative + needle.len();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {needle:?}; transcript:\n{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        drop(bytes);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn assert_tui_terminal_restored(transcript: &str) {
+    assert_eq!(
+        transcript.matches("\x1b[?1049h").count(),
+        1,
+        "onboarding must use one alternate-screen session:\n{transcript}"
+    );
+    assert_eq!(
+        transcript.matches("\x1b[?1049l").count(),
+        1,
+        "onboarding must leave the alternate screen exactly once:\n{transcript}"
+    );
+    let enter = transcript
+        .find("\x1b[?1049h")
+        .expect("TUI must enter the alternate screen");
+    let leave = transcript
+        .rfind("\x1b[?1049l")
+        .expect("TUI must leave the alternate screen");
+    assert!(
+        leave > enter,
+        "alternate screen was not restored:\n{transcript}"
+    );
+
+    let hide = transcript
+        .find("\x1b[?25l")
+        .expect("TUI must hide the cursor while drawing");
+    let show = transcript
+        .rfind("\x1b[?25h")
+        .expect("TUI must restore the cursor");
+    assert!(show > hide, "cursor was not restored:\n{transcript}");
+}
+
 #[test]
-fn scripted_pty_can_select_api_review_and_save() {
+fn scripted_pty_can_review_and_save_recommended_baseline() {
+    let steps = [
+        PtyStep {
+            wait_for: "For developers applied",
+            input: b"s",
+        },
+        PtyStep {
+            wait_for: "choosing a final",
+            input: b"\x1b[F",
+        },
+        PtyStep {
+            wait_for: "\x1b[?25l",
+            input: b"s",
+        },
+        PtyStep {
+            wait_for: "Continue with OPEN authority?",
+            input: b"\t\r",
+        },
+    ];
     let (root, xdg, transcript) =
-        scripted_pty("pty", b"1y\nsy\n", &[], "xterm", 0, None);
-    for expected in
-        ["AJ-ONB-001", "AJ-GRANT-001", "AJ-FINAL-001", "AJ-SAVE-001"]
-    {
-        assert!(transcript.contains(expected), "{transcript}");
-    }
-    assert!(!transcript.contains("\x1b["), "NO_COLOR must disable ANSI");
-    let mut normalized = transcript.replace('\r', "");
-    normalized =
-        normalized.replace(&root.to_string_lossy().to_string(), "<ROOT>");
-    if let Some(start) = normalized.find("projects/project-")
-        && let Some(relative_end) = normalized[start..].find(".toml")
-    {
-        let end = start + relative_end + ".toml".len();
-        normalized.replace_range(start..end, "projects/<POLICY>.toml");
-    }
-    let fixture = include_str!("fixtures/onboarding/pty-secure-save.txt");
-    assert_eq!(normalized, fixture);
-    assert!(include_str!("../docs/USER_GUIDE.md").contains(fixture));
+        scripted_pty_steps("pty", &steps, &[], "xterm", 0);
+    assert!(transcript.contains("choosing a final"), "{transcript}");
+    assert!(transcript.contains("Configuration saved"), "{transcript}");
+    assert!(transcript.contains("api.anthropic.com"), "{transcript}");
+    assert!(!transcript.contains("AJ-"), "{transcript}");
+    assert_tui_terminal_restored(&transcript);
     assert!(xdg.join("ai-jail/projects").is_dir());
+    let policy_path = fs::read_dir(xdg.join("ai-jail/projects"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let policy = fs::read_to_string(policy_path).unwrap();
+    assert!(policy.contains("github = true"), "{policy}");
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn scripted_pty_environment_checklist_never_displays_or_saves_values() {
-    let (root, xdg, transcript) = scripted_pty(
+    let steps = [
+        PtyStep {
+            wait_for: "separately.",
+            input: b"e/CUSTOM_MODE\r ",
+        },
+        PtyStep {
+            wait_for: "Consequence:",
+            input: b"\x1b[F",
+        },
+        PtyStep {
+            wait_for: "\x1b[?25l",
+            input: b"\r",
+        },
+        PtyStep {
+            wait_for: "Share this environment value?",
+            input: b"\t\r",
+        },
+        PtyStep {
+            wait_for: "Selected",
+            input: b"\x1b",
+        },
+        PtyStep {
+            wait_for: "ANDROID_HOME",
+            input: b"\x1b",
+        },
+        PtyStep {
+            wait_for: "Review complete",
+            input: b"s",
+        },
+        PtyStep {
+            wait_for: "choosing a final",
+            input: b"\x1b[F",
+        },
+        PtyStep {
+            wait_for: "\x1b[?25l",
+            input: b"s",
+        },
+        PtyStep {
+            wait_for: "Continue with OPEN authority?",
+            input: b"\t\r",
+        },
+    ];
+    let (root, xdg, transcript) = scripted_pty_steps(
         "pty-env",
-        b"eCUSTOM_MODE\nOPEN\nsOPEN\ny\n",
+        &steps,
         &[("CUSTOM_MODE", "secret-value-that-must-never-appear")],
         "xterm",
         0,
-        None,
     );
-    assert!(transcript.contains("AJ-ENV-001"), "{transcript}");
     assert!(transcript.contains("CUSTOM_MODE"), "{transcript}");
-    assert!(transcript.contains("value hidden"), "{transcript}");
+    assert!(!transcript.contains("AJ-"), "{transcript}");
     assert!(!transcript.contains("secret-value-that-must-never-appear"));
+    assert_tui_terminal_restored(&transcript);
 
     let policies = fs::read_dir(xdg.join("ai-jail/projects")).unwrap();
     let policy_path = policies.into_iter().next().unwrap().unwrap().path();
@@ -302,35 +483,54 @@ fn scripted_pty_environment_checklist_never_displays_or_saves_values() {
 
 #[cfg(feature = "test-hooks")]
 #[test]
-fn scripted_pty_adds_removes_constrains_and_saves_restricted_ssh() {
-    let input = b"ka\n1\nkr\n1\nka\n1\nkh\ngit@github.com\n6OPEN\nsOPEN\ny\n";
+fn scripted_pty_configures_and_saves_destination_constrained_ssh() {
+    let steps = [
+        PtyStep {
+            wait_for: "separately.",
+            input: b"k ",
+        },
+        PtyStep {
+            // Ratatui may redraw the status line in fragments, with cursor
+            // movement between "Identity" and this stable suffix.
+            wait_for: "selected.",
+            input: b"\t\tagit@github.com\r",
+        },
+        PtyStep {
+            wait_for: "READY — selected-key SSH is destination constrained",
+            input: b"\x1b",
+        },
+        PtyStep {
+            wait_for: "Selected SSH keys (fresh agent)",
+            input: b"6",
+        },
+        PtyStep {
+            wait_for: "Open this boundary?",
+            input: b"\t\r",
+        },
+        PtyStep {
+            wait_for: "OPEN grant",
+            input: b"s",
+        },
+        PtyStep {
+            wait_for: "choosing a final",
+            input: b"\x1b[F",
+        },
+        PtyStep {
+            wait_for: "\x1b[?25l",
+            input: b"s",
+        },
+        PtyStep {
+            wait_for: "Continue with OPEN authority?",
+            input: b"\t\r",
+        },
+    ];
     let (root, xdg, transcript) =
-        scripted_pty("pty-restricted-ssh", input, &[], "xterm", 0, None);
-    let root_text = root.to_string_lossy();
-    let mut normalized = normalize_ssh_guest_paths(
-        transcript
-            .replace('\r', "")
-            .replace(root_text.as_ref(), "<ROOT>"),
-    );
-    if let Some(start) = normalized.find("projects/project-")
-        && let Some(relative_end) = normalized[start..].find(".toml")
-    {
-        let end = start + relative_end + ".toml".len();
-        normalized.replace_range(start..end, "projects/<POLICY>.toml");
-    }
-    let begin = normalized
-        .find("AJ-SSH-TRANSCRIPT-BEGIN")
-        .expect("production transcript begin marker");
-    let end_marker = "AJ-SSH-TRANSCRIPT-END selected-key SSH interaction";
-    let end = normalized[begin..]
-        .find(end_marker)
-        .map(|offset| begin + offset + end_marker.len())
-        .expect("production transcript end marker");
-    let security_transcript = format!("{}\n", &normalized[begin..end]);
-    let fixture = include_str!("fixtures/onboarding/pty-restricted-ssh.txt");
-    assert_eq!(security_transcript, fixture);
-    let fenced = format!("```text\n{fixture}```");
-    assert!(include_str!("../docs/USER_GUIDE.md").contains(&fenced));
+        scripted_pty_steps("pty-restricted-ssh", &steps, &[], "xterm", 0);
+    assert!(transcript.contains("SHA256:EXAMPLE"), "{transcript}");
+    assert!(transcript.contains("git@github.com"), "{transcript}");
+    assert!(!transcript.contains("AJ-"), "{transcript}");
+    assert!(!transcript.contains("private test fixture"), "{transcript}");
+    assert_tui_terminal_restored(&transcript);
     let policy_path = fs::read_dir(xdg.join("ai-jail/projects"))
         .unwrap()
         .next()
@@ -346,34 +546,35 @@ fn scripted_pty_adds_removes_constrains_and_saves_restricted_ssh() {
 }
 
 #[test]
-fn scripted_pty_arrows_and_space_select_the_highlighted_row() {
-    let (root, xdg, transcript) = scripted_pty(
-        "pty-arrows",
-        b"\x1b[B\x1b[A y\nsy\n",
-        &[],
-        "xterm",
-        0,
-        None,
-    );
-    assert!(
-        transcript.contains("[OK] Selected: host harness state"),
-        "{transcript}"
-    );
-    assert!(
-        transcript.contains("[OK] Selected: filtered model API"),
-        "{transcript}"
-    );
-    assert!(transcript.contains("api.anthropic.com"));
-    assert!(xdg.join("ai-jail/projects").is_dir());
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn term_dumb_q_cancels_at_the_first_review_prompt() {
+fn scripted_pty_arrows_move_the_highlighted_row_and_cancel_restores_terminal() {
+    let steps = [
+        PtyStep {
+            wait_for: "separately.",
+            input: b"\x1b[B",
+        },
+        PtyStep {
+            wait_for: "login/state",
+            input: b"q",
+        },
+    ];
     let (root, xdg, transcript) =
-        scripted_pty("pty-dumb-q", b"q\n", &[], "dumb", 130, None);
-    assert!(transcript.contains("Plain-terminal mode"));
-    assert!(transcript.contains("AJ-CANCEL-001"));
+        scripted_pty_steps("pty-arrows", &steps, &[], "xterm", 130);
+    assert!(transcript.contains("choices"), "{transcript}");
+    assert!(transcript.contains("login/state"), "{transcript}");
+    assert!(
+        transcript.contains("Filtered model API access"),
+        "{transcript}"
+    );
+    assert!(
+        !transcript.contains("Selected:"),
+        "the highlighted list row must be the only selection indicator:\n{transcript}"
+    );
+    assert!(
+        transcript.matches(";7m").count() >= 2
+            || transcript.matches("\x1b[7m").count() >= 2,
+        "initial and moved rows must both render highlighted:\n{transcript}"
+    );
+    assert_tui_terminal_restored(&transcript);
     let projects = xdg.join("ai-jail/projects");
     assert!(
         !projects.exists() || fs::read_dir(projects).unwrap().next().is_none()
@@ -382,22 +583,221 @@ fn term_dumb_q_cancels_at_the_first_review_prompt() {
 }
 
 #[test]
-fn lone_escape_returns_without_waiting_for_an_arrow_sequence() {
-    let (root, _xdg, transcript) =
-        scripted_pty("pty-lone-escape", b"\x1bq", &[], "xterm", 130, Some(1));
-    assert!(transcript.matches("AJ-CHOICE-001 Access choices").count() >= 2);
-    assert!(transcript.contains("AJ-CANCEL-001"));
+fn term_dumb_q_cancels_at_the_first_review_prompt() {
+    let (root, xdg, transcript) =
+        scripted_pty("pty-dumb-q", b"q\n", &[], "dumb", 130, None);
+    assert!(transcript.contains("Plain-terminal mode"));
+    assert!(transcript.contains("Onboarding cancelled"));
+    assert!(!transcript.contains("AJ-"));
+    let projects = xdg.join("ai-jail/projects");
+    assert!(
+        !projects.exists() || fs::read_dir(projects).unwrap().next().is_none()
+    );
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
-fn directory_tab_completion_accepts_utf8_paths() {
+fn escape_at_access_overview_explains_how_to_cancel() {
+    let steps = [
+        PtyStep {
+            wait_for: "separately.",
+            input: b"\x1b",
+        },
+        PtyStep {
+            wait_for: "q cancels setup.",
+            input: b"q",
+        },
+    ];
+    let (root, _xdg, transcript) =
+        scripted_pty_steps("pty-lone-escape", &steps, &[], "xterm", 130);
+    assert!(transcript.contains("q cancels setup."), "{transcript}");
+    assert_eq!(transcript.matches("\x1b[?1049h").count(), 1);
+    assert_tui_terminal_restored(&transcript);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn backing_out_of_final_review_then_cancelling_does_not_save() {
+    let steps = [
+        PtyStep {
+            wait_for: "separately.",
+            input: b"5s",
+        },
+        PtyStep {
+            wait_for: "choosing a final",
+            input: b"b",
+        },
+        PtyStep {
+            wait_for: "Review complete access",
+            input: b"q",
+        },
+    ];
+    let (root, xdg, transcript) =
+        scripted_pty_steps("pty-review-back", &steps, &[], "xterm", 130);
+    assert!(
+        transcript.contains("Review draft discarded"),
+        "{transcript}"
+    );
+    assert!(!transcript.contains("Configuration saved"), "{transcript}");
+    assert_tui_terminal_restored(&transcript);
+    let projects = xdg.join("ai-jail/projects");
+    assert!(
+        !projects.exists() || fs::read_dir(projects).unwrap().next().is_none()
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn directory_browser_accepts_utf8_paths() {
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("onboarding-pty-utf8-tab-{}", std::process::id()));
-    let input = format!("r{}/share-caf\t\ny\nsy\n", root.to_string_lossy());
+    let tui_input = format!("dg{}/share-café\r ", root.to_string_lossy());
+    let steps = [
+        PtyStep {
+            wait_for: "separately.",
+            input: tui_input.as_bytes(),
+        },
+        PtyStep {
+            wait_for: "Added READ-ONLY",
+            input: b"\t",
+        },
+        PtyStep {
+            wait_for: "Selected directories",
+            input: b"m",
+        },
+        PtyStep {
+            wait_for: "Set READ/WRITE",
+            input: b"m",
+        },
+        PtyStep {
+            // Ratatui updates only the changed mode suffix on this row.
+            wait_for: "-ONLY ac",
+            input: b" ",
+        },
+        PtyStep {
+            wait_for: "moved directory access",
+            input: b" ",
+        },
+        PtyStep {
+            wait_for: "Added READ-ONLY",
+            input: b"\x1b",
+        },
+        PtyStep {
+            wait_for: "Directory access",
+            input: b"s",
+        },
+        PtyStep {
+            wait_for: "choosing a final",
+            input: b"\x1b[F",
+        },
+        PtyStep {
+            wait_for: "\x1b[?25l",
+            input: b"s",
+        },
+        PtyStep {
+            wait_for: "Continue with OPEN authority?",
+            input: b"\t\r",
+        },
+    ];
     let (root, xdg, transcript) =
-        scripted_pty("pty-utf8-tab", input.as_bytes(), &[], "xterm", 0, None);
+        scripted_pty_steps("pty-utf8-tab", &steps, &[], "xterm", 0);
     assert!(transcript.contains("share-café"), "{transcript}");
+    assert!(transcript.contains("Selected directories"), "{transcript}");
+    assert!(transcript.contains("Set READ/WRITE"), "{transcript}");
+    assert!(
+        transcript.contains("moved directory access"),
+        "{transcript}"
+    );
+    assert!(!transcript.contains("AJ-"), "{transcript}");
+    assert_tui_terminal_restored(&transcript);
+    let policy_path = fs::read_dir(xdg.join("ai-jail/projects"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let policy = fs::read_to_string(policy_path).unwrap();
+    assert!(policy.contains("share-café"), "{policy}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn forge_open_metadata_is_reviewed_without_reading_a_credential() {
+    let steps = [
+        PtyStep {
+            wait_for: "separately.",
+            input: b"5s",
+        },
+        PtyStep {
+            wait_for: "choosing a final",
+            input: b"\x1b[F",
+        },
+        PtyStep {
+            wait_for: "owner/open-review",
+            input: b"s",
+        },
+        PtyStep {
+            wait_for: "Continue with OPEN authority?",
+            input: b"\r",
+        },
+        PtyStep {
+            wait_for: "cancelled.",
+            input: b"s",
+        },
+        PtyStep {
+            wait_for: "Continue with OPEN authority?",
+            input: b"\t\r",
+        },
+    ];
+    let (root, xdg, transcript) =
+        scripted_pty_steps("pty-forge-open", &steps, &[], "xterm", 0);
+    assert!(transcript.contains("cancelled."), "{transcript}");
+    assert!(!transcript.contains("Type OPEN"), "{transcript}");
+    assert!(transcript.contains("USER-ASSERTED"), "{transcript}");
+    assert!(transcript.contains("PERSISTENT"), "{transcript}");
+    assert!(transcript.contains("owner/open-review"), "{transcript}");
+    assert!(transcript.contains("Configuration saved"), "{transcript}");
+    assert!(
+        !transcript.contains("missing-review-only-credential"),
+        "credential identifiers are not review content:\n{transcript}"
+    );
+    assert_tui_terminal_restored(&transcript);
+    assert!(xdg.join("ai-jail/projects").is_dir());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn forge_scoped_metadata_is_allowed_without_open_confirmation() {
+    let steps = [
+        PtyStep {
+            wait_for: "separately.",
+            input: b"5s",
+        },
+        PtyStep {
+            wait_for: "choosing a final",
+            input: b"\x1b[F",
+        },
+        PtyStep {
+            wait_for: "owner/allowed-review",
+            input: b"s",
+        },
+    ];
+    let (root, xdg, transcript) =
+        scripted_pty_steps("pty-forge-allowed", &steps, &[], "xterm", 0);
+    assert!(transcript.contains("[WARN] ALLOWED"), "{transcript}");
+    assert!(transcript.contains("SCOPED"), "{transcript}");
+    assert!(transcript.contains("PERSISTENT"), "{transcript}");
+    assert!(transcript.contains("owner/allowed-review"), "{transcript}");
+    assert!(transcript.contains("Configuration saved"), "{transcript}");
+    assert!(
+        !transcript.contains("Final effective access contains OPEN authority."),
+        "scoped forge metadata must not cause OPEN confirmation:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("missing-review-only-credential"),
+        "credential identifiers are not review content:\n{transcript}"
+    );
+    assert_tui_terminal_restored(&transcript);
     assert!(xdg.join("ai-jail/projects").is_dir());
     let _ = fs::remove_dir_all(root);
 }

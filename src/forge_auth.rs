@@ -87,6 +87,34 @@ pub(crate) struct Binding {
     open_approved: bool,
 }
 
+/// Credential-free snapshot of the exact forge authority reviewed by a user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AuthorityPreview {
+    binding: Binding,
+}
+
+impl AuthorityPreview {
+    pub(crate) fn is_open(&self) -> bool {
+        !self.binding.scope_verified
+    }
+
+    pub(crate) fn summary(&self) -> String {
+        binding_summary(&self.binding)
+    }
+
+    pub(crate) fn summary_line(&self) -> String {
+        if self.is_open() {
+            format!("- [ERROR] OPEN: {}", self.summary())
+        } else {
+            format!("- [WARN] ALLOWED: {}", self.summary())
+        }
+    }
+
+    pub(crate) fn matches_runtime(&self, runtime: &Runtime) -> bool {
+        self.binding == runtime.binding
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Credential {
@@ -323,30 +351,7 @@ impl Runtime {
     }
 
     pub(crate) fn summary(&self) -> String {
-        let persistence = if !self.binding.scope_verified {
-            "OPEN · USER-ASSERTED · PERSISTENT"
-        } else if self.binding.provider.persistent() {
-            "SCOPED · PERSISTENT"
-        } else {
-            "SCOPED · SHORT-LIVED"
-        };
-        let proof = if self.binding.scope_verified {
-            "server capability verified"
-        } else {
-            "scope selected by the user; ai-jail cannot prove negative access"
-        };
-        format!(
-            "{}: {persistence}; {} / {}; repository ID {}; scopes {}; lifetime {}; {proof}",
-            self.binding.provider.label(),
-            self.binding.origin.display(),
-            self.binding.repository,
-            self.binding.repository_id,
-            self.binding.scopes.join(", "),
-            self.binding
-                .expires_at
-                .as_deref()
-                .unwrap_or("until revoked")
-        )
+        binding_summary(&self.binding)
     }
 
     pub(crate) fn summary_line(&self) -> String {
@@ -356,6 +361,74 @@ impl Runtime {
             format!("- [ERROR] OPEN: {}", self.summary())
         }
     }
+}
+
+fn binding_summary(binding: &Binding) -> String {
+    let persistence = if !binding.scope_verified {
+        "OPEN · USER-ASSERTED · PERSISTENT"
+    } else if binding.provider.persistent() {
+        "SCOPED · PERSISTENT"
+    } else {
+        "SCOPED · SHORT-LIVED"
+    };
+    let proof = if binding.scope_verified {
+        "server capability verified"
+    } else {
+        "scope selected by the user; ai-jail cannot prove negative access"
+    };
+    format!(
+        "{}: {persistence}; {} / {}; repository ID {}; scopes {}; lifetime {}; {proof}",
+        binding.provider.label(),
+        binding.origin.display(),
+        binding.repository,
+        binding.repository_id,
+        binding.scopes.join(", "),
+        binding.expires_at.as_deref().unwrap_or("until revoked")
+    )
+}
+
+pub(crate) fn authority_preview(
+    paths: &StorePaths,
+) -> Result<Option<AuthorityPreview>, String> {
+    Ok(load_binding(paths)?.map(|binding| AuthorityPreview { binding }))
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_binding_metadata(
+    paths: &StorePaths,
+    scoped: bool,
+) -> Result<(), String> {
+    let _lock = paths.prepare()?;
+    secure_subdir(&paths.root.join("forges"))?;
+    let provider = if scoped {
+        Provider::GithubApp
+    } else {
+        Provider::GitlabProject
+    };
+    let binding = Binding {
+        schema_version: SCHEMA_VERSION,
+        provider,
+        origin: Origin::parse(if scoped {
+            GITHUB_API_ORIGIN
+        } else {
+            "https://forge.example"
+        })?,
+        repository_id: 42,
+        repository: "owner/repo".into(),
+        credential_id: format!("{}-{}", "0".repeat(24), "1".repeat(24)),
+        allow_private: false,
+        scope_verified: scoped,
+        scopes: vec!["repository:write".into()],
+        expires_at: (!scoped).then(|| "2099-01-01".into()),
+        open_approved: !scoped,
+    };
+    atomic_private_write(
+        &binding_path(paths),
+        toml::to_string(&binding)
+            .map_err(|error| format!("Cannot encode test binding: {error}"))?
+            .as_bytes(),
+    )
+    .map_err(InstallError::message)
 }
 
 fn git_credential_helper(host: &str, repository: &str) -> String {
@@ -1965,6 +2038,77 @@ mod tests {
         assert!(!binding_text.contains("glpat-test-secret"));
         assert!(credential_text.contains("glpat-test-secret"));
         assert_eq!(toml::from_str::<Binding>(&binding_text).unwrap(), binding);
+    }
+
+    #[test]
+    fn authority_preview_reads_metadata_without_a_credential() {
+        let (base, paths) = test_store("preview-metadata-only");
+        let mut bound = binding(Provider::GitlabProject);
+        bound.credential_id = format!("{}-{}", "0".repeat(24), "1".repeat(24));
+        let credential = Credential {
+            schema_version: SCHEMA_VERSION,
+            provider: Provider::GitlabProject,
+            secret: SecretMaterial::PersistentToken {
+                token: SecretString::new("must-not-be-loaded".into()),
+            },
+        };
+        save(&paths, &bound, &credential).unwrap();
+        fs::remove_file(credential_path(&paths, &bound.credential_id).unwrap())
+            .unwrap();
+
+        let preview = authority_preview(&paths).unwrap().unwrap();
+        assert!(preview.is_open());
+        assert!(preview.summary_line().contains("[ERROR] OPEN"));
+        assert!(!preview.summary().contains("must-not-be-loaded"));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn verified_authority_preview_is_allowed() {
+        let preview = AuthorityPreview {
+            binding: binding(Provider::GithubApp),
+        };
+        assert!(!preview.is_open());
+        assert!(preview.summary_line().contains("[WARN] ALLOWED"));
+    }
+
+    #[test]
+    fn reviewed_forge_expectation_refuses_appearance_and_binding_change() {
+        let expected = AuthorityPreview {
+            binding: binding(Provider::GitlabProject),
+        };
+        let appeared = Runtime {
+            binding: expected.binding.clone(),
+            token: TokenGuard::persistent(Zeroizing::new("token".into())),
+        };
+        crate::ReviewedForge::Reviewed(Some(expected.clone()))
+            .verify(Some(&appeared))
+            .unwrap();
+        assert!(
+            crate::ReviewedForge::Reviewed(None)
+                .verify(Some(&appeared))
+                .unwrap_err()
+                .contains("appeared")
+        );
+        assert!(
+            crate::ReviewedForge::Reviewed(Some(expected.clone()))
+                .verify(None)
+                .unwrap_err()
+                .contains("disappeared")
+        );
+
+        let mut changed = expected.binding.clone();
+        changed.repository_id += 1;
+        let changed = Runtime {
+            binding: changed,
+            token: TokenGuard::persistent(Zeroizing::new("token".into())),
+        };
+        assert!(
+            crate::ReviewedForge::Reviewed(Some(expected))
+                .verify(Some(&changed))
+                .unwrap_err()
+                .contains("changed")
+        );
     }
 
     #[test]

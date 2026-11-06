@@ -918,9 +918,8 @@ fn path_exists(p: &Path) -> bool {
 /// Host path of the Docker/Podman socket to expose, if any: the
 /// first candidate we can actually reach.
 ///
-/// `$DOCKER_HOST` leads because it outranks every other endpoint
-/// source in the Docker CLI's own resolution order, and rootless
-/// Docker's setup instructs exporting it. Rootless Podman keeps its
+/// `$DOCKER_HOST` leads because it outranks every other Docker endpoint.
+/// `$CONTAINER_HOST` follows for native Podman. Rootless engines keep their
 /// socket under `$XDG_RUNTIME_DIR`, while the `podman-docker` compat
 /// package symlinks `/var/run/docker.sock` to the *rootful* socket
 /// under root-only `/run/podman` — the wrong daemon, and unreachable.
@@ -932,8 +931,21 @@ fn path_exists(p: &Path) -> bool {
 /// parsing if that turns up in practice.
 pub(crate) fn docker_socket() -> Option<PathBuf> {
     let docker_host = std::env::var("DOCKER_HOST").ok();
+    let container_host = std::env::var("CONTAINER_HOST").ok();
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let home = home_dir();
+    let uid = unsafe { nix::libc::geteuid() };
+    let user_runtime = PathBuf::from(format!("/run/user/{uid}"));
     let candidates = [
         docker_host.as_deref().and_then(docker_host_socket_path),
+        container_host.as_deref().and_then(docker_host_socket_path),
+        runtime.as_ref().map(|path| path.join("docker.sock")),
+        runtime.as_ref().map(|path| path.join("podman/podman.sock")),
+        Some(home.join(".docker/run/docker.sock")),
+        Some(home.join(".colima/default/docker.sock")),
+        Some(user_runtime.join("docker.sock")),
+        Some(user_runtime.join("podman/podman.sock")),
+        Some(PathBuf::from("/run/podman/podman.sock")),
         Some(PathBuf::from("/var/run/docker.sock")),
     ];
     candidates
@@ -3499,7 +3511,20 @@ mod tests {
         // Whatever is left is one of the well-known paths, or nothing
         // — this runs on hosts with and without a Docker socket.
         if let Some(p) = resolved {
-            let well_known = [PathBuf::from("/var/run/docker.sock")];
+            let uid = unsafe { nix::libc::geteuid() };
+            let mut well_known = vec![
+                home_dir().join(".docker/run/docker.sock"),
+                home_dir().join(".colima/default/docker.sock"),
+                PathBuf::from(format!("/run/user/{uid}/docker.sock")),
+                PathBuf::from(format!("/run/user/{uid}/podman/podman.sock")),
+                PathBuf::from("/run/podman/podman.sock"),
+                PathBuf::from("/var/run/docker.sock"),
+            ];
+            if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+                well_known.push(PathBuf::from(&runtime).join("docker.sock"));
+                well_known
+                    .push(PathBuf::from(runtime).join("podman/podman.sock"));
+            }
             assert!(
                 well_known.iter().any(|candidate| candidate == &p),
                 "unexpected fallback: {}",
@@ -3507,6 +3532,36 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn docker_socket_supports_container_host_and_rootless_runtime_discovery() {
+        let _lock = crate::test_utils::ENV_LOCK.lock().unwrap();
+        let root = docker_socket_fixture("podman-native");
+        let runtime = root.join("runtime");
+        std::fs::create_dir_all(runtime.join("podman")).unwrap();
+        let container_sock = root.join("container.sock");
+        let runtime_sock = runtime.join("podman/podman.sock");
+        let _container_listener =
+            std::os::unix::net::UnixListener::bind(&container_sock).unwrap();
+        let _runtime_listener =
+            std::os::unix::net::UnixListener::bind(&runtime_sock).unwrap();
+        let _docker = crate::test_utils::EnvVarGuard::remove("DOCKER_HOST");
+        let _container_clear =
+            crate::test_utils::EnvVarGuard::remove("CONTAINER_HOST");
+        let _container = crate::test_utils::EnvVarGuard::set(
+            "CONTAINER_HOST",
+            format!("unix://{}", container_sock.display()),
+        );
+        let _runtime = crate::test_utils::EnvVarGuard::set(
+            "XDG_RUNTIME_DIR",
+            runtime.display().to_string(),
+        );
+
+        assert_eq!(docker_socket(), Some(container_sock.clone()));
+        drop(_container);
+        assert_eq!(docker_socket(), Some(runtime_sock));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

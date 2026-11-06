@@ -7,8 +7,11 @@ registries, gated on an unprivileged-netns probe with offline fallback (not the
 plain always-on variant sketched below); rust support also maps the toolchain
 binaries read-only so `cargo`/`rustc` resolve; credential passthrough
 (`--github`/`--aws`/`--kube`/`--gcloud`/`--docker-config`) was added opt-in.
-Part B (container-socket auto-discovery) was deferred. Implementation details
-below are the original plan and may differ in specifics from what shipped.
+Part B was subsequently implemented: the explicit `--docker` grant discovers
+reachable Docker and Podman Unix sockets, including rootless endpoints, and
+forwards the resolved endpoint to compatible clients. TCP and SSH daemon
+endpoints remain excluded. Implementation details below are the original plan
+and may differ in specifics from what shipped.
 
 Two workstreams, both answering "is ai-jail friendly to the tools a developer
 needs inside the jail, without leaking too much":
@@ -269,39 +272,34 @@ mise-enabled read-only path; a user `--env` override wins.
 
 # Part B — Container tooling (docker / podman / …)
 
-## Current state
+## Implemented state
 
-`--docker` / `no_docker` (opt-in, default off) exposes the host daemon socket:
-`docker_socket()` resolves `$DOCKER_HOST` (`unix://` only; TCP/SSH refused by
-design) else `/var/run/docker.sock`, requires an actual socket, binds it rw (mount
-order step 4) with a Landlock rule. A podman socket via `$DOCKER_HOST` already
-works (there is a test). This is a deliberate host-root trust extension and stays
-opt-in; the warning stays.
+`--docker` / `no_docker` (opt-in, default off) exposes one reachable host
+daemon socket. `docker_socket()` resolves, in order:
 
-## Additions (opt-in, additive, backward-compatible)
-
-1. **Auto-discover rootless/podman sockets.** After `$DOCKER_HOST`, add, in order,
-   each gated behind `--docker`, first actual socket wins:
+1. `$DOCKER_HOST` (`unix://` only; TCP/SSH refused by design)
+2. Podman's `$CONTAINER_HOST` with the same validation
+3. Rootless/runtime and common desktop locations:
    - `$XDG_RUNTIME_DIR/docker.sock` (rootless Docker)
    - `$XDG_RUNTIME_DIR/podman/podman.sock` and `/run/user/<uid>/podman/podman.sock`
+   - `/run/user/<uid>/docker.sock`
+   - `~/.docker/run/docker.sock` and `~/.colima/default/docker.sock`
    - `/run/podman/podman.sock` (rootful podman)
    - `/var/run/docker.sock` (unchanged, last)
-     Backward compatible: `$DOCKER_HOST` still leads; the two existing socket tests
-     stay green.
-2. **Honor `$CONTAINER_HOST`** (podman's own var), same `unix://` parsing, ranked
-   just below `$DOCKER_HOST`.
-3. **Forward the resolved endpoint into the child env** as
-   `DOCKER_HOST=unix:///var/run/docker.sock` (the in-jail bind path) when a
-   non-default socket was chosen, overridable by an explicit user `--env`.
+
+The candidate must be an actual reachable Unix socket. It is bound read/write
+and the resolved endpoint is forced into the child as both `DOCKER_HOST` and
+`CONTAINER_HOST`, after environment filtering, so Docker and native Podman
+clients select the same mounted socket. This is a deliberate daemon-owner
+authority extension and stays opt-in with an OPEN warning.
 
 ## Deliberately out of scope / separate follow-ups
 
-- **Registry credentials** (`~/.docker/config.json`,
-  `~/.config/containers/auth.json`). `.docker` is in `DOTDIR_DENY` for good
-  reason. A separate explicit opt-in (e.g. `--docker-config`, read-only, default
-  off) — filed, not built in v1. (Note: a read-only `~/.docker/config.json` is
-  already mounted under `--no-private-home` + `--docker`; this follow-up is about
-  the private-home default.)
+- **Native Podman registry credentials** (`~/.config/containers/auth.json`).
+  Docker registry credentials are now a separate explicit `--docker-config`
+  read-only grant, default off and available in the TUI. Podman's distinct auth
+  file still needs its own narrowly named opt-in; it must not be implied by
+  daemon access.
 - **Nested/rootless container creation _inside_ the jail** (podman/buildah
   building/running within the sandbox) needs userns, subuid/subgid, `/dev/fuse`,
   fuse-overlayfs, and fights bwrap's userns handling. Out of scope: the supported

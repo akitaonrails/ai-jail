@@ -441,7 +441,7 @@ pub(crate) fn validate_policy(policy: &Policy) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_destination(value: &str) -> Result<(), String> {
+pub(crate) fn validate_destination(value: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 253
         || !value.bytes().all(|b| {

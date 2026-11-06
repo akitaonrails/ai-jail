@@ -203,6 +203,7 @@ struct MountSet {
     gpu: Vec<Mount>,
     kvm: Vec<Mount>,
     docker: Vec<Mount>,
+    docker_env: Vec<(String, String)>,
     tailscale: Vec<Mount>,
     shm: Vec<Mount>,
     display: Vec<Mount>,
@@ -391,6 +392,11 @@ impl MountSet {
                 args.push(val.clone());
             }
             for (key, val) in &self.audio_env {
+                args.push("--setenv".into());
+                args.push(key.clone());
+                args.push(val.clone());
+            }
+            for (key, val) in &self.docker_env {
                 args.push("--setenv".into());
                 args.push(key.clone());
                 args.push(val.clone());
@@ -2012,6 +2018,11 @@ fn discover_mounts_full(
     let (overlay_outside, overlay_inside) =
         split_by_project(overlay_mounts_v, project_dir);
 
+    let (docker_mounts, docker_env) = if enable_docker {
+        discover_docker()
+    } else {
+        (vec![], vec![])
+    };
     let mounts = MountSet {
         base: discover_base(
             sources.hosts_mount,
@@ -2060,11 +2071,8 @@ fn discover_mounts_full(
         } else {
             vec![]
         },
-        docker: if enable_docker {
-            discover_docker()
-        } else {
-            vec![]
-        },
+        docker: docker_mounts,
+        docker_env,
         tailscale: if enable_tailscale {
             discover_tailscale()
         } else {
@@ -3183,11 +3191,23 @@ fn discover_kvm_at(kvm: &Path, verbose: bool) -> Vec<Mount> {
     }]
 }
 
-fn discover_docker() -> Vec<Mount> {
+fn discover_docker() -> (Vec<Mount>, Vec<(String, String)>) {
     let Some(sock) = super::docker_socket() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    discover_docker_paths(&sock, Path::new(WSL_DOCKER_DESKTOP_CLI_TOOLS))
+    let mounts =
+        discover_docker_paths(&sock, Path::new(WSL_DOCKER_DESKTOP_CLI_TOOLS));
+    if mounts.is_empty() {
+        return (mounts, Vec::new());
+    }
+    let endpoint = format!("unix://{}", sock.display());
+    (
+        mounts,
+        vec![
+            ("DOCKER_HOST".into(), endpoint.clone()),
+            ("CONTAINER_HOST".into(), endpoint),
+        ],
+    )
 }
 
 fn discover_docker_paths(sock: &Path, wsl_cli_tools: &Path) -> Vec<Mount> {
@@ -8037,6 +8057,16 @@ mod tests {
                 "DBUS_SESSION_BUS_ADDRESS".into(),
                 "unix:path=/run/user/1000/bus".into(),
             )],
+            docker_env: vec![
+                (
+                    "DOCKER_HOST".into(),
+                    "unix:///run/user/1000/podman/podman.sock".into(),
+                ),
+                (
+                    "CONTAINER_HOST".into(),
+                    "unix:///run/user/1000/podman/podman.sock".into(),
+                ),
+            ],
             ssh_env: vec![(
                 "SSH_AUTH_SOCK".into(),
                 "/run/user/1000/ssh".into(),
@@ -8063,6 +8093,8 @@ mod tests {
             "DISPLAY",
             "XAUTHORITY",
             "DBUS_SESSION_BUS_ADDRESS",
+            "DOCKER_HOST",
+            "CONTAINER_HOST",
             "SSH_AUTH_SOCK",
             "CLAUDE_CONFIG_DIR",
             "PS1",

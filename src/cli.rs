@@ -1139,6 +1139,36 @@ mod tests {
     }
 
     #[test]
+    fn every_documented_cli_option_has_a_tui_parity_classification() {
+        let parity = include_str!("../docs/CLI_TUI_PARITY.md");
+        let guidelines = include_str!("../CLAUDE.md");
+        assert!(guidelines.contains("Interface synchronization contract"));
+        assert!(guidelines.contains("CLI/config/TUI capability-parity check"));
+
+        for line in HELP.lines().filter(|line| {
+            line.starts_with("    --")
+                || (line.starts_with("    -") && line.contains(", --"))
+        }) {
+            for token in line
+                .split_whitespace()
+                .filter(|token| token.starts_with("--"))
+            {
+                let option = token
+                    .chars()
+                    .take_while(|character| {
+                        character.is_ascii_alphanumeric()
+                            || matches!(character, '-' | '_')
+                    })
+                    .collect::<String>();
+                assert!(
+                    parity.contains(&format!("`{option}`")),
+                    "{option} is in CLI help but missing from docs/CLI_TUI_PARITY.md"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn every_guarded_sandbox_flag_is_parseable() {
         // Regression for the --ro-map bug: a flag listed in the sandbox-flag
         // guard but missing its parse arm fails with "unknown option" before

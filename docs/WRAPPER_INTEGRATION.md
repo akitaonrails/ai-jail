@@ -131,10 +131,16 @@ identified as requester `command-line`; structured requests should use a
 manifest so they can carry a reason, secret host, writable bit, or port.
 
 On interactive onboarding or `configure`, each request is shown with its
-requester, reason, and resource. It begins selected but can be denied. OPEN
-authority still requires the final exact `OPEN` confirmation. The trusted
+requester, reason, and resource in the persistent staged-request review. Every
+request begins undecided and needs an explicit APPROVE or REJECT decision.
+Opening or revealing a request approves nothing. OPEN authority uses an
+in-TUI confirmation dialog for that request and another confirmation dialog
+before the chosen final action; Cancel is focused by default in both. The trusted
 external project document stores the normalized request identity and requester
 alongside the resulting grant. It does not store environment values.
+
+See the [onboarding walkthrough](USER_GUIDE.md#wrapper-staged-requests) for the
+user flow and [TUI design contract](TUI_DESIGN.md) for renderer invariants.
 
 An existing profile applies only exact requests it previously approved. A new
 or changed request exits with code 3 before the sandbox starts. Review it with:

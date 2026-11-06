@@ -146,7 +146,8 @@ fn noninteractive_unapproved_request_fails_with_distinct_code() {
     ]);
     assert_eq!(output.status.code(), Some(3), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("AJ-REQ-002"), "{stderr}");
+    assert!(stderr.contains("Wrapper request from"), "{stderr}");
+    assert!(!stderr.contains("AJ-"), "{stderr}");
 }
 
 #[test]

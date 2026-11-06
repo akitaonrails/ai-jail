@@ -72,10 +72,12 @@ system-level, so only `--network` applies there. A macOS hard browser profile
 lives in the launch's dedicated session scratch directory and is removed when
 the browser exits; only the selected native `.app` bundle is readable, not all
 of `/Applications`. Systemd user integration uses explicit narrow sockets
-only. Docker requires `DOCKER_HOST` to name an
-actual Unix socket; network endpoints are not mounted, and `~/.docker` is not
-broadly mounted. Kimi and other agent state is command-specific under private
-home.
+only. Docker/Podman control is opt-in and requires an actual reachable Unix
+socket. ai-jail checks `DOCKER_HOST`, `CONTAINER_HOST`, standard rootless
+runtime locations, common macOS Docker Desktop/Colima locations, then rootful
+Podman and Docker sockets. Network endpoints are not mounted, the resolved
+Unix endpoint is forwarded to both CLIs, and `~/.docker` is not broadly
+mounted. Kimi and other agent state is command-specific under private home.
 
 `--allow-tcp-port` is accepted for compatibility but launch fails closed. UDP
 cannot be securely constrained by that interface. Use `--network` if the

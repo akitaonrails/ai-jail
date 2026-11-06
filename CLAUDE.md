@@ -14,6 +14,7 @@ src/
   cli.rs          -- argument parsing with lexopt
   config.rs       -- config schema, legacy parsing, and policy merge
   config_store.rs -- trusted external store and legacy migration
+  onboarding/     -- persistent Ratatui onboarding screens and editors
   sandbox/
     mod.rs        -- shared sandbox logic, mount lists, launch wrapper
     bwrap.rs      -- bwrap command builder + mount discovery (Linux)
@@ -29,6 +30,29 @@ src/
   command.rs      -- harness/ai-memory wrapper detection, effective command names
   fsutil.rs       -- atomic file writes (0600), symlink-safe target checks
 ```
+
+The onboarding UI contract is documented in `docs/TUI_DESIGN.md`. Keep its
+wide/narrow layout, disclosure gating, plain-terminal fallback, terminal
+restoration, and internal-only provenance-ID rules aligned with implementation
+and tests.
+
+### Interface synchronization contract
+
+- Treat the CLI, Ratatui onboarding, saved configuration, effective-access
+  review, user guide, and provenance annotations as one product surface.
+- When adding, removing, renaming, or changing any security-relevant CLI flag,
+  config field, default, capability, or constraint, audit every other surface
+  in the same change. Never update the CLI while silently leaving onboarding
+  or its complete-access review stale.
+- Every broadly useful capability must have a discoverable onboarding control.
+  An intentionally advanced or noninteractive-only CLI option may remain out
+  of the TUI only when the omission is documented with its rationale and the
+  final effective-access review still reports its effect.
+- Update `docs/TUI_DESIGN.md`, `docs/USER_GUIDE.md`, and
+  `docs/onboarding-provenance.toml` with the implementation. Add or update a
+  drift test that fails when the relevant surfaces no longer agree.
+- Reviews and releases must include a CLI/config/TUI capability-parity check;
+  undocumented omissions block release.
 
 ## Critical Rule: Backward Compatibility
 
