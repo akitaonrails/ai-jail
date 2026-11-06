@@ -179,13 +179,13 @@ impl Capability {
         }
     }
 
-    pub(super) const fn detail(self) -> &'static str {
+    const fn security_detail(self) -> &'static str {
         match self {
             Self::ShareHostHome => {
                 "Shares\nYour entire host home directory read/write.\n\nRisk\nThe harness can read credentials and personal files and modify anything your user owns. Prefer specific directory grants."
             }
             Self::Lockdown => {
-                "Restricts\nRemoves optional host integration and keeps writable access narrow.\n\nNote\nThis can override other enabled choices. The final review shows the effective result."
+                "Restricts\nRemoves optional host integration and keeps writable access narrow.\n\nNote\nThis can override other enabled choices. The resulting state remains visible in this screen."
             }
             Self::SystemdUser => {
                 "Allows\nRequests to your host systemd user manager.\n\nRisk\nThe harness may start or change services as your host user."
@@ -255,6 +255,91 @@ impl Capability {
             }
         }
     }
+
+    pub(super) const fn use_when(self) -> &'static str {
+        match self {
+            Self::ShareHostHome => {
+                "A task genuinely needs broad access across your home and specific directories are impractical."
+            }
+            Self::Lockdown => {
+                "You want the strictest supported baseline and can accept reduced tool compatibility."
+            }
+            Self::SystemdUser => {
+                "The harness must inspect, start, stop, or debug your user services."
+            }
+            Self::Gpu => {
+                "The task runs GPU compute, rendering, or hardware-accelerated tests."
+            }
+            Self::Tailscale => {
+                "The task must reach a service available only through your tailnet identity."
+            }
+            Self::Display => {
+                "GUI applications must open on Wayland so the harness can run, instrument, or debug them."
+            }
+            Self::Audio => {
+                "The task must record, inspect, test, or play microphone or system audio."
+            }
+            Self::Kvm => {
+                "The task launches hardware-accelerated virtual machines or VM-based tests."
+            }
+            Self::X11 => {
+                "A GUI application requires X11 and cannot use Wayland or a headless display."
+            }
+            Self::HostShm => {
+                "A host application and jailed process must exchange data through shared memory."
+            }
+            Self::RawTerminal => {
+                "A trusted interactive program requires terminal features blocked by VT filtering."
+            }
+            Self::Aws => {
+                "The task must inspect or change AWS resources using your configured identity."
+            }
+            Self::Kubernetes => {
+                "The task must inspect, deploy, or debug workloads in your configured clusters."
+            }
+            Self::Gcloud => {
+                "The task must inspect or change Google Cloud resources using your configured identity."
+            }
+            Self::RegistryCredentials => {
+                "The task must pull or push private images with your configured registry accounts."
+            }
+            Self::MacosHostIpc => {
+                "A macOS application cannot run with the narrower Chromium or trust-service grants."
+            }
+            Self::MacosChromium => {
+                "Chromium-based applications on macOS need their narrow rendezvous service."
+            }
+            Self::MacosTrustd => {
+                "A macOS TLS client needs the host trust service to verify certificates."
+            }
+            Self::MacosPty => {
+                "A macOS task must create runtime pseudo-terminals for interactive subprocesses."
+            }
+            Self::MacosLoopbackListen => {
+                "A macOS development server must listen locally while outbound access stays filtered."
+            }
+            Self::FullEnvironment => {
+                "A legacy tool needs many unpredictable variables and selecting exact names is not workable."
+            }
+            Self::Worktree => {
+                "The project is a linked Git worktree and the harness must create commits or update metadata."
+            }
+            Self::Pictures => {
+                "The task needs to inspect or process images from your Pictures directory."
+            }
+            Self::AuditLog => {
+                "You need a local record of launches and filtered-network policy decisions."
+            }
+        }
+    }
+
+    pub(super) fn detail(self) -> String {
+        format!(
+            "{}\n\nUse when\n{}",
+            self.security_detail(),
+            self.use_when()
+        )
+    }
 }
 
 pub(super) struct State {
@@ -295,6 +380,7 @@ mod tests {
         for capability in Capability::ALL {
             let detail = capability.detail();
             assert!(!detail.trim().is_empty(), "{capability:?}");
+            assert!(detail.contains("Use when\n"), "{capability:?}: {detail}");
             assert!(
                 detail.split_whitespace().count() <= 70,
                 "{capability:?} is too verbose: {detail}"

@@ -324,6 +324,156 @@ fn install_forge_binding_without_credential(
         .unwrap();
 }
 
+/// One terminal cell: the character drawn there and the byte offset it was
+/// written at. The offset keeps the step cursor meaningful while matching
+/// what a user actually sees.
+type ScreenCell = Option<(char, usize)>;
+
+const SCREEN_ROWS: usize = 64;
+const SCREEN_COLS: usize = 256;
+
+/// Replay a ratatui byte stream into a character grid.
+///
+/// The onboarding UI redraws incrementally: a dialog's label is written as
+/// separate runs positioned with cursor moves, so its text never appears as
+/// one contiguous slice of the raw stream. Matching the rendered grid is what
+/// a user (and a keystroke) is actually responding to.
+fn render_screen(bytes: &[u8]) -> Vec<Vec<ScreenCell>> {
+    let mut screen = vec![vec![None; SCREEN_COLS]; SCREEN_ROWS];
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let text = String::from_utf8_lossy(bytes);
+    let mut chars = text.char_indices().peekable();
+    while let Some((offset, ch)) = chars.next() {
+        match ch {
+            '\x1b' => {
+                let Some((_, '[')) = chars.next() else {
+                    // OSC and other strings: skip to BEL or ST.
+                    for (_, next) in chars.by_ref() {
+                        if next == '\x07' {
+                            break;
+                        }
+                    }
+                    continue;
+                };
+                let mut params = String::new();
+                let mut final_byte = None;
+                for (_, next) in chars.by_ref() {
+                    if next.is_ascii_digit() || next == ';' || next == '?' {
+                        params.push(next);
+                    } else {
+                        final_byte = Some(next);
+                        break;
+                    }
+                }
+                let numbers: Vec<usize> = params
+                    .trim_start_matches('?')
+                    .split(';')
+                    .map(|part| part.parse().unwrap_or(0))
+                    .collect();
+                match final_byte {
+                    Some('H') | Some('f') => {
+                        row = numbers
+                            .first()
+                            .copied()
+                            .filter(|value| *value > 0)
+                            .unwrap_or(1)
+                            .saturating_sub(1);
+                        col = numbers
+                            .get(1)
+                            .copied()
+                            .filter(|value| *value > 0)
+                            .unwrap_or(1)
+                            .saturating_sub(1);
+                    }
+                    Some('J') => match numbers.first().copied().unwrap_or(0) {
+                        2 | 3 => {
+                            for line in screen.iter_mut() {
+                                line.fill(None);
+                            }
+                            row = 0;
+                            col = 0;
+                        }
+                        _ => {
+                            if let Some(line) = screen.get_mut(row) {
+                                for cell in line.iter_mut().skip(col) {
+                                    *cell = None;
+                                }
+                            }
+                            for line in screen.iter_mut().skip(row + 1) {
+                                line.fill(None);
+                            }
+                        }
+                    },
+                    Some('K') => {
+                        if let Some(line) = screen.get_mut(row) {
+                            match numbers.first().copied().unwrap_or(0) {
+                                2 => line.fill(None),
+                                _ => {
+                                    for cell in line.iter_mut().skip(col) {
+                                        *cell = None;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Entering or leaving the alternate screen starts a
+                    // fresh picture, so earlier frames must not match.
+                    Some('h') | Some('l') if params.contains("1049") => {
+                        for line in screen.iter_mut() {
+                            line.fill(None);
+                        }
+                        row = 0;
+                        col = 0;
+                    }
+                    _ => {}
+                }
+            }
+            '\r' => col = 0,
+            '\n' => {
+                row = row.saturating_add(1);
+                col = 0;
+            }
+            ch if ch.is_control() => {}
+            ch => {
+                if let Some(cell) =
+                    screen.get_mut(row).and_then(|line| line.get_mut(col))
+                {
+                    *cell = Some((ch, offset));
+                }
+                col = col.saturating_add(1);
+            }
+        }
+    }
+    screen
+}
+
+/// Find `needle` as contiguous text on one rendered row, ignoring cells that
+/// were written before `after`. Returns the byte offset just past the match.
+fn find_on_screen(bytes: &[u8], needle: &str, after: usize) -> Option<usize> {
+    let needle: Vec<char> = needle.chars().collect();
+    if needle.is_empty() {
+        return Some(after);
+    }
+    for line in render_screen(bytes) {
+        let cells: Vec<Option<(char, usize)>> = line;
+        for start in 0..cells.len().saturating_sub(needle.len() - 1) {
+            let window = &cells[start..start + needle.len()];
+            let matches = window.iter().zip(&needle).all(
+                |(cell, wanted)| matches!(cell, Some((ch, _)) if ch == wanted),
+            );
+            if !matches {
+                continue;
+            }
+            let last = window.last().and_then(|cell| cell.map(|(_, at)| at))?;
+            if last + 1 > after {
+                return Some(last + 1);
+            }
+        }
+    }
+    None
+}
+
 fn wait_for_transcript(
     transcript: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     needle: &str,
@@ -333,9 +483,15 @@ fn wait_for_transcript(
         std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let bytes = transcript.lock().unwrap();
-        let text = String::from_utf8_lossy(&bytes[after.min(bytes.len())..]);
-        if let Some(relative) = text.find(needle) {
-            return after + relative + needle.len();
+        // Raw control sequences (e.g. a cursor-hide marker) are matched on
+        // the stream; user-visible text is matched on the rendered screen.
+        let raw = String::from_utf8_lossy(&bytes[after.min(bytes.len())..]);
+        let found = raw
+            .find(needle)
+            .map(|relative| after + relative + needle.len())
+            .or_else(|| find_on_screen(&bytes, needle, after));
+        if let Some(position) = found {
+            return position;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -379,33 +535,62 @@ fn assert_tui_terminal_restored(transcript: &str) {
 }
 
 #[test]
-fn scripted_pty_can_review_and_save_recommended_baseline() {
+fn scripted_pty_confirms_recommended_github_and_saves_without_final_review() {
     let steps = [
         PtyStep {
-            wait_for: "For developers applied",
+            wait_for: "AI-JAIL",
             input: b"s",
         },
         PtyStep {
-            wait_for: "choosing a final",
-            input: b"\x1b[F",
-        },
-        PtyStep {
-            wait_for: "\x1b[?25l",
-            input: b"s",
-        },
-        PtyStep {
-            wait_for: "Continue with OPEN authority?",
+            wait_for: "Save with OPEN GitHub",
             input: b"\t\r",
         },
     ];
     let (root, xdg, transcript) =
         scripted_pty_steps("pty", &steps, &[], "xterm", 0);
-    assert!(transcript.contains("choosing a final"), "{transcript}");
+    assert!(
+        !transcript.contains("Complete effective access"),
+        "{transcript}"
+    );
     assert!(transcript.contains("Configuration saved"), "{transcript}");
+    assert!(transcript.contains("Review later:"), "{transcript}");
     assert!(transcript.contains("api.anthropic.com"), "{transcript}");
     assert!(!transcript.contains("AJ-"), "{transcript}");
     assert_tui_terminal_restored(&transcript);
     assert!(xdg.join("ai-jail/projects").is_dir());
+    let policy_path = fs::read_dir(xdg.join("ai-jail/projects"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let policy = fs::read_to_string(policy_path).unwrap();
+    assert!(policy.contains("github = true"), "{policy}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn scripted_pty_quit_with_changes_can_save_without_launching() {
+    let steps = [
+        PtyStep {
+            wait_for: "AI-JAIL",
+            input: b"q",
+        },
+        PtyStep {
+            wait_for: "Keep editing",
+            input: b"s",
+        },
+        PtyStep {
+            wait_for: "Save with OPEN GitHub",
+            input: b"\t\r",
+        },
+    ];
+    let (root, xdg, transcript) =
+        scripted_pty_steps("pty-exit-save", &steps, &[], "xterm", 0);
+    assert!(transcript.contains("Configuration saved"), "{transcript}");
+    assert!(transcript.contains("Review later:"), "{transcript}");
+    assert!(!transcript.contains("AJ-"), "{transcript}");
+    assert_tui_terminal_restored(&transcript);
     let policy_path = fs::read_dir(xdg.join("ai-jail/projects"))
         .unwrap()
         .next()
@@ -429,11 +614,15 @@ fn scripted_pty_environment_checklist_never_displays_or_saves_values() {
             input: b"\x1b[F",
         },
         PtyStep {
-            wait_for: "\x1b[?25l",
+            wait_for: "Authority:",
             input: b"\r",
         },
         PtyStep {
             wait_for: "Share this environment value?",
+            input: b"\x1b[F",
+        },
+        PtyStep {
+            wait_for: "\x1b[?25l",
             input: b"\t\r",
         },
         PtyStep {
@@ -447,19 +636,11 @@ fn scripted_pty_environment_checklist_never_displays_or_saves_values() {
             input: b"\x1b",
         },
         PtyStep {
-            wait_for: "Review complete",
+            wait_for: "separately.",
             input: b"s",
         },
         PtyStep {
-            wait_for: "choosing a final",
-            input: b"\x1b[F",
-        },
-        PtyStep {
-            wait_for: "\x1b[?25l",
-            input: b"s",
-        },
-        PtyStep {
-            wait_for: "Continue with OPEN authority?",
+            wait_for: "Save with OPEN GitHub",
             input: b"\t\r",
         },
     ];
@@ -506,7 +687,7 @@ fn scripted_pty_configures_and_saves_destination_constrained_ssh() {
             input: b"6",
         },
         PtyStep {
-            wait_for: "Open this boundary?",
+            wait_for: "Enable OPEN access",
             input: b"\t\r",
         },
         PtyStep {
@@ -514,15 +695,7 @@ fn scripted_pty_configures_and_saves_destination_constrained_ssh() {
             input: b"s",
         },
         PtyStep {
-            wait_for: "choosing a final",
-            input: b"\x1b[F",
-        },
-        PtyStep {
-            wait_for: "\x1b[?25l",
-            input: b"s",
-        },
-        PtyStep {
-            wait_for: "Continue with OPEN authority?",
+            wait_for: "Save with OPEN GitHub",
             input: b"\t\r",
         },
     ];
@@ -558,6 +731,10 @@ fn scripted_pty_arrows_move_the_highlighted_row_and_cancel_restores_terminal() {
             wait_for: "login/state",
             input: b"q",
         },
+        PtyStep {
+            wait_for: "Keep editing",
+            input: b"d",
+        },
     ];
     let (root, xdg, transcript) =
         scripted_pty_steps("pty-arrows", &steps, &[], "xterm", 130);
@@ -585,7 +762,7 @@ fn scripted_pty_arrows_move_the_highlighted_row_and_cancel_restores_terminal() {
 }
 
 #[test]
-fn term_dumb_q_cancels_at_the_first_review_prompt() {
+fn term_dumb_q_cancels_at_the_first_prompt() {
     let (root, xdg, transcript) =
         scripted_pty("pty-dumb-q", b"q\n", &[], "dumb", 130, None);
     assert!(transcript.contains("Plain-terminal mode"));
@@ -599,47 +776,40 @@ fn term_dumb_q_cancels_at_the_first_review_prompt() {
 }
 
 #[test]
-fn escape_at_access_overview_explains_how_to_cancel() {
+fn escape_at_access_overview_prompts_before_discarding_unsaved_changes() {
     let steps = [
         PtyStep {
             wait_for: "separately.",
             input: b"\x1b",
         },
         PtyStep {
-            wait_for: "q cancels setup.",
-            input: b"q",
+            wait_for: "Keep editing",
+            input: b"d",
         },
     ];
     let (root, _xdg, transcript) =
         scripted_pty_steps("pty-lone-escape", &steps, &[], "xterm", 130);
-    assert!(transcript.contains("q cancels setup."), "{transcript}");
+    assert!(transcript.contains("Keep editing"), "{transcript}");
     assert_eq!(transcript.matches("\x1b[?1049h").count(), 1);
     assert_tui_terminal_restored(&transcript);
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
-fn backing_out_of_final_review_then_cancelling_does_not_save() {
+fn discarding_unsaved_exit_does_not_save() {
     let steps = [
         PtyStep {
             wait_for: "separately.",
-            input: b"5s",
+            input: b"5q",
         },
         PtyStep {
-            wait_for: "choosing a final",
-            input: b"b",
-        },
-        PtyStep {
-            wait_for: "Review complete access",
-            input: b"q",
+            wait_for: "Save changes",
+            input: b"d",
         },
     ];
     let (root, xdg, transcript) =
-        scripted_pty_steps("pty-review-back", &steps, &[], "xterm", 130);
-    assert!(
-        transcript.contains("Review draft discarded"),
-        "{transcript}"
-    );
+        scripted_pty_steps("pty-discard", &steps, &[], "xterm", 130);
+    assert!(transcript.contains("Onboarding cancelled"), "{transcript}");
     assert!(!transcript.contains("Configuration saved"), "{transcript}");
     assert_tui_terminal_restored(&transcript);
     let projects = xdg.join("ai-jail/projects");
@@ -689,15 +859,7 @@ fn directory_browser_accepts_utf8_paths() {
             input: b"s",
         },
         PtyStep {
-            wait_for: "choosing a final",
-            input: b"\x1b[F",
-        },
-        PtyStep {
-            wait_for: "\x1b[?25l",
-            input: b"s",
-        },
-        PtyStep {
-            wait_for: "Continue with OPEN authority?",
+            wait_for: "Save with OPEN GitHub",
             input: b"\t\r",
         },
     ];
@@ -724,40 +886,20 @@ fn directory_browser_accepts_utf8_paths() {
 }
 
 #[test]
-fn forge_open_metadata_is_reviewed_without_reading_a_credential() {
+fn forge_open_binding_is_finalized_without_reading_a_credential() {
     let steps = [
         PtyStep {
             wait_for: "separately.",
-            input: b"5s",
-        },
-        PtyStep {
-            wait_for: "choosing a final",
-            input: b"\x1b[F",
-        },
-        PtyStep {
-            wait_for: "owner/open-review",
             input: b"s",
         },
         PtyStep {
-            wait_for: "Continue with OPEN authority?",
-            input: b"\r",
-        },
-        PtyStep {
-            wait_for: "cancelled.",
-            input: b"s",
-        },
-        PtyStep {
-            wait_for: "Continue with OPEN authority?",
+            wait_for: "Save with OPEN GitHub",
             input: b"\t\r",
         },
     ];
     let (root, xdg, transcript) =
         scripted_pty_steps("pty-forge-open", &steps, &[], "xterm", 0);
-    assert!(transcript.contains("cancelled."), "{transcript}");
     assert!(!transcript.contains("Type OPEN"), "{transcript}");
-    assert!(transcript.contains("USER-ASSERTED"), "{transcript}");
-    assert!(transcript.contains("PERSISTENT"), "{transcript}");
-    assert!(transcript.contains("owner/open-review"), "{transcript}");
     assert!(transcript.contains("Configuration saved"), "{transcript}");
     assert!(
         !transcript.contains("missing-review-only-credential"),
@@ -769,27 +911,19 @@ fn forge_open_metadata_is_reviewed_without_reading_a_credential() {
 }
 
 #[test]
-fn forge_scoped_metadata_is_allowed_without_open_confirmation() {
+fn forge_scoped_binding_saves_without_a_final_review() {
     let steps = [
         PtyStep {
             wait_for: "separately.",
-            input: b"5s",
-        },
-        PtyStep {
-            wait_for: "choosing a final",
-            input: b"\x1b[F",
-        },
-        PtyStep {
-            wait_for: "owner/allowed-review",
             input: b"s",
+        },
+        PtyStep {
+            wait_for: "Save with OPEN GitHub",
+            input: b"\t\r",
         },
     ];
     let (root, xdg, transcript) =
         scripted_pty_steps("pty-forge-allowed", &steps, &[], "xterm", 0);
-    assert!(transcript.contains("[WARN] ALLOWED"), "{transcript}");
-    assert!(transcript.contains("SCOPED"), "{transcript}");
-    assert!(transcript.contains("PERSISTENT"), "{transcript}");
-    assert!(transcript.contains("owner/allowed-review"), "{transcript}");
     assert!(transcript.contains("Configuration saved"), "{transcript}");
     assert!(
         !transcript.contains("Final effective access contains OPEN authority."),

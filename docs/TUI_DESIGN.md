@@ -4,16 +4,19 @@
 
 The onboarding interface is one persistent terminal application. It must not
 alternate between a full-screen list and printed prompts. Every capability,
-explanation, editor, confirmation, and final review is a screen or overlay
+explanation, editor, and confirmation is a screen or overlay
 inside the same terminal session.
 
 ## Interaction model
 
-- A preset bar sits above the capability list. `Tab`/`Shift-Tab` or left/right
-  moves between `Fully closed`, `For developers`, and `Mostly open`. Moving
-  focus previews the resulting checklist without mutating the draft; the UI
-  must say `PREVIEW — not applied`. `Enter` or `Space` applies the focused
-  preset. `Down` or `Esc` leaves preview without changes.
+- A preset bar sits above the capability list. `Tab`/`Shift-Tab` only moves
+  focus between access, guarantees, and preset panels; it must
+  never change or preview a preset. With the
+  preset row focused, left/right moves between `Fully closed`, `For
+developers`, and `Mostly open` and previews the resulting checklist without
+  mutating the draft; the UI must say `PREVIEW — not applied`. `Enter` or
+  `Space` applies the focused preset. `Tab`, `Down`, or `Esc` leaves preview
+  without changes.
 - `For developers` is applied only for incomplete first-run onboarding. It
   enables the known harness's filtered model API, harness state, and dependency
   tooling, plus the full active host GitHub token. GitHub must be visibly
@@ -44,22 +47,47 @@ inside the same terminal session.
   y/n prompts are not used in the TUI.
 - Toggling access is immediate and visibly updates the checklist. Complete
   consequences remain visible in the adjacent security-detail pane.
+- Every configurable detail pane includes a short `Use when` statement that
+  gives a concrete reason to enable that authority. It remains separate from
+  the security consequence. Non-configurable guarantees use `Why it matters`
+  instead so the UI never implies that an enforced boundary is optional.
+- On the main access screen, every choice backed by an add/remove editor
+  summarizes its current granular selections. Environment summaries show names
+  only and keep values hidden; directory summaries show each path's read-only
+  or read/write mode; selected-key SSH shows keys, destinations, and lifetime;
+  additional capabilities show each enabled item and whether it is ALLOWED or
+  OPEN. The user opens an editor only to add, remove, or change an entry.
 
 ## Visual hierarchy
 
 The interface is dense, restrained, and optimized for careful review.
 
-- Header: harness, canonical project, and progress/location breadcrumb.
+- Header: a bold colored `AI-JAIL` title, compact identifying project path,
+  and exact external profile path (home may be abbreviated as `~`). Do not
+  spend header space on explanatory security slogans or empty breadcrumbs.
 - Primary pane: the current list or editor. Checkbox state is never inferred
   from color alone.
+- The main access view has a focusable `Always enforced` pane directly below
+  access choices. It lists non-optional protections, including the platform
+  sandbox, external trusted policy, directory identity checks, credential-root
+  refusal, and names-only environment persistence. Up/down selects a guarantee
+  and the context pane explains it. These rows are informative, not toggles.
 - Context pane: full resource, access, process, duration, scope, limits,
   default, consequence, remote, and authority facts for the focused item, but
   expressed as short, plain-language `Allows`, `Still blocked`, `Scope`, and
   `Risk` statements. Do not expose the internal data-model field list in the
   normal capability detail pane. Complete field-by-field disclosure remains in
-  approval dialogs and the final review.
+  approval dialogs.
 - Footer: current keys on the first line; confirmation, validation error, or
   concise status on the second line.
+- A read-only `CLI from defaults` panel near the bottom updates from the current
+  draft and is skipped by Tab navigation. It emits only choices that differ
+  from built-in defaults, uses shell-safe quoting, and copies the command with
+  the global main-screen key `y` through a trusted platform clipboard helper (`wl-copy`,
+  `xclip`, or `xsel` on Linux; `pbcopy` on macOS). It never copies environment
+  values. Choices that cannot be represented faithfully as launch flags are
+  labeled profile-only. The external config path remains in the header instead
+  of being repeated in this panel.
 - Wide terminals use list/detail split panes. Narrow terminals stack the
   detail pane below the list. Very small terminals show a clear minimum-size
   message without losing cancellation or terminal restoration.
@@ -93,6 +121,9 @@ The interface is dense, restrained, and optimized for careful review.
   list, live filter, and the canonical destination preview.
 - Arrow keys browse; `Enter` descends into a child; `Backspace` goes to the
   parent; `/` focuses the filter; `Space` adds the highlighted directory.
+- `Down` from a directory filter or environment search focuses its results
+  without requiring `Enter`. Typing while those results are focused returns to
+  the search field and appends to the current query.
 - Read-only/read-write mode is explicit in the header and can be changed before
   approval. The context pane explains the exact resulting authority.
 - The first grant opens a lower `Selected directories` pane. `Tab` moves focus
@@ -130,14 +161,28 @@ The interface is dense, restrained, and optimized for careful review.
   prerequisite, private-key boundary, and signature authority. Save and launch
   remain refused until at least one key and enforced destination exist.
 
-## Final review
+## Saving
 
-- Scrollable complete effective access grouped as `RESTRICTED`, `ALLOWED`, and
-  `OPEN`, followed by the exact effective policy and authority details.
-- The action bar always distinguishes `Save and launch`, `Launch once`, `Save
-profile`, `Back`, and `Cancel` according to invocation mode.
-- If any OPEN authority remains, the final action opens the shared dialog and
-  names the exact persistence and launch consequence. Cancel is the default.
+- `Save configuration` persists the choices already visible in the access
+  screen without adding a redundant final review page.
+- If the first-run developer preset's full host GitHub token has not already
+  been explicitly approved, saving opens one short Cancel-first OPEN dialog
+  naming its complete token authority. This is a boundary confirmation, not a
+  second review screen. A previously saved GitHub grant is not reconfirmed on
+  every edit.
+- Normal first-run onboarding saves and launches. `ai-jail configure HARNESS`
+  saves and exits without launching.
+- The TUI offers save-then-launch, or save-and-exit from the unsaved-changes
+  dialog. A one-off launch that is not saved remains available in the
+  plain-terminal fallback (`Save and launch [s], launch once [o], cancel
+[q]`); it is not exposed as a TUI control because a trial run whose grants
+  are not persisted would need a second copy of the confirmation flow.
+- After saving, terminal output names the exact external config path for later
+  inspection.
+- `Esc` or `q` from the access overview exits directly only when the draft is
+  unchanged. A changed or first-run draft opens the unsaved-changes dialog;
+  keeping the draft is the default, discard is explicit, and `Save changes`
+  persists without launching a jail.
 - Cancellation writes no onboarding grants and starts no harness. Terminal
   state is restored on success, cancellation, validation failure, and panic.
 

@@ -88,6 +88,7 @@ pub(super) struct DirectoryBrowser {
     filter: String,
     show_hidden: bool,
     focus: Focus,
+    resume_filter_on_text: bool,
     path_input: String,
     phase: Phase,
     feedback: String,
@@ -108,6 +109,7 @@ impl DirectoryBrowser {
             filter: String::new(),
             show_hidden: false,
             focus: Focus::Browser,
+            resume_filter_on_text: false,
             path_input: String::new(),
             phase: Phase::Browse,
             feedback: String::new(),
@@ -123,6 +125,7 @@ impl DirectoryBrowser {
 
     pub(super) fn captures_text_input(&self) -> bool {
         matches!(self.focus, Focus::Filter | Focus::GoToPath)
+            || self.resume_filter_on_text
     }
 
     pub(super) fn set_entries(
@@ -322,7 +325,16 @@ impl DirectoryBrowser {
     fn handle_browse_key(&mut self, code: KeyCode) -> DirectoryAction {
         match self.focus {
             Focus::Filter => match code {
-                KeyCode::Esc | KeyCode::Enter => self.focus = Focus::Browser,
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.focus = Focus::Browser;
+                    self.resume_filter_on_text = false;
+                }
+                KeyCode::Down => {
+                    self.focus = Focus::Browser;
+                    self.resume_filter_on_text = true;
+                    self.selected =
+                        usize::from(!self.visible_entries().is_empty());
+                }
                 KeyCode::Backspace => {
                     self.filter.pop();
                     self.selected = 0;
@@ -380,6 +392,7 @@ impl DirectoryBrowser {
             Focus::Browser => match code {
                 KeyCode::Tab | KeyCode::BackTab if !self.grants.is_empty() => {
                     self.focus = Focus::Selected;
+                    self.resume_filter_on_text = false;
                 }
                 KeyCode::Up => self.selected = self.selected.saturating_sub(1),
                 KeyCode::Down => {
@@ -391,6 +404,7 @@ impl DirectoryBrowser {
                     self.selected = self.visible_entries().len();
                 }
                 KeyCode::Enter => {
+                    self.resume_filter_on_text = false;
                     if self.selected == 0 {
                         self.feedback =
                             "Press Space to add this directory.".into();
@@ -403,12 +417,14 @@ impl DirectoryBrowser {
                     };
                 }
                 KeyCode::Char(' ') => {
+                    self.resume_filter_on_text = false;
                     return DirectoryAction::Prepare {
                         path: self.highlighted_path(),
                         mode: self.mode,
                     };
                 }
                 KeyCode::Backspace => {
+                    self.resume_filter_on_text = false;
                     if let Some(parent) = self.current.parent() {
                         return DirectoryAction::Reload {
                             directory: parent.to_path_buf(),
@@ -416,7 +432,16 @@ impl DirectoryBrowser {
                         };
                     }
                 }
-                KeyCode::Char('/') => self.focus = Focus::Filter,
+                KeyCode::Char('/') => {
+                    self.focus = Focus::Filter;
+                    self.resume_filter_on_text = false;
+                }
+                KeyCode::Char(value) if self.resume_filter_on_text => {
+                    self.focus = Focus::Filter;
+                    self.resume_filter_on_text = false;
+                    self.filter.push(value);
+                    self.selected = 0;
+                }
                 KeyCode::Char('g') => {
                     self.focus = Focus::GoToPath;
                     self.path_input.clear();
@@ -557,19 +582,19 @@ pub(super) fn render(
 
     let detail = match &state.phase {
         Phase::Browse => format!(
-            "Selected\n{}\n\nSpace\nAdd with {} access.\n\nEnter\nOpen this folder and browse inside it.",
+            "Selected\n{}\n\nUse when\nThe task needs files in this folder outside its existing project access.\n\nSpace\nAdd with {} access.\n\nEnter\nOpen this folder and browse inside it.",
             escape_control_bytes(&state.highlighted_path().to_string_lossy()),
             state.mode.title()
         ),
         Phase::Preview(preview) => format!(
-            "Entered: {}\nResolved: {}\n\n{}\n\n{}",
+            "Entered: {}\nResolved: {}\n\nUse when\nThe task needs files in this exact resolved folder.\n\n{}\n\n{}",
             escape_control_bytes(&preview.entered),
             escape_control_bytes(&preview.resolved.to_string_lossy()),
             preview.disclosure,
             "OPEN authority — review every line, then press Space to choose."
         ),
         Phase::ConfirmOpen(preview, _) => format!(
-            "{}\n\nOPEN removes an important boundary.",
+            "{}\n\nUse when\nThe task genuinely needs this broad directory scope.\n\nOPEN removes an important boundary.",
             preview.disclosure
         ),
     };
@@ -648,7 +673,7 @@ pub(super) fn render(
                 "↑/↓ selected grants  •  m read-only/read-write  •  Space remove  •  Tab browse  •  Esc back"
             }
             _ => {
-                "↑/↓ browse  •  Enter open  •  Space add  •  Tab selected  •  m read-only/read-write\nBackspace parent  •  / filter  •  g go to path  •  . hidden  •  Esc back"
+                "↑/↓ browse  •  Enter open  •  Space add  •  Tab selected  •  m read-only/read-write\n/ filter  •  ↓ results  •  type to refine  •  g go to path  •  . hidden  •  Esc back"
             }
         }
     } else {
@@ -774,8 +799,41 @@ mod tests {
         );
         state.handle_key(KeyCode::Char('/'));
         state.handle_key(KeyCode::Char('q'));
-        assert!(rendered(&state).contains("quiet"));
-        assert!(!rendered(&state).contains("alpha"));
+        let output = rendered(&state);
+        assert!(output.contains("quiet"));
+        assert!(output.contains("Use when"));
+        assert!(!output.contains("alpha"));
+    }
+
+    #[test]
+    fn down_focuses_filtered_results_and_typing_resumes_filtering() {
+        let mut state =
+            DirectoryBrowser::new(DirectoryMode::ReadOnly, "/work".into());
+        state.set_entries(
+            "/work".into(),
+            vec![entry("alpha"), entry("alpine"), entry("beta")],
+        );
+
+        state.handle_key(KeyCode::Char('/'));
+        state.handle_key(KeyCode::Char('a'));
+        state.handle_key(KeyCode::Down);
+        assert_eq!(state.focus, Focus::Browser);
+        assert_eq!(state.selected, 1);
+        assert!(state.resume_filter_on_text);
+
+        state.handle_key(KeyCode::Char('l'));
+        assert_eq!(state.focus, Focus::Filter);
+        assert_eq!(state.filter, "al");
+        assert_eq!(state.selected, 0);
+
+        state.handle_key(KeyCode::Down);
+        assert_eq!(
+            state.handle_key(KeyCode::Enter),
+            DirectoryAction::Reload {
+                directory: PathBuf::from("/work/alpha"),
+                show_hidden: false,
+            }
+        );
     }
 
     #[test]

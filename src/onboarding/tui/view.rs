@@ -1,12 +1,13 @@
 use super::app::{
-    AccessPreset, App, CapabilityId, ConfirmMode, MIN_HEIGHT, MIN_WIDTH, Screen,
+    AccessPreset, App, BuiltinProtection, CapabilityId, ConfirmMode,
+    MIN_HEIGHT, MIN_WIDTH, Screen,
 };
 use super::wrapper::{Decision, resource_label};
 use crate::output::escape_control_bytes;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, Wrap,
 };
@@ -14,6 +15,13 @@ use ratatui::widgets::{
 const WIDE_WIDTH: u16 = 96;
 
 pub(super) fn render(frame: &mut Frame, app: &mut App<'_>) {
+    render_screen(frame, app);
+    if let Some(dialog) = &app.exit_dialog {
+        dialog.render(frame, app.use_color);
+    }
+}
+
+fn render_screen(frame: &mut Frame, app: &mut App<'_>) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_too_small(frame, area.width, area.height);
@@ -21,12 +29,6 @@ pub(super) fn render(frame: &mut Frame, app: &mut App<'_>) {
     }
     if app.screen == Screen::WrapperRequests {
         render_wrapper_requests(frame, app);
-        return;
-    }
-    if app.screen == Screen::Review {
-        if let Some(review) = &mut app.review {
-            super::review::render(frame, review);
-        }
         return;
     }
     if app.screen == Screen::Additional {
@@ -59,75 +61,70 @@ pub(super) fn render(frame: &mut Frame, app: &mut App<'_>) {
         return;
     }
 
-    let intro_height = 3;
     let [
         header_area,
-        intro_area,
         preset_area,
         content_area,
+        cli_area,
         footer_area,
     ] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(intro_height),
+        Constraint::Length(4),
         Constraint::Length(3),
         Constraint::Min(8),
-        Constraint::Length(5),
+        Constraint::Length(4),
+        Constraint::Length(3),
     ])
     .areas(area);
 
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("Configure {}", app.harness),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  •  project access"),
-            ]),
+            Line::from(Span::styled("AI-JAIL", brand(app))),
             Line::from(vec![
                 Span::styled("Project  ", muted(app)),
-                Span::raw(&app.project),
+                Span::styled(
+                    compact_project_path(&app.project),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
             ]),
+            Line::from(Span::styled(
+                format!("Config   {}", compact_home_path(&app.profile_path)),
+                muted(app),
+            )),
         ]),
         header_area,
     );
-    let mut intro = vec![Line::from(Span::styled(
-        super::super::messages::INTRO,
-        muted(app),
-    ))];
-    if app.recommended_baseline {
-        intro.push(Line::from(vec![
-            Span::styled("✓ For developers applied  ", granted(app)),
-            Span::raw(
-                "Filtered API, harness login/state, dependency tools, and ",
-            ),
-            Span::styled("OPEN full GitHub token.", danger(app)),
-        ]));
-    }
-    frame.render_widget(
-        Paragraph::new(intro).wrap(Wrap { trim: true }),
-        intro_area,
-    );
     render_presets(frame, app, preset_area);
 
-    let [list_area, detail_area] = if area.width >= WIDE_WIDTH {
-        Layout::horizontal([
-            Constraint::Percentage(42),
-            Constraint::Percentage(58),
-        ])
-        .areas(content_area)
-    } else {
-        Layout::vertical([Constraint::Length(13), Constraint::Min(3)])
+    let [access_area, protections_area, detail_area] =
+        if area.width >= WIDE_WIDTH {
+            let [navigation_area, detail_area] = Layout::horizontal([
+                Constraint::Percentage(42),
+                Constraint::Percentage(58),
+            ])
+            .areas(content_area);
+            let [access_area, protections_area] =
+                Layout::vertical([Constraint::Min(10), Constraint::Length(7)])
+                    .areas(navigation_area);
+            [access_area, protections_area, detail_area]
+        } else {
+            Layout::vertical([
+                Constraint::Length(9),
+                Constraint::Length(7),
+                Constraint::Min(4),
+            ])
             .areas(content_area)
-    };
-    render_list(frame, app, list_area);
+        };
+    render_list(frame, app, access_area);
+    render_protections(frame, app, protections_area);
     render_detail(frame, app, detail_area);
+    render_cli_equivalent(frame, app, cli_area);
     render_footer(frame, app, footer_area);
     if let Some(confirm) = &app.confirmation {
         match confirm {
             ConfirmMode::Open { dialog, .. }
             | ConfirmMode::MostlyOpen { dialog }
-            | ConfirmMode::AdditionalOpen { dialog, .. } => {
+            | ConfirmMode::AdditionalOpen { dialog, .. }
+            | ConfirmMode::SaveWithGithub { dialog, .. } => {
                 dialog.render(frame, app.use_color);
             }
         }
@@ -214,14 +211,16 @@ fn render_additional(frame: &mut Frame, app: &mut App<'_>) {
         detail_area,
     );
     let feedback = if state.feedback.is_empty() {
-        "↑/↓ move  •  PgUp/PgDn jump  •  Space/Enter toggle  •  Esc back  •  q cancel"
+        "↑/↓ move  •  PgUp/PgDn jump  •  Space/Enter toggle  •  Esc back  •  q exit"
     } else {
         &state.feedback
     };
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(feedback),
-            Line::from("OPEN grants require an explicit dialog; final review remains mandatory."),
+            Line::from(
+                "OPEN grants require an explicit dialog when they are enabled.",
+            ),
         ])
         .block(Block::default().borders(Borders::TOP)),
         footer,
@@ -241,7 +240,8 @@ fn render_presets(
     let mut line = Vec::new();
     for (index, preset) in AccessPreset::ALL.into_iter().enumerate() {
         let focused = app.preset_focus && app.preset_cursor == index;
-        let applied = active == Some(preset) && !app.preset_focus;
+        let applied = active == Some(preset)
+            && (!app.preset_focus || !app.preset_preview);
         let marker = if focused {
             "▶"
         } else if applied {
@@ -271,15 +271,15 @@ fn render_presets(
         line.push(Span::styled(label, style));
         line.push(Span::raw(" "));
     }
-    if active.is_none() && !app.preset_focus {
+    if active.is_none() && !app.preset_preview {
         line.push(Span::styled(" ✓ Custom ", granted(app)));
-    } else if app.preset_focus {
+    } else if app.preset_focus && app.preset_preview {
         line.push(Span::styled(" PREVIEW — not applied ", danger(app)));
     }
     frame.render_widget(
         Paragraph::new(Line::from(line)).block(
             Block::default()
-                .title(" Presets • Tab/Shift-Tab preview • Enter/Space apply ")
+                .title(" Presets • ←/→ preview • Enter/Space apply ")
                 .borders(Borders::ALL),
         ),
         area,
@@ -357,7 +357,7 @@ fn render_wrapper_requests(frame: &mut Frame, app: &mut App<'_>) {
         "Press a to validate this staged request and reveal its complete access disclosure before deciding.",
     );
     let detail = format!(
-        "Requested by: {}\nResource: {}\nReason: {}\n\n{prior}\n\n{disclosure}",
+        "Requested by: {}\nResource: {}\n\nUse when\n{}\n\n{prior}\n\n{disclosure}",
         escape_control_bytes(&request.approval.requester),
         resource_label(request),
         escape_control_bytes(&request.reason),
@@ -448,16 +448,52 @@ fn render_list(
         }
         ListItem::new(Line::from(spans))
     });
+    let access_focused = !app.preset_focus && !app.protection_focus;
     let list = List::new(items)
         .block(
             Block::default()
                 .title(" Access choices ")
                 .borders(Borders::ALL),
         )
-        .highlight_symbol("▶ ")
-        .highlight_style(focus(app));
+        .highlight_symbol(if access_focused { "▶ " } else { "  " })
+        .highlight_style(if access_focused {
+            focus(app)
+        } else {
+            Style::default()
+        });
     let mut state = ListState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_protections(
+    frame: &mut Frame,
+    app: &mut App<'_>,
+    area: ratatui::layout::Rect,
+) {
+    let items = BuiltinProtection::ALL.into_iter().map(|protection| {
+        ListItem::new(Line::from(vec![
+            Span::styled("◆ ", closed(app)),
+            Span::raw(protection.label()),
+        ]))
+    });
+    let mut state =
+        ListState::default().with_selected(Some(app.protection_selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .title(" Always enforced • Tab to inspect ")
+                    .borders(Borders::ALL),
+            )
+            .highlight_symbol(if app.protection_focus { "▶ " } else { "  " })
+            .highlight_style(if app.protection_focus {
+                focus(app)
+            } else {
+                Style::default()
+            }),
+        area,
+        &mut state,
+    );
 }
 
 fn render_detail(
@@ -465,10 +501,29 @@ fn render_detail(
     app: &App<'_>,
     area: ratatui::layout::Rect,
 ) {
+    if app.protection_focus {
+        let protection = app.selected_protection();
+        frame.render_widget(
+            Paragraph::new(protection.detail())
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title(format!(
+                            " Built-in guarantee — {} ",
+                            protection.label()
+                        ))
+                        .borders(Borders::ALL),
+                ),
+            area,
+        );
+        return;
+    }
     let capability = app.selected_capability();
     let detail = app.detail(capability);
     let total = wrapped_line_count(&detail, area.width.saturating_sub(2));
-    let paragraph = Paragraph::new(detail).wrap(Wrap { trim: false });
+    let paragraph =
+        Paragraph::new(highlighted_detail(app, capability, &detail))
+            .wrap(Wrap { trim: false });
     let visible = area.height.saturating_sub(2).max(1);
     let max_scroll = total.saturating_sub(visible);
     let scroll = app.detail_scroll.min(max_scroll);
@@ -489,6 +544,46 @@ fn render_detail(
     );
 }
 
+fn highlighted_detail(
+    app: &App<'_>,
+    capability: CapabilityId,
+    detail: &str,
+) -> Text<'static> {
+    Text::from(
+        detail
+            .lines()
+            .map(|line| match capability {
+                CapabilityId::Environment => line
+                    .strip_prefix("• ")
+                    .map(|name| {
+                        Line::from(vec![
+                            Span::raw("• "),
+                            Span::styled(name.to_owned(), selected_value(app)),
+                        ])
+                    })
+                    .unwrap_or_else(|| Line::from(line.to_owned())),
+                CapabilityId::DirectoryAccess => {
+                    ["• READ-ONLY  ", "• READ/WRITE "]
+                        .into_iter()
+                        .find_map(|prefix| {
+                            line.strip_prefix(prefix).map(|path| {
+                                Line::from(vec![
+                                    Span::raw(prefix),
+                                    Span::styled(
+                                        path.to_owned(),
+                                        selected_value(app),
+                                    ),
+                                ])
+                            })
+                        })
+                        .unwrap_or_else(|| Line::from(line.to_owned()))
+                }
+                _ => Line::from(line.to_owned()),
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn wrapped_line_count(text: &str, width: u16) -> u16 {
     let width = usize::from(width.max(1));
     text.lines()
@@ -499,7 +594,7 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
 }
 
 fn render_subscreen(frame: &mut Frame, app: &App<'_>) {
-    let instruction = "Esc returns to access choices  •  q cancels";
+    let instruction = "Esc returns to access choices  •  q exits";
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
@@ -521,6 +616,28 @@ fn render_subscreen(frame: &mut Frame, app: &App<'_>) {
     );
 }
 
+fn render_cli_equivalent(
+    frame: &mut Frame,
+    app: &mut App<'_>,
+    area: ratatui::layout::Rect,
+) {
+    let text = app.cli_equivalent_display();
+    let width = area.width.saturating_sub(2).max(1);
+    let total = wrapped_line_count(&text, width);
+    frame.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title(format!(
+                    " CLI from defaults • y copy anywhere • {} line{} ",
+                    total.max(1),
+                    if total == 1 { "" } else { "s" }
+                ))
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
 fn render_footer(
     frame: &mut Frame,
     app: &App<'_>,
@@ -530,16 +647,22 @@ fn render_footer(
         Some(
             ConfirmMode::Open { .. }
             | ConfirmMode::MostlyOpen { .. }
-            | ConfirmMode::AdditionalOpen { .. },
+            | ConfirmMode::AdditionalOpen { .. }
+            | ConfirmMode::SaveWithGithub { .. },
         ) => Line::from(
             "Choose explicitly in the confirmation dialog; Cancel is selected by default.",
         ),
-        None if app.preset_focus => Line::from(
-            "PREVIEW only — the list shows this preset; Enter/Space applies it, Down/Esc returns unchanged.",
+        None if app.preset_focus => Line::from(if app.preset_preview {
+            "PREVIEW only — ←/→ chooses; Enter/Space applies; Tab/Esc changes focus only."
+        } else {
+            "Preset row focused — ←/→ previews; Enter/Space applies; Tab changes focus only."
+        }),
+        None if app.protection_focus => Line::from(
+            "↑/↓ inspect guarantees  •  Tab presets  •  y copy CLI  •  Esc access choices",
         ),
         None if !app.feedback.is_empty() => Line::from(app.feedback.clone()),
         None => Line::from(
-            "↑/↓ move  •  Space/Enter select  •  q cancel  •  Esc back",
+            "↑/↓ move  •  Space/Enter select  •  Tab next panel  •  y copy CLI  •  Esc/q exit",
         ),
     };
     frame.render_widget(
@@ -553,6 +676,39 @@ fn render_footer(
         .block(Block::default().borders(Borders::TOP)),
         area,
     );
+}
+
+fn compact_project_path(path: &str) -> String {
+    let components = path
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    if components.len() > 2 {
+        format!(
+            "../{}/{}",
+            components[components.len() - 2],
+            components[components.len() - 1]
+        )
+    } else {
+        path.to_string()
+    }
+}
+
+fn compact_home_path(path: &str) -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return path.into();
+    };
+    let home = home.to_string_lossy();
+    if path == home {
+        "~".into()
+    } else if let Some(suffix) = path.strip_prefix(home.as_ref()) {
+        if suffix.starts_with('/') {
+            return format!("~{suffix}");
+        }
+        path.into()
+    } else {
+        path.into()
+    }
 }
 
 fn render_too_small(frame: &mut Frame, width: u16, height: u16) {
@@ -583,6 +739,24 @@ fn muted(app: &App<'_>) -> Style {
         Style::default().fg(Color::DarkGray)
     } else {
         Style::default()
+    }
+}
+
+fn brand(app: &App<'_>) -> Style {
+    let style = Style::default().add_modifier(Modifier::BOLD);
+    if app.use_color {
+        style.fg(Color::Cyan)
+    } else {
+        style
+    }
+}
+
+fn selected_value(app: &App<'_>) -> Style {
+    let style = Style::default().add_modifier(Modifier::BOLD);
+    if app.use_color {
+        style.fg(Color::Cyan)
+    } else {
+        style
     }
 }
 
@@ -680,16 +854,153 @@ mod tests {
             &Default::default(),
             &[],
         );
-        app.recommended_baseline = true;
+        app.set_recommended_baseline(true);
         let rendered = buffer_text(140, 34, &mut app);
-        assert!(rendered.contains("For developers applied"));
-        assert!(rendered.contains("Filtered API"));
+        assert!(rendered.contains("AI-JAIL"));
+        assert!(rendered.contains("/work/project"));
+        assert!(!rendered.contains("Repository files cannot grant access"));
+        assert!(rendered.contains("For developers"));
+        assert!(rendered.contains("Filtered model API access"));
         assert!(rendered.contains("harness login/state"));
-        assert!(rendered.contains("harness login/state"));
-        assert!(rendered.contains("OPEN full GitHub token"));
-        assert!(rendered.contains("dependency tools"));
+        assert!(rendered.contains("Full host GitHub token"));
+        assert!(rendered.contains("Dependency tools"));
+        assert!(rendered.contains("Always enforced"));
+        #[cfg(target_os = "linux")]
+        assert!(rendered.contains("Bubblewrap sandbox"));
         assert!(rendered.contains("✓"));
         assert!(rendered.contains("CLOSED"));
+    }
+
+    #[test]
+    fn built_in_guarantees_are_focusable_and_replace_the_detail_panel() {
+        let mut selection = Selection::default();
+        let mut app = App::new(
+            &mut selection,
+            "claude",
+            "/mnt/data/Projects/ai-memory".into(),
+            false,
+            &Default::default(),
+            &[],
+        );
+        app.handle_key(crossterm::event::KeyCode::Tab);
+        assert!(app.protection_focus);
+        let rendered = buffer_text(140, 34, &mut app);
+        assert!(rendered.contains("../Projects/ai-memory"));
+        assert!(rendered.contains("Built-in guarantee"));
+        assert!(rendered.contains("Always enforced"));
+        assert!(rendered.contains("every child process"));
+        assert!(!rendered.contains("Configure claude"));
+    }
+
+    #[test]
+    fn main_view_shows_granular_access_summaries_without_opening_editors() {
+        let mut selection = Selection {
+            env_names: vec!["GH_TOKEN".into()],
+            ro_dirs: vec![std::path::PathBuf::from("/srv/reference")],
+            rw_dirs: vec![std::path::PathBuf::from("/srv/output")],
+            ..Selection::default()
+        };
+        selection.additional.audit_log = true;
+        let mut app = App::new(
+            &mut selection,
+            "claude",
+            "/work/project".into(),
+            false,
+            &Default::default(),
+            &[],
+        );
+
+        app.selected = CapabilityId::ALL
+            .iter()
+            .position(|capability| *capability == CapabilityId::Environment)
+            .unwrap();
+        let environment = buffer_text(140, 34, &mut app);
+        assert!(environment.contains("GH_TOKEN"));
+        assert!(environment.contains("values hidden"));
+
+        app.selected = CapabilityId::ALL
+            .iter()
+            .position(|capability| *capability == CapabilityId::DirectoryAccess)
+            .unwrap();
+        let directories = buffer_text(140, 34, &mut app);
+        assert!(directories.contains("READ-ONLY  /srv/reference"));
+        assert!(directories.contains("READ/WRITE /srv/output"));
+
+        app.selected = CapabilityId::ALL
+            .iter()
+            .position(|capability| *capability == CapabilityId::Additional)
+            .unwrap();
+        let additional = buffer_text(140, 34, &mut app);
+        assert!(additional.contains("ALLOWED  Local security audit log"));
+        assert_eq!(app.screen, Screen::Access);
+    }
+
+    #[test]
+    fn detail_highlights_selected_environment_names_and_directory_paths() {
+        let mut selection = Selection {
+            env_names: vec!["GH_TOKEN".into()],
+            ro_dirs: vec![std::path::PathBuf::from("/srv/reference")],
+            ..Selection::default()
+        };
+        let app = App::new(
+            &mut selection,
+            "claude",
+            "/work/project".into(),
+            true,
+            &Default::default(),
+            &[],
+        );
+
+        let environment = app.detail(CapabilityId::Environment);
+        let environment =
+            highlighted_detail(&app, CapabilityId::Environment, &environment);
+        let env_span = &environment.lines[1].spans[1];
+        assert_eq!(env_span.content, "GH_TOKEN");
+        assert_eq!(env_span.style.fg, Some(Color::Cyan));
+        assert!(env_span.style.add_modifier.contains(Modifier::BOLD));
+
+        let directories = app.detail(CapabilityId::DirectoryAccess);
+        let directories = highlighted_detail(
+            &app,
+            CapabilityId::DirectoryAccess,
+            &directories,
+        );
+        let path_span = &directories.lines[1].spans[1];
+        assert_eq!(path_span.content, "/srv/reference");
+        assert_eq!(path_span.style.fg, Some(Color::Cyan));
+        assert!(path_span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn compact_project_path_keeps_the_identifying_parent_and_name() {
+        assert_eq!(
+            compact_project_path("/mnt/data/Projects/ai-memory"),
+            "../Projects/ai-memory"
+        );
+        assert_eq!(compact_project_path("/work/project"), "/work/project");
+    }
+
+    #[test]
+    fn cli_panel_shows_copy_help_without_repeating_config_path() {
+        let mut selection = Selection {
+            env_names: vec!["GH_TOKEN".into()],
+            ..Selection::default()
+        };
+        let mut app = App::new(
+            &mut selection,
+            "claude",
+            "/work/project".into(),
+            false,
+            &Default::default(),
+            &[],
+        );
+        app.set_profile_path(std::path::Path::new(
+            "/home/alice/.config/ai-jail/projects/demo.toml",
+        ));
+        let rendered = buffer_text(140, 38, &mut app);
+        assert!(rendered.contains("CLI from defaults"));
+        assert!(rendered.contains("y copy"));
+        assert_eq!(rendered.matches("demo.toml").count(), 1);
     }
 
     #[test]
@@ -709,6 +1020,7 @@ mod tests {
             &[],
         );
         app.preset_focus = true;
+        app.preset_preview = true;
         app.preset_cursor = 2;
         let rendered = buffer_text(140, 36, &mut app);
         assert!(rendered.contains("Mostly open"));
@@ -738,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_plain_detail_fits_without_unneeded_scrolling() {
+    fn narrow_detail_scroll_is_clamped_to_available_geometry() {
         let mut selection = Selection::default();
         let mut app = App::new(
             &mut selection,
@@ -749,9 +1061,10 @@ mod tests {
             &[],
         );
         app.selected = 3;
-        app.detail_scroll = 3;
+        app.detail_scroll = u16::MAX;
         let rendered = buffer_text(72, 40, &mut app);
-        assert!(rendered.contains("lines 1–11/11"), "{rendered}");
+        assert!(rendered.contains("lines 8–15/15"), "{rendered}");
+        assert!(rendered.contains("Use when"), "{rendered}");
         assert!(rendered.contains("PgUp/PgDn"), "{rendered}");
     }
 
@@ -822,6 +1135,26 @@ mod tests {
         assert!(rendered.contains("Cancel"));
         assert!(rendered.contains("Full host SSH access"));
         assert!(rendered.contains("every file in ~/.ssh"));
+    }
+
+    #[test]
+    fn unsaved_exit_dialog_is_rendered_over_the_current_screen() {
+        let mut selection = Selection::default();
+        let mut app = App::new(
+            &mut selection,
+            "claude",
+            "/work/project".into(),
+            false,
+            &Default::default(),
+            &[],
+        );
+        app.handle_key(crossterm::event::KeyCode::Char('1'));
+        app.handle_key(crossterm::event::KeyCode::Esc);
+        let rendered = buffer_text(140, 34, &mut app);
+        assert!(rendered.contains("Unsaved changes"));
+        assert!(rendered.contains("Keep editing"));
+        assert!(rendered.contains("Discard & quit"));
+        assert!(rendered.contains("Save changes"));
     }
 
     #[test]

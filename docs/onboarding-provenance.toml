@@ -20,11 +20,12 @@ verified_by = [
   "onboarding::tests::unknown_harness_baseline_does_not_invent_an_api_destination",
   "onboarding::tests::completed_onboarding_reopens_saved_choices_without_applying_baseline",
   "onboarding::tui::app::tests::preset_navigation_previews_access_without_applying_it",
+  "onboarding::tui::app::tests::tab_focuses_the_preset_row_without_changing_a_custom_checklist",
   "onboarding::tui::app::tests::mostly_open_preset_requires_explicit_dialog_confirmation",
   "onboarding::tui::app::tests::granular_change_is_reported_as_custom",
   "onboarding::tui::app::tests::fully_closed_preset_clears_every_optional_and_granular_grant",
   "onboarding::tui::view::tests::preset_focus_renders_a_live_unapplied_access_preview",
-  "scripted_pty_can_review_and_save_recommended_baseline",
+  "scripted_pty_confirms_recommended_github_and_saves_without_final_review",
 ]
 guide_sections = ["Access presets"]
 
@@ -41,11 +42,18 @@ verified_by = [
   "onboarding::tests::grant_disclosure_contains_every_required_field",
   "onboarding::tui::view::tests::wide_view_keeps_choices_and_security_detail_visible",
   "onboarding::tui::view::tests::narrow_view_stacks_without_losing_detail_or_help",
+  "onboarding::tui::view::tests::built_in_guarantees_are_focusable_and_replace_the_detail_panel",
+  "onboarding::tui::view::tests::compact_project_path_keeps_the_identifying_parent_and_name",
+  "onboarding::tui::view::tests::main_view_shows_granular_access_summaries_without_opening_editors",
   "onboarding::tui::app::tests::inline_errors_hide_internal_provenance_ids",
   "onboarding::tui::app::tests::every_capability_detail_is_short_plain_and_action_specific",
+  "onboarding::tui::app::tests::main_details_summarize_environment_and_directory_selections",
+  "onboarding::tui::app::tests::cli_equivalent_is_shell_safe_and_names_profile_only_choices",
   "onboarding::tui::app::tests::container_engine_is_closed_by_every_preset_and_requires_open_confirmation",
   "onboarding::tui::app::tests::additional_capabilities_are_outside_presets_and_open_grants_confirm",
   "onboarding::tui::view::tests::additional_capability_screen_keeps_platform_relevant_controls_discoverable",
+  "onboarding::tui::view::tests::cli_panel_shows_copy_help_without_repeating_config_path",
+  "onboarding::tui::view::tests::detail_highlights_selected_environment_names_and_directory_paths",
   "onboarding::tests::tui_container_and_additional_choices_map_to_the_same_config_fields_as_cli",
   "onboarding::tests::every_additional_tui_choice_round_trips_through_config",
 ]
@@ -62,6 +70,7 @@ enforced_by = [
 verified_by = [
   "onboarding::tests::environment_names_reject_assignments_and_values_never_render",
   "onboarding::tui::environment::tests::model_and_rendering_never_need_environment_values",
+  "onboarding::tui::environment::tests::down_focuses_search_results_and_typing_resumes_search",
   "onboarding::tui::environment::tests::open_dialog_ignores_text_and_defaults_to_cancel",
   "onboarding::tui::environment::tests::narrow_open_preview_requires_complete_disclosure_review",
   "tests::missing_approved_environment_name_fails_closed_except_in_editor",
@@ -77,37 +86,31 @@ enforced_by = [
   "src/onboarding/tui/app.rs::App::handle_confirmation",
   "src/onboarding/tui/environment.rs::EnvironmentSelector",
   "src/onboarding/tui/directory.rs::DirectoryBrowser",
-  "src/onboarding/tui/review.rs::ReviewState",
 ]
 verified_by = [
   "onboarding::tests::open_grants_are_classified_open",
   "onboarding::tui::dialog::tests::safe_choice_is_default_and_requires_navigation_to_confirm",
   "onboarding::tui::app::tests::open_dialog_defaults_to_cancel_and_requires_explicit_enable_choice",
+  "onboarding::tui::app::tests::recommended_github_requires_cancel_first_open_confirmation_on_save",
   "onboarding::tui::directory::tests::open_preview_dialog_ignores_text_and_defaults_to_cancel",
   "onboarding::tui::environment::tests::open_dialog_ignores_text_and_defaults_to_cancel",
-  "onboarding::tui::review::tests::open_authority_dialog_defaults_to_cancel",
 ]
-guide_sections = ["Capability review", "Complete effective-access review"]
+guide_sections = ["Capability review"]
 
 [[claim]]
 message_ids = ["AJ-SUM-001"]
 policy = "onboarding.launch_summary"
-enforced_by = [
-  "src/onboarding.rs::render_summary",
-  "src/onboarding/tui/review.rs::ReviewContent",
-]
+enforced_by = ["src/onboarding.rs::render_summary"]
 verified_by = [
   "onboarding::tests::secure_selection_denies_optional_credentials_and_registries",
-  "onboarding::tui::review::tests::narrow_layout_scrolls_and_shows_position",
 ]
-guide_sections = ["Complete effective-access review"]
+guide_sections = ["Plain-terminal and noninteractive behavior"]
 
 [[claim]]
 message_ids = ["AJ-SAVE-001", "AJ-CANCEL-001"]
 policy = "onboarding.persistence_safety"
 enforced_by = [
   "src/config_store.rs::save_project_grants",
-  "src/onboarding/tui/review.rs::ReviewState",
   "src/onboarding/tui/mod.rs::TerminalSession",
   "src/main.rs::run",
 ]
@@ -115,14 +118,16 @@ verified_by = [
   "config_store::tests::project_document_round_trip_marks_onboarding_complete",
   "config_store::tests::saving_onboarding_grants_preserves_existing_constraints",
   "config_store::tests::save_refuses_directory_swapped_after_preview_and_preserves_policy",
-  "onboarding::tui::review::tests::normal_mode_distinguishes_both_launch_actions",
-  "onboarding::tui::review::tests::back_and_cancel_are_always_available",
+  "onboarding::tui::app::tests::changed_draft_intercepts_escape_and_q_until_exit_choice_is_explicit",
+  "onboarding::tui::app::tests::exit_save_choice_requests_save_only_without_launching",
+  "onboarding::tui::app::tests::unchanged_or_reverted_draft_exits_without_an_unsaved_prompt",
   "onboarding::tui::tests::restoration_sequence_shows_cursor_and_leaves_alternate_screen",
-  "backing_out_of_final_review_then_cancelling_does_not_save",
-  "term_dumb_q_cancels_at_the_first_review_prompt",
+  "scripted_pty_quit_with_changes_can_save_without_launching",
+  "discarding_unsaved_exit_does_not_save",
+  "term_dumb_q_cancels_at_the_first_prompt",
 ]
 guide_sections = [
-  "Complete effective-access review",
+  "Saving and leaving",
   "Plain-terminal and noninteractive behavior",
 ]
 
@@ -147,18 +152,13 @@ enforced_by = [
   "src/main.rs::LaunchRunner::finish_proxy_config",
   "src/main.rs::LaunchRunner::build_sandbox",
   "src/onboarding.rs::render_effective_access",
-  "src/onboarding/tui/review.rs::ReviewState",
 ]
 verified_by = [
   "tests::actual_sandbox_and_proxy_handoffs_receive_finalized_launch_unchanged",
   "onboarding::tests::effective_output_escapes_inline_terminal_controls",
-  "onboarding::tui::review::tests::action_is_blocked_until_final_disclosure_line_is_reviewed",
-  "onboarding::tui::review::tests::open_confirmation_names_save_profile_persistence_and_no_launch",
-  "onboarding::tui::review::tests::open_confirmation_names_save_and_launch_persistence_and_duration",
-  "onboarding::tui::review::tests::open_confirmation_names_launch_once_non_persistence_and_duration",
-  "scripted_pty_can_review_and_save_recommended_baseline",
+  "scripted_pty_confirms_recommended_github_and_saves_without_final_review",
 ]
-guide_sections = ["Complete effective-access review"]
+guide_sections = ["Saving and leaving"]
 
 [[claim]]
 message_ids = ["AJ-PATH-001", "AJ-PATH-002", "AJ-PATH-003", "AJ-PATH-004"]
@@ -179,6 +179,7 @@ verified_by = [
   "onboarding::tui::directory::tests::current_directory_is_an_explicit_space_action",
   "onboarding::tui::directory::tests::selected_pane_uses_tab_and_space_and_closes_when_empty",
   "onboarding::tui::directory::tests::live_filter_and_path_inputs_escape_controls_and_bidi",
+  "onboarding::tui::directory::tests::down_focuses_filtered_results_and_typing_resumes_filtering",
   "directory_browser_accepts_utf8_paths",
 ]
 guide_sections = ["Directory browser"]

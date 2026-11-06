@@ -544,10 +544,10 @@ pub(crate) struct FinalizedLaunch {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ReviewedForge {
-    /// Legacy/non-onboarding launches did not present forge authority in a
-    /// review screen and retain the established attach behavior.
+    /// Legacy/non-onboarding launches did not present forge authority in the
+    /// access overview and retain the established attach behavior.
     Unreviewed,
-    /// Onboarding reviewed the exact metadata snapshot, including absence.
+    /// Onboarding confirmed the exact metadata snapshot, including absence.
     Reviewed(Option<forge_auth::AuthorityPreview>),
 }
 
@@ -561,15 +561,15 @@ impl ReviewedForge {
             (Self::Reviewed(Some(expected)), Some(actual))
                 if expected.matches_runtime(actual) => Ok(()),
             (Self::Reviewed(None), Some(_)) => Err(
-                "Forge authority appeared after final review; review access again before launch"
+                "Forge authority appeared after confirmation; confirm access again before launch"
                     .into(),
             ),
             (Self::Reviewed(Some(_)), None) => Err(
-                "Reviewed forge authority disappeared before launch; review access again"
+                "Confirmed forge authority disappeared before launch; confirm access again"
                     .into(),
             ),
             (Self::Reviewed(Some(_)), Some(_)) => Err(
-                "Forge authority changed after final review; review access again before launch"
+                "Forge authority changed after confirmation; confirm access again before launch"
                     .into(),
             ),
         }
@@ -1480,7 +1480,7 @@ fn run(
                     profile.restricted_ssh.clone(),
                 )?;
                 eprintln!(
-                    "[OK] Configuration saved\n  Project policy: {}\n  The project cannot edit or enable this policy from inside the jail.",
+                    "[OK] Configuration saved\n  Review later: {}",
                     onboarding::safe_path(&store.project)?
                 );
             }

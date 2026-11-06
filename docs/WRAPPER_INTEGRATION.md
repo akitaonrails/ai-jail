@@ -134,9 +134,8 @@ On interactive onboarding or `configure`, each request is shown with its
 requester, reason, and resource in the persistent staged-request review. Every
 request begins undecided and needs an explicit APPROVE or REJECT decision.
 Opening or revealing a request approves nothing. OPEN authority uses an
-in-TUI confirmation dialog for that request and another confirmation dialog
-before the chosen final action; Cancel is focused by default in both. The trusted
-external project document stores the normalized request identity and requester
+in-TUI confirmation dialog for that request, with Cancel focused by default.
+The trusted external project document stores the normalized request identity and requester
 alongside the resulting grant. It does not store environment values.
 
 See the [onboarding walkthrough](USER_GUIDE.md#wrapper-staged-requests) for the

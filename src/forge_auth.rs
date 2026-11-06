@@ -94,14 +94,17 @@ pub(crate) struct AuthorityPreview {
 }
 
 impl AuthorityPreview {
+    #[cfg(test)]
     pub(crate) fn is_open(&self) -> bool {
         !self.binding.scope_verified
     }
 
+    #[cfg(test)]
     pub(crate) fn summary(&self) -> String {
         binding_summary(&self.binding)
     }
 
+    #[cfg(test)]
     pub(crate) fn summary_line(&self) -> String {
         if self.is_open() {
             format!("- [ERROR] OPEN: {}", self.summary())
@@ -2157,6 +2160,10 @@ mod tests {
             ("evil.example", "owner/repo", false),
         ] {
             let mut child = Command::new("git")
+                // Spawn from a stable directory: the working directory is
+                // process-global and another test may be inside a temp dir
+                // it is about to remove.
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
                 .args([
                     "-c",
                     "credential.helper=",

@@ -10,21 +10,25 @@ use super::super::{
 use super::additional::{
     Capability as AdditionalCapability, State as AdditionalState,
 };
-use super::dialog::{ConfirmDialog, DialogAction};
+use super::dialog::{
+    ConfirmDialog, DialogAction, ExitDialog, ExitDialogAction,
+};
 use super::directory::{
     DirectoryAction, DirectoryBrowser, DirectoryEntry, DirectoryGrantEntry,
     DirectoryMode, DirectoryPreview,
 };
 use super::environment::{EnvironmentAction, EnvironmentSelector};
-use super::review::{FinalAction, ReviewAction, ReviewState};
 use super::ssh::{
     Editor as SshEditor, EditorAction as SshAction, IdentityRow,
     OperationRequest as SshRequest,
 };
 use super::wrapper::{WrapperAction, WrapperReview};
 use crate::integration::{RequestApproval, RequestSet};
+use crate::output::escape_control_bytes;
 use crossterm::event::KeyCode;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 pub(super) const MIN_WIDTH: u16 = 64;
 pub(super) const MIN_HEIGHT: u16 = 30;
@@ -39,6 +43,70 @@ pub(super) fn human_error(error: String) -> String {
     } else {
         error
     }
+}
+
+fn copy_to_clipboard(text: &str) -> Result<&'static str, String> {
+    #[cfg(target_os = "linux")]
+    let candidates: &[(&str, &[&str])] =
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            &[
+                ("wl-copy", &[]),
+                ("xclip", &["-selection", "clipboard"]),
+                ("xsel", &["--clipboard", "--input"]),
+            ]
+        } else {
+            &[
+                ("xclip", &["-selection", "clipboard"]),
+                ("xsel", &["--clipboard", "--input"]),
+                ("wl-copy", &[]),
+            ]
+        };
+
+    #[cfg(target_os = "macos")]
+    let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let candidates: &[(&str, &[&str])] = &[];
+
+    for (name, arguments) in candidates {
+        #[cfg(target_os = "linux")]
+        let program = crate::sandbox::bwrap::trusted_system_binary(name);
+        #[cfg(target_os = "macos")]
+        let program = {
+            let path = PathBuf::from("/usr/bin").join(name);
+            path.is_file().then_some(path)
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let program: Option<PathBuf> = None;
+
+        let Some(program) = program else {
+            continue;
+        };
+        let mut child = Command::new(program)
+            .args(*arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("Could not start {name}: {error}"))?;
+        let write_result = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("Could not open {name} input."))?
+            .write_all(text.as_bytes());
+        if let Err(error) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Could not copy with {name}: {error}"));
+        }
+        let status = child
+            .wait()
+            .map_err(|error| format!("Could not wait for {name}: {error}"))?;
+        if status.success() {
+            return Ok(name);
+        }
+    }
+    Err("Clipboard unavailable. Install wl-clipboard, xclip, or xsel (pbcopy is used on macOS).".into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +131,79 @@ pub(super) enum AccessPreset {
     FullyClosed,
     Developer,
     MostlyOpen,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BuiltinProtection {
+    PlatformSandbox,
+    ExternalPolicy,
+    DirectoryIdentity,
+    CredentialRoots,
+    EnvironmentValues,
+}
+
+impl BuiltinProtection {
+    pub(super) const ALL: [Self; 5] = [
+        Self::PlatformSandbox,
+        Self::ExternalPolicy,
+        Self::DirectoryIdentity,
+        Self::CredentialRoots,
+        Self::EnvironmentValues,
+    ];
+
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::PlatformSandbox => {
+                #[cfg(target_os = "linux")]
+                {
+                    "Bubblewrap sandbox"
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    "macOS sandbox-exec boundary"
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    "Platform sandbox"
+                }
+            }
+            Self::ExternalPolicy => "Approvals stored outside project",
+            Self::DirectoryIdentity => "Saved directory identity checks",
+            Self::CredentialRoots => "Credential-folder refusal",
+            Self::EnvironmentValues => "Environment values are not stored",
+        }
+    }
+
+    pub(super) const fn detail(self) -> &'static str {
+        match self {
+            Self::PlatformSandbox => {
+                #[cfg(target_os = "linux")]
+                {
+                    "Always enforced\nThe harness and every child process start inside Bubblewrap. Access choices add specific resources inside that boundary; this setup screen cannot turn the sandbox off.\n\nWhy it matters\nOptional grants widen a sandboxed process; they never become an unsandboxed launch."
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    "Always enforced\nThe harness and every child process start inside Apple's sandbox-exec boundary. Access choices add specific resources inside it; this setup screen cannot turn the sandbox off.\n\nWhy it matters\nOptional grants widen a sandboxed process; they never become an unsandboxed launch."
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    "Always enforced\nThe harness and every child process start inside the platform sandbox. Access choices add resources inside it; this setup screen cannot turn the sandbox off.\n\nWhy it matters\nOptional grants widen a sandboxed process; they never become an unsandboxed launch."
+                }
+            }
+            Self::ExternalPolicy => {
+                "Always enforced\nAccess approvals are read from the external config path shown above, not from this project.\n\nWhy it matters\nProject content cannot silently change the host access you approved."
+            }
+            Self::DirectoryIdentity => {
+                "Always enforced\nEvery saved directory approval is tied to the reviewed filesystem object. If the path disappears, moves, or changes identity, ai-jail refuses the grant.\n\nWhy it matters\nA replaced path cannot silently inherit an earlier directory approval."
+            }
+            Self::CredentialRoots => {
+                "Always enforced\nThe general directory picker refuses credential roots such as ~/.ssh. Credential access must use a dedicated, clearly disclosed capability instead.\n\nWhy it matters\nA convenient directory grant cannot quietly expose a whole credential store."
+            }
+            Self::EnvironmentValues => {
+                "Always enforced\nEnvironment approvals store names only. Values never appear in this TUI or the saved profile; ai-jail reads the current value only when launching a jail.\n\nWhy it matters\nRotated secrets stay current without being copied into persistent ai-jail configuration."
+            }
+        }
+    }
 }
 
 impl AccessPreset {
@@ -125,7 +266,47 @@ impl CapabilityId {
             Self::Environment => "Environment variables (names only)",
             Self::DirectoryAccess => "Directory access",
             Self::Additional => "Additional capabilities",
-            Self::Review => "Review complete access",
+            Self::Review => "Save configuration",
+        }
+    }
+
+    pub(super) const fn use_when(self) -> &'static str {
+        match self {
+            Self::ModelApi => "The harness needs its hosted model API.",
+            Self::HarnessState => {
+                "You want to reuse the host login and persist harness settings or history."
+            }
+            Self::Dependencies => {
+                "The project needs package managers, registries, or development tools."
+            }
+            Self::FullSsh => {
+                "The harness must use arbitrary host SSH identities and selected-key SSH is too narrow."
+            }
+            Self::RestrictedSsh => {
+                "The harness needs SSH or Git access to specific known destinations."
+            }
+            Self::FullGithub => {
+                "The harness must use gh across everything your current token can access."
+            }
+            Self::ContainerEngine => {
+                "The harness must build, run, inspect, or debug host Docker/Podman workloads."
+            }
+            Self::UnrestrictedNetwork => {
+                "The task needs destinations that cannot be expressed as a small reviewed host list."
+            }
+            Self::Loopback => {
+                "A macOS task must reach an existing service on host localhost."
+            }
+            Self::Environment => {
+                "A tool needs specific host configuration or credential variables."
+            }
+            Self::DirectoryAccess => {
+                "The task needs files outside the project directory."
+            }
+            Self::Additional => {
+                "The task needs a less common host integration, device, credential store, or compatibility grant."
+            }
+            Self::Review => "You are ready to save these choices and continue.",
         }
     }
 }
@@ -138,7 +319,6 @@ pub(super) enum Screen {
     Environment,
     DirectoryPicker { writable: bool },
     Additional,
-    Review,
 }
 impl Screen {
     pub(super) const fn title(self) -> &'static str {
@@ -150,7 +330,6 @@ impl Screen {
             Self::DirectoryPicker { writable: false } => "Read-only directory",
             Self::DirectoryPicker { writable: true } => "Read/write directory",
             Self::Additional => "Additional capabilities",
-            Self::Review => "Review complete access",
         }
     }
     pub(super) const fn placeholder(self) -> &'static str {
@@ -167,9 +346,6 @@ impl Screen {
             }
             Self::DirectoryPicker { writable: true } => {
                 "The read/write directory browser opens here."
-            }
-            Self::Review => {
-                "Continue to the complete effective-access review, including every contributing policy layer."
             }
             Self::Additional => {
                 "Less common host integrations and security-sensitive compatibility grants open here."
@@ -192,17 +368,19 @@ pub(super) enum ConfirmMode {
         capability: AdditionalCapability,
         dialog: ConfirmDialog,
     },
+    SaveWithGithub {
+        save_only: bool,
+        dialog: ConfirmDialog,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AppExit {
-    Final(FinalAction),
     Cancel,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Transition {
     Stay,
-    PrepareReview,
-    DiscardReview,
+    PrepareSave { save_only: bool },
     Exit(AppExit),
 }
 
@@ -210,11 +388,11 @@ pub(super) struct App<'a> {
     pub(super) selection: &'a mut Selection,
     pub(super) harness: String,
     pub(super) project: String,
+    pub(super) profile_path: String,
     pub(super) screen: Screen,
     pub(super) wrapper: Option<WrapperReview>,
     pub(super) directory: Option<DirectoryBrowser>,
     pub(super) environment: Option<EnvironmentSelector>,
-    pub(super) review: Option<ReviewState>,
     pub(super) ssh: Option<SshEditor>,
     pub(super) additional: Option<AdditionalState>,
     ssh_identities: Vec<crate::ssh_restricted::KeyIdentity>,
@@ -222,13 +400,20 @@ pub(super) struct App<'a> {
     pub(super) approved_wrapper_requests: Vec<RequestApproval>,
     pub(super) selected: usize,
     pub(super) confirmation: Option<ConfirmMode>,
+    pub(super) exit_dialog: Option<ExitDialog>,
     pub(super) feedback: String,
     pub(super) detail_scroll: u16,
     pub(super) viewport_safe: bool,
     pub(super) use_color: bool,
     pub(super) recommended_baseline: bool,
     pub(super) preset_focus: bool,
+    pub(super) preset_preview: bool,
     pub(super) preset_cursor: usize,
+    pub(super) protection_focus: bool,
+    pub(super) protection_selected: usize,
+    github_open_confirmed: bool,
+    initial_selection: Selection,
+    initial_approved_wrapper_requests: Vec<RequestApproval>,
 }
 
 impl<'a> App<'a> {
@@ -240,6 +425,10 @@ impl<'a> App<'a> {
         requests: &RequestSet,
         approved_wrapper_requests: &[RequestApproval],
     ) -> Self {
+        let initial_selection = selection.clone();
+        let github_open_confirmed = selection.github;
+        let initial_approved_wrapper_requests =
+            approved_wrapper_requests.to_vec();
         if !requests.items.is_empty() {
             for approval in approved_wrapper_requests {
                 revoke_wrapper_request(selection, approval);
@@ -251,6 +440,7 @@ impl<'a> App<'a> {
             selection,
             harness: harness.into(),
             project,
+            profile_path: "[external profile path unavailable]".into(),
             screen: if wrapper.is_some() {
                 Screen::WrapperRequests
             } else {
@@ -259,7 +449,6 @@ impl<'a> App<'a> {
             wrapper,
             directory: None,
             environment: None,
-            review: None,
             ssh: None,
             additional: None,
             ssh_identities: Vec::new(),
@@ -267,13 +456,77 @@ impl<'a> App<'a> {
             approved_wrapper_requests: approved_wrapper_requests.to_vec(),
             selected: 0,
             confirmation: None,
+            exit_dialog: None,
             feedback: String::new(),
             detail_scroll: 0,
             viewport_safe: true,
             use_color,
             recommended_baseline: false,
             preset_focus: false,
+            preset_preview: false,
             preset_cursor: 1,
+            protection_focus: false,
+            protection_selected: 0,
+            github_open_confirmed,
+            initial_selection,
+            initial_approved_wrapper_requests,
+        }
+    }
+
+    pub(super) fn has_unsaved_changes(&self) -> bool {
+        self.recommended_baseline
+            || *self.selection != self.initial_selection
+            || self.approved_wrapper_requests
+                != self.initial_approved_wrapper_requests
+    }
+
+    pub(super) fn set_recommended_baseline(&mut self, enabled: bool) {
+        self.recommended_baseline = enabled;
+        if enabled && self.selection.github {
+            self.github_open_confirmed = false;
+        }
+    }
+
+    fn request_save(&mut self, save_only: bool) -> Transition {
+        if self.selection.github && !self.github_open_confirmed {
+            self.confirmation = Some(ConfirmMode::SaveWithGithub {
+                save_only,
+                dialog: ConfirmDialog::new(
+                    "Save with full GitHub access?",
+                    "The active host gh token is OPEN: the harness can use every repository and organization permission carried by that token, not only this project.",
+                    "Save with OPEN GitHub",
+                ),
+            });
+            Transition::Stay
+        } else {
+            Transition::PrepareSave { save_only }
+        }
+    }
+
+    fn request_exit(&mut self) -> Transition {
+        if self.has_unsaved_changes() {
+            self.exit_dialog = Some(ExitDialog::new());
+            Transition::Stay
+        } else {
+            Transition::Exit(AppExit::Cancel)
+        }
+    }
+
+    fn handle_exit_dialog(&mut self, code: KeyCode) -> Transition {
+        let Some(mut dialog) = self.exit_dialog.take() else {
+            return Transition::Stay;
+        };
+        match dialog.handle_key(code) {
+            ExitDialogAction::Stay => {
+                self.exit_dialog = Some(dialog);
+                Transition::Stay
+            }
+            ExitDialogAction::KeepEditing => {
+                self.feedback = "Unsaved changes kept for editing.".into();
+                Transition::Stay
+            }
+            ExitDialogAction::Discard => Transition::Exit(AppExit::Cancel),
+            ExitDialogAction::Save => self.request_save(true),
         }
     }
     pub(super) fn resize(&mut self, width: u16, height: u16) {
@@ -282,13 +535,181 @@ impl<'a> App<'a> {
     pub(super) fn set_project_path(&mut self, project: &Path) {
         self.project_path = project.to_path_buf();
     }
-    pub(super) fn show_review(&mut self, review: ReviewState) {
-        self.review = Some(review);
-        self.screen = Screen::Review;
-        self.feedback.clear();
+    pub(super) fn set_profile_path(&mut self, path: &Path) {
+        self.profile_path = safe_path(path)
+            .unwrap_or_else(|_| "[invalid profile path refused]".into());
     }
     pub(super) fn selected_capability(&self) -> CapabilityId {
         CapabilityId::ALL[self.selected]
+    }
+    pub(super) fn selected_protection(&self) -> BuiltinProtection {
+        BuiltinProtection::ALL[self.protection_selected]
+    }
+
+    pub(super) fn cli_equivalent(&self) -> String {
+        self.cli_equivalent_inner(false)
+    }
+
+    pub(super) fn cli_equivalent_display(&self) -> String {
+        self.cli_equivalent_inner(true)
+    }
+
+    fn cli_equivalent_inner(&self, display_safe: bool) -> String {
+        fn quote(value: &str, display_safe: bool) -> String {
+            let escaped;
+            let value = if display_safe {
+                escaped = escape_control_bytes(value);
+                escaped.as_str()
+            } else {
+                value
+            };
+            if !value.is_empty()
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric()
+                        || matches!(
+                            character,
+                            '_' | '-' | '.' | '/' | ':' | '@'
+                        )
+                })
+            {
+                value.into()
+            } else {
+                format!("'{}'", value.replace('\'', "'\\''"))
+            }
+        }
+        fn path_option(
+            parts: &mut Vec<String>,
+            notes: &mut Vec<String>,
+            option: &str,
+            path: &Path,
+            display_safe: bool,
+        ) {
+            if let Some(path) = path.to_str() {
+                parts.push(option.into());
+                parts.push(quote(path, display_safe));
+            } else {
+                notes.push(format!(
+                    "Profile-only: one {option} path is not valid UTF-8."
+                ));
+            }
+        }
+
+        let mut parts = vec!["ai-jail".into()];
+        let mut notes = Vec::new();
+        if !self.selection.agent_state {
+            parts.push("--no-agent-state".into());
+        }
+        if !self.selection.dependency_hosts {
+            parts.push("--no-mise".into());
+            parts.push("--no-toolchains".into());
+        }
+        if self.selection.ssh {
+            parts.push("--ssh".into());
+        }
+        if self.selection.github {
+            parts.push("--github".into());
+        }
+        if self.selection.container_engine {
+            parts.push("--docker".into());
+        }
+        if self.selection.unrestricted_network {
+            parts.push("--network".into());
+        }
+        if self.selection.loopback_connect {
+            parts.push("--allow-loopback-connect".into());
+        }
+        if !self.selection.unrestricted_network {
+            let automatic_api_hosts = api_hosts(&self.harness);
+            let suppress_automatic_hosts =
+                !self.selection.api_access && !automatic_api_hosts.is_empty();
+            if suppress_automatic_hosts {
+                parts.push("--no-network".into());
+                #[cfg(target_os = "linux")]
+                if self.selection.dependency_hosts {
+                    for host in crate::sandbox::TOOLCHAIN_REGISTRY_HOSTS {
+                        parts.push("--allow-host".into());
+                        parts.push(quote(host, display_safe));
+                    }
+                }
+            }
+            for host in &self.selection.requested_hosts {
+                parts.push("--allow-host".into());
+                parts.push(quote(host, display_safe));
+            }
+            for host in &self.selection.requested_private_hosts {
+                parts.push("--allow-private-host".into());
+                parts.push(quote(host, display_safe));
+            }
+            for (name, host) in &self.selection.requested_secrets {
+                parts.push("--secret".into());
+                parts.push(quote(&format!("{name}={host}"), display_safe));
+            }
+        }
+        for name in &self.selection.env_names {
+            parts.push("--env".into());
+            parts.push(quote(name, display_safe));
+        }
+        for path in &self.selection.ro_dirs {
+            path_option(&mut parts, &mut notes, "--map", path, display_safe);
+        }
+        for path in &self.selection.rw_dirs {
+            path_option(&mut parts, &mut notes, "--rw-map", path, display_safe);
+        }
+
+        let additional = &self.selection.additional;
+        let mut enabled_flag = |enabled: bool, flag: &str| {
+            if enabled {
+                parts.push(flag.into());
+            }
+        };
+        enabled_flag(additional.share_host_home, "--no-private-home");
+        enabled_flag(additional.lockdown, "--lockdown");
+        enabled_flag(additional.systemd_user, "--systemd-user");
+        enabled_flag(additional.gpu, "--gpu");
+        enabled_flag(additional.tailscale, "--tailscale");
+        enabled_flag(additional.display, "--display");
+        enabled_flag(additional.audio, "--audio");
+        enabled_flag(additional.kvm, "--kvm");
+        enabled_flag(additional.x11, "--x11");
+        enabled_flag(additional.host_shm, "--host-shm");
+        enabled_flag(additional.terminal_passthrough, "--terminal-passthrough");
+        enabled_flag(additional.aws, "--aws");
+        enabled_flag(additional.kube, "--kube");
+        enabled_flag(additional.gcloud, "--gcloud");
+        enabled_flag(additional.docker_config, "--docker-config");
+        enabled_flag(additional.macos_host_ipc, "--macos-host-ipc");
+        enabled_flag(additional.macos_chromium, "--macos-chromium");
+        enabled_flag(additional.macos_trustd, "--macos-trustd");
+        enabled_flag(additional.allow_pty, "--allow-pty");
+        enabled_flag(
+            additional.allow_loopback_listen,
+            "--allow-loopback-listen",
+        );
+        enabled_flag(additional.inherit_env, "--inherit-env");
+        enabled_flag(additional.worktree, "--worktree");
+        enabled_flag(additional.pictures, "--pictures");
+        enabled_flag(additional.audit_log, "--audit-log");
+
+        if self.selection.restricted_ssh.is_some() {
+            notes.push(
+                "Profile-only: selected-key SSH cannot be expressed as launch flags; keep the saved profile."
+                    .into(),
+            );
+        }
+        if !self.approved_wrapper_requests.is_empty() {
+            notes.push(
+                "Profile-only: approved wrapper requests require their trusted request manifest."
+                    .into(),
+            );
+        }
+        parts.push(quote(&self.harness, display_safe));
+        let mut output = parts.join(" ");
+        for note in notes {
+            output.push('\n');
+            output.push_str("# ");
+            output.push_str(&note);
+        }
+        output
     }
     pub(super) fn grant(&self, c: CapabilityId) -> Option<GrantSpec> {
         match c {
@@ -322,20 +743,21 @@ impl<'a> App<'a> {
 
     pub(super) fn detail(&self, c: CapabilityId) -> String {
         let saved = "This run. Saving keeps this choice for this project.";
-        match c {
+        let detail = match c {
             CapabilityId::ModelApi => {
                 let hosts = api_hosts(&self.harness);
                 if hosts.is_empty() {
-                    return format!(
+                    format!(
                         "Allows\nNo model API is known for {}. This choice adds no destination.\n\n{saved}",
                         self.harness
-                    );
+                    )
+                } else {
+                    format!(
+                        "Allows\n{} and its child processes can connect only to {} and subdomains.\n\nStill blocked\nOther hosts, private IP addresses, and localhost.\n\nRisk\nThese API services can receive prompts and any jail data the process sends.\n\n{saved}",
+                        self.harness,
+                        hosts.join(", ")
+                    )
                 }
-                format!(
-                    "Allows\n{} and its child processes can connect only to {} and subdomains.\n\nStill blocked\nOther hosts, private IP addresses, and localhost.\n\nRisk\nThese API services can receive prompts and any jail data the process sends.\n\n{saved}",
-                    self.harness,
-                    hosts.join(", ")
-                )
             }
             CapabilityId::HarnessState => {
                 let resource = state_grant(&self.harness, None).resource;
@@ -353,8 +775,55 @@ impl<'a> App<'a> {
                 self.harness
             ),
             CapabilityId::RestrictedSsh => {
-                "Allows\nCreate a fresh SSH agent with only the keys you select. Keys must be limited to verified destinations.\n\nStill private\nPrivate-key files and your normal host agent never enter the jail.\n\nAlso needed\nSSH network access must be enabled separately."
-                    .into()
+                let selected = self
+                    .selection
+                    .restricted_ssh
+                    .as_ref()
+                    .map(|policy| {
+                        let keys = policy
+                            .keys
+                            .iter()
+                            .map(|key| {
+                                format!(
+                                    "• {}  {}",
+                                    key.fingerprint,
+                                    safe_path(&key.public_path).unwrap_or_else(
+                                        |_| "[invalid path refused]".into()
+                                    )
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let destinations = policy
+                            .destinations
+                            .iter()
+                            .map(|destination| {
+                                format!(
+                                    "• {}",
+                                    escape_control_bytes(destination)
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        format!(
+                            "Selected keys\n{}\n\nDestinations\n{}\n\nLifetime\n{} seconds",
+                            if keys.is_empty() {
+                                "None".into()
+                            } else {
+                                keys.join("\n")
+                            },
+                            if destinations.is_empty() {
+                                "None".into()
+                            } else {
+                                destinations.join("\n")
+                            },
+                            policy.lifetime_seconds
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "Selected keys\nNone\n\nDestinations\nNone".into()
+                    });
+                format!(
+                    "{selected}\n\nTo change\nPress Enter or Space to add or remove keys and destinations.\n\nStill private\nPrivate-key files and your normal host agent never enter the jail.\n\nAlso needed\nSSH network access must be enabled separately."
+                )
             }
             CapabilityId::FullGithub => format!(
                 "OPEN access\n{} and its child processes can use and copy your active github.com gh token.\n\nScope\nEvery repository and organization that token can access—not only this project.\n\nRisk\nA jailed process can act on GitHub with all permissions carried by the token.\n\n{saved}",
@@ -373,22 +842,79 @@ impl<'a> App<'a> {
                 self.harness
             ),
             CapabilityId::Environment => {
-                "Choose exact variable names to pass into the jail. Values stay hidden and are never saved.\n\nRisk\nEvery jailed child process can read and copy an approved value."
-                    .into()
+                let selected = if self.selection.env_names.is_empty() {
+                    "None".into()
+                } else {
+                    self.selection
+                        .env_names
+                        .iter()
+                        .map(|name| format!("• {name}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                format!(
+                    "Selected names — values hidden\n{selected}\n\nTo change\nPress Enter or Space to add or remove names. Values never appear here or in the saved profile.\n\nRisk\nEvery jailed child process can read and copy an approved value."
+                )
             }
             CapabilityId::DirectoryAccess => {
-                "Choose extra host directories and set each one read-only or read/write.\n\nSafety\nCredential folders are refused. Broad folders require OPEN approval."
-                    .into()
+                let mut selected = self
+                    .selection
+                    .ro_dirs
+                    .iter()
+                    .map(|path| {
+                        format!(
+                            "• READ-ONLY  {}",
+                            safe_path(path)
+                                .unwrap_or_else(|_| "[invalid path refused]".into())
+                        )
+                    })
+                    .chain(self.selection.rw_dirs.iter().map(|path| {
+                        format!(
+                            "• READ/WRITE {}",
+                            safe_path(path)
+                                .unwrap_or_else(|_| "[invalid path refused]".into())
+                        )
+                    }))
+                    .collect::<Vec<_>>();
+                selected.sort();
+                let selected = if selected.is_empty() {
+                    "None beyond the project directory".into()
+                } else {
+                    selected.join("\n")
+                };
+                format!(
+                    "Selected extra directories\n{selected}\n\nTo change\nPress Enter or Space to add, remove, or change access.\n\nSafety\nCredential folders are refused. Broad folders require OPEN approval."
+                )
             }
             CapabilityId::Additional => {
-                "Open a categorized list of less common host integrations, credentials, devices, and compatibility grants.\n\nSafety\nNothing here is enabled by a preset. Broad grants require an explicit OPEN dialog."
-                    .into()
+                let enabled = AdditionalCapability::available()
+                    .into_iter()
+                    .filter(|capability| {
+                        capability.enabled(&self.selection.additional)
+                    })
+                    .map(|capability| {
+                        let state = match capability.risk() {
+                            Risk::Allowed => "ALLOWED",
+                            Risk::Open => "OPEN",
+                        };
+                        format!("• {state}  {}", capability.label())
+                    })
+                    .collect::<Vec<_>>();
+                let enabled = if enabled.is_empty() {
+                    "None".into()
+                } else {
+                    enabled.join("\n")
+                };
+                format!(
+                    "Enabled additional capabilities\n{enabled}\n\nTo change\nPress Enter or Space to add or remove capabilities.\n\nSafety\nNothing here is enabled by a preset. Broad grants require an explicit OPEN dialog."
+                )
             }
             CapabilityId::Review => {
-                "See the final combined access before saving or launching. This includes presets, granular choices, CLI flags, and policy defaults."
+                "Save the choices shown in this screen. Normal onboarding then launches the harness; `ai-jail configure` saves and exits."
                     .into()
             }
-        }
+        };
+        format!("{detail}\n\nUse when\n{}", c.use_when())
     }
 
     pub(super) fn enabled(&self, c: CapabilityId) -> bool {
@@ -411,7 +937,7 @@ impl<'a> App<'a> {
     }
 
     pub(super) fn displayed_enabled(&self, c: CapabilityId) -> bool {
-        if self.preset_focus {
+        if self.preset_focus && self.preset_preview {
             return self
                 .preset_enabled(AccessPreset::ALL[self.preset_cursor], c);
         }
@@ -489,6 +1015,7 @@ impl<'a> App<'a> {
                 self.selection.agent_state = true;
                 self.selection.dependency_hosts = true;
                 self.selection.github = true;
+                self.github_open_confirmed = false;
             }
             AccessPreset::MostlyOpen => {
                 self.selection.api_access =
@@ -502,6 +1029,7 @@ impl<'a> App<'a> {
             }
         }
         self.preset_focus = false;
+        self.preset_preview = false;
         self.feedback = format!("Applied {} preset.", preset.label());
     }
 
@@ -511,13 +1039,28 @@ impl<'a> App<'a> {
             self.confirmation = Some(ConfirmMode::MostlyOpen {
                 dialog: ConfirmDialog::new(
                     "Apply Mostly open?",
-                    "This opens unrestricted network, the full host GitHub token, the ambient SSH agent, and host loopback services. It clears selected directories, environment variables, selected-key SSH, and wrapper approvals. The final review still shows the complete effective access.",
+                    "This opens unrestricted network, the full host GitHub token, the ambient SSH agent, and host loopback services. It clears selected directories, environment variables, selected-key SSH, and wrapper approvals. The resulting OPEN choices remain visible in the access list.",
                     "Apply Mostly open",
                 ),
             });
         } else {
             self.apply_preset(preset);
         }
+    }
+
+    fn focus_presets(&mut self) {
+        self.protection_focus = false;
+        self.preset_focus = true;
+        self.preset_preview = false;
+        self.preset_cursor = self
+            .active_preset()
+            .and_then(|active| {
+                AccessPreset::ALL
+                    .iter()
+                    .position(|preset| *preset == active)
+            })
+            .unwrap_or(1);
+        self.feedback.clear();
     }
     fn set_enabled(&mut self, c: CapabilityId, on: bool) {
         match c {
@@ -553,23 +1096,24 @@ impl<'a> App<'a> {
     }
 
     pub(super) fn handle_key(&mut self, code: KeyCode) -> Transition {
+        if self.exit_dialog.is_some() {
+            return self.handle_exit_dialog(code);
+        }
         if !self.viewport_safe {
             return match code {
-                KeyCode::Char('q') => Transition::Exit(AppExit::Cancel),
+                KeyCode::Char('q') => self.request_exit(),
                 KeyCode::Esc if self.screen == Screen::WrapperRequests => {
-                    Transition::Exit(AppExit::Cancel)
-                }
-                KeyCode::Esc if self.screen == Screen::Review => {
-                    self.review = None;
-                    self.screen = Screen::Access;
-                    self.feedback =
-                        "Review draft discarded; resize to continue.".into();
-                    Transition::DiscardReview
+                    self.request_exit()
                 }
                 KeyCode::Esc => {
-                    self.screen = Screen::Access;
-                    self.feedback = "Resize the terminal to continue.".into();
-                    Transition::Stay
+                    if self.screen == Screen::Access {
+                        self.request_exit()
+                    } else {
+                        self.screen = Screen::Access;
+                        self.feedback =
+                            "Resize the terminal to continue.".into();
+                        Transition::Stay
+                    }
                 }
                 _ => Transition::Stay,
             };
@@ -578,7 +1122,6 @@ impl<'a> App<'a> {
             return self.handle_wrapper(code);
         }
         match self.screen {
-            Screen::Review => return self.handle_review(code),
             Screen::RestrictedSsh => return self.handle_ssh(code),
             Screen::Environment => return self.handle_environment(code),
             Screen::DirectoryPicker { .. } => {
@@ -588,7 +1131,7 @@ impl<'a> App<'a> {
             _ => {}
         }
         if code == KeyCode::Char('q') {
-            return Transition::Exit(AppExit::Cancel);
+            return self.request_exit();
         }
         debug_assert_eq!(self.screen, Screen::Access);
         if let Some(confirm) = self.confirmation.take() {
@@ -606,22 +1149,79 @@ impl<'a> App<'a> {
             }
             return self.handle_confirmation(confirm, code);
         }
+        if code == KeyCode::Char('y') {
+            self.feedback = match copy_to_clipboard(&self.cli_equivalent()) {
+                Ok(helper) => {
+                    format!("Copied CLI from defaults with {helper}.")
+                }
+                Err(error) => error,
+            };
+            return Transition::Stay;
+        }
+        if self.protection_focus {
+            match code {
+                KeyCode::Tab => self.focus_presets(),
+                KeyCode::BackTab | KeyCode::Esc | KeyCode::Left => {
+                    self.protection_focus = false;
+                    self.feedback.clear();
+                }
+                KeyCode::Up => {
+                    self.protection_selected =
+                        self.protection_selected.saturating_sub(1);
+                    self.reset_detail();
+                }
+                KeyCode::Down => {
+                    self.protection_selected = (self.protection_selected + 1)
+                        .min(BuiltinProtection::ALL.len() - 1);
+                    self.reset_detail();
+                }
+                KeyCode::Home => {
+                    self.protection_selected = 0;
+                    self.reset_detail();
+                }
+                KeyCode::End => {
+                    self.protection_selected = BuiltinProtection::ALL.len() - 1;
+                    self.reset_detail();
+                }
+                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => {
+                    self.feedback =
+                        "Built-in protection; there is nothing to enable."
+                            .into();
+                }
+                _ => {}
+            }
+            return Transition::Stay;
+        }
         if self.preset_focus {
             match code {
-                KeyCode::Tab | KeyCode::Right => {
+                KeyCode::Right => {
+                    self.preset_preview = true;
                     self.preset_cursor =
                         (self.preset_cursor + 1) % AccessPreset::ALL.len();
                 }
-                KeyCode::BackTab | KeyCode::Left => {
+                KeyCode::Left => {
+                    self.preset_preview = true;
                     self.preset_cursor = if self.preset_cursor == 0 {
                         AccessPreset::ALL.len() - 1
                     } else {
                         self.preset_cursor - 1
                     };
                 }
+                KeyCode::Tab => {
+                    self.preset_focus = false;
+                    self.preset_preview = false;
+                    self.feedback.clear();
+                }
+                KeyCode::BackTab => {
+                    self.preset_focus = false;
+                    self.preset_preview = false;
+                    self.protection_focus = true;
+                    self.feedback.clear();
+                }
                 KeyCode::Enter | KeyCode::Char(' ') => self.activate_preset(),
                 KeyCode::Down | KeyCode::Esc => {
                     self.preset_focus = false;
+                    self.preset_preview = false;
                     self.feedback =
                         "Preset preview closed without applying it.".into();
                 }
@@ -630,18 +1230,11 @@ impl<'a> App<'a> {
             return Transition::Stay;
         }
         match code {
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.preset_focus = true;
-                self.preset_cursor = self
-                    .active_preset()
-                    .and_then(|active| {
-                        AccessPreset::ALL
-                            .iter()
-                            .position(|preset| *preset == active)
-                    })
-                    .unwrap_or(1);
+            KeyCode::Tab => {
+                self.protection_focus = true;
                 self.feedback.clear();
             }
+            KeyCode::BackTab => self.focus_presets(),
             KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
                 self.reset_detail();
@@ -670,8 +1263,7 @@ impl<'a> App<'a> {
                 return self.activate(self.selected_capability());
             }
             KeyCode::Esc => {
-                self.feedback =
-                    "Already at the access overview; q cancels setup.".into()
+                return self.request_exit();
             }
             KeyCode::Char(v) => {
                 if let Some(i) =
@@ -686,28 +1278,6 @@ impl<'a> App<'a> {
         }
         Transition::Stay
     }
-    fn handle_review(&mut self, code: KeyCode) -> Transition {
-        let Some(review) = &mut self.review else {
-            self.screen = Screen::Access;
-            self.feedback = "Review must be prepared again.".into();
-            return Transition::DiscardReview;
-        };
-        match review.handle_key(code) {
-            ReviewAction::Stay => Transition::Stay,
-            ReviewAction::Back => {
-                self.review = None;
-                self.screen = Screen::Access;
-                self.feedback =
-                    "Review draft discarded; access choices are editable."
-                        .into();
-                Transition::DiscardReview
-            }
-            ReviewAction::Cancel => Transition::Exit(AppExit::Cancel),
-            ReviewAction::Complete(action) => {
-                Transition::Exit(AppExit::Final(action))
-            }
-        }
-    }
     fn handle_wrapper(&mut self, code: KeyCode) -> Transition {
         let Some(wrapper) = &mut self.wrapper else {
             self.screen = Screen::Access;
@@ -715,7 +1285,7 @@ impl<'a> App<'a> {
         };
         match wrapper.handle_key(code) {
             WrapperAction::Stay => Transition::Stay,
-            WrapperAction::Cancel => Transition::Exit(AppExit::Cancel),
+            WrapperAction::Cancel => self.request_exit(),
             WrapperAction::PrepareApprove => {
                 let approval = wrapper.selected_request().approval.clone();
                 match prepare_wrapper_request(
@@ -801,7 +1371,7 @@ impl<'a> App<'a> {
         let action = browser.handle_key(code);
         if code == KeyCode::Char('q') && !captures_text {
             self.directory = Some(browser);
-            return Transition::Exit(AppExit::Cancel);
+            return self.request_exit();
         }
         match action {
             DirectoryAction::None => {}
@@ -1001,7 +1571,7 @@ impl<'a> App<'a> {
         let captures_text = selector.captures_text_input();
         let action = selector.handle_key(code);
         if code == KeyCode::Char('q') && !captures_text {
-            return Transition::Exit(AppExit::Cancel);
+            return self.request_exit();
         }
         match action {
             EnvironmentAction::None => {}
@@ -1119,7 +1689,7 @@ impl<'a> App<'a> {
         let action = editor.handle_key(code);
         if code == KeyCode::Char('q') && !captures_text {
             self.ssh = Some(editor);
-            return Transition::Exit(AppExit::Cancel);
+            return self.request_exit();
         }
         match action {
             SshAction::Stay => {}
@@ -1230,7 +1800,9 @@ impl<'a> App<'a> {
                     self.additional = Some(AdditionalState::new());
                     Screen::Additional
                 }
-                CapabilityId::Review => return Transition::PrepareReview,
+                CapabilityId::Review => {
+                    return self.request_save(false);
+                }
                 _ => Screen::Access,
             };
             self.feedback.clear();
@@ -1253,7 +1825,7 @@ impl<'a> App<'a> {
                     dialog: ConfirmDialog::new(
                         "Open this boundary?",
                         format!(
-                            "{} removes an important isolation boundary. The complete effect remains visible in the final review.",
+                            "{} removes an important isolation boundary. The resulting OPEN state remains visible in the access list.",
                             c.label()
                         ),
                         "Enable OPEN access",
@@ -1275,6 +1847,9 @@ impl<'a> App<'a> {
             } => match dialog.handle_key(code) {
                 DialogAction::Confirm => {
                     self.set_enabled(capability, true);
+                    if capability == CapabilityId::FullGithub {
+                        self.github_open_confirmed = true;
+                    }
                     self.feedback = "OPEN grant enabled.".into();
                 }
                 DialogAction::Cancel => {
@@ -1289,6 +1864,7 @@ impl<'a> App<'a> {
                 match dialog.handle_key(code) {
                     DialogAction::Confirm => {
                         self.apply_preset(AccessPreset::MostlyOpen);
+                        self.github_open_confirmed = true;
                     }
                     DialogAction::Cancel => {
                         self.feedback = "Mostly open was not applied.".into();
@@ -1317,6 +1893,22 @@ impl<'a> App<'a> {
                     });
                 }
             },
+            ConfirmMode::SaveWithGithub {
+                save_only,
+                mut dialog,
+            } => match dialog.handle_key(code) {
+                DialogAction::Confirm => {
+                    self.github_open_confirmed = true;
+                    return Transition::PrepareSave { save_only };
+                }
+                DialogAction::Cancel => {
+                    self.feedback = "GitHub remains OPEN in the draft; configuration was not saved.".into();
+                }
+                DialogAction::Stay => {
+                    self.confirmation =
+                        Some(ConfirmMode::SaveWithGithub { save_only, dialog });
+                }
+            },
         }
         Transition::Stay
     }
@@ -1334,7 +1926,7 @@ impl<'a> App<'a> {
                 self.screen = Screen::Access;
                 self.additional = None;
             }
-            KeyCode::Char('q') => return Transition::Exit(AppExit::Cancel),
+            KeyCode::Char('q') => return self.request_exit(),
             KeyCode::Up => {
                 state.selected = state.selected.saturating_sub(1);
                 state.feedback.clear();
@@ -1368,7 +1960,7 @@ impl<'a> App<'a> {
                         dialog: ConfirmDialog::new(
                             "Open this boundary?",
                             format!(
-                                "{} removes an important isolation boundary. The final review shows the effective result.",
+                                "{} removes an important isolation boundary. The resulting OPEN state remains visible in this screen.",
                                 capability.label()
                             ),
                             "Enable OPEN access",
@@ -1458,6 +2050,10 @@ mod tests {
             let detail = app.detail(capability);
             assert!(!detail.trim().is_empty(), "missing {capability:?} detail");
             assert!(
+                detail.contains("Use when\n"),
+                "missing use case for {capability:?}: {detail}"
+            );
+            assert!(
                 detail.split_whitespace().count() <= 90,
                 "{capability:?} detail is too long: {detail}"
             );
@@ -1488,6 +2084,55 @@ mod tests {
     }
 
     #[test]
+    fn main_details_summarize_environment_and_directory_selections() {
+        let mut selection = Selection {
+            env_names: vec!["GH_TOKEN".into(), "CUSTOM_MODE".into()],
+            ro_dirs: vec![PathBuf::from("/srv/reference")],
+            rw_dirs: vec![PathBuf::from("/srv/output")],
+            restricted_ssh: Some(crate::ssh_restricted::Policy {
+                keys: vec![crate::ssh_restricted::KeyIdentity {
+                    private_path: PathBuf::from("/keys/id_test"),
+                    public_path: PathBuf::from("/keys/id_test.pub"),
+                    fingerprint: "SHA256:TEST".into(),
+                    comment: "not rendered".into(),
+                    private_dev: 1,
+                    private_ino: 2,
+                    public_dev: 1,
+                    public_ino: 3,
+                }],
+                lifetime_seconds: 900,
+                destinations: vec!["git@example.test".into()],
+            }),
+            ..Selection::default()
+        };
+        selection.additional.audit_log = true;
+        selection.additional.aws = true;
+        let app = app(&mut selection);
+
+        let environment = app.detail(CapabilityId::Environment);
+        assert!(environment.contains("GH_TOKEN"));
+        assert!(environment.contains("CUSTOM_MODE"));
+        assert!(environment.contains("values hidden"));
+        assert!(environment.contains("Press Enter or Space"));
+
+        let directories = app.detail(CapabilityId::DirectoryAccess);
+        assert!(directories.contains("READ-ONLY  /srv/reference"));
+        assert!(directories.contains("READ/WRITE /srv/output"));
+        assert!(directories.contains("Press Enter or Space"));
+
+        let additional = app.detail(CapabilityId::Additional);
+        assert!(additional.contains("ALLOWED  Local security audit log"));
+        assert!(additional.contains("OPEN  AWS credentials"));
+        assert!(additional.contains("Press Enter or Space"));
+
+        let ssh = app.detail(CapabilityId::RestrictedSsh);
+        assert!(ssh.contains("SHA256:TEST  /keys/id_test.pub"));
+        assert!(ssh.contains("git@example.test"));
+        assert!(ssh.contains("900 seconds"));
+        assert!(!ssh.contains("not rendered"));
+    }
+
+    #[test]
     fn preset_navigation_previews_access_without_applying_it() {
         let mut selection = Selection {
             api_access: true,
@@ -1500,9 +2145,21 @@ mod tests {
         assert_eq!(app.active_preset(), Some(AccessPreset::Developer));
 
         app.handle_key(KeyCode::Tab);
+        assert!(app.protection_focus);
+        app.handle_key(KeyCode::Tab);
+        assert!(app.preset_focus);
+        app.handle_key(KeyCode::BackTab);
+        assert!(app.protection_focus);
+        assert!(!app.preset_focus);
+        app.handle_key(KeyCode::Tab);
         assert!(app.preset_focus);
         assert_eq!(app.preset_cursor, 1);
+        assert!(!app.preset_preview);
+        assert!(!app.displayed_enabled(CapabilityId::FullSsh));
+        assert!(app.displayed_enabled(CapabilityId::FullGithub));
+        assert!(!app.displayed_enabled(CapabilityId::UnrestrictedNetwork));
         app.handle_key(KeyCode::Right);
+        assert!(app.preset_preview);
         assert_eq!(app.preset_cursor, 2);
         assert!(app.displayed_enabled(CapabilityId::FullSsh));
         assert!(app.displayed_enabled(CapabilityId::FullGithub));
@@ -1510,6 +2167,79 @@ mod tests {
         assert!(!app.selection.ssh);
         assert!(app.selection.github);
         assert!(!app.selection.unrestricted_network);
+    }
+
+    #[test]
+    fn tab_focuses_the_preset_row_without_changing_a_custom_checklist() {
+        let mut selection = Selection {
+            api_access: true,
+            loopback_connect: true,
+            ..Selection::default()
+        };
+        let mut app = app(&mut selection);
+        assert_eq!(app.active_preset(), None);
+
+        app.handle_key(KeyCode::BackTab);
+
+        assert!(app.preset_focus);
+        assert!(!app.preset_preview);
+        assert!(app.displayed_enabled(CapabilityId::ModelApi));
+        assert!(app.displayed_enabled(CapabilityId::Loopback));
+        assert!(!app.displayed_enabled(CapabilityId::FullGithub));
+        assert_eq!(app.active_preset(), None);
+    }
+
+    #[test]
+    fn cli_equivalent_is_shell_safe_and_names_profile_only_choices() {
+        let mut selection = Selection {
+            api_access: true,
+            agent_state: true,
+            dependency_hosts: true,
+            github: true,
+            env_names: vec!["GH_TOKEN".into(), "SPOOF\n\x1b[31m".into()],
+            ro_dirs: vec![PathBuf::from("/srv/reference files")],
+            restricted_ssh: Some(crate::ssh_restricted::Policy {
+                keys: Vec::new(),
+                lifetime_seconds: 900,
+                destinations: vec!["git@example.test".into()],
+            }),
+            ..Selection::default()
+        };
+        selection.additional.explicit = true;
+        selection.additional.display = true;
+        let app = app(&mut selection);
+
+        let command = app.cli_equivalent();
+        assert!(command.starts_with("ai-jail --github"), "{command}");
+        assert!(!command.contains("--agent-state"));
+        assert!(!command.contains("--allow-host api.anthropic.com"));
+        assert!(!command.contains("--no-network"));
+        assert!(command.contains("--github"));
+        assert!(command.contains("--env GH_TOKEN"));
+        assert!(command.contains("--map '/srv/reference files'"));
+        assert!(command.contains("--display"));
+        assert!(command.ends_with("keep the saved profile."), "{command}");
+        assert!(!command.contains("GH_TOKEN="));
+        assert!(command.contains("\n\x1b[31m"));
+
+        let displayed = app.cli_equivalent_display();
+        assert_eq!(displayed.lines().count(), 2, "{displayed}");
+        assert!(!displayed.contains('\x1b'));
+        assert!(displayed.contains("SPOOF??[31m"), "{displayed}");
+    }
+
+    #[test]
+    fn developer_preset_cli_uses_built_in_defaults() {
+        let mut selection = Selection {
+            api_access: true,
+            agent_state: true,
+            dependency_hosts: true,
+            github: true,
+            ..Selection::default()
+        };
+        let app = app(&mut selection);
+
+        assert_eq!(app.cli_equivalent(), "ai-jail --github claude");
     }
 
     #[test]
@@ -1831,7 +2561,10 @@ mod tests {
         assert!(!a.selection.api_access);
         assert_eq!(a.selected, 0);
         assert!(a.confirmation.is_none());
-        assert_eq!(a.handle_key(KeyCode::Esc), Transition::Stay);
+        assert_eq!(
+            a.handle_key(KeyCode::Esc),
+            Transition::Exit(AppExit::Cancel)
+        );
         assert_eq!(
             a.handle_key(KeyCode::Char('q')),
             Transition::Exit(AppExit::Cancel)
@@ -1845,22 +2578,115 @@ mod tests {
         assert_eq!(a.screen, Screen::Environment);
         a.handle_key(KeyCode::Esc);
         assert_eq!(a.screen, Screen::Access);
-        assert_eq!(a.handle_key(KeyCode::Char('s')), Transition::PrepareReview);
+        assert_eq!(
+            a.handle_key(KeyCode::Char('s')),
+            Transition::PrepareSave { save_only: false }
+        );
         assert_eq!(a.screen, Screen::Access);
-        a.show_review(ReviewState::new(
-            super::super::review::ReviewContent {
-                restricted: "restricted".into(),
-                allowed: "allowed".into(),
-                open: "open".into(),
-                effective_policy: "effective".into(),
-            },
-            true,
-            false,
-            false,
+        assert_eq!(a.screen, Screen::Access);
+    }
+
+    #[test]
+    fn recommended_github_requires_cancel_first_open_confirmation_on_save() {
+        let mut s = Selection {
+            github: true,
+            ..Selection::default()
+        };
+        let mut a = app(&mut s);
+        a.set_recommended_baseline(true);
+
+        assert_eq!(a.handle_key(KeyCode::Char('s')), Transition::Stay);
+        assert!(matches!(
+            &a.confirmation,
+            Some(ConfirmMode::SaveWithGithub { dialog, .. })
+                if !dialog.confirm_selected()
         ));
-        assert_eq!(a.screen, Screen::Review);
-        assert_eq!(a.handle_key(KeyCode::Esc), Transition::DiscardReview);
-        assert_eq!(a.screen, Screen::Access);
+        assert_eq!(a.handle_key(KeyCode::Enter), Transition::Stay);
+        assert!(a.confirmation.is_none());
+
+        assert_eq!(a.handle_key(KeyCode::Char('s')), Transition::Stay);
+        assert_eq!(a.handle_key(KeyCode::Tab), Transition::Stay);
+        assert_eq!(
+            a.handle_key(KeyCode::Enter),
+            Transition::PrepareSave { save_only: false }
+        );
+    }
+
+    #[test]
+    fn previously_saved_github_grant_does_not_require_reconfirmation() {
+        let mut s = Selection {
+            github: true,
+            ..Selection::default()
+        };
+        let mut a = app(&mut s);
+
+        assert_eq!(
+            a.handle_key(KeyCode::Char('s')),
+            Transition::PrepareSave { save_only: false }
+        );
+        assert!(a.confirmation.is_none());
+    }
+
+    #[test]
+    fn changed_draft_intercepts_escape_and_q_until_exit_choice_is_explicit() {
+        let mut s = Selection::default();
+        let mut a = app(&mut s);
+        a.handle_key(KeyCode::Char('1'));
+        assert!(a.has_unsaved_changes());
+
+        assert_eq!(a.handle_key(KeyCode::Esc), Transition::Stay);
+        assert!(a.exit_dialog.is_some());
+        assert_eq!(a.handle_key(KeyCode::Esc), Transition::Stay);
+        assert!(a.exit_dialog.is_none());
+
+        assert_eq!(a.handle_key(KeyCode::Char('q')), Transition::Stay);
+        assert!(a.exit_dialog.is_some());
+        assert_eq!(
+            a.handle_key(KeyCode::Char('d')),
+            Transition::Exit(AppExit::Cancel)
+        );
+    }
+
+    #[test]
+    fn exit_save_choice_requests_save_only_without_launching() {
+        let mut s = Selection::default();
+        let mut a = app(&mut s);
+        a.handle_key(KeyCode::Char('1'));
+        assert_eq!(a.handle_key(KeyCode::Char('q')), Transition::Stay);
+        assert_eq!(
+            a.handle_key(KeyCode::Char('s')),
+            Transition::PrepareSave { save_only: true }
+        );
+        assert!(a.exit_dialog.is_none());
+    }
+
+    #[test]
+    fn unchanged_or_reverted_draft_exits_without_an_unsaved_prompt() {
+        let mut s = Selection::default();
+        let mut a = app(&mut s);
+        assert_eq!(
+            a.handle_key(KeyCode::Esc),
+            Transition::Exit(AppExit::Cancel)
+        );
+        assert!(a.exit_dialog.is_none());
+
+        a.handle_key(KeyCode::Char('1'));
+        a.handle_key(KeyCode::Char('1'));
+        assert!(!a.has_unsaved_changes());
+        assert_eq!(
+            a.handle_key(KeyCode::Char('q')),
+            Transition::Exit(AppExit::Cancel)
+        );
+    }
+
+    #[test]
+    fn first_run_recommended_profile_is_unsaved_before_manual_edits() {
+        let mut s = Selection::default();
+        let mut a = app(&mut s);
+        a.set_recommended_baseline(true);
+        assert!(a.has_unsaved_changes());
+        assert_eq!(a.handle_key(KeyCode::Esc), Transition::Stay);
+        assert!(a.exit_dialog.is_some());
     }
     #[test]
     fn editor_text_focus_consumes_q_before_global_cancel() {

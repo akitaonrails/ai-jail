@@ -688,6 +688,7 @@ fn security_detail(editor: &Editor) -> String {
 Shares\nA fresh SSH agent containing only the keys you select. Private-key files and your normal host agent stay outside the jail.\n\n\
 Can access\nAccounts that accept those keys, only at verified destinations: {}\n\n\
 Key lifetime\n{} seconds, then the fresh agent drops them.\n\n\
+Use when\nThe harness needs SSH or Git access to the listed destinations without receiving your whole host agent.\n\n\
 Also needed\nUnrestricted network access (OPEN).\n\n\
 Safety\nLaunch is refused if destination or host-key checks cannot be enforced.\n\n\
 Risk\nThe jail can authenticate as accounts accepted by the selected keys for this run.",
@@ -879,6 +880,7 @@ mod tests {
             "Accounts that accept those keys",
             "3600 seconds",
             "git@example.com",
+            "Use when",
             "Unrestricted network access (OPEN)",
             "Risk",
         ] {

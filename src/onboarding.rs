@@ -35,7 +35,7 @@ pub(crate) mod messages {
     pub const SSH_DRIFT_ID: &str = "AJ-SSH-003";
     pub const SSH_NETWORK_ID: &str = "AJ-SSH-004";
 
-    pub const INTRO: &str = "ai-jail stores this approval outside the project. Files in this repository cannot add access on their own.";
+    pub const INTRO: &str = "Choose the access this project needs.";
     pub const CANCEL: &str = "Onboarding cancelled. No onboarding grants were saved and the harness was not started. A completed legacy migration is not rolled back.";
 }
 
@@ -234,7 +234,7 @@ impl GrantSpec {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Selection {
     pub api_access: bool,
     pub agent_state: bool,
@@ -406,9 +406,9 @@ pub(crate) struct EffectiveContext<'a> {
     pub(crate) store: &'a crate::config_store::StorePaths,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
-pub(crate) struct ReviewDisplay {
-    pub(crate) restricted: String,
+pub(crate) struct PreparedDisplay {
     pub(crate) allowed: String,
     pub(crate) open: String,
     pub(crate) effective_access: String,
@@ -416,19 +416,20 @@ pub(crate) struct ReviewDisplay {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ReviewDraft {
+pub(crate) struct PreparedProfile {
     pub(crate) profile: ProposedProfile,
-    pub(crate) display: ReviewDisplay,
+    #[cfg(test)]
+    pub(crate) display: PreparedDisplay,
 }
 
-pub(crate) fn prepare_review(
+pub(crate) fn prepare_profile(
     selection: &Selection,
-    harness: &str,
+    _harness: &str,
     harnesses: &[String],
     project: &Path,
     approved_wrapper_requests: &[crate::integration::RequestApproval],
     effective: &EffectiveContext<'_>,
-) -> Result<ReviewDraft, String> {
+) -> Result<PreparedProfile, String> {
     let mut proposed = selection.profile_for(harnesses);
     proposed.approved_wrapper_requests = approved_wrapper_requests.to_vec();
     proposed.directory_grants = crate::config_store::capture_directory_grants(
@@ -462,58 +463,62 @@ pub(crate) fn prepare_review(
         };
     finalized.reviewed_forge =
         crate::ReviewedForge::Reviewed(forge_preview.clone());
-    let summary = summary_text(selection, harness, project, None);
-    let (_, grouped) =
-        summary.split_once("[LOCK] RESTRICTED\n").ok_or_else(|| {
-            "Cannot group restricted review disclosure".to_string()
-        })?;
-    let (restricted, grouped) = grouped
-        .split_once("\n[WARN] ALLOWED\n")
-        .ok_or_else(|| "Cannot group allowed review disclosure".to_string())?;
-    let (allowed, open) = grouped
-        .split_once("\n[ERROR] OPEN\n")
-        .ok_or_else(|| "Cannot group OPEN review disclosure".to_string())?;
-    let mut allowed = allowed.trim().to_string();
-    let mut open = open.trim().to_string();
-    let mut effective_access = render_effective_access(
-        &finalized.config,
-        project,
-        harness,
-        None,
-        &selection.env_names,
-    )?;
-    if let Some(preview) = &forge_preview {
-        let line = preview.summary_line();
-        if preview.is_open() {
-            if open == "None" {
-                open.clear();
-            }
-            if !open.is_empty() {
-                open.push('\n');
-            }
-            open.push_str(&line);
-        } else {
-            allowed.push_str(&format!("\n{line}"));
-        }
-        effective_access.push_str(&format!(
-            "\nForge authority reviewed before launch:\n{line}"
-        ));
-    }
-    let display = ReviewDisplay {
-        restricted: restricted.trim().into(),
-        allowed,
-        open,
-        effective_access,
-        has_open_authority: effective_has_open_authority(
+    #[cfg(test)]
+    let display = {
+        let summary = summary_text(selection, _harness, project, None);
+        let (_, grouped) =
+            summary.split_once("[LOCK] RESTRICTED\n").ok_or_else(|| {
+                "Cannot group restricted review disclosure".to_string()
+            })?;
+        let (_restricted, grouped) =
+            grouped.split_once("\n[WARN] ALLOWED\n").ok_or_else(|| {
+                "Cannot group allowed review disclosure".to_string()
+            })?;
+        let (allowed, open) = grouped
+            .split_once("\n[ERROR] OPEN\n")
+            .ok_or_else(|| "Cannot group OPEN review disclosure".to_string())?;
+        let mut allowed = allowed.trim().to_string();
+        let mut open = open.trim().to_string();
+        let mut effective_access = render_effective_access(
             &finalized.config,
             project,
-        )? || forge_preview
-            .as_ref()
-            .is_some_and(|preview| preview.is_open()),
+            _harness,
+            None,
+            &selection.env_names,
+        )?;
+        if let Some(preview) = &forge_preview {
+            let line = preview.summary_line();
+            if preview.is_open() {
+                if open == "None" {
+                    open.clear();
+                }
+                if !open.is_empty() {
+                    open.push('\n');
+                }
+                open.push_str(&line);
+            } else {
+                allowed.push_str(&format!("\n{line}"));
+            }
+            effective_access.push_str(&format!(
+                "\nForge authority reviewed before launch:\n{line}"
+            ));
+        }
+        PreparedDisplay {
+            allowed,
+            open,
+            effective_access,
+            has_open_authority: effective_has_open_authority(
+                &finalized.config,
+                project,
+            )? || forge_preview
+                .as_ref()
+                .is_some_and(|preview| preview.is_open()),
+        }
     };
     proposed.finalized = Some(finalized);
-    Ok(ReviewDraft {
+    Ok(PreparedProfile {
         profile: proposed,
+        #[cfg(test)]
         display,
     })
 }
@@ -1112,9 +1117,10 @@ pub(crate) fn run(
         tui::RunOptions {
             configure_only,
             recommended_baseline: use_recommended_defaults,
+            profile_path: &effective.store.project,
         },
         |current, approved| {
-            prepare_review(
+            prepare_profile(
                 current, harness, &harnesses, project, approved, &effective,
             )
         },
@@ -2916,7 +2922,7 @@ mod tests {
 
         crate::forge_auth::install_test_binding_metadata(&store, false)
             .unwrap();
-        let open = prepare_review(
+        let open = prepare_profile(
             &Selection::default(),
             "claude",
             &harnesses,
@@ -2930,7 +2936,7 @@ mod tests {
         assert!(open.display.effective_access.contains("[ERROR] OPEN"));
 
         crate::forge_auth::install_test_binding_metadata(&store, true).unwrap();
-        let scoped = prepare_review(
+        let scoped = prepare_profile(
             &Selection::default(),
             "claude",
             &harnesses,
@@ -2970,7 +2976,7 @@ mod tests {
         };
         let harnesses = vec!["claude".to_string()];
         let mut selection = Selection::default();
-        let first = prepare_review(
+        let first = prepare_profile(
             &selection,
             "claude",
             &harnesses,
@@ -2980,7 +2986,7 @@ mod tests {
         )
         .unwrap();
         selection.github = true;
-        let second = prepare_review(
+        let second = prepare_profile(
             &selection,
             "claude",
             &harnesses,
@@ -3733,15 +3739,15 @@ mod tests {
         assert!(rendered.contains("ssh = false"));
         assert!(rendered.contains("[WARN] ALLOWED"));
         let design = include_str!("../docs/TUI_DESIGN.md");
-        assert!(design.contains("## Final review"));
-        assert!(
-            design.contains("exact effective policy and authority details")
-        );
+        assert!(design.contains("## Saving"));
+        assert!(design.contains("exact external config path"));
         let provenance = include_str!("../docs/onboarding-provenance.toml");
         assert!(
             provenance
                 .contains("policy = \"onboarding.complete_effective_access\"")
         );
-        assert!(provenance.contains("onboarding::tui::review::tests::action_is_blocked_until_final_disclosure_line_is_reviewed"));
+        assert!(provenance.contains(
+            "scripted_pty_confirms_recommended_github_and_saves_without_final_review"
+        ));
     }
 }

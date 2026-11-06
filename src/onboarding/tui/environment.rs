@@ -46,6 +46,7 @@ pub(super) struct EnvironmentSelector {
     selected: usize,
     search: String,
     focus: Focus,
+    resume_search_on_text: bool,
     phase: Phase,
     feedback: String,
     detail_scroll: u16,
@@ -66,6 +67,7 @@ impl EnvironmentSelector {
             selected: 0,
             search: String::new(),
             focus: Focus::List,
+            resume_search_on_text: false,
             phase: Phase::Browse,
             feedback: String::new(),
             detail_scroll: 0,
@@ -96,7 +98,7 @@ impl EnvironmentSelector {
     }
 
     pub(super) fn captures_text_input(&self) -> bool {
-        self.focus == Focus::Search
+        self.focus == Focus::Search || self.resume_search_on_text
     }
 
     fn visible_names(&self) -> Vec<&String> {
@@ -217,7 +219,14 @@ impl EnvironmentSelector {
     fn handle_browse_key(&mut self, code: KeyCode) -> EnvironmentAction {
         if self.focus == Focus::Search {
             match code {
-                KeyCode::Esc | KeyCode::Enter => self.focus = Focus::List,
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.focus = Focus::List;
+                    self.resume_search_on_text = false;
+                }
+                KeyCode::Down => {
+                    self.focus = Focus::List;
+                    self.resume_search_on_text = true;
+                }
                 KeyCode::Backspace => {
                     self.search.pop();
                     self.selected = 0;
@@ -240,8 +249,12 @@ impl EnvironmentSelector {
             KeyCode::End => {
                 self.selected = self.visible_names().len().saturating_sub(1);
             }
-            KeyCode::Char('/') => self.focus = Focus::Search,
+            KeyCode::Char('/') => {
+                self.focus = Focus::Search;
+                self.resume_search_on_text = false;
+            }
             KeyCode::Char(' ') | KeyCode::Enter => {
+                self.resume_search_on_text = false;
                 if let Some(name) = self.highlighted_name() {
                     if self.approved.remove(&name) {
                         return EnvironmentAction::Remove(name);
@@ -250,12 +263,19 @@ impl EnvironmentSelector {
                 }
             }
             KeyCode::Esc => {
+                self.resume_search_on_text = false;
                 if self.search.is_empty() {
                     return EnvironmentAction::Back;
                 }
                 self.search.clear();
                 self.selected = 0;
                 self.feedback = "Search cleared.".into();
+            }
+            KeyCode::Char(value) if self.resume_search_on_text => {
+                self.focus = Focus::Search;
+                self.resume_search_on_text = false;
+                self.search.push(value);
+                self.selected = 0;
             }
             _ => {}
         }
@@ -367,14 +387,14 @@ pub(super) fn render(
         Phase::Browse => state.highlighted_name().map_or_else(
             || "No matching variable names.".into(),
             |name| format!(
-                "Selected\n{name}\n\nIf approved\nEvery process in the jail can read and copy its current value. The value stays hidden here and is never saved.\n\nSpace/Enter\nReview or remove this variable."
+                "Selected\n{name}\n\nUse when\nA jailed tool needs configuration or authority carried by this exact variable.\n\nIf approved\nEvery process in the jail can read and copy its current value. The value stays hidden here and is never saved.\n\nSpace/Enter\nReview or remove this variable."
             ),
         ),
         Phase::Preview { name, disclosure } => format!(
-            "{name}\n\n{disclosure}\n\nAuthority cannot be verified from a variable name. Review every line, then press Enter to choose."
+            "{name}\n\nUse when\nA jailed tool needs configuration or authority carried by this exact variable.\n\n{disclosure}\n\nAuthority cannot be verified from a variable name. Review every line, then press Enter to choose."
         ),
         Phase::ConfirmOpen { name, disclosure, .. } => format!(
-            "{name}\n\n{disclosure}\n\nOPEN grants the jailed process this host value."
+            "{name}\n\nUse when\nA jailed tool needs configuration or authority carried by this exact variable.\n\n{disclosure}\n\nOPEN grants the jailed process this host value."
         ),
     };
     let detail_width = detail_area.width.saturating_sub(2).max(1);
@@ -402,7 +422,7 @@ pub(super) fn render(
         detail_area,
     );
     let help = if state.feedback.is_empty() {
-        "↑/↓ move  •  Space/Enter review or remove  •  / search\nEsc clears search or returns  •  values never appear in this screen"
+        "↑/↓ move  •  Space/Enter review or remove  •  / search  •  ↓ results  •  type to refine\nEsc clears search or returns  •  values never appear in this screen"
     } else {
         &state.feedback
     };
@@ -470,6 +490,32 @@ mod tests {
     }
 
     #[test]
+    fn down_focuses_search_results_and_typing_resumes_search() {
+        let mut state = EnvironmentSelector::new(
+            vec!["ALPHA".into(), "ALPINE".into(), "BETA".into()],
+            Vec::<String>::new(),
+        );
+
+        state.handle_key(KeyCode::Char('/'));
+        state.handle_key(KeyCode::Char('a'));
+        state.handle_key(KeyCode::Down);
+        assert_eq!(state.focus, Focus::List);
+        assert_eq!(state.selected, 0);
+        assert!(state.resume_search_on_text);
+
+        state.handle_key(KeyCode::Char('l'));
+        assert_eq!(state.focus, Focus::Search);
+        assert_eq!(state.search, "al");
+        assert_eq!(state.selected, 0);
+
+        state.handle_key(KeyCode::Down);
+        assert_eq!(
+            state.handle_key(KeyCode::Char(' ')),
+            EnvironmentAction::Prepare("ALPHA".into())
+        );
+    }
+
+    #[test]
     fn model_and_rendering_never_need_environment_values() {
         let state = EnvironmentSelector::new(
             vec!["GH_TOKEN".into()],
@@ -477,6 +523,7 @@ mod tests {
         );
         let output = rendered(&state);
         assert!(output.contains("GH_TOKEN"));
+        assert!(output.contains("Use when"));
         assert!(!output.contains("secret-value-that-must-never-appear"));
     }
 

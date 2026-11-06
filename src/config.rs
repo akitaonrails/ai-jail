@@ -2586,9 +2586,14 @@ mod tests {
     use crate::cli::CliArgs;
     use crate::test_utils::{ENV_LOCK, EnvVarGuard};
 
-    // Tests that call set_current_dir must hold this lock to avoid
-    // racing each other (cwd is process-global).
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Tests that call set_current_dir take the crate-wide ENV_LOCK: the
+    // working directory is process-global, so no other env-mutating or
+    // child-spawning test may interleave with the window.
+    fn cwd_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn serialize_config(config: &Config) -> Result<String, String> {
         toml::to_string_pretty(config).map_err(|e| e.to_string())
@@ -7588,7 +7593,7 @@ hide_dotdirs = [".my_secrets"]
 
     #[test]
     fn save_and_load_roundtrip() {
-        let _cwd = CWD_LOCK.lock().unwrap();
+        let _cwd = cwd_guard();
         let dir = std::env::temp_dir()
             .join(format!("ai-jail-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -7683,7 +7688,7 @@ hide_dotdirs = [".my_secrets"]
 
     #[test]
     fn save_rejects_symlink_target() {
-        let _cwd = CWD_LOCK.lock().unwrap();
+        let _cwd = cwd_guard();
         let dir = std::env::temp_dir()
             .join(format!("ai-jail-test-{}-symlink", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

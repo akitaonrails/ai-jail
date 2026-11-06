@@ -7,8 +7,8 @@ experience fails the parity test.
 `TUI` means the persistent onboarding interface exposes the capability or its
 equivalent. `Gap` means a broadly useful security or compatibility choice still
 needs a discoverable TUI control. `Advanced` means the option remains CLI-only
-because it is a precise policy primitive; its effective result must still be
-visible in final review. `Operational` means it controls invocation, diagnostics,
+because it is a precise policy primitive; its effect must remain documented and
+inspectable through dry-run/config output. `Operational` means it controls invocation, diagnostics,
 or integration rather than saved sandbox authority.
 
 ## TUI
@@ -56,7 +56,7 @@ or integration rather than saved sandbox authority.
 - Environment/secret sources: `--env-from-file`, `--secret`
 - Harness-specific path override: `--claude-dir`
 - Browser command/profile mode: `--browser`, `--no-browser` (command-specific;
-  known browser commands are detected automatically, and the final review
+  known browser commands are detected automatically, and dry-run output
   exposes the effective hard/soft profile)
 - Persistence and presentation preferences: `--save-config`,
   `--no-save-config`, `--hide-config`, `--no-hide-config`, `--update-check`,
@@ -75,4 +75,5 @@ or integration rather than saved sandbox authority.
 A release audit must resolve every `Gap`, or explicitly retain it here with a
 current rationale and user-facing documentation. Advanced and operational
 options do not require a direct onboarding control, but security-relevant
-effects must be represented in the complete effective-access review.
+effects must remain inspectable through documented configuration or dry-run
+output.

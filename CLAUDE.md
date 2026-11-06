@@ -132,8 +132,10 @@ must durably verify its external destination before deleting the source.
   opt-in read-only credential flags (`--github`, `--aws`,
   `--kube`, `--gcloud`, `--docker-config`) are monotonic capabilities: a
   repository policy may only disable them, never enable them, and all are
-  disabled under `--lockdown`. Fresh known-harness profiles start with optional
-  grants unchecked.
+  disabled under `--lockdown`. The raw credential defaults remain off. Fresh
+  known-harness profiles visibly apply `For developers`: agent state,
+  dependency tooling, filtered model access, and GitHub. The OPEN GitHub grant
+  requires a Cancel-first confirmation before the first save.
 - Current per-project policy is an owner-only external document with separate
   grants and constraints. Legacy project `.ai-jail` is untrusted monotonic
   migration input. It may tighten the sandbox but cannot import capabilities,

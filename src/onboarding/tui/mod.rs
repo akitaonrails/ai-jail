@@ -3,14 +3,12 @@ mod app;
 mod dialog;
 mod directory;
 mod environment;
-mod review;
 mod ssh;
 mod view;
 mod wrapper;
 
 use self::app::{App, AppExit, Transition};
-use self::review::{FinalAction, ReviewContent, ReviewState};
-use super::{Outcome, ReviewDraft, Selection, safe_path};
+use super::{Outcome, PreparedProfile, Selection, safe_path};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
@@ -24,9 +22,10 @@ use std::io::{self, Stderr, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-pub(super) struct RunOptions {
+pub(super) struct RunOptions<'a> {
     pub configure_only: bool,
     pub recommended_baseline: bool,
+    pub profile_path: &'a Path,
 }
 
 pub(super) fn run_app<F>(
@@ -36,13 +35,13 @@ pub(super) fn run_app<F>(
     requests: &crate::integration::RequestSet,
     approved_wrapper_requests: &[crate::integration::RequestApproval],
     options: RunOptions,
-    mut prepare_review: F,
+    mut prepare_profile: F,
 ) -> Result<Outcome, String>
 where
     F: FnMut(
         &Selection,
         &[crate::integration::RequestApproval],
-    ) -> Result<ReviewDraft, String>,
+    ) -> Result<PreparedProfile, String>,
 {
     let project_path = project.to_path_buf();
     let project = safe_path(project)?;
@@ -55,9 +54,9 @@ where
         requests,
         approved_wrapper_requests,
     );
-    app.recommended_baseline = options.recommended_baseline;
+    app.set_recommended_baseline(options.recommended_baseline);
     app.set_project_path(&project_path);
-    let mut review_draft: Option<ReviewDraft> = None;
+    app.set_profile_path(options.profile_path);
     let mut session =
         TerminalSession::new().map_err(|error| error.to_string())?;
 
@@ -78,48 +77,21 @@ where
         }
         match app.handle_key(key.code) {
             Transition::Stay => {}
-            Transition::PrepareReview => match prepare_review(
+            Transition::PrepareSave { save_only } => match prepare_profile(
                 app.selection,
                 &app.approved_wrapper_requests,
             ) {
                 Ok(draft) => {
-                    let content = ReviewContent {
-                        restricted: draft.display.restricted.clone(),
-                        allowed: draft.display.allowed.clone(),
-                        open: draft.display.open.clone(),
-                        effective_policy: draft
-                            .display
-                            .effective_access
-                            .clone(),
-                    };
-                    let state = ReviewState::new(
-                        content,
-                        options.configure_only,
-                        draft.display.has_open_authority,
-                        app.use_color,
-                    );
-                    review_draft = Some(draft);
-                    app.show_review(state);
+                    return Ok(if options.configure_only || save_only {
+                        Outcome::SaveOnly(draft.profile)
+                    } else {
+                        Outcome::SaveAndLaunch(draft.profile)
+                    });
                 }
                 Err(error) => app.feedback = app::human_error(error),
             },
-            Transition::DiscardReview => review_draft = None,
             Transition::Exit(AppExit::Cancel) => return Ok(Outcome::Cancel),
-            Transition::Exit(AppExit::Final(action)) => {
-                let draft = review_draft.take().ok_or_else(|| {
-                    "Final review action had no prepared draft".to_string()
-                })?;
-                return Ok(outcome_for_action(draft, action));
-            }
         }
-    }
-}
-
-fn outcome_for_action(draft: ReviewDraft, action: FinalAction) -> Outcome {
-    match action {
-        FinalAction::SaveProfile => Outcome::SaveOnly(draft.profile),
-        FinalAction::SaveAndLaunch => Outcome::SaveAndLaunch(draft.profile),
-        FinalAction::LaunchOnce => Outcome::LaunchOnce(draft.profile),
     }
 }
 
@@ -201,19 +173,6 @@ impl Drop for PanicHookGuard {
 mod tests {
     use super::*;
 
-    fn review_draft() -> ReviewDraft {
-        ReviewDraft {
-            profile: Selection::default().profile("claude"),
-            display: super::super::ReviewDisplay {
-                restricted: String::new(),
-                allowed: String::new(),
-                open: String::new(),
-                effective_access: String::new(),
-                has_open_authority: false,
-            },
-        }
-    }
-
     #[test]
     fn restoration_sequence_shows_cursor_and_leaves_alternate_screen() {
         let mut output = Vec::new();
@@ -221,21 +180,5 @@ mod tests {
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("\x1b[?25h"), "{text:?}");
         assert!(text.contains("\x1b[?1049l"), "{text:?}");
-    }
-
-    #[test]
-    fn final_actions_map_to_semantic_outcomes() {
-        assert!(matches!(
-            outcome_for_action(review_draft(), FinalAction::SaveProfile),
-            Outcome::SaveOnly(_)
-        ));
-        assert!(matches!(
-            outcome_for_action(review_draft(), FinalAction::SaveAndLaunch),
-            Outcome::SaveAndLaunch(_)
-        ));
-        assert!(matches!(
-            outcome_for_action(review_draft(), FinalAction::LaunchOnce),
-            Outcome::LaunchOnce(_)
-        ));
     }
 }

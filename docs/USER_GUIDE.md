@@ -3,12 +3,12 @@
 The first run of a known harness opens one persistent terminal application for
 reviewing project access. It stays on the alternate screen while you inspect
 capabilities, choose directories and environment variables, configure selected
-SSH keys, decide wrapper requests, and review the complete effective policy.
-It does not interleave full-screen pages with printed prompts.
+SSH keys, and decide wrapper requests. It does not interleave full-screen pages
+with printed prompts.
 
 The saved policy lives under `$XDG_CONFIG_HOME/ai-jail/projects` (normally
-`~/.config/ai-jail/projects`), outside the checkout. Repository files cannot
-add grants. The implementation contract and minimum terminal behavior are in
+`~/.config/ai-jail/projects`), outside the checkout. The implementation
+contract and minimum terminal behavior are in
 [TUI_DESIGN.md](TUI_DESIGN.md).
 
 The examples below preserve the labels, states, and action keys checked by the
@@ -20,14 +20,21 @@ the onboarding capability list.
 
 ## What the screen shows
 
-Every normal screen has four parts:
+The main screen has six parts:
 
-- The header names the harness, canonical project, and current editor.
+- The header shows a bold `AI-JAIL` title, a compact project path, and the exact
+  external profile path.
 - The primary pane contains the capability list or editor. Checkboxes always
   show state in text, so color is never the only signal.
+- The `Always enforced` pane lists protections that cannot be disabled here,
+  including the platform sandbox. Focus it to read each guarantee in the
+  context pane.
 - The context pane describes the focused item: resource, access, process,
   duration, scope, limits, default, consequence, and, where applicable, remote
   service or authority.
+- The read-only `CLI from defaults` pane shows the shortest shell-safe command
+  for the current choices relative to ai-jail's built-in defaults. Press `y`
+  anywhere on the main screen to copy it through the platform clipboard helper.
 - The footer lists only keys that work on the current screen. Confirmation and
   validation messages appear there without leaving the application.
 
@@ -42,25 +49,29 @@ and its value is never displayed or saved. GitHub is explicitly marked OPEN:
 the jail gets every permission carried by the active `gh` token, not only
 access to the current repository. This preset does not enable unrestricted
 network, SSH, loopback, arbitrary environment variables, or extra directories.
+Saving this first-run preset opens a short Cancel-first dialog for the OPEN
+GitHub grant. It names the token's full authority; confirming it saves directly
+without adding a separate review page.
 
 The top row provides three starting points:
 
 - `Fully closed` removes every optional grant, including granular selections
   and wrapper approvals.
 - `For developers` applies the first-run baseline described above. Its full
-  GitHub-token grant is OPEN and requires confirmation in the final review.
+  GitHub-token grant is visibly marked OPEN in the access list.
 - `Mostly open` enables unrestricted network, the full host GitHub token, the
   ambient SSH agent, and host loopback access. It is red, carries a warning,
   and requires an explicit in-TUI confirmation with Cancel focused by default.
 
-Press `Tab` or `Shift-Tab` to focus and move between presets. As focus moves,
-the checklist below changes immediately to show a `PREVIEW — not applied` of
-the preset. Previewing never changes the draft. Press `Enter` or `Space` to
-apply the focused preset; press `Down` or `Esc` to return unchanged. Changing
-any granular option makes the active label `Custom`. Arbitrary environment
-variables and extra directories are never guessed by a preset. The sole
-environment exception is a detected, well-known harness API key bundled with
-the explicitly visible harness-state grant.
+`Tab` and `Shift-Tab` move focus between the access list, `Always enforced`
+pane, and preset row. They skip the read-only CLI preview and never change a setting or start a
+preview. In the preset row, Left/Right selects a preset and changes the
+checklist to a clearly labeled `PREVIEW — not applied`. Press `Enter` or
+`Space` to apply it; press `Tab`, `Down`, or `Esc` to leave without applying
+it. Changing any granular option makes the active label `Custom`. Arbitrary
+environment variables and extra directories are never guessed by a preset.
+The sole environment exception is a detected, well-known harness API key
+bundled with the explicitly visible harness-state grant.
 
 Reopening a completed profile starts from its saved choices and does not
 reapply the developer baseline. Noninteractive execution also remains
@@ -69,10 +80,11 @@ restricted; these presets are an interactive onboarding convenience.
 At 96 columns or wider, the access list and its details sit side by side:
 
 ```text
-Configure claude  •  project access
-Project  /home/alice/src/demo
+AI-JAIL
+Project  ../src/demo
+Config   ~/.config/ai-jail/projects/demo.toml
 
-┌ Presets • Tab/Shift-Tab preview • Enter/Space apply ─────┐
+┌ Presets • ←/→ preview • Enter/Space apply ───────────────┐
 │   Fully closed    ✓ ⚠ For developers    ⚠ Mostly open   │
 └──────────────────────────────────────────────────────────┘
 ┌ Access choices ───────────────────────────┐┌ Details — Filtered model API access ─┐
@@ -85,8 +97,16 @@ Project  /home/alice/src/demo
 │  c ○ Host container engine      ✓ CLOSED  ││Risk: API can receive readable data.   │
 │  6 ○ Network: unrestricted      ✓ CLOSED  ││                                       │
 │  a • Additional capabilities              ││                                       │
+├ Always enforced • Tab to inspect ─────────┤│                                       │
+│  ◆ Bubblewrap sandbox                     ││                                       │
+│  ◆ Approvals stored outside project       ││                                       │
 └───────────────────────────────────────────┘└───────────────────────────────────────┘
-↑/↓ move  •  Space/Enter select  •  q cancel  •  Esc back
+↑/↓ move  •  Space/Enter select  •  Tab next panel  •  Esc/q exit
+
+┌ CLI from defaults • y copy anywhere • 2 lines ─────────┐
+│ai-jail --github --env GH_TOKEN claude                  │
+│Config file (advanced): ~/.config/ai-jail/projects/...  │
+└────────────────────────────────────────────────────────┘
 ```
 
 On a narrower supported terminal, the same information is stacked. Nothing is
@@ -119,6 +139,27 @@ A disabled broad grant says `CLOSED`; selecting it opens a confirmation dialog
 with Cancel focused by default. No TUI action asks you to type `OPEN` or answer
 y/n.
 
+Main-screen details summarize every add/remove editor without opening it.
+`Environment variables` lists approved names without reading or displaying
+values. `Directory access` lists extra directories as `READ-ONLY` or
+`READ/WRITE`. Selected-key SSH lists keys, destinations, and lifetime.
+`Additional capabilities` lists each enabled item as `ALLOWED` or `OPEN`. You
+open those editors only when you want to add, remove, or change an entry.
+Every configurable detail also includes `Use when`, with a concrete example of
+why the authority may be needed. For example, Wayland display access is useful
+when GUI applications must open so the harness can run, instrument, or debug
+them. `Always enforced` details use `Why it matters` instead.
+
+The CLI panel updates as choices change and is skipped by Tab navigation. It
+omits options already equal to built-in defaults. Press `y` anywhere on the
+main screen to copy it using `wl-copy`, `xclip`, or `xsel` on Linux and
+`pbcopy` on macOS. It copies environment names, never their values. Existing
+global or project policy can still affect the copied command. A note identifies
+profile-only choices, such as selected-key SSH, that cannot be recreated
+faithfully with launch flags. The full config path appears there as `Config
+file (advanced)` for users who intentionally want to edit TOML directly;
+`ai-jail configure HARNESS` remains the safer editor.
+
 The broad compatibility choices remain clearly OPEN:
 
 - Full host SSH shares `~/.ssh` and the ambient agent.
@@ -142,7 +183,7 @@ registry credential stores, full environment inheritance, worktree metadata,
 Pictures, local audit logging, and platform-specific compatibility grants.
 Only controls relevant to the current operating system are shown. No preset
 enables anything on this screen; every OPEN item uses the same confirmation
-dialog and remains visible in the final review.
+dialog and remains visibly marked OPEN in the access summary.
 
 Pressing `Space` or `Enter` toggles an ALLOWED choice immediately. An OPEN
 choice uses the same dialog everywhere:
@@ -177,8 +218,8 @@ Filter: ref  •  hidden: hidden
 │  dir  research                     ││                                    │
 │                                    ││Space reviews it for READ-ONLY access│
 └────────────────────────────────────┘└─────────────────────────────────────┘
-↑/↓ browse  •  Enter open  •  Space review  •  / filter  •  g go to path
-Backspace parent  •  . hidden  •  m mode  •  Esc back
+↑/↓ browse  •  Enter open  •  Space review  •  / filter  •  ↓ results
+Type to refine  •  g go to path  •  . hidden  •  m mode  •  Esc back
 ```
 
 On a narrow terminal, the directory list appears above the same scrollable
@@ -199,6 +240,11 @@ as entered and its resolved canonical destination. Press `Space` to add the
 highlighted directory. Ordinary narrow grants need no additional y/n prompt.
 A broad home or project-ancestor grant still requires reviewing the complete
 disclosure and selecting the OPEN action in the shared dialog.
+
+While filtering, press `Down` to move directly into the matching directories;
+the first match is highlighted. If you start typing again while browsing those
+results, focus returns to the filter and the new text is appended. `Enter` is
+only needed to open the highlighted directory, not to leave the filter.
 
 After the first selection, a `Selected directories` pane appears below the
 browser. Press `Tab` to move between panes. In the lower pane, highlight a
@@ -229,9 +275,13 @@ Search: CUSTOM█
 │  ✓ CUSTOM_CACHE                   ││Every jailed descendant can read and │
 │                                   ││copy the current host value.          │
 └───────────────────────────────────┘└──────────────────────────────────────┘
-↑/↓ move  •  Space/Enter review or remove  •  / search
+↑/↓ move  •  Space/Enter review or remove  •  / search  •  ↓ results
 Esc clears search or returns  •  values never appear in this screen
 ```
+
+Press `Down` from the search field to focus the matching names immediately.
+Typing again while the results are focused returns to the search field and
+continues the current query; `Enter` is not required to switch focus.
 
 At narrow widths, the variable list is stacked above `Security details`. The
 checked names and the complete scroll position remain visible; values still do
@@ -362,59 +412,35 @@ removed from the draft and reviewed again when requested. Revealing a
 disclosure or opening this screen approves nothing. If any request remains
 undecided, Enter does not continue.
 
-## Complete effective-access review
+## Saving and leaving
 
-The final screen recomputes the effective policy from global settings, the
-draft project profile, CLI grants, repository constraints, wrapper decisions,
-forge binding, and platform defaults. It groups the result as `RESTRICTED`,
-`ALLOWED`, `OPEN`, and `COMPLETE EFFECTIVE POLICY`.
+Select `Save configuration` or press `s` to save the choices shown in the
+access screen. During first-run onboarding, saving continues into the harness.
+`ai-jail configure HARNESS` saves and exits without launching it. After the TUI
+closes, ai-jail prints a short confirmation with the exact external config path
+for later inspection.
 
-```text
-Complete effective access
-Review every contributing policy layer before choosing a final action.
+### Leaving with unsaved changes
 
-┌ Security review • lines 1–18/42 • PgUp/PgDn ─────────────────────────────┐
-│RESTRICTED                                                               │
-│  Full host SSH and host GitHub token                                    │
-│                                                                         │
-│ALLOWED                                                                  │
-│  Project read/write; filtered api.anthropic.com                         │
-│                                                                         │
-│OPEN                                                                     │
-│  Unrestricted network                                                   │
-│                                                                         │
-│COMPLETE EFFECTIVE POLICY                                                │
-│  Every nondefault field and authority consequence                       │
-└─────────────────────────────────────────────────────────────────────────┘
-PgUp/PgDn scroll  •  Home/End first/final line
-s save & launch  •  o launch once  •  b back  •  q cancel
-```
-
-The review uses one scrollable pane at every supported width. Narrow terminals
-wrap each authority entry and show the exact visible line range in the title;
-they do not omit a group or policy field.
-
-You must review through the final effective-access line before choosing an
-action. A normal first run offers:
-
-- `Save & Launch`: persist the profile and start one jail.
-- `Launch Once`: start one jail without saving the draft approvals.
-- `Back`: return to the checklist.
-- `Cancel`: save nothing and start no harness.
-
-`ai-jail configure HARNESS` replaces the first two actions with `Save Profile`,
-which persists the profile without launching a jail. If the effective result
-contains any OPEN authority, the chosen final action shows its consequence in
-the shared dialog. Cancelling returns to the review;
-it does not approve or perform the action.
+On the access overview, `Esc` and `q` both request exit. If the draft still
+matches the loaded profile, setup closes without writing anything. If choices
+changed—or a first-run preset has not been saved—a dialog keeps the consequence
+explicit:
 
 ```text
-┌ Continue with OPEN authority? ───────────────────────────┐
-│ This saves the OPEN approvals and starts one jail now.  │
-│                                                         │
-│  [ Cancel ]       [ Save & launch ]                     │
-└─────────────────────────────────────────────────────────┘
+┌ Unsaved changes ───────────────────────────────────────────────────────┐
+│ Your access changes have not been saved.                              │
+│ Save them, discard them, or keep editing.                             │
+│                                                                       │
+│ [ Keep editing ]  [ Discard & quit ]  [ Save changes ]                │
+└───────────────────────────────────────────────────────────────────────┘
 ```
+
+`Keep editing` is selected by default, and `Esc` in this dialog also keeps the
+draft open. `Discard & quit` is the only choice that intentionally throws the
+draft away. `Save changes` persists the profile directly and does not launch a
+jail. While editing a nested picker, `Esc` first closes input or returns to the
+access overview; it does not mistake ordinary navigation for an exit request.
 
 ## Plain-terminal and noninteractive behavior
 
