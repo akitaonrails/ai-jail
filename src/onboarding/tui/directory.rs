@@ -599,13 +599,19 @@ pub(super) fn render(
     );
 
     if let Some(selected_area) = selected_area {
+        let inner_width = selected_area.width.saturating_sub(4);
         let items = state.grants.iter().map(|entry| {
+            let mode = entry.mode.title();
+            let path = escape_control_bytes(&entry.path.to_string_lossy());
+            let path_width = usize::from(inner_width)
+                .saturating_sub(mode.chars().count() + 2)
+                .max(1);
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("{}  ", entry.mode.title()),
+                    format!("{mode}  "),
                     risk_style(entry.mode, use_color),
                 ),
-                Span::raw(escape_control_bytes(&entry.path.to_string_lossy())),
+                Span::raw(visible_path_tail(&path, path_width)),
             ]))
         });
         let mut selected_state = ListState::default().with_selected(
@@ -657,6 +663,18 @@ pub(super) fn render(
     }
 }
 
+fn visible_path_tail(path: &str, width: usize) -> String {
+    let count = path.chars().count();
+    if count <= width {
+        return path.to_string();
+    }
+    if width <= 1 {
+        return "…".into();
+    }
+    let tail = path.chars().skip(count - (width - 1)).collect::<String>();
+    format!("…{tail}")
+}
+
 fn muted(use_color: bool) -> Style {
     if use_color {
         Style::default().fg(Color::DarkGray)
@@ -706,6 +724,12 @@ pub(super) struct DirectoryGrantEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_selected_paths_keep_the_identifying_tail_visible() {
+        assert_eq!(visible_path_tail("/very/long/share-café", 11), "…share-café");
+        assert_eq!(visible_path_tail("/short", 20), "/short");
+    }
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 

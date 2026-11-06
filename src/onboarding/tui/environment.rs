@@ -255,6 +255,7 @@ impl EnvironmentSelector {
                 }
                 self.search.clear();
                 self.selected = 0;
+                self.feedback = "Search cleared.".into();
             }
             _ => {}
         }

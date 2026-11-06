@@ -441,7 +441,9 @@ fn scripted_pty_environment_checklist_never_displays_or_saves_values() {
             input: b"\x1b",
         },
         PtyStep {
-            wait_for: "ANDROID_HOME",
+            // Clearing the search must not depend on whichever unrelated
+            // variables happen to exist in the build host environment.
+            wait_for: "Search cleared.",
             input: b"\x1b",
         },
         PtyStep {
