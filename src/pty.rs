@@ -501,6 +501,7 @@ fn io_loop(
     resize_redraw_key: Option<&[u8]>,
     terminal_passthrough: bool,
     status_bar: bool,
+    stdin_is_tty: bool,
 ) {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let master_raw = master.as_raw_fd();
@@ -521,13 +522,15 @@ fn io_loop(
     }
     state.prime_terminal();
 
+    let mut fds = vec![PollFd::new(master_bfd, PollFlags::POLLIN)];
+    // Redirected stdin belongs to the child directly. Reading it here
+    // would steal its input, and polling an exhausted pipe would spin.
+    if stdin_is_tty {
+        fds.push(PollFd::new(stdin_bfd, PollFlags::POLLIN));
+    }
     loop {
         state.handle_sigwinch();
 
-        let mut fds = [
-            PollFd::new(stdin_bfd, PollFlags::POLLIN),
-            PollFd::new(master_bfd, PollFlags::POLLIN),
-        ];
         if status_bar && crate::statusbar::take_requests() {
             state.pending_redraw = true;
         }
@@ -544,7 +547,7 @@ fn io_loop(
 
         // Check master (child output) first for responsiveness.
         let mut should_break = false;
-        if let Some(revents) = fds[1].revents() {
+        if let Some(revents) = fds[0].revents() {
             if revents.contains(PollFlags::POLLIN) {
                 match nix::unistd::read(master_raw, &mut buf) {
                     Ok(0) => {
@@ -572,7 +575,7 @@ fn io_loop(
 
         // Status bar / resize-key flush when child is quiet.
         let child_quiet = !matches!(
-            fds[1].revents(),
+            fds[0].revents(),
             Some(r) if r.contains(PollFlags::POLLIN)
         );
         if child_quiet {
@@ -580,7 +583,7 @@ fn io_loop(
         }
 
         // stdin (user input) → PTY master.
-        if let Some(revents) = fds[0].revents()
+        if let Some(revents) = fds.get(1).and_then(|fd| fd.revents())
             && revents.contains(PollFlags::POLLIN)
         {
             match nix::unistd::read(stdin_fd, &mut buf) {
@@ -1443,11 +1446,16 @@ fn run_with_passthrough(
     // Reserve a row only when the status overlay is active.
     set_initial_size(&master, if status_bar { rows - 1 } else { rows }, cols);
 
-    // Enter raw mode on real stdin
-    let saved = enter_raw_mode()?;
-    let raw_mode_guard = RawModeGuard::new(saved);
+    // Only interactive stdin needs raw mode. A pipe/file stays inherited by
+    // the child, including its natural EOF, while output still uses the PTY.
+    let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let raw_mode_guard = if stdin_is_tty {
+        Some(RawModeGuard::new(enter_raw_mode()?))
+    } else {
+        None
+    };
 
-    // Configure child to use PTY slave as stdin/stdout/stderr
+    // Configure terminal stdio without replacing redirected stdin.
     let slave_raw = slave.as_raw_fd();
     unsafe {
         cmd.pre_exec(move || {
@@ -1460,7 +1468,9 @@ fn run_with_passthrough(
             if nix::libc::ioctl(slave_raw, nix::libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
-            nix::libc::dup2(slave_raw, 0);
+            if stdin_is_tty {
+                nix::libc::dup2(slave_raw, 0);
+            }
             nix::libc::dup2(slave_raw, 1);
             nix::libc::dup2(slave_raw, 2);
             if slave_raw > 2 {
@@ -1488,6 +1498,7 @@ fn run_with_passthrough(
         resize_redraw_key,
         terminal_passthrough,
         status_bar,
+        stdin_is_tty,
     );
 
     // Clean up
