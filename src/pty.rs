@@ -1894,6 +1894,7 @@ pub fn run_with_config(
     resize_redraw_key: Option<&[u8]>,
     config: &crate::config::Config,
     status_bar: bool,
+    spawn_bracket: &mut dyn crate::signals::SpawnBracket,
 ) -> Result<crate::exit_reason::ChildStatus, String> {
     let supervision_gate = crate::signals::wrap_supervised_command(cmd)?;
     run_with_passthrough(
@@ -1904,6 +1905,7 @@ pub fn run_with_config(
         config.terminal_appearance_enabled(),
         status_bar,
         supervision_gate,
+        spawn_bracket,
     )
 }
 
@@ -1915,6 +1917,7 @@ fn run_with_passthrough(
     terminal_appearance: bool,
     status_bar: bool,
     supervision_gate: crate::signals::SupervisionGate,
+    spawn_bracket: &mut dyn crate::signals::SpawnBracket,
 ) -> Result<crate::exit_reason::ChildStatus, String> {
     use std::os::unix::process::CommandExt;
 
@@ -1976,7 +1979,8 @@ fn run_with_passthrough(
     }
 
     // Spawn child
-    let child = crate::signals::spawn_supervised(cmd, supervision_gate)?;
+    let child =
+        crate::signals::spawn_supervised(cmd, supervision_gate, spawn_bracket)?;
 
     let pid = child.id() as i32;
     MASTER_FD.store(master_raw, Ordering::SeqCst);
