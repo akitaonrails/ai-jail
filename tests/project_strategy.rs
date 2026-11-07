@@ -213,7 +213,7 @@ fn noninteractive_worktree_launch_skips_first_run_with_repo_root() {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         tree.command(&tree.worktree)
-            .args(["--harness", "claude", "--", "/bin/true"])
+            .args(["--harness", "claude", "--", "/usr/bin/true"])
             .output()
             .unwrap()
     };
@@ -282,7 +282,7 @@ impl Tree {
             .unwrap_or_else(|e| e.into_inner());
         let output = self
             .command(cwd)
-            .args(["--harness", "claude", "--", "/bin/true"])
+            .args(["--harness", "claude", "--", "/usr/bin/true"])
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
