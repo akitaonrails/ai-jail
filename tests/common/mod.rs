@@ -393,3 +393,29 @@ macro_rules! require_sandbox_exec {
         }
     };
 }
+
+/// Skip a launch test when this platform's sandbox backend cannot start
+/// a jail here, without requiring curl. Nix build sandboxes, for example,
+/// refuse bwrap's network setup. Expands to a `return`, so it must be
+/// called directly in a `#[test]` body.
+#[macro_export]
+macro_rules! require_any_sandbox {
+    () => {
+        #[cfg(target_os = "linux")]
+        if !$crate::common::bwrap_available() {
+            eprintln!(
+                "SKIPPED: bwrap cannot create namespaces on this system \
+                 (AppArmor/kernel restriction, or a build sandbox)"
+            );
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if !$crate::common::sandbox_exec_available() {
+            eprintln!(
+                "SKIPPED: sandbox-exec cannot apply a profile here \
+                 (already sandboxed?)"
+            );
+            return;
+        }
+    };
+}

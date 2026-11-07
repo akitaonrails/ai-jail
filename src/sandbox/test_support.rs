@@ -51,6 +51,12 @@ pub(crate) fn linked_worktree_fixture(prefix: &str) -> LinkedWorktreeFixture {
 
     std::fs::create_dir_all(&project_dir).unwrap();
     std::fs::create_dir_all(&git_dir).unwrap();
+    // macOS puts the temp root behind /var -> /private/var. Store validation
+    // refuses symlinked components, so hand out the canonical root.
+    let root = std::fs::canonicalize(&root).unwrap();
+    let project_dir = root.join("project");
+    let common_dir = root.join("common/.git");
+    let git_dir = common_dir.join("worktrees/wt1");
     std::fs::write(
         project_dir.join(".git"),
         "gitdir: ../common/.git/worktrees/wt1\n",

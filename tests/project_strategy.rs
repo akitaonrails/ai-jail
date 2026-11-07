@@ -203,6 +203,7 @@ fn worktree_status_requires_onboarding_with_basename() {
 
 #[test]
 fn noninteractive_worktree_launch_skips_first_run_with_repo_root() {
+    require_any_sandbox!();
     let tree = Tree::new("repo-root-launch");
     tree.write_global("project_strategy = \"repo-root\"\n");
     tree.write_project_doc(&tree.main, true);
@@ -291,6 +292,7 @@ impl Tree {
 
 #[test]
 fn worktree_launch_keeps_main_checkout_constraints_with_repo_root() {
+    require_any_sandbox!();
     let tree = Tree::new("repo-root-keep-main");
     let vendor = tree.main.join("vendor");
     std::fs::create_dir_all(&vendor).unwrap();
@@ -312,6 +314,7 @@ fn worktree_launch_keeps_main_checkout_constraints_with_repo_root() {
 
 #[test]
 fn main_launch_keeps_worktree_constraints_with_repo_root() {
+    require_any_sandbox!();
     let tree = Tree::new("repo-root-keep-worktree");
     let vendor = tree.worktree.join("vendor");
     std::fs::create_dir_all(&vendor).unwrap();
