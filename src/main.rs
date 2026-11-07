@@ -1625,7 +1625,12 @@ fn run(
                     "One or more wrapper requests are pending approval".into(),
                 ));
             }
-            if let Some(policy) = stored_ssh_for_onboarding.as_ref()
+            // Launch uses the selected-key agent only when SSH was not
+            // explicitly disabled and neither full SSH nor lockdown applies.
+            if cli.ssh != Some(false)
+                && !config.ssh_enabled()
+                && !config.lockdown_enabled()
+                && let Some(policy) = stored_ssh_for_onboarding.as_ref()
                 && let Err(error) = ssh_restricted::validate_policy(policy)
             {
                 status_blockers.push(("changed_ssh_key".into(), error));

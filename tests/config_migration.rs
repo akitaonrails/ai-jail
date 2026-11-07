@@ -98,6 +98,46 @@ fn launch_sandbox_available() -> bool {
 }
 
 #[test]
+fn status_ignores_keys_when_selected_key_ssh_is_inactive() {
+    let tree = Tree::new("inactive-ssh");
+    assert_ok(&tree.run(&["--init", "--", "/bin/true"]));
+    let path = tree.project_doc();
+    let original = std::fs::read_to_string(&path).unwrap();
+    let missing_key = tree.home.join("missing-key");
+    let private = toml::Value::String(missing_key.display().to_string());
+    let public = toml::Value::String(
+        missing_key.with_extension("pub").display().to_string(),
+    );
+    std::fs::write(
+        &path,
+        format!(
+            "{original}\n[restricted_ssh]\ndestinations = ['git@example.test']\n\
+             [[restricted_ssh.keys]]\nprivate_path = {private}\npublic_path = {public}\n\
+             fingerprint = 'SHA256:fixture'\nprivate_dev = 1\nprivate_ino = 2\n\
+             public_dev = 1\npublic_ino = 3\n"
+        ),
+    ).unwrap();
+
+    for (flags, expects_blocker) in [
+        (&[][..], true),
+        (&["--no-ssh"][..], false),
+        (&["--lockdown"][..], false),
+        (&["--ssh"][..], false),
+    ] {
+        let output = tree.run(&[flags, &["status", "--json"]].concat());
+        assert_ok(&output);
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap();
+        let has_blocker = report["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "changed_ssh_key");
+        assert_eq!(has_blocker, expects_blocker, "{flags:?}");
+    }
+}
+
+#[test]
 fn no_save_config_still_performs_security_migration() {
     if !launch_sandbox_available() {
         eprintln!("SKIPPED: this environment cannot launch the sandbox");
