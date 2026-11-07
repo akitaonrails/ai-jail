@@ -1690,14 +1690,11 @@ fn run(
 
     // Persist user-level preferences in the external XDG config store.
     if should_save_global_preferences(&cli) && store.available {
-        let mut global = config_store::load_global(&store)?;
-        if config.no_status_bar.is_some() {
-            global.base.no_status_bar = config.no_status_bar;
-        }
-        if config.status_bar_style.is_some() {
-            global.base.status_bar_style = config.status_bar_style.clone();
-        }
-        config_store::save_global_document(&store, &global)?;
+        config_store::save_global_preferences(
+            &store,
+            config.no_status_bar,
+            config.status_bar_style.as_deref(),
+        )?;
     }
 
     // Handle --init: save config and exit.
