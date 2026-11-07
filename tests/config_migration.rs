@@ -463,6 +463,7 @@ fn global_plain_and_safe_symlink_migrate_without_deleting_target() {
 }
 
 const GLOBAL_POLICY_WITH_ENV: &str = r#"
+project_strategy = "repo-root"
 env_pass = ["AJ_SYNTHETIC=base-value"]
 env_from_file = ["/synthetic/base.env"]
 future_setting = "preserve-me"

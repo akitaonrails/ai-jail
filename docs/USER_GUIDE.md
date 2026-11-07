@@ -478,6 +478,10 @@ and directory grants are shared.
 
 - Only the root of a linked worktree resolves to the main repository.
   Subdirectories of a worktree or of the main checkout keep their own policy.
+  The name matches ai-memory's marker setting, but the scope does not: under
+  ai-memory, `repo-root` also collapses subdirectories onto one project, while
+  ai-jail currently shares policy between worktree roots only. A launch from a
+  package directory therefore still onboards on its own.
 - ai-jail validates the worktree's repository metadata structurally. Metadata
   it refuses falls back to the launch directory's own policy with a warning.
 - A main checkout that is missing on disk also falls back to the launch
@@ -491,7 +495,7 @@ and directory grants are shared.
   default strategy would use, ai-jail prints one warning each time it runs
   there:
   `project_strategy = repo-root: using the policy of <root>; the saved policy
-  for <launch dir> is ignored`. Restrictions saved only in that per-directory
+for <launch dir> is ignored`. Restrictions saved only in that per-directory
   policy no longer apply there.
 - Every checkout adds to the shared document's restrictions. The automatic
   save at launch and `--init` merge the restrictions they capture into the
