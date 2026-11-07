@@ -1389,30 +1389,40 @@ fn run(
         && !cli.bootstrap
         && !cli.status
         && !cli.clean;
+    let interactive_review =
+        (configure_only || first_run) && onboarding::is_interactive();
+    if !interactive_review
+        && !cli.status
+        && !cli.dry_run
+        && !cli.init
+        && !cli.bootstrap
+    {
+        let pending = wrapper_requests.pending(&stored_wrapper_approvals);
+        if !pending.is_empty() {
+            for request in pending {
+                output::error(&format!(
+                    "Wrapper request from {} is not approved: {} {}",
+                    output::escape_control_bytes(&request.approval.requester),
+                    output::escape_control_bytes(&request.approval.kind),
+                    output::escape_control_bytes(&request.approval.value)
+                ));
+            }
+            let harness = effective_harness.as_deref().unwrap_or("HARNESS");
+            output::error(&format!(
+                "Review requests with `ai-jail configure --harness {harness}`."
+            ));
+            return Ok(integration::EXIT_REQUIRED_GRANT);
+        }
+    }
     let mut prepared_launch: Option<FinalizedLaunch> = None;
     let mut final_access_render: Option<(String, Option<bool>, Vec<String>)> =
         None;
-    let mut skip_project_auto_save = first_run && !onboarding::is_interactive();
+    let mut skip_project_auto_save = first_run && !interactive_review;
     if configure_only || first_run {
         let harness = effective_harness
             .as_deref()
             .ok_or_else(|| "configure requires a known harness".to_string())?;
-        if !onboarding::is_interactive() {
-            if !wrapper_requests.items.is_empty() {
-                for request in
-                    wrapper_requests.pending(&stored_wrapper_approvals)
-                {
-                    output::error(&format!(
-                        "Wrapper request from {} is not approved: {} {}",
-                        output::escape_control_bytes(
-                            &request.approval.requester
-                        ),
-                        output::escape_control_bytes(&request.approval.kind),
-                        output::escape_control_bytes(&request.approval.value)
-                    ));
-                }
-                return Ok(integration::EXIT_REQUIRED_GRANT);
-            }
+        if !interactive_review {
             config = build_noninteractive_onboarding_effective(
                 &global_for_onboarding,
                 harness,
@@ -1521,19 +1531,6 @@ fn run(
         && !cli.init
         && !cli.bootstrap
     {
-        let pending = wrapper_requests.pending(&stored_wrapper_approvals);
-        if !pending.is_empty() && !cli.status {
-            for request in pending {
-                output::error(&format!(
-                    "Wrapper request from {} is not approved: {} {}. Review it with `ai-jail configure --harness {}`.",
-                    output::escape_control_bytes(&request.approval.requester),
-                    output::escape_control_bytes(&request.approval.kind),
-                    output::escape_control_bytes(&request.approval.value),
-                    effective_harness.as_deref().unwrap_or("HARNESS")
-                ));
-            }
-            return Ok(integration::EXIT_REQUIRED_GRANT);
-        }
         config = build_onboarding_effective(
             global_for_onboarding,
             stored_grants_for_onboarding,
