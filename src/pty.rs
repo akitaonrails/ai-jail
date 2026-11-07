@@ -1894,7 +1894,7 @@ pub fn run_with_config(
     resize_redraw_key: Option<&[u8]>,
     config: &crate::config::Config,
     status_bar: bool,
-) -> Result<i32, String> {
+) -> Result<crate::exit_reason::ChildStatus, String> {
     let supervision_gate = crate::signals::wrap_supervised_command(cmd)?;
     run_with_passthrough(
         pty,
@@ -1915,7 +1915,7 @@ fn run_with_passthrough(
     terminal_appearance: bool,
     status_bar: bool,
     supervision_gate: crate::signals::SupervisionGate,
-) -> Result<i32, String> {
+) -> Result<crate::exit_reason::ChildStatus, String> {
     use std::os::unix::process::CommandExt;
 
     let (rows, cols) = real_term_size().unwrap_or((24, 80));
@@ -2003,12 +2003,12 @@ fn run_with_passthrough(
     drop(raw_mode_guard);
 
     // Wait for child
-    let exit_code = crate::signals::wait_child(pid);
+    let status = crate::signals::wait_child_status(pid);
 
     // Prevent double-wait
     std::mem::forget(child);
 
-    Ok(exit_code)
+    Ok(status)
 }
 
 fn real_term_size() -> Option<(u16, u16)> {

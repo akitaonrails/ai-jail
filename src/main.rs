@@ -11,6 +11,7 @@ mod command;
 mod config;
 mod config_store;
 mod egress_log;
+mod exit_reason;
 mod forge_auth;
 mod fsutil;
 mod github_auth;
@@ -2138,9 +2139,9 @@ fn run(
     // across fork+exec). NPROC is applied inside the sandbox instead
     // — see run_landlock_exec() — to avoid EAGAIN during bwrap's
     // internal clone() calls for namespace creation.
-    sandbox::rlimits::apply(config, cli.verbose);
+    let file_size_set = sandbox::rlimits::apply(config, cli.verbose);
 
-    let exit_code = if use_pty {
+    let child_status = if use_pty {
         let resize_redraw_key =
             match config.resize_redraw_key.as_deref() {
                 Some(spec) => match pty::parse_resize_redraw_key(spec) {
@@ -2187,9 +2188,9 @@ fn run(
             config,
             use_status_bar,
         ) {
-            Ok(code) => {
+            Ok(status) => {
                 statusbar::teardown();
-                code
+                status
             }
             Err(e) => {
                 statusbar::teardown();
@@ -2203,15 +2204,29 @@ fn run(
 
         let pid = child.id() as i32;
 
-        let code = signals::wait_child(pid);
+        let status = signals::wait_child_status(pid);
         std::mem::forget(child);
         // Defensive terminal reset — see issue #40. The child may
         // have left mouse tracking, alt-screen, etc. on. The PTY path
         // does its own reset in pty::run; here we cover the
         // no-status-bar / multiplexer-detected / crush paths.
         output::terminal_reset();
-        code
+        status
     };
+    // The plain wait-status mapping, never a value derived from the
+    // classified reason, so scripts see the same code as before.
+    let exit_code = child_status.exit_code();
+
+    // One explanation line per run, after the terminal is restored so
+    // it is not drawn into the child's screen. Normal exits and
+    // deliberate signals print nothing.
+    let reason = exit_reason::classify(
+        &child_status,
+        &exit_reason::LimitsInForce::read_back(file_size_set),
+    );
+    if let Some(line) = reason.explanation(exit_reason::HostTraits::CURRENT) {
+        output::security_warn(&line);
+    }
 
     // A tunnel the command left open would otherwise end only when this
     // process exits, after the run is over, and its egress line and bytes

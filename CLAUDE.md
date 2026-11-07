@@ -27,6 +27,7 @@ src/
   signals.rs      -- signal forwarding + child process reaping
   output.rs       -- colored terminal output helpers (raw ANSI, no deps)
   egress_log.rs   -- one JSON line per filtered-egress connection (--egress-log)
+  exit_reason.rs  -- why a run ended: wait status + limits in force -> one stderr line
   bootstrap.rs    -- AI tool config generation (Claude, Codex, OpenCode)
   command.rs      -- harness/ai-memory wrapper detection, effective command names
   fsutil.rs       -- atomic file writes (0600), symlink-safe target checks
