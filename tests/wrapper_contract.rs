@@ -151,6 +151,45 @@ fn noninteractive_unapproved_request_fails_with_distinct_code() {
 }
 
 #[test]
+fn pending_request_blocks_launch_without_a_known_harness() {
+    let tree = Tree::new("unknown-harness");
+    let args = ["--request", "env=WRAPPER_FIXTURE", "--no-save-config"];
+    let status = tree.run(
+        &[
+            args.as_slice(),
+            &["status", "--json", "--", "/bin/echo", "child-ran"],
+        ]
+        .concat(),
+    );
+    assert!(status.status.success(), "{status:?}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(report["harnesses"], serde_json::json!([]));
+    assert!(
+        report["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| {
+                blocker["code"] == "required_grant_not_approved"
+            })
+    );
+
+    let output = tree.run(
+        &[
+            args.as_slice(),
+            &["--exec", "--no-network", "--", "/bin/echo", "child-ran"],
+        ]
+        .concat(),
+    );
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("env WRAPPER_FIXTURE")
+    );
+}
+
+#[test]
 fn request_file_inside_checkout_is_refused() {
     let tree = Tree::new("inside-checkout");
     let inside = tree.project.join("requests.json");
