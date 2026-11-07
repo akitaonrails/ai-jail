@@ -34,8 +34,11 @@ pub(crate) mod messages {
     pub const SSH_SCOPE_ID: &str = "AJ-SSH-002";
     pub const SSH_DRIFT_ID: &str = "AJ-SSH-003";
     pub const SSH_NETWORK_ID: &str = "AJ-SSH-004";
+    pub const POLICY_SHARED_ID: &str = "AJ-PROJ-001";
 
     pub const INTRO: &str = "Choose the access this project needs.";
+    pub const POLICY_SHARED: &str =
+        "shared with its linked worktrees (project_strategy = \"repo-root\")";
     pub const CANCEL: &str = "Onboarding cancelled. No onboarding grants were saved and the harness was not started. A completed legacy migration is not rolled back.";
 }
 
@@ -436,7 +439,7 @@ pub(crate) fn prepare_profile(
     proposed.approved_wrapper_requests = approved_wrapper_requests.to_vec();
     proposed.directory_grants = crate::config_store::capture_directory_grants(
         &proposed.grants,
-        project,
+        effective.store.policy_root(),
     )?;
     crate::materialize_approved_env_names(&proposed.approved_env_names, false)?;
     let base = crate::build_onboarding_effective(
@@ -1064,6 +1067,34 @@ fn initial_selection(
     selection
 }
 
+/// The policy root, only when it differs from the launch directory.
+pub(crate) fn shared_policy_root<'a>(
+    project: &Path,
+    store: &'a crate::config_store::StorePaths,
+) -> Option<&'a Path> {
+    let root = store.policy_root();
+    (root != project && root != store.canonical_project).then_some(root)
+}
+
+fn plain_header(
+    harness: &str,
+    project: &Path,
+    policy_root: Option<&Path>,
+) -> Result<String, String> {
+    let mut header = format!(
+        "\nConfigure {harness} for this project\n\nProject: {}\n",
+        safe_path(project)?
+    );
+    if let Some(root) = policy_root {
+        header.push_str(&format!(
+            "Policy:  {} \u{b7} {}\n",
+            safe_path(root)?,
+            messages::POLICY_SHARED
+        ));
+    }
+    Ok(header)
+}
+
 pub(crate) fn run(
     harness: &str,
     project: &Path,
@@ -1089,8 +1120,8 @@ pub(crate) fn run(
     } else {
         effective.cli.harnesses.clone()
     };
-    eprintln!("\nConfigure {harness} for this project\n");
-    eprintln!("Project: {}\n", safe_path(project)?);
+    let policy_root = shared_policy_root(project, effective.store);
+    eprintln!("{}", plain_header(harness, project, policy_root)?);
     eprintln!("{}\n", messages::INTRO);
     if std::env::var_os("TERM").is_some_and(|value| value == "dumb") {
         let approved_wrapper_requests = review_wrapper_requests(
@@ -1120,6 +1151,7 @@ pub(crate) fn run(
             configure_only,
             recommended_baseline: use_recommended_defaults,
             profile_path: &effective.store.project,
+            policy_root,
         },
         |current, approved| {
             prepare_profile(
@@ -1512,7 +1544,7 @@ fn run_sequential(
     proposed.approved_wrapper_requests = approved_wrapper_requests;
     proposed.directory_grants = crate::config_store::capture_directory_grants(
         &proposed.grants,
-        project,
+        effective.store.policy_root(),
     )?;
     crate::materialize_approved_env_names(&proposed.approved_env_names, false)?;
     let base = crate::build_onboarding_effective(
@@ -2882,6 +2914,8 @@ mod tests {
             legacy_global: base.join("legacy-global"),
             legacy_project: project.join(".ai-jail"),
             canonical_project: std::fs::canonicalize(project).unwrap(),
+            policy_root: std::fs::canonicalize(project).unwrap(),
+            project_strategy: crate::config::ProjectStrategy::Basename,
             root,
         }
     }
@@ -3621,11 +3655,27 @@ mod tests {
             messages::SSH_SCOPE_ID,
             messages::SSH_DRIFT_ID,
             messages::SSH_NETWORK_ID,
+            messages::POLICY_SHARED_ID,
         ];
         let mut sorted = ids.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), ids.len());
+    }
+
+    #[test]
+    fn plain_header_names_shared_policy_root() {
+        let shared = plain_header(
+            "claude",
+            Path::new("/work/wt"),
+            Some(Path::new("/work/main")),
+        )
+        .unwrap();
+        assert!(shared.contains("/work/main"));
+        assert!(shared.contains("shared with its linked worktrees"));
+        assert!(!shared.contains("AJ-"));
+        let own = plain_header("claude", Path::new("/work/wt"), None).unwrap();
+        assert!(!own.contains("Policy"));
     }
 
     #[test]
@@ -3671,6 +3721,7 @@ mod tests {
             messages::SSH_SCOPE_ID,
             messages::SSH_DRIFT_ID,
             messages::SSH_NETWORK_ID,
+            messages::POLICY_SHARED_ID,
         ];
         catalog_ids.sort_unstable();
         assert_eq!(claimed_ids, catalog_ids, "catalog/provenance ID drift");

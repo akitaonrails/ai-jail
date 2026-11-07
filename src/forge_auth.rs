@@ -1038,8 +1038,11 @@ fn binding_path(paths: &StorePaths) -> PathBuf {
 }
 
 fn credential_prefix(paths: &StorePaths) -> String {
+    // Keyed like the binding (`identity()`), so every worktree sharing a
+    // policy root reaches the same credentials. Equal to the launch directory
+    // unless `project_strategy = "repo-root"` resolved a linked worktree.
     let mut hash = Sha256::new();
-    hash.update(paths.canonical_project.as_os_str().as_encoded_bytes());
+    hash.update(paths.policy_root.as_os_str().as_encoded_bytes());
     hex(&hash.finalize()[..12])
 }
 
@@ -1893,6 +1896,68 @@ fn forbidden_ipv4(ip: std::net::Ipv4Addr, allow_private: bool) -> bool {
 mod tests {
     use super::*;
 
+    fn store_for_checkout(checkout: &Path, store: &Path) -> StorePaths {
+        let canonical = fs::canonicalize(checkout).unwrap();
+        StorePaths {
+            available: true,
+            root: store.to_path_buf(),
+            global: store.join("config.toml"),
+            global_provenance: store.join("global-migration.toml"),
+            project: store.join("projects/project.toml"),
+            legacy_global: store.join("legacy-global"),
+            legacy_project: canonical.join(".ai-jail"),
+            policy_root: canonical.clone(),
+            project_strategy: crate::config::ProjectStrategy::Basename,
+            canonical_project: canonical,
+        }
+    }
+
+    #[test]
+    fn credential_prefix_is_shared_by_worktrees_under_repo_root() {
+        use crate::config::ProjectStrategy;
+        let fixture =
+            crate::sandbox::test_support::linked_worktree_fixture("forge-rr");
+        let second = fixture.root.join("second");
+        let second_git_dir = fixture.common_dir.join("worktrees/wt2");
+        fs::create_dir_all(&second).unwrap();
+        fs::create_dir_all(&second_git_dir).unwrap();
+        fs::write(
+            second.join(".git"),
+            "gitdir: ../common/.git/worktrees/wt2\n",
+        )
+        .unwrap();
+        fs::write(second_git_dir.join("gitdir"), "../../../../second/.git\n")
+            .unwrap();
+        fs::write(second_git_dir.join("commondir"), "../..\n").unwrap();
+        let store = fixture.root.join("config/ai-jail");
+
+        let first_paths = store_for_checkout(&fixture.project_dir, &store);
+        let second_paths = store_for_checkout(&second, &store);
+        let first = first_paths
+            .clone()
+            .with_project_strategy(ProjectStrategy::RepoRoot)
+            .unwrap();
+        let other = second_paths
+            .clone()
+            .with_project_strategy(ProjectStrategy::RepoRoot)
+            .unwrap();
+        assert_eq!(credential_prefix(&first), credential_prefix(&other));
+
+        // Basename keeps the historical launch-directory prefix, so existing
+        // credential names do not change.
+        let basename = first_paths
+            .clone()
+            .with_project_strategy(ProjectStrategy::Basename)
+            .unwrap();
+        let mut hash = Sha256::new();
+        hash.update(
+            first_paths.canonical_project.as_os_str().as_encoded_bytes(),
+        );
+        let legacy = hex(&hash.finalize()[..12]);
+        assert_eq!(credential_prefix(&basename), legacy);
+        assert_ne!(credential_prefix(&basename), credential_prefix(&first));
+    }
+
     fn test_store(name: &str) -> (PathBuf, StorePaths) {
         let base =
             fs::canonicalize(std::env::temp_dir())
@@ -1917,7 +1982,9 @@ mod tests {
             project: root.join("projects/project.toml"),
             legacy_global: base.join("legacy-global"),
             legacy_project: project.join(".ai-jail"),
-            canonical_project: fs::canonicalize(project).unwrap(),
+            canonical_project: fs::canonicalize(&project).unwrap(),
+            policy_root: fs::canonicalize(&project).unwrap(),
+            project_strategy: crate::config::ProjectStrategy::Basename,
         };
         (base, paths)
     }

@@ -13,6 +13,24 @@ use ratatui::widgets::{
 };
 
 const WIDE_WIDTH: u16 = 96;
+/// Rows the access header may take when it wraps the shared-policy line.
+/// `MIN_HEIGHT` leaves room for this beside the other fixed zones.
+const MAX_HEADER_HEIGHT: u16 = 8;
+
+/// Rows `lines` need when word-wrapped to `width` columns. Word wrapping can
+/// need one row more than the character count suggests, so a line that
+/// wraps reserves that extra row.
+fn wrapped_rows(lines: &[Line<'_>], width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let rows: usize = lines
+        .iter()
+        .map(|line| match line.width() {
+            w if w <= width => 1,
+            w => w.div_ceil(width) + 1,
+        })
+        .sum();
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
 
 pub(super) fn render(frame: &mut Frame, app: &mut App<'_>) {
     render_screen(frame, app);
@@ -61,6 +79,36 @@ fn render_screen(frame: &mut Frame, app: &mut App<'_>) {
         return;
     }
 
+    let mut header = vec![
+        Line::from(Span::styled("AI-JAIL", brand(app))),
+        Line::from(vec![
+            Span::styled("Project  ", muted(app)),
+            Span::styled(
+                compact_project_path(&app.project),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!("Config   {}", compact_home_path(&app.profile_path)),
+            muted(app),
+        )),
+    ];
+    // The shared-policy disclosure comes before the root, and the header
+    // wraps and grows to fit, so a long path never truncates it.
+    let shared_policy = app.policy_root.is_some();
+    if let Some(root) = &app.policy_root {
+        header.push(Line::from(vec![
+            Span::styled("Policy   ", muted(app)),
+            Span::raw(super::super::messages::POLICY_SHARED),
+            Span::raw(format!(" \u{b7} {}", compact_home_path(root))),
+        ]));
+    }
+    let header_height = if shared_policy {
+        (wrapped_rows(&header, area.width) + 1).clamp(4, MAX_HEADER_HEIGHT)
+    } else {
+        4
+    };
+
     let [
         header_area,
         preset_area,
@@ -68,7 +116,7 @@ fn render_screen(frame: &mut Frame, app: &mut App<'_>) {
         cli_area,
         footer_area,
     ] = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(header_height),
         Constraint::Length(3),
         Constraint::Min(8),
         Constraint::Length(4),
@@ -76,23 +124,13 @@ fn render_screen(frame: &mut Frame, app: &mut App<'_>) {
     ])
     .areas(area);
 
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled("AI-JAIL", brand(app))),
-            Line::from(vec![
-                Span::styled("Project  ", muted(app)),
-                Span::styled(
-                    compact_project_path(&app.project),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(Span::styled(
-                format!("Config   {}", compact_home_path(&app.profile_path)),
-                muted(app),
-            )),
-        ]),
-        header_area,
-    );
+    let header = Paragraph::new(header);
+    let header = if shared_policy {
+        header.wrap(Wrap { trim: false })
+    } else {
+        header
+    };
+    frame.render_widget(header, header_area);
     render_presets(frame, app, preset_area);
 
     let [access_area, protections_area, detail_area] =
@@ -816,6 +854,67 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn header_names_shared_policy_root_for_worktree() {
+        let mut selection = Selection::default();
+        let mut app = App::new(
+            &mut selection,
+            "claude",
+            "/work/wt".into(),
+            false,
+            &Default::default(),
+            &[],
+        );
+        app.policy_root = Some("/work/main".into());
+        let rendered = buffer_text(160, 34, &mut app);
+        assert!(rendered.contains("/work/main"));
+        assert!(rendered.contains("shared with its linked worktrees"));
+        assert!(!rendered.contains("AJ-"));
+    }
+
+    #[test]
+    fn header_omits_policy_line_for_basename() {
+        let mut selection = Selection::default();
+        let mut app = App::new(
+            &mut selection,
+            "claude",
+            "/work/project".into(),
+            false,
+            &Default::default(),
+            &[],
+        );
+        let rendered = buffer_text(160, 34, &mut app);
+        assert!(!rendered.contains(crate::onboarding::messages::POLICY_SHARED));
+        assert!(!rendered.contains("shared with its linked worktrees"));
+    }
+
+    #[test]
+    fn header_keeps_policy_disclosure_at_80_columns() {
+        let mut selection = Selection::default();
+        let root = format!("/home/developer/{}/main-checkout", "w".repeat(60));
+        let mut app = App::new(
+            &mut selection,
+            "claude",
+            format!("{root}__worktrees/feat-x"),
+            false,
+            &Default::default(),
+            &[],
+        );
+        app.policy_root = Some(root);
+        // 80x24 is below MIN_HEIGHT and renders the too-small screen, so the
+        // 80-column case uses the minimum supported height.
+        for width in [80, MIN_WIDTH] {
+            let rendered = buffer_text(width, MIN_HEIGHT, &mut app);
+            assert!(
+                rendered.contains("shared with its linked worktrees"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("main-checkout"), "{rendered}");
+            assert!(rendered.contains("Access choices"), "{rendered}");
+            assert!(!rendered.contains("AJ-"));
+        }
     }
 
     #[test]

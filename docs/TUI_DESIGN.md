@@ -67,6 +67,13 @@ The interface is dense, restrained, and optimized for careful review.
 - Header: a bold colored `AI-JAIL` title, compact identifying project path,
   and exact external profile path (home may be abbreviated as `~`). Do not
   spend header space on explanatory security slogans or empty breadcrumbs.
+  When `project_strategy = "repo-root"` resolves a linked worktree to its
+  main repository, a `Policy` line states that the policy is shared with its
+  linked worktrees and then names that shared root. The statement comes
+  before the path, and the header wraps and grows to fit this line, so a long
+  path never truncates the disclosure at 80 columns. The line is omitted when
+  the policy root is the launch directory, and the header keeps its fixed
+  height. The plain-terminal header prints the same facts.
 - Primary pane: the current list or editor. Checkbox state is never inferred
   from color alone.
 - The main access view has a focusable `Always enforced` pane directly below

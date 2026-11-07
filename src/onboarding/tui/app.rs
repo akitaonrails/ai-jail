@@ -389,6 +389,8 @@ pub(super) struct App<'a> {
     pub(super) harness: String,
     pub(super) project: String,
     pub(super) profile_path: String,
+    /// Set only when the policy root differs from the launch directory.
+    pub(super) policy_root: Option<String>,
     pub(super) screen: Screen,
     pub(super) wrapper: Option<WrapperReview>,
     pub(super) directory: Option<DirectoryBrowser>,
@@ -441,6 +443,7 @@ impl<'a> App<'a> {
             harness: harness.into(),
             project,
             profile_path: "[external profile path unavailable]".into(),
+            policy_root: None,
             screen: if wrapper.is_some() {
                 Screen::WrapperRequests
             } else {

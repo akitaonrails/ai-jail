@@ -1,6 +1,7 @@
 //! Trusted external configuration store and legacy `.ai-jail` migration.
 
-use crate::config::{self, Config, GlobalConfig};
+use crate::config::{self, Config, GlobalConfig, ProjectStrategy};
+use crate::output;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::{CString, OsStr};
@@ -24,7 +25,15 @@ pub(crate) struct StorePaths {
     pub(crate) project: PathBuf,
     pub(crate) legacy_global: PathBuf,
     pub(crate) legacy_project: PathBuf,
+    /// The canonical launch directory: the checkout on disk.
     pub(crate) canonical_project: PathBuf,
+    /// The directory whose policy document applies. Equal to
+    /// `canonical_project` unless `project_strategy = "repo-root"` resolved a
+    /// linked worktree to its main checkout.
+    pub(crate) policy_root: PathBuf,
+    /// The trusted strategy this store was resolved with. `discover` starts
+    /// at `Basename`; `with_project_strategy` records the configured one.
+    pub(crate) project_strategy: ProjectStrategy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -231,9 +240,47 @@ fn validate_no_symlink_components(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the launch directory's policy lives in the trusted store, so its
+/// legacy `.ai-jail` name must stay masked. Fails closed: any error resolving
+/// the store or the strategy answers `true`, which only adds that mask.
 pub(crate) fn project_has_external_policy(project_dir: &Path) -> bool {
-    StorePaths::discover(project_dir)
-        .is_ok_and(|paths| paths.available && paths.project.is_file())
+    match StorePaths::discover(project_dir) {
+        Ok(paths) => paths_have_external_policy(paths),
+        Err(_) => true,
+    }
+}
+
+fn paths_have_external_policy(paths: StorePaths) -> bool {
+    let Ok(strategy) = load_project_strategy(&paths) else {
+        return true;
+    };
+    match paths.resolve_project_strategy(strategy) {
+        // The launch already warned about an ignored strategy; this check
+        // runs during sandbox setup and must not repeat it.
+        Ok((resolved, _ignored)) => store_has_external_policy(&resolved),
+        Err(_) => true,
+    }
+}
+
+fn store_has_external_policy(paths: &StorePaths) -> bool {
+    paths.available && paths.project.is_file()
+}
+
+/// The trusted `project_strategy`: from the store's global config when it
+/// exists, otherwise from the legacy `$HOME/.ai-jail`. Never read from a
+/// project file.
+pub(crate) fn load_project_strategy(
+    paths: &StorePaths,
+) -> Result<ProjectStrategy, String> {
+    if paths.global.exists() {
+        Ok(load_global(paths)?.project_strategy)
+    } else {
+        config::load_legacy_global_project_strategy()
+    }
+}
+
+fn path_is_within(path: &Path, dir: &Path) -> bool {
+    path == dir || path.starts_with(dir)
 }
 
 fn canonical_or_absolute(path: &Path) -> Result<PathBuf, String> {
@@ -316,7 +363,7 @@ impl StorePaths {
             }
             Err(error) => return Err(error),
         };
-        if root == canonical_project || root.starts_with(&canonical_project) {
+        if path_is_within(&root, &canonical_project) {
             return Err(format!(
                 "Refusing trusted config store inside project: {}",
                 root.display()
@@ -336,13 +383,94 @@ impl StorePaths {
                 .join(format!("{}.toml", identity.key)),
             legacy_global,
             legacy_project: PathBuf::from(".ai-jail"),
+            policy_root: canonical_project.clone(),
             canonical_project,
             root,
+            project_strategy: ProjectStrategy::Basename,
         })
     }
 
+    /// Re-key the policy document according to the trusted strategy.
+    ///
+    /// `RepoRoot` moves a validated linked worktree root onto its main
+    /// checkout's document; everything else keeps the launch directory.
+    /// Worktree metadata that cannot be trusted only produces a warning and
+    /// keeps the launch directory. A store inside the resolved root is
+    /// refused, as for the launch directory.
+    pub(crate) fn with_project_strategy(
+        self,
+        strategy: ProjectStrategy,
+    ) -> Result<Self, String> {
+        let (paths, ignored) = self.resolve_project_strategy(strategy)?;
+        if let Some(reason) = ignored {
+            output::warn(&format!(
+                "project_strategy repo-root ignored: {reason}; using {}",
+                paths.canonical_project.display()
+            ));
+        }
+        Ok(paths)
+    }
+
+    /// `with_project_strategy` without the warning: returns the reason a
+    /// `RepoRoot` strategy fell back to the launch directory, if it did.
+    fn resolve_project_strategy(
+        mut self,
+        strategy: ProjectStrategy,
+    ) -> Result<(Self, Option<String>), String> {
+        self.project_strategy = strategy;
+        if strategy != ProjectStrategy::RepoRoot {
+            return Ok((self, None));
+        }
+        let root = match crate::sandbox::main_repo_root(&self.canonical_project)
+        {
+            Ok(Some(root)) => root,
+            Ok(None) => return Ok((self, None)),
+            Err(reason) => return Ok((self, Some(reason))),
+        };
+        let canonical_store =
+            fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        if path_is_within(&self.root, &root)
+            || path_is_within(&canonical_store, &root)
+        {
+            return Err(format!(
+                "Refusing trusted config store inside project: {}",
+                self.root.display()
+            ));
+        }
+        let identity = project_identity(&root);
+        self.project = self
+            .root
+            .join("projects")
+            .join(format!("{}.toml", identity.key));
+        self.policy_root = root;
+        Ok((self, None))
+    }
+
+    pub(crate) fn policy_root(&self) -> &Path {
+        &self.policy_root
+    }
+
+    /// The launch directory's own policy document when `repo-root` resolved
+    /// to another root and that document exists: the basename key would
+    /// have selected it, and this launch ignores it.
+    pub(crate) fn ignored_directory_policy(&self) -> Option<PathBuf> {
+        if !self.available || self.policy_root == self.canonical_project {
+            return None;
+        }
+        let key = project_identity(&self.canonical_project).key;
+        let path = self.root.join("projects").join(format!("{key}.toml"));
+        fs::symlink_metadata(&path).is_ok().then_some(path)
+    }
+
     pub(crate) fn identity(&self) -> ProjectIdentity {
-        project_identity(&self.canonical_project)
+        project_identity(&self.policy_root)
+    }
+
+    /// Whether the store at `canonical_root` lies inside the launch
+    /// directory or the policy root.
+    fn store_inside_project(&self, canonical_root: &Path) -> bool {
+        path_is_within(canonical_root, &self.canonical_project)
+            || path_is_within(canonical_root, &self.policy_root)
     }
 
     pub(crate) fn prepare(&self) -> Result<StoreLock, String> {
@@ -356,9 +484,7 @@ impl StorePaths {
         let canonical_root = fs::canonicalize(&self.root).map_err(|e| {
             format!("Cannot resolve config store {}: {e}", self.root.display())
         })?;
-        if canonical_root == self.canonical_project
-            || canonical_root.starts_with(&self.canonical_project)
-        {
+        if self.store_inside_project(&canonical_root) {
             return Err(format!(
                 "Refusing trusted config store inside project: {}",
                 canonical_root.display()
@@ -423,9 +549,7 @@ fn validate_store_for_read(paths: &StorePaths) -> Result<bool, String> {
     let canonical = fs::canonicalize(&paths.root).map_err(|error| {
         format!("Cannot resolve {}: {error}", paths.root.display())
     })?;
-    if canonical == paths.canonical_project
-        || canonical.starts_with(&paths.canonical_project)
-    {
+    if paths.store_inside_project(&canonical) {
         return Err(format!(
             "Refusing trusted config store inside project: {}",
             canonical.display()
@@ -942,6 +1066,9 @@ fn migrate_project(
         &selector,
         &Config::default(),
     );
+    // The legacy file lives in, and its relative paths refer to, the launch
+    // checkout. Only the destination document follows the policy root; the
+    // runtime merge filters stored paths against the launch directory again.
     let dropped = dropped_capability_requests(
         &legacy,
         &baseline,
@@ -1012,7 +1139,7 @@ pub(crate) fn save_project_grants(
     validate_directory_grants(
         &mut grants,
         approved_directory_grants,
-        &paths.canonical_project,
+        &paths.policy_root,
     )?;
     let identity = paths.identity();
     let mut doc = if paths.project.exists() {
@@ -1753,10 +1880,27 @@ pub(crate) fn save_project_constraints(
             migration: None,
         }
     };
-    doc.constraints = config::monotonic_project_constraints(
+    // Constraints are captured from this launch, so they are projected
+    // against the launch checkout; the document follows the policy root.
+    let projected = config::monotonic_project_constraints(
         &constraints,
         &paths.canonical_project,
     );
+    doc.constraints = match paths.project_strategy {
+        ProjectStrategy::Basename => projected,
+        // Under repo-root every checkout of the repository shares this
+        // document, and the projection above drops paths outside this
+        // launch's checkout. Replacing would erase restrictions saved from
+        // another checkout, so merge monotonically as migration does.
+        ProjectStrategy::RepoRoot => {
+            config::merge_with_global_report(
+                doc.constraints,
+                projected,
+                &paths.canonical_project,
+            )
+            .0
+        }
+    };
     write_project_document(&paths.project, &doc)
 }
 
@@ -2597,6 +2741,8 @@ mod tests {
                 .join(format!("{}.toml", identity.key)),
             legacy_global: base.join("home/.ai-jail"),
             legacy_project: project.join(".ai-jail"),
+            policy_root: canonical_project.clone(),
+            project_strategy: crate::config::ProjectStrategy::Basename,
             canonical_project,
         };
         let grants = Config {
@@ -2657,6 +2803,8 @@ mod tests {
                 .join(format!("{}.toml", identity.key)),
             legacy_global: base.join("home/.ai-jail"),
             legacy_project: project.join(".ai-jail"),
+            policy_root: canonical_project.clone(),
+            project_strategy: crate::config::ProjectStrategy::Basename,
             canonical_project,
         };
         let constraints = Config {
@@ -2731,6 +2879,8 @@ mod tests {
                 .join(format!("{}.toml", identity.key)),
             legacy_global: base.join("home/.ai-jail"),
             legacy_project: project.join(".ai-jail"),
+            policy_root: canonical_project.clone(),
+            project_strategy: crate::config::ProjectStrategy::Basename,
             canonical_project,
         };
         let grants = Config {
@@ -2817,6 +2967,8 @@ mod tests {
                 .join(format!("{}.toml", identity.key)),
             legacy_global: base.join("home/.ai-jail"),
             legacy_project: project.join(".ai-jail"),
+            policy_root: canonical_project.clone(),
+            project_strategy: crate::config::ProjectStrategy::Basename,
             canonical_project,
         };
         save_project_grants(
@@ -2928,5 +3080,384 @@ mod tests {
             toml::from_str::<ProjectPolicyDocument>(&text).unwrap(),
             doc
         );
+    }
+
+    /// A linked worktree whose main checkout (`common/`) is a real directory,
+    /// plus a second linked worktree of the same repository and a store root
+    /// that lives outside every checkout.
+    struct RepoRootFixture {
+        fixture: crate::sandbox::test_support::LinkedWorktreeFixture,
+        main: PathBuf,
+        second: PathBuf,
+        /// A linked worktree nested inside the main checkout
+        /// (`common/wts/wt3`), as `git worktree add .worktrees/x` makes.
+        nested: PathBuf,
+        store: PathBuf,
+        home: PathBuf,
+    }
+
+    fn repo_root_fixture(prefix: &str) -> RepoRootFixture {
+        let fixture =
+            crate::sandbox::test_support::linked_worktree_fixture(prefix);
+        let main = fixture.root.join("common");
+        let second = fixture.root.join("second");
+        let second_git_dir = fixture.common_dir.join("worktrees/wt2");
+        fs::create_dir_all(&second).unwrap();
+        fs::create_dir_all(&second_git_dir).unwrap();
+        fs::write(
+            second.join(".git"),
+            "gitdir: ../common/.git/worktrees/wt2\n",
+        )
+        .unwrap();
+        fs::write(second_git_dir.join("gitdir"), "../../../../second/.git\n")
+            .unwrap();
+        fs::write(second_git_dir.join("commondir"), "../..\n").unwrap();
+        let nested = main.join("wts/wt3");
+        let nested_git_dir = fixture.common_dir.join("worktrees/wt3");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&nested_git_dir).unwrap();
+        fs::write(nested.join(".git"), "gitdir: ../../.git/worktrees/wt3\n")
+            .unwrap();
+        fs::write(nested_git_dir.join("gitdir"), "../../../wts/wt3/.git\n")
+            .unwrap();
+        fs::write(nested_git_dir.join("commondir"), "../..\n").unwrap();
+        let store = fixture.root.join("config/ai-jail");
+        let home = fixture.root.join("home");
+        RepoRootFixture {
+            fixture,
+            main,
+            second,
+            nested,
+            store,
+            home,
+        }
+    }
+
+    /// The `StorePaths` that `discover` builds for `project`, with the store
+    /// rooted at `root` instead of the process environment.
+    fn store_paths_at(project: &Path, root: &Path, home: &Path) -> StorePaths {
+        let canonical_project = fs::canonicalize(project).unwrap();
+        let identity = project_identity(&canonical_project);
+        StorePaths {
+            available: true,
+            root: root.to_path_buf(),
+            global: root.join("config.toml"),
+            global_provenance: root.join("global-migration.toml"),
+            project: root
+                .join("projects")
+                .join(format!("{}.toml", identity.key)),
+            legacy_global: home.join(".ai-jail"),
+            legacy_project: canonical_project.join(".ai-jail"),
+            policy_root: canonical_project.clone(),
+            project_strategy: crate::config::ProjectStrategy::Basename,
+            canonical_project,
+        }
+    }
+
+    #[test]
+    fn repo_root_strategy_gives_worktree_the_main_checkout_identity() {
+        let f = repo_root_fixture("cs-rr-identity");
+        let main = store_paths_at(&f.main, &f.store, &f.home);
+        let worktree =
+            store_paths_at(&f.fixture.project_dir, &f.store, &f.home)
+                .with_project_strategy(config::ProjectStrategy::RepoRoot)
+                .unwrap();
+        assert_eq!(worktree.identity(), main.identity());
+        assert_eq!(worktree.project, main.project);
+        assert_eq!(worktree.policy_root(), main.policy_root());
+    }
+
+    #[test]
+    fn basename_strategy_keeps_per_directory_identity() {
+        let f = repo_root_fixture("cs-basename-identity");
+        let main = store_paths_at(&f.main, &f.store, &f.home);
+        let worktree =
+            store_paths_at(&f.fixture.project_dir, &f.store, &f.home)
+                .with_project_strategy(config::ProjectStrategy::Basename)
+                .unwrap();
+        assert_ne!(worktree.identity(), main.identity());
+        assert_ne!(worktree.project, main.project);
+        assert_eq!(worktree.policy_root(), worktree.canonical_project);
+    }
+
+    #[test]
+    fn repo_root_strategy_keeps_launch_dir_as_canonical_project() {
+        let f = repo_root_fixture("cs-rr-launch-dir");
+        let launch = fs::canonicalize(&f.fixture.project_dir).unwrap();
+        let worktree =
+            store_paths_at(&f.fixture.project_dir, &f.store, &f.home)
+                .with_project_strategy(config::ProjectStrategy::RepoRoot)
+                .unwrap();
+        assert_eq!(worktree.canonical_project, launch);
+        assert_eq!(worktree.legacy_project, launch.join(".ai-jail"));
+        assert_eq!(worktree.policy_root(), fs::canonicalize(&f.main).unwrap());
+    }
+
+    #[test]
+    fn repo_root_strategy_ignores_subdirectory_of_worktree() {
+        let f = repo_root_fixture("cs-rr-subdir");
+        let sub = f.fixture.project_dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let plain = store_paths_at(&sub, &f.store, &f.home);
+        let resolved = store_paths_at(&sub, &f.store, &f.home)
+            .with_project_strategy(config::ProjectStrategy::RepoRoot)
+            .unwrap();
+        assert_eq!(resolved.identity(), plain.identity());
+        assert_eq!(resolved.project, plain.project);
+        assert_eq!(
+            resolved.identity().canonical_path,
+            fs::canonicalize(&sub).unwrap()
+        );
+    }
+
+    #[test]
+    fn worktree_loads_document_saved_for_main_checkout() {
+        let f = repo_root_fixture("cs-rr-load-main-doc");
+        let main = store_paths_at(&f.main, &f.store, &f.home);
+        save_project_grants(
+            &main,
+            Config {
+                github: Some(true),
+                ..Config::default()
+            },
+            Vec::new(),
+            Vec::new(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let worktree =
+            store_paths_at(&f.fixture.project_dir, &f.store, &f.home)
+                .with_project_strategy(config::ProjectStrategy::RepoRoot)
+                .unwrap();
+        let loaded = load_project(&worktree).unwrap();
+        assert!(loaded.present);
+        assert!(loaded.onboarding_complete);
+        assert_eq!(loaded.grants.github, Some(true));
+    }
+
+    #[test]
+    fn directory_grants_saved_in_one_worktree_validate_in_another() {
+        let f = repo_root_fixture("cs-rr-dir-grants");
+        // `common/wts` contains the nested worktree but not the main
+        // checkout, so its `open_scope` depends on which root is used.
+        let ancestor = fs::canonicalize(f.main.join("wts")).unwrap();
+        let nested = store_paths_at(&f.nested, &f.store, &f.home)
+            .with_project_strategy(config::ProjectStrategy::RepoRoot)
+            .unwrap();
+        assert_eq!(nested.policy_root(), fs::canonicalize(&f.main).unwrap());
+        let grants = Config {
+            ro_maps: vec![ancestor.clone()],
+            ..Config::default()
+        };
+        let approved =
+            capture_directory_grants(&grants, nested.policy_root()).unwrap();
+        let against_launch =
+            capture_directory_grants(&grants, &nested.canonical_project)
+                .unwrap();
+        assert!(!approved[0].open_scope);
+        assert!(against_launch[0].open_scope);
+        assert_ne!(approved, against_launch);
+        save_project_grants(
+            &nested,
+            grants.clone(),
+            Vec::new(),
+            Vec::new(),
+            &approved,
+            None,
+        )
+        .unwrap();
+        let first = store_paths_at(&f.fixture.project_dir, &f.store, &f.home)
+            .with_project_strategy(config::ProjectStrategy::RepoRoot)
+            .unwrap();
+        let second = store_paths_at(&f.second, &f.store, &f.home)
+            .with_project_strategy(config::ProjectStrategy::RepoRoot)
+            .unwrap();
+        assert_eq!(first.project, nested.project);
+        assert_eq!(second.project, nested.project);
+        for paths in [&nested, &first, &second] {
+            let loaded = load_project_for_status(paths).unwrap();
+            assert!(loaded.present);
+            assert!(
+                loaded.validation_blockers.is_empty(),
+                "{:?}",
+                loaded.validation_blockers
+            );
+            assert_eq!(loaded.grants.ro_maps, grants.ro_maps);
+        }
+    }
+
+    #[test]
+    fn store_inside_main_checkout_is_refused_from_worktree() {
+        let f = repo_root_fixture("cs-rr-store-inside-main");
+        let inside = fs::canonicalize(&f.main).unwrap().join("config/ai-jail");
+        let error = store_paths_at(&f.fixture.project_dir, &inside, &f.home)
+            .with_project_strategy(config::ProjectStrategy::RepoRoot)
+            .unwrap_err();
+        assert!(
+            error.contains("Refusing trusted config store inside project"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn external_policy_check_follows_repo_root() {
+        let f = repo_root_fixture("cs-rr-external-policy");
+        let main = store_paths_at(&f.main, &f.store, &f.home);
+        save_project_grants(
+            &main,
+            Config::default(),
+            Vec::new(),
+            Vec::new(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let worktree =
+            store_paths_at(&f.fixture.project_dir, &f.store, &f.home);
+        assert!(store_has_external_policy(
+            &worktree
+                .clone()
+                .with_project_strategy(config::ProjectStrategy::RepoRoot)
+                .unwrap()
+        ));
+        assert!(!store_has_external_policy(
+            &worktree
+                .with_project_strategy(config::ProjectStrategy::Basename)
+                .unwrap()
+        ));
+    }
+
+    #[test]
+    fn legacy_worktree_constraints_migrate_into_shared_document() {
+        let f = repo_root_fixture("cs-rr-legacy-migrate");
+        let worktree =
+            store_paths_at(&f.fixture.project_dir, &f.store, &f.home)
+                .with_project_strategy(config::ProjectStrategy::RepoRoot)
+                .unwrap();
+        fs::write(&worktree.legacy_project, "mask = [\"secret.txt\"]\n")
+            .unwrap();
+        let mut notices = Vec::new();
+        migrate(&worktree, true, &mut notices).unwrap();
+        assert!(!worktree.legacy_project.exists());
+        let main = store_paths_at(&f.main, &f.store, &f.home);
+        let loaded = load_project(&main).unwrap();
+        assert!(loaded.present);
+        assert!(
+            loaded
+                .constraints
+                .mask
+                .contains(&PathBuf::from("secret.txt")),
+            "{:?}",
+            loaded.constraints.mask
+        );
+    }
+
+    #[test]
+    fn repo_root_constraint_save_keeps_entries_outside_launch_dir() {
+        let f = repo_root_fixture("cs-rr-save-merge");
+        let main = store_paths_at(&f.main, &f.store, &f.home);
+        let vendor = fs::canonicalize(&f.main).unwrap().join("vendor");
+        fs::create_dir_all(&vendor).unwrap();
+        save_project_constraints(
+            &main,
+            Config {
+                ro_maps: vec![vendor.clone()],
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let worktree =
+            store_paths_at(&f.fixture.project_dir, &f.store, &f.home)
+                .with_project_strategy(config::ProjectStrategy::RepoRoot)
+                .unwrap();
+        save_project_constraints(
+            &worktree,
+            Config {
+                mask: vec![PathBuf::from("secret.txt")],
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let doc =
+            read_project_document(&main.project, &main.identity()).unwrap();
+        assert_eq!(doc.constraints.ro_maps, vec![vendor]);
+        assert_eq!(doc.constraints.mask, vec![PathBuf::from("secret.txt")]);
+    }
+
+    #[test]
+    fn basename_constraint_save_still_replaces_constraints() {
+        let f = repo_root_fixture("cs-basename-save-replace");
+        let worktree =
+            store_paths_at(&f.fixture.project_dir, &f.store, &f.home)
+                .with_project_strategy(config::ProjectStrategy::Basename)
+                .unwrap();
+        let vendor = worktree.canonical_project.join("vendor");
+        fs::create_dir_all(&vendor).unwrap();
+        save_project_constraints(
+            &worktree,
+            Config {
+                ro_maps: vec![vendor],
+                mask: vec![PathBuf::from("a.txt")],
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        save_project_constraints(
+            &worktree,
+            Config {
+                mask: vec![PathBuf::from("b.txt")],
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let doc =
+            read_project_document(&worktree.project, &worktree.identity())
+                .unwrap();
+        assert!(doc.constraints.ro_maps.is_empty());
+        assert_eq!(doc.constraints.mask, vec![PathBuf::from("b.txt")]);
+    }
+
+    #[test]
+    fn external_policy_check_fails_closed_on_missing_project() {
+        let f = repo_root_fixture("cs-external-policy-missing");
+        assert!(project_has_external_policy(&f.fixture.root.join("gone")));
+    }
+
+    #[test]
+    fn external_policy_check_fails_closed_on_unreadable_strategy() {
+        let f = repo_root_fixture("cs-external-policy-bad-global");
+        let worktree =
+            store_paths_at(&f.fixture.project_dir, &f.store, &f.home);
+        let _lock = worktree.prepare().unwrap();
+        fs::write(&worktree.global, "project_strategy = [\n").unwrap();
+        fs::set_permissions(
+            &worktree.global,
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(load_project_strategy(&worktree).is_err());
+        assert!(paths_have_external_policy(worktree));
+    }
+
+    #[test]
+    fn external_policy_check_fails_closed_on_refused_strategy() {
+        let f = repo_root_fixture("cs-external-policy-refused");
+        let inside = fs::canonicalize(&f.main).unwrap().join("config/ai-jail");
+        let worktree = store_paths_at(&f.fixture.project_dir, &inside, &f.home);
+        let _lock = worktree.prepare().unwrap();
+        fs::write(&worktree.global, "project_strategy = \"repo-root\"\n")
+            .unwrap();
+        fs::set_permissions(
+            &worktree.global,
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert_eq!(
+            load_project_strategy(&worktree),
+            Ok(config::ProjectStrategy::RepoRoot)
+        );
+        assert!(!worktree.project.is_file());
+        assert!(paths_have_external_policy(worktree));
     }
 }

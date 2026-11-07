@@ -1042,6 +1042,35 @@ pub(crate) fn discover_git_worktree_paths(
     }
 }
 
+/// Main repository root of a linked worktree rooted at `project_dir`.
+///
+/// Builds on `validate_linked_git_worktree`, so every structural check
+/// (GHSA-w976-gw52-hvx2) still applies. `Ok(None)` means `project_dir` is
+/// not a linked worktree root, or its common dir is not a `.git` directory
+/// (bare repository). `Err` means worktree metadata exists but is refused or
+/// dangling (for instance the main checkout was removed).
+pub(crate) fn main_repo_root(
+    project_dir: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let Some(paths) = validate_linked_git_worktree(project_dir)? else {
+        return Ok(None);
+    };
+    let common_dir = paths.common_dir;
+    if common_dir.file_name() != Some(OsStr::new(".git")) {
+        return Ok(None);
+    }
+    let Some(root) = common_dir.parent() else {
+        return Ok(None);
+    };
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    match std::fs::canonicalize(root.join(".git")) {
+        Ok(canon) if canon == common_dir => Ok(Some(root.to_path_buf())),
+        _ => Ok(None),
+    }
+}
+
 fn validate_linked_git_worktree(
     project_dir: &Path,
 ) -> Result<Option<GitWorktreePaths>, String> {
@@ -3679,5 +3708,72 @@ mod tests {
         // Only the symlink hops are collected; no final dir exists.
         assert!(paths.iter().all(|p| p.starts_with(&home)));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn bare_common_fixture(prefix: &str) -> PathBuf {
+        let root = temp_test_dir(prefix);
+        let project = root.join("project");
+        let git_dir = root.join("common/repo.git/worktrees/wt1");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            project.join(".git"),
+            "gitdir: ../common/repo.git/worktrees/wt1\n",
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("gitdir"), "../../../../project/.git\n")
+            .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        root
+    }
+
+    #[test]
+    fn main_repo_root_resolves_linked_worktree_to_common_dir_parent() {
+        let fixture = linked_worktree_fixture("mrr-ok");
+        let expected =
+            std::fs::canonicalize(fixture.root.join("common")).unwrap();
+        assert_eq!(main_repo_root(&fixture.project_dir), Ok(Some(expected)));
+    }
+
+    #[test]
+    fn main_repo_root_is_none_for_main_checkout() {
+        let dir = temp_test_dir("mrr-main");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        assert_eq!(main_repo_root(&dir), Ok(None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn main_repo_root_is_none_for_plain_directory() {
+        let dir = temp_test_dir("mrr-plain");
+        assert_eq!(main_repo_root(&dir), Ok(None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn main_repo_root_is_none_for_bare_common_dir() {
+        let root = bare_common_fixture("mrr-bare");
+        assert_eq!(main_repo_root(&root.join("project")), Ok(None));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn main_repo_root_reports_missing_main_checkout() {
+        let fixture = linked_worktree_fixture("mrr-gone");
+        std::fs::remove_dir_all(&fixture.common_dir).unwrap();
+        assert!(main_repo_root(&fixture.project_dir).is_err());
+    }
+
+    #[test]
+    fn main_repo_root_reports_refused_metadata() {
+        let fixture = linked_worktree_fixture("mrr-forged");
+        let elsewhere = fixture.root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(
+            fixture.git_dir.join("commondir"),
+            format!("{}\n", elsewhere.display()),
+        )
+        .unwrap();
+        assert!(main_repo_root(&fixture.project_dir).is_err());
     }
 }
