@@ -29,7 +29,9 @@ developers`, and `Mostly open` and previews the resulting checklist without
 - `Fully closed` clears all optional and granular grants. `Mostly open` opens
   unrestricted network, the full GitHub token, ambient SSH, and loopback, and
   clears granular grants. It requires the shared dialog with Cancel focused and
-  names every opened boundary. Presets never guess directories or arbitrary
+  names every opened boundary. Unrestricted network already covers the model
+  API, so its host is not saved next to it: the launcher rejects filtered hosts
+  combined with `--network`. Presets never guess directories or arbitrary
   environment variables; the known harness-key exception belongs to the
   disclosed harness-state grant. Any non-preset combination is visibly labeled
   `Custom`.

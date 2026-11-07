@@ -325,7 +325,9 @@ impl Selection {
 
     pub(crate) fn grants_for(&self, harnesses: &[String]) -> Config {
         let mut allow_hosts = self.requested_hosts.clone();
-        if self.api_access {
+        // Unrestricted network already reaches the model API, and the launcher
+        // refuses --network combined with any filtered host.
+        if self.api_access && !self.unrestricted_network {
             for harness in harnesses {
                 for host in api_hosts(harness) {
                     if !allow_hosts.iter().any(|existing| existing == host) {
@@ -3142,6 +3144,20 @@ mod tests {
         assert!(grants.inherit_env_enabled());
         assert!(grants.worktree_enabled());
         assert!(grants.audit_log_enabled());
+    }
+
+    #[test]
+    fn unrestricted_network_does_not_persist_the_model_api_host() {
+        let selection = Selection {
+            api_access: true,
+            unrestricted_network: true,
+            ..Selection::default()
+        };
+        let grants = selection.grants("claude");
+
+        assert!(grants.network_enabled());
+        assert!(grants.allow_hosts.is_empty());
+        assert!(!grants.has_filtered_hosts());
     }
 
     #[test]
