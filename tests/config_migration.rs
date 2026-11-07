@@ -422,6 +422,68 @@ fn global_plain_and_safe_symlink_migrate_without_deleting_target() {
     assert_eq!(std::fs::read_to_string(target).unwrap(), "no_gpu=true\n");
 }
 
+const GLOBAL_POLICY_WITH_ENV: &str = r#"
+env_pass = ["AJ_SYNTHETIC=base-value"]
+env_from_file = ["/synthetic/base.env"]
+future_setting = "preserve-me"
+[secret_hosts]
+AJ_SYNTHETIC = "example.com"
+[commands.example]
+env_pass = ["AJ_COMMAND_SYNTHETIC=command-value"]
+env_from_file = ["/synthetic/command.env"]
+future_setting = "preserve-me-too"
+[commands.example.secret_hosts]
+AJ_COMMAND_SYNTHETIC = "command.example.com"
+"#;
+
+fn assert_global_preferences_preserve_policy(tree: &Tree) {
+    let path = tree.store().join("config.toml");
+    let mut expected: toml::Table =
+        toml::from_str(GLOBAL_POLICY_WITH_ENV).unwrap();
+    expected.insert("status_bar_style".into(), "dark".into());
+    assert_ok(&tree.run(&[
+        "--status-bar=dark",
+        "--env",
+        "AJ_TRANSIENT=cli-value",
+        "--secret",
+        "AJ_TRANSIENT=example.com",
+        "--init",
+        "/bin/true",
+    ]));
+    let actual: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(actual, expected);
+
+    expected.insert("no_status_bar".into(), true.into());
+    assert_ok(&tree.run(&["--no-status-bar", "--init", "/bin/true"]));
+    let actual: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn global_preferences_preserve_legacy_policy_during_migration() {
+    let tree = Tree::new("global-legacy-preferences");
+    std::fs::write(tree.legacy_global(), GLOBAL_POLICY_WITH_ENV).unwrap();
+    assert_global_preferences_preserve_policy(&tree);
+    assert!(!tree.legacy_global().exists());
+}
+
+#[test]
+fn global_preferences_preserve_external_policy() {
+    let tree = Tree::new("global-external-preferences");
+    assert_ok(&tree.run(&["--init", "/bin/true"]));
+    let path = tree.store().join("config.toml");
+    std::fs::write(&path, GLOBAL_POLICY_WITH_ENV).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .unwrap();
+    assert_global_preferences_preserve_policy(&tree);
+}
+
 #[test]
 fn restored_global_source_preserves_edited_destination() {
     let tree = Tree::new("global-edited-idempotency");

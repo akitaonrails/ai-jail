@@ -1760,16 +1760,43 @@ pub(crate) fn save_project_constraints(
     write_project_document(&paths.project, &doc)
 }
 
-pub(crate) fn save_global_document(
+pub(crate) fn save_global_preferences(
     paths: &StorePaths,
-    global: &GlobalConfig,
+    no_status_bar: Option<bool>,
+    status_bar_style: Option<&str>,
 ) -> Result<(), String> {
     let _lock = paths.prepare()?;
-    let body = toml::to_string_pretty(global)
+    let raw = read_trusted_regular(&paths.global)?.unwrap_or_default();
+    let text = std::str::from_utf8(&raw).map_err(|e| {
+        format!("Failed to parse {}: {e}", paths.global.display())
+    })?;
+    let mut expected = config::parse_global_toml(text).map_err(|e| {
+        format!("Failed to parse {}: {e}", paths.global.display())
+    })?;
+    // Config deliberately omits credential fields when serialized. Patch the
+    // on-disk document instead, retaining existing fields and command tables
+    // without ever writing transient CLI environment or secret values.
+    let mut document: toml::Table = toml::from_str(text).map_err(|e| {
+        format!("Failed to parse {}: {e}", paths.global.display())
+    })?;
+    if let Some(value) = no_status_bar {
+        document.insert("no_status_bar".into(), value.into());
+        expected.base.no_status_bar = Some(value);
+    }
+    if let Some(value) = status_bar_style {
+        document.insert("status_bar_style".into(), value.into());
+        expected.base.status_bar_style = Some(value.into());
+    }
+    let body = toml::to_string_pretty(&document)
         .map_err(|e| format!("Cannot serialize global config: {e}"))?;
+    let encoded = config::parse_global_toml(&body)
+        .map_err(|e| format!("Cannot verify updated global config: {e}"))?;
+    if encoded != expected {
+        return Err(format!("Cannot preserve {}", paths.global.display()));
+    }
     durable_write(&paths.global, body.as_bytes())?;
     let checked = load_global(paths)?;
-    if checked != *global {
+    if checked != expected {
         return Err(format!("Failed to verify {}", paths.global.display()));
     }
     Ok(())
