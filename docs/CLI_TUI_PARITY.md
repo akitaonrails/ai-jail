@@ -77,6 +77,8 @@ or integration rather than saved sandbox authority.
 - Maintenance and inspection: `--clean`, `--dry-run`, `--init`, `--bootstrap`,
   `--audit-show`, `--audit-verify`
 - Standard process information: `--help`, `--version`, `--verbose`
+- Run observability: `--egress-log` (a per-run output file, not saved
+  authority: no configuration key, refused outside filtered networking)
 - Backward-compatible rejected option: `--allow-tcp-port`
 
 ## Release rule

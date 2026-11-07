@@ -32,10 +32,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::egress_log::{ConnRecord, CountingReader, Verdict};
 
 /// Hard cap on the CONNECT request (request line plus headers).
 const REQUEST_CAP: usize = 8 * 1024;
@@ -104,6 +106,23 @@ pub(crate) struct ProxyConfig {
     /// being refused outright. The SSRF address-range guard still
     /// applies to approved hosts.
     pub prompt: Option<Arc<dyn HostPrompt>>,
+    /// The `--egress-log` file: one line per accepted
+    /// connection. `None` writes nothing, but `stats` still counts.
+    pub egress: Option<Arc<crate::egress_log::EgressLog>>,
+    /// Run-wide connection and byte counters, kept with or without a log.
+    pub stats: Arc<crate::egress_log::EgressStats>,
+    /// Whether the run shuts the tunnels still open when the command
+    /// exits ([`Proxy::drain`]). Only a run that records its egress needs
+    /// that; any other run ends its proxy as before, when it exits.
+    pub drain_on_exit: bool,
+    /// Test seam: delay before a connection's handler starts, to widen
+    /// the accept-to-handler window the drain must cover.
+    #[cfg(test)]
+    pub(crate) test_handler_delay: Duration,
+    /// Test seam: the accept threads never accept, so connections stay in
+    /// the kernel backlog for the drain to find.
+    #[cfg(test)]
+    pub(crate) test_accept_paused: bool,
 }
 
 impl ProxyConfig {
@@ -119,6 +138,13 @@ impl ProxyConfig {
             secrets: Vec::new(),
             danger_extra_roots: Vec::new(),
             prompt: None,
+            egress: None,
+            stats: Arc::new(crate::egress_log::EgressStats::default()),
+            drain_on_exit: false,
+            #[cfg(test)]
+            test_handler_delay: Duration::ZERO,
+            #[cfg(test)]
+            test_accept_paused: false,
         }
     }
 }
@@ -304,6 +330,8 @@ fn notify_reply(reply: &str) -> PromptAnswer {
 pub(crate) struct Proxy {
     port: Option<u16>,
     unix_path: Option<PathBuf>,
+    shared: Arc<Shared>,
+    drain_on_exit: bool,
 }
 
 impl Proxy {
@@ -314,19 +342,27 @@ impl Proxy {
         config: ProxyConfig,
         unix_socket_path: Option<&Path>,
     ) -> io::Result<Proxy> {
+        let drain_on_exit = config.drain_on_exit;
         let shared = Arc::new(Shared::new(config));
 
         let port = if unix_socket_path.is_none() {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
             let port = listener.local_addr()?.port();
+            shared.keep_listener(listener.try_clone().map(DrainListener::Tcp));
             let tcp_shared = Arc::clone(&shared);
             thread::spawn(move || {
                 loop {
+                    #[cfg(test)]
+                    if tcp_shared.config.test_accept_paused {
+                        park_forever();
+                    }
                     let stream = accept_next("proxy TCP listener", &mut || {
-                        listener.accept().map(|(stream, _)| stream)
+                        let accepted =
+                            listener.accept().map(|(stream, _)| stream);
+                        tcp_shared.stop_accepting_if_draining(&accepted);
+                        accepted
                     });
-                    let shared = Arc::clone(&tcp_shared);
-                    thread::spawn(move || handle_conn(stream, shared));
+                    spawn_handler(stream, &tcp_shared);
                 }
             });
             Some(port)
@@ -342,15 +378,21 @@ impl Proxy {
                 path,
                 std::fs::Permissions::from_mode(0o600),
             )?;
+            shared.keep_listener(
+                unix_listener.try_clone().map(DrainListener::Unix),
+            );
             let unix_shared = Arc::clone(&shared);
             thread::spawn(move || {
                 loop {
                     let stream =
                         accept_next("proxy Unix listener", &mut || {
-                            unix_listener.accept().map(|(stream, _)| stream)
+                            let accepted = unix_listener
+                                .accept()
+                                .map(|(stream, _)| stream);
+                            unix_shared.stop_accepting_if_draining(&accepted);
+                            accepted
                         });
-                    let shared = Arc::clone(&unix_shared);
-                    thread::spawn(move || handle_conn(stream, shared));
+                    spawn_handler(stream, &unix_shared);
                 }
             });
             Some(path.to_path_buf())
@@ -358,7 +400,17 @@ impl Proxy {
             None
         };
 
-        Ok(Proxy { port, unix_path })
+        Ok(Proxy {
+            port,
+            unix_path,
+            shared,
+            drain_on_exit,
+        })
+    }
+
+    /// Whether the run asked for its open tunnels to be drained at exit.
+    pub(crate) fn drain_on_exit(&self) -> bool {
+        self.drain_on_exit
     }
 
     /// Loopback TCP port the proxy listens on.
@@ -375,7 +427,51 @@ impl Proxy {
     pub(crate) fn unix_path(&self) -> Option<&Path> {
         self.unix_path.as_deref()
     }
+
+    /// End every live connection before the egress log is closed:
+    /// refuse new ones, shut every registered socket so both
+    /// relay pumps return, and wait up to `grace` for the handlers to
+    /// finish. A handler writes its egress line before it leaves `active`,
+    /// so once this sees 0 every line and every byte is counted.
+    pub(crate) fn drain(&self, grace: Duration) {
+        let shared = &self.shared;
+        shared.draining.store(true, Ordering::SeqCst);
+        // Connections waiting on another connection's prompt give up now.
+        shared.decided.notify_all();
+        // The sandbox has exited, so nothing new arrives; what is still in
+        // the kernel backlog is accepted here and refused with its line, so
+        // the log and the totals cover the same connections.
+        shared.take_backlog();
+        for entry in shared.live_conns().values() {
+            entry.shut();
+        }
+        let deadline = Instant::now() + grace;
+        while shared.active.load(Ordering::SeqCst) > 0 {
+            if Instant::now() >= deadline {
+                let open = shared.active.load(Ordering::SeqCst);
+                let undrainable = shared
+                    .live_conns()
+                    .values()
+                    .filter(|entry| entry.undrainable)
+                    .count();
+                // A handler still resolving, dialing or awaiting a prompt
+                // holds a registered socket too, so the open count is not
+                // split by phase: it would claim a precision it lacks.
+                crate::output::security_warn(&format!(
+                    "egress proxy: {open} connection(s) still open after a \
+                     {} ms drain ({undrainable} could not be shut); their \
+                     egress lines are missing from the log",
+                    grace.as_millis()
+                ));
+                return;
+            }
+            thread::sleep(DRAIN_POLL);
+        }
+    }
 }
+
+/// How often `Proxy::drain` checks whether the handlers have finished.
+const DRAIN_POLL: Duration = Duration::from_millis(10);
 
 impl Drop for Proxy {
     fn drop(&mut self) {
@@ -393,6 +489,44 @@ struct Shared {
     decisions: Mutex<HashMap<String, Decision>>,
     /// Wakes connections waiting on a `Pending` host.
     decided: Condvar,
+    /// Set by `Proxy::drain`: new connections are refused, and a socket
+    /// registered after the drain began is shut at once.
+    draining: AtomicBool,
+    /// Shutdown handles of every live connection, keyed by `next_conn`.
+    conns: Mutex<HashMap<u64, DrainEntry>>,
+    next_conn: AtomicU64,
+    /// `try_clone`s of the listeners, for the drain's backlog sweep.
+    listeners: Mutex<Vec<DrainListener>>,
+}
+
+/// A listener clone the drain accepts the remaining backlog from.
+enum DrainListener {
+    Tcp(TcpListener),
+    Unix(UnixListener),
+}
+
+/// Spawn the handler of a connection the accept loop just returned. It is
+/// admitted (counted in `active`) here, before the thread exists, so a
+/// drain can never miss a connection whose handler has not started yet.
+fn spawn_handler<S: ClientStream + Send + 'static>(
+    stream: S,
+    shared: &Arc<Shared>,
+) {
+    let admission = Shared::admit(shared);
+    let shared = Arc::clone(shared);
+    thread::spawn(move || {
+        #[cfg(test)]
+        thread::sleep(shared.config.test_handler_delay);
+        handle_conn(stream, shared, admission)
+    });
+}
+
+/// Never returns: an accept thread that saw the drain begin stops here,
+/// leaving the backlog to the drain's own sweep.
+fn park_forever() -> ! {
+    loop {
+        thread::park();
+    }
 }
 
 impl Shared {
@@ -402,6 +536,144 @@ impl Shared {
             active: AtomicUsize::new(0),
             decisions: Mutex::new(HashMap::new()),
             decided: Condvar::new(),
+            draining: AtomicBool::new(false),
+            conns: Mutex::new(HashMap::new()),
+            next_conn: AtomicU64::new(0),
+            listeners: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Count a connection the moment it is accepted.
+    fn admit(shared: &Arc<Shared>) -> Admission {
+        let active = shared.active.fetch_add(1, Ordering::SeqCst) + 1;
+        let id = shared.next_conn.fetch_add(1, Ordering::Relaxed);
+        Admission {
+            slot: ConnSlot {
+                shared: Arc::clone(shared),
+                id,
+            },
+            active,
+        }
+    }
+
+    #[cfg(test)]
+    fn listeners_kept(&self) -> usize {
+        self.listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// Keep a listener clone for the drain. A failed clone only means the
+    /// drain cannot sweep that listener's backlog.
+    fn keep_listener(&self, listener: io::Result<DrainListener>) {
+        if !self.config.drain_on_exit {
+            return;
+        }
+        if let Ok(listener) = listener {
+            self.listeners
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(listener);
+        }
+    }
+
+    /// An accept thread stops for good once a drain has begun and its
+    /// accept did not yield a connection (the drain set the listener
+    /// non-blocking): the drain owns the backlog from then on.
+    fn stop_accepting_if_draining<T>(&self, accepted: &io::Result<T>) {
+        if accepted.is_err() && self.draining.load(Ordering::SeqCst) {
+            park_forever();
+        }
+    }
+
+    /// Accept, without blocking, every connection still queued on a
+    /// listener, and run each through the handler, which refuses it as
+    /// `connection-cap` and writes its line. Runs on the drain's thread.
+    fn take_backlog(self: &Arc<Self>) {
+        let listeners =
+            self.listeners.lock().unwrap_or_else(|e| e.into_inner());
+        for listener in listeners.iter() {
+            match listener {
+                DrainListener::Tcp(l) => {
+                    if l.set_nonblocking(true).is_ok() {
+                        while let Ok((stream, _)) = l.accept() {
+                            let _ = stream.set_nonblocking(false);
+                            let admission = Shared::admit(self);
+                            handle_conn(stream, Arc::clone(self), admission);
+                        }
+                    }
+                }
+                DrainListener::Unix(l) => {
+                    if l.set_nonblocking(true).is_ok() {
+                        while let Ok((stream, _)) = l.accept() {
+                            let _ = stream.set_nonblocking(false);
+                            let admission = Shared::admit(self);
+                            handle_conn(stream, Arc::clone(self), admission);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A poisoned registry only means a handler panicked while holding
+    /// it; the handles inside are still valid.
+    fn live_conns(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<u64, DrainEntry>> {
+        self.conns.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Register a `try_clone` handle for connection `id`. A failed clone
+    /// leaves the connection undrainable (counted, never a panic). Under
+    /// the registry lock, a drain already under way is seen here, so a
+    /// socket can never slip in after the drain's sweep.
+    fn register(&self, id: u64, handle: io::Result<ShutHandle>) {
+        let mut conns = self.live_conns();
+        let entry = conns.entry(id).or_default();
+        match handle {
+            Ok(handle) => {
+                if self.draining.load(Ordering::SeqCst) {
+                    handle();
+                }
+                entry.handles.push(handle);
+            }
+            Err(_) => entry.undrainable = true,
+        }
+    }
+}
+
+/// Shuts one socket both ways. Its error (ENOTCONN once the peer is
+/// gone) is ignored: the socket is closing either way.
+type ShutHandle = Box<dyn Fn() + Send>;
+
+fn shut_handle<S: ClientStream>(stream: &S) -> io::Result<ShutHandle> {
+    let clone = stream.try_clone_stream()?;
+    Ok(Box::new(move || {
+        let _ = clone.shutdown_both();
+    }))
+}
+
+fn shut_tcp_handle(stream: &TcpStream) -> io::Result<ShutHandle> {
+    let clone = stream.try_clone()?;
+    Ok(Box::new(move || {
+        let _ = clone.shutdown(Shutdown::Both);
+    }))
+}
+
+/// The drainable sockets of one live connection: the client, then the
+/// upstream once it is dialed.
+#[derive(Default)]
+struct DrainEntry {
+    handles: Vec<ShutHandle>,
+    undrainable: bool,
+}
+
+impl DrainEntry {
+    fn shut(&self) {
+        for handle in &self.handles {
+            handle();
         }
     }
 }
@@ -419,12 +691,60 @@ enum Decision {
     NoAnswer,
 }
 
-/// Decrements the active-connection count when the handler returns.
-struct ActiveGuard(Arc<Shared>);
+/// One accepted connection: its egress record and its place in the
+/// proxy's bookkeeping. Fields drop in declaration order, so the record
+/// bumps the stats and writes its line before the slot leaves the drain
+/// registry and the active count: a drain that sees `active == 0` sees
+/// every line and every byte.
+struct Conn {
+    record: ConnRecord,
+    slot: ConnSlot,
+}
 
-impl Drop for ActiveGuard {
+impl Conn {
+    /// Returns the connection and the active count including it.
+    fn begin(shared: &Arc<Shared>, admission: Admission) -> (Conn, usize) {
+        let record = ConnRecord::begin(
+            shared.config.egress.clone(),
+            Arc::clone(&shared.config.stats),
+        );
+        let Admission { slot, active } = admission;
+        (Conn { record, slot }, active)
+    }
+
+    // Only a proxy that will be drained keeps socket clones: any other
+    // holds the same descriptors per tunnel as before.
+    fn register<S: ClientStream>(&self, stream: &S) {
+        if self.slot.shared.config.drain_on_exit {
+            self.slot.shared.register(self.slot.id, shut_handle(stream));
+        }
+    }
+
+    fn register_tcp(&self, stream: &TcpStream) {
+        if self.slot.shared.config.drain_on_exit {
+            self.slot
+                .shared
+                .register(self.slot.id, shut_tcp_handle(stream));
+        }
+    }
+}
+
+/// A connection counted in `active` at accept time, not yet handled.
+struct Admission {
+    slot: ConnSlot,
+    active: usize,
+}
+
+/// Leaves the drain registry (under its lock), then the active count.
+struct ConnSlot {
+    shared: Arc<Shared>,
+    id: u64,
+}
+
+impl Drop for ConnSlot {
     fn drop(&mut self) {
-        self.0.active.fetch_sub(1, Ordering::SeqCst);
+        self.shared.live_conns().remove(&self.id);
+        self.shared.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -499,23 +819,38 @@ impl Reject {
     }
 }
 
-fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
-    let active = shared.active.fetch_add(1, Ordering::SeqCst) + 1;
-    let _guard = ActiveGuard(Arc::clone(&shared));
-    if active > shared.config.max_connections {
+/// Every connection is one `Conn`, made first, so each `return` below
+/// drops it and writes exactly one egress line. The verdict
+/// is set next to the reply that carries it; `audit_verdict` is left as it
+/// was.
+fn handle_conn<S: ClientStream>(
+    mut client: S,
+    shared: Arc<Shared>,
+    admission: Admission,
+) {
+    let (mut conn, active) = Conn::begin(&shared, admission);
+    if active > shared.config.max_connections
+        || shared.draining.load(Ordering::SeqCst)
+    {
+        conn.record.verdict(Verdict::Error, "connection-cap");
         reject(&mut client, &Reject::Unavailable);
         return;
     }
+    conn.register(&client);
 
     let _ = client.set_read_timeout(Some(shared.config.read_timeout));
     let request = match read_request(&mut client, REQUEST_CAP) {
         Ok(request) => request,
         Err(ReadFail::TooLarge) => {
+            conn.record.verdict(Verdict::Error, "request-too-large");
             reject(&mut client, &Reject::TooLarge);
             return;
         }
         // Slowloris timeout or a reset peer: close without a reply.
-        Err(ReadFail::Io) => return,
+        Err(ReadFail::Io) => {
+            conn.record.verdict(Verdict::Error, "client-read-failed");
+            return;
+        }
     };
     let _ = client.set_read_timeout(None);
 
@@ -530,20 +865,32 @@ fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
             // become a general HTTP relay.
             match parse_absolute_form(&request) {
                 Some(target) => {
-                    handle_http_termination(client, target, request, &shared);
+                    // A target was parsed, so the line names it even when
+                    // the request is refused (null only without one).
+                    conn.record.target(&target.0, target.1);
+                    // The method was refused unless termination takes it.
+                    conn.record.verdict(Verdict::Error, "method-not-allowed");
+                    handle_http_termination(
+                        client, target, request, &shared, &mut conn,
+                    );
                     return;
                 }
                 None => {
+                    conn.record.verdict(Verdict::Error, "method-not-allowed");
                     reject(&mut client, &Reject::MethodNotAllowed);
                     return;
                 }
             }
         }
         Err(why) => {
+            conn.record.verdict(Verdict::Error, "malformed-request");
             reject(&mut client, &why);
             return;
         }
     };
+    // Only the parsed host and port reach the record, never the request
+    // bytes.
+    conn.record.target(&host, port);
 
     let allowlisted = allowlist_matches(&shared.config.allowlist, &host);
     let prompting = !allowlisted
@@ -551,6 +898,7 @@ fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
         && promptable_host(&host);
     if !allowlisted && !prompting {
         audit_verdict(&shared, &host, port, "deny", "not-in-allowlist");
+        conn.record.verdict(Verdict::Deny, "not-in-allowlist");
         reject(&mut client, &Reject::ForbiddenHost);
         return;
     }
@@ -560,6 +908,9 @@ fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
     let addrs = match resolve(&host, port) {
         Ok(addrs) => addrs,
         Err(why) => {
+            // No audit verdict here: a failed lookup is an upstream
+            // error, not a policy refusal.
+            conn.record.verdict(Verdict::Error, "upstream-unreachable");
             reject(&mut client, &why);
             return;
         }
@@ -574,15 +925,19 @@ fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
             }
             Some(Decision::NoAnswer) => {
                 audit_verdict(&shared, &host, port, "deny", "prompt-no-answer");
+                conn.record.verdict(Verdict::Deny, "prompt-no-answer");
                 reject(&mut client, &Reject::ForbiddenHost);
                 return;
             }
             Some(_) => {
                 audit_verdict(&shared, &host, port, "deny", "prompt-deny");
+                conn.record.verdict(Verdict::Deny, "prompt-deny");
                 reject(&mut client, &Reject::ForbiddenHost);
                 return;
             }
             None => {
+                conn.record
+                    .verdict(Verdict::Deny, "forbidden-address-range");
                 audit_verdict(
                     &shared,
                     &host,
@@ -611,16 +966,32 @@ fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
                         "forbidden-address-range",
                     );
                 }
+                let (verdict, reason) = dial_failure_verdict(&why);
+                conn.record.verdict(verdict, reason);
                 reject(&mut client, &why);
                 return;
             }
         };
     audit_verdict(&shared, &host, port, "allow", allow_reason);
+    conn.register_tcp(&upstream);
 
     if client.write_all(REPLY_OK.as_bytes()).is_err() {
+        conn.record.verdict(Verdict::Error, "client-write-failed");
         return;
     }
-    relay(client, upstream);
+    conn.record.verdict(Verdict::Allow, allow_reason);
+    let (up, down) = conn.record.counters();
+    relay(client, upstream, Some((up, down)));
+}
+
+/// Egress verdict of a failed dial: every answer filtered out by the SSRF
+/// guard is a policy refusal, anything else an upstream error.
+fn dial_failure_verdict(why: &Reject) -> (Verdict, &'static str) {
+    if matches!(why, Reject::ForbiddenRange) {
+        (Verdict::Deny, "forbidden-address-range")
+    } else {
+        (Verdict::Error, "upstream-unreachable")
+    }
 }
 
 /// Verdict for a promptable host outside the allowlist, given its resolved
@@ -666,6 +1037,10 @@ fn prompt_verdict(
                     .decided
                     .wait(decisions)
                     .unwrap_or_else(|e| e.into_inner());
+                // Woken by Proxy::drain: the run is over, stop waiting.
+                if shared.draining.load(Ordering::SeqCst) {
+                    return Some(Decision::NoAnswer);
+                }
             }
             Some(decided) => return Some(decided),
             // The prompt this connection waited on went unanswered: it
@@ -1100,6 +1475,7 @@ fn handle_http_termination<S: ClientStream>(
     target: (String, u16),
     request: Vec<u8>,
     shared: &Shared,
+    conn: &mut Conn,
 ) {
     let (host, port) = target;
     // Secret-bound allowlisted hosts only: the allowlist check is the
@@ -1119,6 +1495,8 @@ fn handle_http_termination<S: ClientStream>(
 
     let (chunked, content_length) = head_body_framing(&request);
     if chunked {
+        // Unsupported framing: the request is refused before any dial.
+        conn.record.verdict(Verdict::Error, "malformed-request");
         // API clients send Content-Length; chunked bodies are out of
         // scope for v1 rather than silently mishandled.
         reject(&mut client, &Reject::NotImplemented);
@@ -1153,21 +1531,32 @@ fn handle_http_termination<S: ClientStream>(
     let mut upstream = match tls_connect(&binding.host, port, &shared.config) {
         Ok(stream) => stream,
         Err(why) => {
+            let (verdict, reason) = dial_failure_verdict(&why);
+            conn.record.verdict(verdict, reason);
             reject(&mut client, &why);
             return;
         }
     };
+    conn.register_tcp(&upstream.sock);
+    conn.record.verdict(Verdict::Allow, "secret-termination");
+    let (up, down) = conn.record.counters();
 
+    // The forwarded head, body bytes already read and the rest of the
+    // body all go through one counting reader: the record gets a byte
+    // count, never the bytes.
     let body_len = content_length.unwrap_or(0) as usize;
     let write_result = (|| -> io::Result<()> {
-        upstream.write_all(&rewritten)?;
-        upstream.write_all(body_so_far)?;
-        if body_len > body_so_far.len() {
-            let mut remaining = client
-                .try_clone_stream()?
-                .take((body_len - body_so_far.len()) as u64);
-            io::copy(&mut remaining, &mut upstream)?;
-        }
+        let rest = body_len.saturating_sub(body_so_far.len()) as u64;
+        let body_rest: Box<dyn Read> = if rest > 0 {
+            Box::new(client.try_clone_stream()?.take(rest))
+        } else {
+            Box::new(io::empty())
+        };
+        let mut forwarded = CountingReader::new(
+            rewritten.as_slice().chain(body_so_far).chain(body_rest),
+            up,
+        );
+        io::copy(&mut forwarded, &mut upstream)?;
         upstream.flush()?;
         Ok(())
     })();
@@ -1178,7 +1567,10 @@ fn handle_http_termination<S: ClientStream>(
     // Upstream closes at the end of the response (Connection: close),
     // which ends this copy and the connection.
     let mut client_writer = client;
-    let _ = io::copy(&mut upstream, &mut client_writer);
+    let _ = io::copy(
+        &mut CountingReader::new(&mut upstream, down),
+        &mut client_writer,
+    );
     let _ = client_writer.shutdown_both();
 }
 
@@ -1221,25 +1613,46 @@ fn tls_connect(
 ///
 /// Shared with the in-sandbox bridge (phase 3): the proxy relays
 /// client<->TCP-target, the bridge relays client<->Unix-socket.
-pub(crate) fn relay<C: ClientStream, U: ClientStream>(client: C, upstream: U) {
-    let (mut client_reader, mut upstream_reader) =
+pub(crate) fn relay<C: ClientStream, U: ClientStream>(
+    client: C,
+    upstream: U,
+    counters: Option<(Arc<AtomicU64>, Arc<AtomicU64>)>,
+) {
+    let (client_reader, upstream_reader) =
         match (client.try_clone_stream(), upstream.try_clone_stream()) {
             (Ok(reader), Ok(upstream)) => (reader, upstream),
             _ => return,
         };
+    let (up_count, down_count) = counters.unzip();
     let mut client_writer = client;
     let mut upstream_writer = upstream;
 
     let up = thread::spawn(move || {
-        let _ = io::copy(&mut client_reader, &mut upstream_writer);
+        pump(client_reader, &mut upstream_writer, up_count);
         let _ = upstream_writer.shutdown_write();
     });
     let down = thread::spawn(move || {
-        let _ = io::copy(&mut upstream_reader, &mut client_writer);
+        pump(upstream_reader, &mut client_writer, down_count);
         let _ = client_writer.shutdown_write();
     });
     let _ = up.join();
     let _ = down.join();
+}
+
+/// One direction of [`relay`]. With a counter, every read is counted as
+/// it happens, so a reset tunnel keeps the bytes that crossed before it
+/// (`io::copy` returns no count on error).
+fn pump<R: Read, W: Write>(
+    mut reader: R,
+    writer: &mut W,
+    count: Option<Arc<AtomicU64>>,
+) {
+    let _ = match count {
+        Some(count) => {
+            io::copy(&mut CountingReader::new(reader, count), writer)
+        }
+        None => io::copy(&mut reader, writer),
+    };
 }
 
 /// Fixed loopback port the in-sandbox bridge listens on (Linux,
@@ -1355,7 +1768,7 @@ pub(crate) fn run_bridge(port: u16, socket: &Path) -> Result<(), String> {
         let socket = socket.to_path_buf();
         thread::spawn(move || {
             if let Ok(upstream) = UnixStream::connect(&socket) {
-                relay(client, upstream);
+                relay(client, upstream, None);
             }
         });
     }
@@ -1438,7 +1851,7 @@ impl PortForward {
                 let active = Arc::clone(&active);
                 thread::spawn(move || {
                     match connect_loopback(port) {
-                        Ok(upstream) => relay(client, upstream),
+                        Ok(upstream) => relay(client, upstream, None),
                         Err(e) if verbose => crate::output::verbose(&format!(
                             "forward {port}: host service unreachable: {e}"
                         )),
@@ -1689,7 +2102,7 @@ fn serve_published(control: &UnixStream, port: u16) {
         let active = Arc::clone(&active);
         thread::spawn(move || {
             if let Ok(upstream) = connect_loopback(port) {
-                relay(client, upstream);
+                relay(client, upstream, None);
             }
             active.fetch_sub(1, Ordering::SeqCst);
         });
@@ -1799,6 +2212,8 @@ fn recv_fd(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egress_log::{EgressLog, EgressStats};
+    use std::sync::mpsc;
 
     fn entries(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| (*v).to_string()).collect()
@@ -3041,7 +3456,7 @@ mod tests {
         let mut config = test_config(&["127.0.0.1"]);
         config.secrets = vec![binding];
         config.danger_extra_roots = vec![fixture_root()];
-        let shared = Shared::new(config);
+        let shared = Arc::new(Shared::new(config));
         let body = "Transfer-Encoding: chunked\r\nContent-Length: 0\r\n";
         // Supply the read-ahead bytes explicitly so the regression does not
         // depend on whether TCP delivers headers and body in the same read.
@@ -3058,11 +3473,13 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         let handler = thread::spawn(move || {
+            let (mut conn, _) = Conn::begin(&shared, Shared::admit(&shared));
             handle_http_termination(
                 server,
                 ("127.0.0.1".into(), fixture),
                 request,
                 &shared,
+                &mut conn,
             );
         });
         let mut response = String::new();
@@ -3092,7 +3509,7 @@ mod tests {
                 let socket = bridge_socket.clone();
                 thread::spawn(move || {
                     if let Ok(upstream) = UnixStream::connect(&socket) {
-                        relay(client, upstream);
+                        relay(client, upstream, None);
                     }
                 });
             }
@@ -3202,5 +3619,715 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         drop(sender);
         assert!(recv_fd(&receiver).unwrap().is_none());
+    }
+
+    // ── egress log ──────────────────────────────
+    // Egress-log wiring: one line per accepted connection with the verdict
+    // and its reason, and the drain on exit only when a log was asked for
+    // (`ProxyConfig::egress`, `ProxyConfig::stats`).
+
+    struct Harness {
+        proxy: Proxy,
+        path: PathBuf,
+        dir: PathBuf,
+        stats: Arc<EgressStats>,
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn harness(name: &str, mut config: ProxyConfig) -> Harness {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-jail-proxy-egress-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("egress.jsonl");
+        let log = EgressLog::open(&path, &crate::egress_log::run_id().unwrap())
+            .unwrap();
+        let stats = Arc::new(EgressStats::default());
+        config.egress = Some(Arc::new(log));
+        config.stats = Arc::clone(&stats);
+        // Setup: a proxy with an egress log is one the run drains.
+        config.drain_on_exit = true;
+        let proxy = Proxy::start(config, None).unwrap();
+        Harness {
+            proxy,
+            path,
+            dir,
+            stats,
+        }
+    }
+
+    fn private_config(allowlist: &[&str]) -> ProxyConfig {
+        let mut config =
+            ProxyConfig::new(allowlist.iter().map(|s| s.to_string()).collect());
+        config.danger_allow_private = true;
+        config
+    }
+
+    fn lines(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("line is JSON"))
+            .collect()
+    }
+
+    /// Wait until the log holds `n` lines, then make sure no extra line
+    /// follows (exactly one line per connection).
+    fn wait_lines(path: &std::path::Path, n: usize) -> Vec<serde_json::Value> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let got = lines(path);
+            if got.len() >= n {
+                std::thread::sleep(Duration::from_millis(150));
+                let got = lines(path);
+                assert_eq!(got.len(), n, "exactly {n} line(s): {got:?}");
+                return got;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {n} lines",
+                got.len()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn send(port: u16, request: &[u8]) -> TcpStream {
+        let s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        (&s).write_all(request).unwrap();
+        s
+    }
+
+    fn read_head(s: &TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut c = [0_u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            match (&mut &*s).read(&mut c) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => buf.push(c[0]),
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn free_port() -> u16 {
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    fn assert_error(line: &serde_json::Value, reason: &str, host_null: bool) {
+        assert_eq!(line["verdict"], "error", "{line}");
+        assert_eq!(line["reason"], reason, "{line}");
+        assert_eq!(line["host"].is_null(), host_null, "{line}");
+        assert_eq!(line["bytes_up"], 0, "{line}");
+        assert_eq!(line["bytes_down"], 0, "{line}");
+    }
+
+    #[test]
+    fn every_early_exit_writes_exactly_one_error_line() {
+        let h = harness("early", private_config(&["127.0.0.1"]));
+        let port = h.proxy.port();
+
+        // malformed request (no port): no target parsed -> host null
+        let s = send(port, b"CONNECT example.com HTTP/1.1\r\n\r\n");
+        assert!(read_head(&s).contains("400"));
+        let got = wait_lines(&h.path, 1);
+        assert_error(&got[0], "malformed-request", true);
+
+        // method not allowed
+        let s = send(port, b"GET / HTTP/1.1\r\n\r\n");
+        assert!(read_head(&s).contains("405"));
+        let got = wait_lines(&h.path, 2);
+        assert_error(&got[1], "method-not-allowed", true);
+
+        // request too large
+        let mut big = b"CONNECT example.com:443 HTTP/1.1\r\nX: ".to_vec();
+        big.extend(std::iter::repeat_n(b'A', REQUEST_CAP));
+        let s = send(port, &big);
+        assert!(read_head(&s).contains("431"));
+        let got = wait_lines(&h.path, 3);
+        assert_error(&got[2], "request-too-large", true);
+
+        // client read failure: connect and close without a request
+        let s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        s.shutdown(Shutdown::Both).unwrap();
+        drop(s);
+        let got = wait_lines(&h.path, 4);
+        assert_error(&got[3], "client-read-failed", true);
+
+        // upstream unreachable: the target WAS parsed, so the host stays
+        let dead = free_port();
+        let s = send(
+            port,
+            format!("CONNECT 127.0.0.1:{dead} HTTP/1.1\r\n\r\n").as_bytes(),
+        );
+        assert!(read_head(&s).contains("502"));
+        let got = wait_lines(&h.path, 5);
+        assert_error(&got[4], "upstream-unreachable", false);
+        assert_eq!(got[4]["host"], "127.0.0.1");
+        assert_eq!(got[4]["port"], dead);
+
+        assert_eq!(h.stats.snapshot().errored, 5);
+    }
+
+    #[test]
+    fn connection_cap_is_an_error_line() {
+        let mut config = private_config(&["127.0.0.1"]);
+        config.max_connections = 0;
+        let h = harness("cap", config);
+        let s = send(h.proxy.port(), b"CONNECT 127.0.0.1:443 HTTP/1.1\r\n\r\n");
+        assert!(read_head(&s).contains("503"));
+        let got = wait_lines(&h.path, 1);
+        assert_error(&got[0], "connection-cap", true);
+    }
+
+    #[test]
+    fn policy_refusals_are_deny_lines_written_at_refusal_time() {
+        // Two hostile shapes of "deny": not allowlisted, and allowlisted but
+        // in a forbidden range (SSRF guard on: no danger_allow_private).
+        let h =
+            harness("deny", ProxyConfig::new(vec!["127.0.0.1".to_string()]));
+        let port = h.proxy.port();
+        let held_a = send(port, b"CONNECT evil.example:443 HTTP/1.1\r\n\r\n");
+        assert!(read_head(&held_a).contains("403"));
+        // The client still holds its socket: the line exists already.
+        let got = wait_lines(&h.path, 1);
+        assert_eq!(got[0]["verdict"], "deny");
+        assert_eq!(got[0]["reason"], "not-in-allowlist");
+        assert_eq!(got[0]["host"], "evil.example");
+        assert_eq!(got[0]["port"], 443);
+        assert_eq!(got[0]["bytes_up"], 0);
+        assert_eq!(got[0]["bytes_down"], 0);
+
+        let held_b = send(port, b"CONNECT 127.0.0.1:80 HTTP/1.1\r\n\r\n");
+        assert!(read_head(&held_b).contains("403"));
+        let got = wait_lines(&h.path, 2);
+        assert_eq!(got[1]["verdict"], "deny");
+        assert_eq!(got[1]["reason"], "forbidden-address-range");
+        assert_eq!(got[1]["host"], "127.0.0.1");
+        let t = h.stats.snapshot();
+        assert_eq!((t.allowed, t.denied, t.errored), (0, 2, 0));
+        drop((held_a, held_b));
+    }
+
+    #[test]
+    fn allowed_tunnel_counts_only_tunneled_bytes() {
+        // Neither the CONNECT request nor REPLY_OK may be
+        // counted as upstream traffic.
+        let echo = echo_server();
+        let h = harness("allow", private_config(&["127.0.0.1"]));
+        let s = send(
+            h.proxy.port(),
+            format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\n\r\n").as_bytes(),
+        );
+        assert_eq!(read_head(&s), REPLY_OK);
+        (&s).write_all(b"hello").unwrap();
+        let mut buf = [0_u8; 5];
+        (&mut &s).read_exact(&mut buf).unwrap();
+        s.shutdown(Shutdown::Write).unwrap();
+        let mut rest = Vec::new();
+        let _ = (&mut &s).read_to_end(&mut rest);
+        drop(s);
+        let got = wait_lines(&h.path, 1);
+        assert_eq!(got[0]["verdict"], "allow");
+        assert_eq!(got[0]["reason"], "in-allowlist");
+        assert_eq!(got[0]["host"], "127.0.0.1");
+        assert_eq!(got[0]["port"], echo);
+        assert_eq!(got[0]["bytes_up"], 5);
+        assert_eq!(got[0]["bytes_down"], 5);
+        let t = h.stats.snapshot();
+        assert_eq!((t.allowed, t.bytes_up, t.bytes_down), (1, 5, 5));
+    }
+
+    #[test]
+    fn bytes_survive_an_upstream_reset() {
+        // io::copy returns Err with no count on a reset: the counting reader
+        // must still report what crossed before it.
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let up_port = l.local_addr().unwrap().port();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut ping = [0_u8; 4];
+            s.read_exact(&mut ping).unwrap();
+            s.write_all(&[b'x'; 1000]).unwrap();
+            let _ = go_rx.recv_timeout(Duration::from_secs(5));
+            // SO_LINGER 0 turns close into a RST.
+            let linger = nix::libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            // SAFETY: `s` is an open socket this thread owns, and `linger`
+            // outlives the call that copies it.
+            let rc = unsafe {
+                nix::libc::setsockopt(
+                    std::os::fd::AsRawFd::as_raw_fd(&s),
+                    nix::libc::SOL_SOCKET,
+                    nix::libc::SO_LINGER,
+                    (&linger as *const nix::libc::linger).cast(),
+                    std::mem::size_of::<nix::libc::linger>()
+                        as nix::libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0, "SO_LINGER must hold, or the close is no reset");
+            drop(s);
+        });
+        let h = harness("reset", private_config(&["127.0.0.1"]));
+        let s = send(
+            h.proxy.port(),
+            format!("CONNECT 127.0.0.1:{up_port} HTTP/1.1\r\n\r\n").as_bytes(),
+        );
+        assert_eq!(read_head(&s), REPLY_OK);
+        (&s).write_all(b"ping").unwrap();
+        let mut got = vec![0_u8; 1000];
+        (&mut &s).read_exact(&mut got).unwrap();
+        go_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        drop(s);
+        let lines = wait_lines(&h.path, 1);
+        assert_eq!(lines[0]["bytes_up"], 4, "{}", lines[0]);
+        assert_eq!(lines[0]["bytes_down"], 1000, "{}", lines[0]);
+    }
+
+    #[test]
+    fn no_request_content_reaches_the_line() {
+        let echo = echo_server();
+        let h = harness("content", private_config(&["127.0.0.1"]));
+        let port = h.proxy.port();
+        // 405 path with a path, query and a credential header.
+        let s = send(
+            port,
+            b"GET http://127.0.0.1:1/secret/path?token=hunter2 HTTP/1.1\r\n\
+          Authorization: Bearer hunter2\r\n\r\n",
+        );
+        let _ = read_head(&s);
+        // malformed path carrying content
+        let s2 = send(
+            port,
+            b"BREW /leak?q=hunter2 HTCPCP/9\r\nX-Key: hunter2\r\n\r\n",
+        );
+        let _ = read_head(&s2);
+        // allowed tunnel with proxy headers and tunneled payload
+        let s3 = send(
+            port,
+            format!(
+                "CONNECT 127.0.0.1:{echo} HTTP/1.1\r\n\
+             Proxy-Authorization: Basic aHVudGVyMg==\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        assert_eq!(read_head(&s3), REPLY_OK);
+        (&s3)
+            .write_all(b"GET /tunnel?token=hunter2 HTTP/1.1\r\n\r\n")
+            .unwrap();
+        let mut b = [0_u8; 8];
+        let _ = (&mut &s3).read(&mut b);
+        drop((s, s2, s3));
+        wait_lines(&h.path, 3);
+        let raw = std::fs::read_to_string(&h.path).unwrap();
+        for needle in [
+            "hunter2",
+            "aHVudGVyMg",
+            "secret",
+            "token",
+            "leak",
+            "Bearer",
+            "/",
+        ] {
+            assert!(!raw.contains(needle), "{needle:?} leaked: {raw}");
+        }
+    }
+
+    #[test]
+    fn without_an_egress_log_audit_records_are_unchanged_and_stats_still_count()
+    {
+        // no egress line, and the audit `connect` records keep their
+        // exact shape; the run-wide counters still count.
+        let echo = echo_server();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-proxy-egress-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let audit = crate::audit::AuditLog::open(&home).unwrap();
+        let stats = Arc::new(EgressStats::default());
+        let mut config = private_config(&["127.0.0.1"]);
+        config.audit = Some(audit);
+        config.stats = Arc::clone(&stats);
+        assert!(config.egress.is_none(), "no egress log unless asked");
+        let proxy = Proxy::start(config, None).unwrap();
+        let d = send(proxy.port(), b"CONNECT example.com:443 HTTP/1.1\r\n\r\n");
+        assert!(read_head(&d).contains("403"));
+        let a = send(
+            proxy.port(),
+            format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\n\r\n").as_bytes(),
+        );
+        assert_eq!(read_head(&a), REPLY_OK);
+        drop((a, d));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stats.snapshot().allowed + stats.snapshot().denied < 2 {
+            assert!(Instant::now() < deadline, "stats never counted");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let content = std::fs::read_to_string(
+            home.join(".local/share/ai-jail/history.jsonl"),
+        )
+        .unwrap();
+        let records: Vec<serde_json::Value> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &serde_json::Value| v["type"] == "connect")
+            .collect();
+        assert_eq!(records.len(), 2);
+        for r in &records {
+            for key in ["bytes_up", "bytes_down", "duration_ms", "run_id", "v"]
+            {
+                assert!(r.get(key).is_none(), "audit record grew {key}: {r}");
+            }
+        }
+        assert_eq!(records[0]["verdict"], "deny");
+        assert_eq!(records[1]["verdict"], "allow");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn drain_closes_a_live_tunnel_and_writes_its_line() {
+        // An upstream that never closes and a client that never closes: only
+        // drain can end this tunnel, and its line must exist when drain
+        // returns (the totals are read right after).
+        let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let up_port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut ping = [0_u8; 4];
+            let _ = s.read_exact(&mut ping);
+            let _ = s.write_all(b"pong!!");
+            // Hold the socket open, reading until the proxy shuts it.
+            let mut sink = [0_u8; 64];
+            while matches!(s.read(&mut sink), Ok(n) if n > 0) {}
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let h = harness("drain", private_config(&["127.0.0.1"]));
+        let s = send(
+            h.proxy.port(),
+            format!("CONNECT 127.0.0.1:{up_port} HTTP/1.1\r\n\r\n").as_bytes(),
+        );
+        assert_eq!(read_head(&s), REPLY_OK);
+        (&s).write_all(b"ping").unwrap();
+        let mut pong = [0_u8; 6];
+        (&mut &s).read_exact(&mut pong).unwrap();
+        assert!(lines(&h.path).is_empty(), "the tunnel is still open");
+
+        let grace = Duration::from_millis(2000);
+        let started = Instant::now();
+        h.proxy.drain(grace);
+        let took = started.elapsed();
+        assert!(took <= grace + Duration::from_millis(250), "{took:?}");
+        assert!(
+            took < Duration::from_millis(1500),
+            "closed sockets end the handlers; drain must not sleep the whole \
+         grace: {took:?}"
+        );
+
+        // No polling: the line is there as soon as drain returns.
+        let got = lines(&h.path);
+        assert_eq!(got.len(), 1, "exactly one line: {got:?}");
+        assert_eq!(got[0]["verdict"], "allow");
+        assert_eq!(got[0]["bytes_up"], 4);
+        assert_eq!(got[0]["bytes_down"], 6);
+        let t = h.stats.snapshot();
+        assert_eq!((t.allowed, t.bytes_up, t.bytes_down), (1, 4, 6));
+
+        // The client side was shut down too.
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut b = [0_u8; 8];
+        let closed = match (&mut &s).read(&mut b) {
+            Ok(0) => true,
+            Ok(_) => false,
+            // A read timeout means the socket is still open.
+            Err(e) => !matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+        };
+        assert!(closed, "the client socket is still open after drain");
+    }
+
+    // ── prompt verdicts ─────────────────────────
+
+    /// Stands in for the `--prompt-hosts` desktop prompt through the
+    /// proxy's own `HostPrompt` seam: answers per host from a script and
+    /// records every host it was asked about.
+    struct ScriptedHostPrompt {
+        answers: Vec<(String, PromptAnswer)>,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl HostPrompt for ScriptedHostPrompt {
+        fn ask(
+            &self,
+            host: &str,
+            _port: u16,
+            _internal: &[std::net::IpAddr],
+        ) -> PromptAnswer {
+            self.asked.lock().unwrap().push(host.to_string());
+            self.answers
+                .iter()
+                .find(|(h, _)| h == host)
+                .map(|(_, a)| *a)
+                .unwrap_or(PromptAnswer::Deny)
+        }
+    }
+
+    fn scripted_prompt(
+        answers: &[(&str, PromptAnswer)],
+    ) -> Arc<ScriptedHostPrompt> {
+        Arc::new(ScriptedHostPrompt {
+            answers: answers.iter().map(|(h, a)| (h.to_string(), *a)).collect(),
+            asked: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn assert_verdict(line: &serde_json::Value, verdict: &str, reason: &str) {
+        assert_eq!(line["verdict"], verdict, "{line}");
+        assert_eq!(line["reason"], reason, "{line}");
+    }
+
+    #[test]
+    fn prompt_verdicts_are_egress_lines() {
+        let echo = echo_server();
+        let prompt = scripted_prompt(&[
+            ("203.0.113.5", PromptAnswer::Deny),
+            ("203.0.113.6", PromptAnswer::NoAnswer),
+            ("127.0.0.1", PromptAnswer::Allow),
+        ]);
+        // The allowlist names an unrelated host, so every target prompts.
+        let mut config = private_config(&["example.com"]);
+        config.prompt = Some(Arc::clone(&prompt) as Arc<dyn HostPrompt>);
+        let h = harness("prompt", config);
+        let port = h.proxy.port();
+
+        // Two refusals share the verdict `deny`, and the line must still tell a
+        // refusal from no answer.
+        let deny = send(port, b"CONNECT 203.0.113.5:443 HTTP/1.1\r\n\r\n");
+        assert!(read_head(&deny).contains("403"));
+        let got = wait_lines(&h.path, 1);
+        assert_verdict(&got[0], "deny", "prompt-deny");
+        assert_eq!(got[0]["host"], "203.0.113.5");
+        assert_eq!(got[0]["port"], 443);
+        assert_eq!(got[0]["bytes_up"], 0);
+        assert_eq!(got[0]["bytes_down"], 0);
+
+        let silent = send(port, b"CONNECT 203.0.113.6:443 HTTP/1.1\r\n\r\n");
+        assert!(read_head(&silent).contains("403"));
+        let got = wait_lines(&h.path, 2);
+        assert_verdict(&got[1], "deny", "prompt-no-answer");
+        assert_eq!(got[1]["host"], "203.0.113.6");
+
+        // A refusal remembered for the session is still the
+        // prompt's verdict, not `not-in-allowlist`, though nobody is asked.
+        let again = send(port, b"CONNECT 203.0.113.5:443 HTTP/1.1\r\n\r\n");
+        assert!(read_head(&again).contains("403"));
+        let got = wait_lines(&h.path, 3);
+        assert_verdict(&got[2], "deny", "prompt-deny");
+
+        // An approved tunnel is an allow line with its own reason.
+        let a = send(
+            port,
+            format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\n\r\n").as_bytes(),
+        );
+        assert_eq!(read_head(&a), REPLY_OK);
+        (&a).write_all(b"hi").unwrap();
+        let mut buf = [0_u8; 2];
+        (&mut &a).read_exact(&mut buf).unwrap();
+        a.shutdown(Shutdown::Write).unwrap();
+        let mut rest = Vec::new();
+        let _ = (&mut &a).read_to_end(&mut rest);
+        drop(a);
+        let got = wait_lines(&h.path, 4);
+        assert_verdict(&got[3], "allow", "prompt-allow");
+        assert_eq!(got[3]["host"], "127.0.0.1");
+        assert_eq!(got[3]["port"], echo);
+        assert_eq!(got[3]["bytes_up"], 2);
+        assert_eq!(got[3]["bytes_down"], 2);
+        assert_eq!(
+            *prompt.asked.lock().unwrap(),
+            ["203.0.113.5", "203.0.113.6", "127.0.0.1"],
+            "the remembered refusal is not asked again"
+        );
+        let t = h.stats.snapshot();
+        assert_eq!((t.allowed, t.denied, t.errored), (1, 3, 0));
+        drop((deny, silent, again));
+
+        // With a prompt configured, an allowlisted host is never
+        // relabelled `prompt-allow`.
+        let listed_prompt =
+            scripted_prompt(&[("127.0.0.1", PromptAnswer::Allow)]);
+        let mut config = private_config(&["127.0.0.1"]);
+        config.prompt = Some(Arc::clone(&listed_prompt) as Arc<dyn HostPrompt>);
+        let listed = harness("prompt-listed", config);
+        let s = send(
+            listed.proxy.port(),
+            format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\n\r\n").as_bytes(),
+        );
+        assert_eq!(read_head(&s), REPLY_OK);
+        s.shutdown(Shutdown::Write).unwrap();
+        let mut rest = Vec::new();
+        let _ = (&mut &s).read_to_end(&mut rest);
+        drop(s);
+        let got = wait_lines(&listed.path, 1);
+        assert_verdict(&got[0], "allow", "in-allowlist");
+        assert!(listed_prompt.asked.lock().unwrap().is_empty());
+
+        // The prompt's own address-class refusal (SSRF guard on): loopback is
+        // never offered, and the line says why.
+        let guarded_prompt =
+            scripted_prompt(&[("127.0.0.1", PromptAnswer::Allow)]);
+        let mut config = ProxyConfig::new(vec!["example.com".to_string()]);
+        config.prompt =
+            Some(Arc::clone(&guarded_prompt) as Arc<dyn HostPrompt>);
+        let guarded = harness("prompt-guarded", config);
+        let s = send(
+            guarded.proxy.port(),
+            b"CONNECT 127.0.0.1:80 HTTP/1.1\r\n\r\n",
+        );
+        assert!(read_head(&s).contains("403"));
+        let got = wait_lines(&guarded.path, 1);
+        assert_verdict(&got[0], "deny", "forbidden-address-range");
+        assert_eq!(got[0]["host"], "127.0.0.1");
+        assert!(guarded_prompt.asked.lock().unwrap().is_empty());
+        drop(s);
+    }
+
+    // ── drain only on request ───────────────────
+
+    #[test]
+    fn drain_is_off_unless_requested() {
+        // A launch that asked for no egress log builds its proxy from the
+        // plain constructor, and its proxy must end as it did before the
+        // flag existed: no drain. `drain` itself stays unconditional (the
+        // tests above call it directly); the run decides whether to call it.
+        let plain = ProxyConfig::new(vec!["127.0.0.1".to_string()]);
+        assert!(!plain.drain_on_exit, "the drain is opt-in");
+
+        // The setting is the run's request, not something the
+        // proxy infers. A config that carries the run-wide counters and an
+        // audit handle (both present on every filtered launch) is still not
+        // asked to drain.
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-proxy-drain-flag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let mut counted = private_config(&["127.0.0.1"]);
+        counted.audit = Some(crate::audit::AuditLog::open(&home).unwrap());
+        counted.stats = Arc::new(EgressStats::default());
+        assert!(
+            !counted.drain_on_exit,
+            "counters alone do not ask for a drain"
+        );
+
+        // The run's request is a plain setting it can make, and a
+        // proxy started with it still serves connections.
+        let mut asked = private_config(&["127.0.0.1"]);
+        asked.drain_on_exit = true;
+        let proxy = Proxy::start(asked, None).unwrap();
+        let s = send(proxy.port(), b"CONNECT example.com:443 HTTP/1.1\r\n\r\n");
+        assert!(read_head(&s).contains("403"), "the proxy still serves");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── drain coverage ──────────────────────────
+    // Drain coverage (connections accepted before their handler runs, the
+    // listen backlog) and absolute-form targets.
+
+    fn start(mut config: ProxyConfig) -> (Proxy, Arc<EgressStats>) {
+        let stats = Arc::new(EgressStats::default());
+        config.stats = Arc::clone(&stats);
+        config.drain_on_exit = true;
+        (Proxy::start(config, None).unwrap(), stats)
+    }
+
+    #[test]
+    fn the_proxy_reports_whether_the_run_asked_for_a_drain() {
+        let plain = Proxy::start(ProxyConfig::new(Vec::new()), None).unwrap();
+        assert!(!plain.drain_on_exit());
+        assert_eq!(plain.shared.listeners_kept(), 0, "no clone kept");
+        let mut asked = ProxyConfig::new(Vec::new());
+        asked.drain_on_exit = true;
+        let asked = Proxy::start(asked, None).unwrap();
+        assert!(asked.drain_on_exit());
+        assert_eq!(asked.shared.listeners_kept(), 1);
+    }
+
+    #[test]
+    fn drain_waits_for_a_connection_accepted_before_its_handler_runs() {
+        let mut config = ProxyConfig::new(vec!["example.com".into()]);
+        config.test_handler_delay = Duration::from_millis(300);
+        let (proxy, stats) = start(config);
+        let _client =
+            std::net::TcpStream::connect(("127.0.0.1", proxy.port())).unwrap();
+        // Accepted, handler not started yet (it sleeps 300 ms).
+        thread::sleep(Duration::from_millis(50));
+        proxy.drain(Duration::from_secs(2));
+        let t = stats.snapshot();
+        assert_eq!(
+            t.allowed + t.denied + t.errored,
+            1,
+            "the accepted connection must be counted before drain returns"
+        );
+    }
+
+    #[test]
+    fn drain_takes_the_listen_backlog() {
+        let mut config = ProxyConfig::new(vec!["example.com".into()]);
+        config.test_accept_paused = true;
+        let (proxy, stats) = start(config);
+        let mut client =
+            std::net::TcpStream::connect(("127.0.0.1", proxy.port())).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        proxy.drain(Duration::from_secs(1));
+        assert_eq!(stats.snapshot().errored, 1, "backlog refused as an error");
+        let mut reply = String::new();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let _ = client.read_to_string(&mut reply);
+        assert!(reply.starts_with("HTTP/1.1 503"), "{reply:?}");
+    }
+
+    #[test]
+    fn a_refused_absolute_form_request_keeps_its_target() {
+        let dir = std::env::temp_dir()
+            .join(format!("ai-jail-abs-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("egress.jsonl");
+        let mut config = ProxyConfig::new(vec!["example.com".into()]);
+        config.egress = Some(Arc::new(EgressLog::open(&path, "r1").unwrap()));
+        let (proxy, _stats) = start(config);
+        let mut client =
+            std::net::TcpStream::connect(("127.0.0.1", proxy.port())).unwrap();
+        client
+            .write_all(
+                b"GET http://example.com/x HTTP/1.1\r\n\
+                  Host: example.com\r\n\r\n",
+            )
+            .unwrap();
+        let mut reply = String::new();
+        let _ = client.read_to_string(&mut reply);
+        proxy.drain(Duration::from_secs(1));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line: serde_json::Value =
+            serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(line["reason"], "method-not-allowed");
+        assert_eq!(line["host"], "example.com", "{line}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

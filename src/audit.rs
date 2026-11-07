@@ -505,7 +505,7 @@ fn open_log_for_append(home: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-fn is_security_open_error(error: &std::io::Error) -> bool {
+pub(crate) fn is_security_open_error(error: &std::io::Error) -> bool {
     use nix::libc;
 
     matches!(
@@ -601,7 +601,7 @@ impl AuditLog {
 
 /// RFC3339 (UTC, second precision) from std alone -- no chrono. The
 /// civil-date conversion is Howard Hinnant's days-from-civil algorithm.
-fn rfc3339(now: SystemTime) -> String {
+pub(crate) fn rfc3339(now: SystemTime) -> String {
     let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let days = (secs / 86400) as i64;
     let rem = secs % 86400;

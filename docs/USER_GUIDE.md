@@ -539,6 +539,19 @@ for <launch dir> is ignored`. Restrictions saved only in that per-directory
 
 The setting is global only. A repository file cannot enable it.
 
+## Run observability
+
+Onboarding has no control for `--egress-log PATH`, by design: it records a run,
+it grants nothing, and it is never saved to a profile. Pass it on each launch
+that should be observed. It needs filtered networking (`--allow-host`, or the
+filtered default a known agent gets); with the network off or full, ai-jail
+refuses to start rather than log nothing. Each connection through the egress
+proxy becomes one JSON line in `PATH` (mode 0600, an existing file narrowed to
+it, appended across runs) with its host, port, verdict, reason, byte counts and
+duration, and never any request content. A file that cannot be opened is a
+warning, not a launch failure. The README's `Run observability` section
+describes every field.
+
 ## Migration and reapproval
 
 Legacy repository `.ai-jail` files contribute restrictions only. Commands,
