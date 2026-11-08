@@ -1,7 +1,7 @@
-// Sub-task 6.4 through the built binary: a global config carrying an
-// unknown top-level `profiles = 5`, which upstream fe4dfe0 ignores, still
-// launches when no profile is named (R7.11, R6.8, R6.9), and `status` /
-// `status --json` with `--profile w` name the selected profile (R8.5) —
+// Through the built binary: a global config carrying an unknown
+// top-level `profiles = 5`, which releases before profiles ignore, still
+// launches when no profile is named, and `status` / `status --json` with
+// `--profile w` name the selected profile —
 // in a field of its own, not the onboarding `project.profile_present`.
 // Each test gets a temporary HOME, XDG_CONFIG_HOME and project under the
 // cargo target tmp dir; the global config is
@@ -36,7 +36,7 @@ impl Tree {
     fn new(name: &str, global: &str) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-            "aj-prof-gatefix2-{name}-{}-{id}",
+            "aj-prof-stray-key-{name}-{}-{id}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -139,10 +139,10 @@ fn has_token(line: &str, word: &str) -> bool {
         .any(|t| t == word)
 }
 
-// ── R7.11 — an unknown top-level `profiles` key is inert ─────────────
+// ── An unknown top-level `profiles` key is inert ─────────────────────
 
 #[test]
-fn gatefix2_plain_launch_with_a_non_table_profiles_key_exits_zero() {
+fn plain_launch_with_a_non_table_profiles_key_exits_zero() {
     // Hostile half first: the shapes an upstream user could already
     // have, none of which upstream refuses.
     for (tag, global) in [
@@ -170,9 +170,9 @@ fn gatefix2_plain_launch_with_a_non_table_profiles_key_exits_zero() {
 }
 
 #[test]
-fn gatefix2_profile_with_a_non_table_profiles_key_is_refused_as_a_table() {
+fn profile_with_a_non_table_profiles_key_is_refused_as_a_table() {
     // The converse: the same file, once a profile is named, is refused,
-    // saying `profiles` must be a table (R7.12).
+    // saying `profiles` must be a table.
     let tree = Tree::new("int-sel", "profiles = 5\n");
     let out = tree.run(&[
         "--no-status-bar",
@@ -187,10 +187,10 @@ fn gatefix2_profile_with_a_non_table_profiles_key_is_refused_as_a_table() {
     assert!(err.contains("profiles") && err.contains("table"), "{err}");
 }
 
-// ── R8.5 — status names the selected profile ─────────────────────────
+// ── Status names the selected profile ────────────────────────────────
 
 #[test]
-fn gatefix2_status_json_names_the_selected_profile() {
+fn status_json_names_the_selected_profile() {
     let tree = Tree::new("status-json", W);
     let out = tree.run(&["--profile", "w", "status", "--json"]);
     assert_ok(&out);
@@ -216,7 +216,7 @@ fn gatefix2_status_json_names_the_selected_profile() {
 }
 
 #[test]
-fn gatefix2_status_json_names_no_profile_when_none_is_selected() {
+fn status_json_names_no_profile_when_none_is_selected() {
     // The converse: the same global, no --profile — nothing in the
     // report may claim that `w` is in force.
     let tree = Tree::new("status-json-none", W);
@@ -230,7 +230,7 @@ fn gatefix2_status_json_names_no_profile_when_none_is_selected() {
 }
 
 #[test]
-fn gatefix2_status_text_names_the_selected_profile() {
+fn status_text_names_the_selected_profile() {
     let tree = Tree::new("status-text", W);
     let out = tree.run(&["--profile", "w", "status"]);
     assert_ok(&out);

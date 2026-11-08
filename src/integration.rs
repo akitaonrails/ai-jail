@@ -80,7 +80,7 @@ pub(crate) struct StatusReport {
     version: &'static str,
     schema_version: u32,
     project: StatusProject,
-    /// The `--profile` in force (R8.5). Absent when none is selected;
+    /// The `--profile` in force. Absent when none is selected;
     /// `project.profile_present` is the onboarding profile, not this.
     #[serde(skip_serializing_if = "Option::is_none")]
     named_profile: Option<String>,

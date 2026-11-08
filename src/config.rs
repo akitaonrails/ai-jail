@@ -423,7 +423,7 @@ pub(crate) struct GlobalConfig {
 /// The top-level `profiles` key as found. Upstream has no such key and
 /// ignores an unknown `profiles = 5`, so a value that is not a table is
 /// kept raw instead of failing the whole file, and refused only when
-/// `--profile` asks for an entry in it (R7.11, R7.12). Kept, not dropped,
+/// `--profile` asks for an entry in it. Kept, not dropped,
 /// so a rewrite of the global config does not lose it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ProfilesKey {
@@ -450,7 +450,7 @@ impl ProfilesKey {
         match self {
             ProfilesKey::Tables(map) => Ok(map),
             ProfilesKey::NotATable(value) => Err(format!(
-                "--profile: `profiles` in the global config is a {}, not \
+                "--profile: `profiles` in the global config is of type {}, not \
                  a table: write each profile as [profiles.NAME]",
                 value.type_str()
             )),
@@ -624,7 +624,7 @@ pub(crate) fn select_profile(
     };
     let Some(table) = value.as_table() else {
         return Err(format!(
-            "profile '{name}' is a {}, not a table: write it as \
+            "profile '{name}' is of type {}, not a table: write it as \
              [profiles.{name}]",
             value.type_str()
         ));
@@ -1801,7 +1801,7 @@ fn profile_widenings(
         let next: Config = toml::Value::Table(table)
             .try_into()
             .map_err(|e| format!("{label}: cannot compare layers: {e}"))?;
-        // Fields that do not serialise (secrets) keep their merged form.
+        // Fields that do not serialise (secrets) keep the baseline's values.
         baseline = Config {
             env_pass: baseline.env_pass,
             env_from_file: baseline.env_from_file,
@@ -10072,7 +10072,7 @@ hide_dotdirs = [\".secrets\"]
 // `<XDG_CONFIG_HOME>/ai-jail/config.toml` (dir 0700, file 0600), loaded
 // through `load_global_for_command_from_path`, as a launch loads it.
 #[cfg(test)]
-mod profile_gatefix_tests {
+mod profile_trust_tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -10090,7 +10090,7 @@ mod profile_gatefix_tests {
     fn global_file(body: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!(
-            "aj-profile-gatefix-{}-{}",
+            "aj-profile-trust-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -10343,19 +10343,18 @@ mod profile_review_regression_tests {
     }
 }
 
-// Sub-task 6.4 (appended to `src/config.rs` on `feat/profiles`): the
-// `[profiles]` container itself is lenient. Upstream fe4dfe0 has no
-// `profiles` field, so a top-level `profiles = 5` is an unknown key it
-// ignores; a launch that names no profile must keep ignoring it (R7.11,
-// R6.8, R6.9), and only `--profile` refuses it, saying `profiles` must be
-// a table (R7.12). And the effective-access review of a launch that
-// selects no profile carries no named-profile line at all (R5.6), so it
+// The `[profiles]` container itself is lenient. A release without
+// profiles has no `profiles` field, so a top-level `profiles = 5` is an
+// unknown key it ignores; a launch that names no profile must keep
+// ignoring it, and only `--profile` refuses it, saying `profiles` must be
+// a table. And the effective-access review of a launch that selects no
+// profile carries no named-profile line at all, so it
 // reads as it did before profiles existed. Fixtures are the trusted global
 // config `<root>/xdg/ai-jail/config.toml` (dir 0700, file 0600) under the
 // test temp dir, loaded through `load_global_for_command_from_path`, as a
 // launch loads it.
 #[cfg(test)]
-mod profile_gatefix2_tests {
+mod profile_stray_key_tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -10372,7 +10371,7 @@ mod profile_gatefix2_tests {
 
     fn scratch_root() -> PathBuf {
         std::env::temp_dir().join(format!(
-            "aj-profile-gatefix2-{}-{}",
+            "aj-profile-stray-key-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
@@ -10414,10 +10413,10 @@ mod profile_gatefix2_tests {
         "[[profiles]]\nprofile_version = 1\npictures = true\n",
     ];
 
-    // ── R7.11 — inert without --profile ──────────────────────────────
+    // ── Inert without --profile ──────────────────────────────────────
 
     #[test]
-    fn gatefix2_non_table_profiles_key_is_inert_without_profile() {
+    fn non_table_profiles_key_is_inert_without_profile() {
         // Hostile half first: an upstream config that happens to carry an
         // unknown `profiles` key must launch exactly as upstream does,
         // base policy intact, with no profile reported.
@@ -10440,10 +10439,10 @@ mod profile_gatefix2_tests {
         }
     }
 
-    // ── R7.12 — refused with --profile, naming `profiles` and "table" ─
+    // ── Refused with --profile, naming `profiles` and "table" ────────
 
     #[test]
-    fn gatefix2_non_table_profiles_key_is_refused_with_profile() {
+    fn non_table_profiles_key_is_refused_with_profile() {
         for stray in NOT_A_TABLE {
             let body = format!("no_gpu = true\n{stray}");
             let err = load(&body, &["--profile", "x", "claude"])
@@ -10463,7 +10462,7 @@ mod profile_gatefix2_tests {
     }
 
     #[test]
-    fn gatefix2_table_profiles_still_select_through_the_lenient_container() {
+    fn table_profiles_still_select_through_the_lenient_container() {
         // The converse: leniency must not swallow a real table, in either
         // spelling, nor turn a missing name into the "must be a table"
         // refusal.
@@ -10485,10 +10484,10 @@ mod profile_gatefix2_tests {
         assert!(err.contains("defined"), "not an existence refusal: {err}");
     }
 
-    // ── R5.6 — the review names no profile when none is selected ─────
+    // ── The review names no profile when none is selected ────────────
 
     fn review(named: Option<&str>) -> String {
-        let project = Path::new("/var/empty/aj-gatefix2-project");
+        let project = Path::new("/var/empty/aj-stray-key-project");
         crate::onboarding::render_effective_access_with_profile(
             &Config::default(),
             project,
@@ -10501,10 +10500,10 @@ mod profile_gatefix2_tests {
     }
 
     #[test]
-    fn gatefix2_review_without_a_profile_has_no_named_profile_line() {
+    fn review_without_a_profile_has_no_named_profile_line() {
         let plain = crate::onboarding::render_effective_access(
             &Config::default(),
-            Path::new("/var/empty/aj-gatefix2-project"),
+            Path::new("/var/empty/aj-stray-key-project"),
             "claude",
             None,
             &[],
@@ -10518,9 +10517,9 @@ mod profile_gatefix2_tests {
     }
 
     #[test]
-    fn gatefix2_review_with_a_profile_still_names_it() {
+    fn review_with_a_profile_still_names_it() {
         // The converse: dropping the "none" line must not drop the line
-        // that names a selected profile (R5.6, 5.4's interface test).
+        // that names a selected profile, which the interface test needs.
         let named = review(Some("w"));
         assert!(named.contains("profile=w"), "{named}");
         // And a selected profile is the only difference: one extra line.
@@ -10531,5 +10530,131 @@ mod profile_gatefix2_tests {
             .collect();
         assert_eq!(extra.len(), 1, "{extra:?}");
         assert!(extra[0].contains("profile=w"), "{extra:?}");
+    }
+}
+
+// The `--profile` refusals name the TOML type of the value that is not a
+// table. `toml::Value::type_str()` returns a bare noun ("integer",
+// "array"), so a message built as "is a {}" reads "is a integer" and
+// "is a array". The wording "is of type {}" is grammatical for every
+// type name, so these tests pin it on both refusals: the top-level
+// `profiles` key, and one entry under `[profiles]`. Fixtures are the
+// trusted global config `<root>/xdg/ai-jail/config.toml` (dir 0700, file
+// 0600) under the test temp dir, loaded as a launch loads it.
+#[cfg(test)]
+mod profile_type_word_tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    fn cli(args: &[&str]) -> CliArgs {
+        crate::cli::parse_from(lexopt::Parser::from_args(
+            args.iter().map(std::ffi::OsString::from),
+        ))
+        .expect("test CLI parses")
+    }
+
+    fn scratch_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aj-profile-type-words-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// The refusal `--profile w` gets for the global config `body`.
+    fn refusal(body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root();
+        let store = root.join("xdg").join("ai-jail");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::set_permissions(
+            &store,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let path = store.join("config.toml");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let got = load_global_for_command_from_path(
+            &path,
+            &cli(&["--profile", "w", "claude"]),
+            &Config::default(),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        match got {
+            Ok(_) => panic!("{body:?}: --profile w must be refused"),
+            Err(e) => e,
+        }
+    }
+
+    /// The article form is ungrammatical for these type names; no refusal
+    /// may carry it, whichever site produced it.
+    fn assert_no_bare_article(body: &str, err: &str) {
+        for bad in ["is a integer", "is a array"] {
+            assert!(
+                !err.contains(bad),
+                "{body:?}: refusal still says {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn type_words_top_level_integer_profiles_says_of_type_integer() {
+        let body = "profiles = 5\n";
+        let err = refusal(body);
+        assert_no_bare_article(body, &err);
+        assert!(
+            err.contains("is of type integer"),
+            "{body:?}: must name the type as \"is of type integer\": {err}"
+        );
+        // The rewording keeps what the refusal is for: `profiles` must be
+        // a table.
+        assert!(err.contains("profiles"), "{body:?}: {err}");
+        assert!(err.contains("table"), "{body:?}: {err}");
+    }
+
+    #[test]
+    fn type_words_top_level_array_profiles_says_of_type_array() {
+        // A mixed array, so the type word cannot come from an element.
+        let body = "profiles = [1, \"a\"]\n";
+        let err = refusal(body);
+        assert_no_bare_article(body, &err);
+        assert!(
+            err.contains("is of type array"),
+            "{body:?}: must name the type as \"is of type array\": {err}"
+        );
+        assert!(err.contains("table"), "{body:?}: {err}");
+    }
+
+    #[test]
+    fn type_words_non_table_entry_says_of_type_integer() {
+        // The per-entry refusal is a second message site: fixing only the
+        // top-level one would leave this one reading "is a integer".
+        let body = "[profiles]\nw = 5\n";
+        let err = refusal(body);
+        assert_no_bare_article(body, &err);
+        assert!(
+            err.contains("is of type integer"),
+            "{body:?}: must name the type as \"is of type integer\": {err}"
+        );
+        assert!(err.contains("'w'"), "{body:?}: names the entry: {err}");
+        assert!(err.contains("table"), "{body:?}: {err}");
+    }
+
+    #[test]
+    fn type_words_non_table_array_entry_says_of_type_array() {
+        let body = "[profiles]\nw = [1, \"a\"]\n";
+        let err = refusal(body);
+        assert_no_bare_article(body, &err);
+        assert!(
+            err.contains("is of type array"),
+            "{body:?}: must name the type as \"is of type array\": {err}"
+        );
+        assert!(err.contains("table"), "{body:?}: {err}");
     }
 }

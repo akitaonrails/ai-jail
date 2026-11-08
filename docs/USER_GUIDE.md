@@ -584,7 +584,8 @@ github = true
   `profile=NAME widens=FIELD granted="…"`.
 
 The final `Complete effective access` review names the selected profile as
-`Named profile: profile=NAME`. The README section
+`Named profile: profile=NAME (a trusted global layer)`; text `status`
+prints `Named profile: profile=NAME`. The README section
 [Named profiles](../README.md#named-profiles---profile-name) lists the merge
 order and the trust rules in full.
 

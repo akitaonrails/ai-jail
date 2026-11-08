@@ -1757,7 +1757,7 @@ fn run(
             "Project constraints",
             if provenance.constraints { "yes" } else { "no" },
         );
-        // R8.5: name the --profile in force; nothing when none is.
+        // Name the --profile in force; nothing when none is.
         if let Some(name) = cli.profile.as_deref() {
             output::status_header("Named profile", &format!("profile={name}"));
         }

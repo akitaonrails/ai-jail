@@ -2534,7 +2534,7 @@ pub(crate) fn render_effective_access_with_profile(
         "Scope: global policy, proposed project grants, command-line grants, project constraints, and derived platform defaults".into(),
     ];
     // Only when one is selected: a user who never names a profile sees the
-    // review as it was before profiles existed (R5.6).
+    // review as it was before profiles existed.
     if let Some(name) = named_profile {
         lines.push(format!(
             "Named profile: profile={} (a trusted global layer)",
