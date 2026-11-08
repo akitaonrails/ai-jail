@@ -9808,3 +9808,52 @@ mod profile_story047_project_tests {
         assert_eq!(with, parse_toml("no_gpu = true\n").unwrap());
     }
 }
+
+// Story 047, Task 4.1 — a profile table and a `[commands.<name>]` table
+// with the same keys produce the same Config (R6.2: same keys and types),
+// and that Config survives a serialize/parse round trip.
+//
+// Materialization: append this whole file to the end of `src/config.rs`
+// on `feat/profiles` (and keep it on `integration`). Test names contain
+// `roundtrip`. Fixtures use only keys upstream/master knows.
+#[cfg(test)]
+mod story047_roundtrip_profiles_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    const KEYS: &str = "\
+allow_hosts = [\"registry.npmjs.org\", \"api.example.com\"]
+mask = [\"/usr/bin/ssh\", \"/usr/bin/scp\"]
+ssh = true
+no_gpu = true
+hide_dotdirs = [\".secrets\"]
+";
+
+    fn as_toml(config: &Config) -> toml::Table {
+        toml::to_string(config).unwrap().parse().unwrap()
+    }
+
+    #[test]
+    fn roundtrip_profile_equals_the_same_keys_as_a_command_table() {
+        let mut profile: toml::Table = KEYS.parse().unwrap();
+        profile.insert("profile_version".into(), toml::Value::Integer(1));
+        let profiles = BTreeMap::from([("agent-test".to_string(), profile)]);
+        let from_profile = select_profile(&profiles, "agent-test").unwrap();
+        let global =
+            parse_global_toml(&format!("[commands.bash]\n{KEYS}")).unwrap();
+        let from_command = global.commands.get("bash").unwrap();
+        assert_eq!(as_toml(&from_profile), as_toml(from_command));
+    }
+
+    #[test]
+    fn roundtrip_selected_profile_serializes_and_parses_back_unchanged() {
+        let mut profile: toml::Table = KEYS.parse().unwrap();
+        profile.insert("profile_version".into(), toml::Value::Integer(1));
+        let profiles = BTreeMap::from([("p".to_string(), profile)]);
+        let config = select_profile(&profiles, "p").unwrap();
+        let body = toml::to_string(&config).unwrap();
+        assert!(!body.contains("profile_version"), "{body}");
+        assert_eq!(as_toml(&parse_toml(&body).unwrap()), as_toml(&config));
+    }
+}
