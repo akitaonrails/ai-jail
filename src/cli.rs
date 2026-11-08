@@ -44,6 +44,8 @@ OPTIONS:
     --landlock / --no-landlock     Enable/disable Landlock LSM (Linux 5.13+, default: on)
     --seccomp / --no-seccomp       Enable/disable seccomp syscall filter (Linux, default: on)
     --rlimits / --no-rlimits       Enable/disable resource limits (default: on)
+    --profile <NAME>               Apply [profiles.NAME] from the global config (once;
+                                   every access it widens is printed before launch)
     --systemd-user / --no-systemd-user
                                    Expose host systemd --user bus (dangerous; default: off)
     --no-gpu / --gpu               Disable/enable GPU device passthrough (Linux only)
@@ -212,6 +214,9 @@ pub struct CliArgs {
     pub landlock: Option<bool>,
     pub seccomp: Option<bool>,
     pub rlimits: Option<bool>,
+    /// `--profile NAME`: a `[profiles.NAME]` table of the global config.
+    /// Validated against the global config at load, not here.
+    pub profile: Option<String>,
     pub systemd_user: Option<bool>,
     pub gpu: Option<bool>,
     pub docker: Option<bool>,
@@ -446,6 +451,15 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("systemd-user" | "no-systemd-user")) => {
                 args.systemd_user = Some(s == "systemd-user");
+            }
+            Long("profile") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                if args.profile.is_some() {
+                    return Err("--profile given more than once: a launch \
+                                selects one profile"
+                        .into());
+                }
+                args.profile = Some(val.to_string_lossy().into_owned());
             }
             Long("allow-tcp-port") => {
                 let val: String = parser
@@ -1097,6 +1111,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-seccomp",
     "--rlimits",
     "--no-rlimits",
+    "--profile",
     "--ssh",
     "--no-ssh",
     "--pictures",
@@ -1226,6 +1241,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn profile_is_taken_once_and_refused_after_the_command() {
+        let parse = |args: &[&str]| {
+            parse_argv(args.iter().map(std::ffi::OsString::from).collect())
+        };
+        let once = parse(&["--profile", "agent-test", "bash"]).unwrap();
+        assert_eq!(once.profile.as_deref(), Some("agent-test"));
+        assert!(parse(&["bash"]).unwrap().profile.is_none());
+        let twice = parse(&["--profile", "a", "--profile", "b", "bash"])
+            .expect_err("a second --profile must be refused");
+        assert!(twice.contains("--profile"), "{twice}");
+        let after = parse(&["bash", "--profile", "a"])
+            .expect_err("--profile after the command must be refused");
+        assert!(after.contains("--profile"), "{after}");
     }
 
     #[test]

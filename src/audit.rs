@@ -346,6 +346,9 @@ pub(crate) struct LaunchRecord<'a> {
     pub project_grants: bool,
     pub project_constraints: bool,
     pub global_config: bool,
+    /// The `--profile` this launch selected and what it widened; the
+    /// record omits the key when no profile was selected.
+    pub profile: Option<&'a crate::config::ProfileReport>,
     pub exit_code: i32,
     pub duration: std::time::Duration,
 }
@@ -622,7 +625,7 @@ pub(crate) fn rfc3339(now: SystemTime) -> String {
 /// One launch record: who ran, with which effective capabilities, from
 /// which config sources, and how it ended.
 pub(crate) fn launch_record(record: &LaunchRecord<'_>) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "ts": rfc3339(SystemTime::now()),
         "type": "launch",
         "command": record.command,
@@ -645,7 +648,24 @@ pub(crate) fn launch_record(record: &LaunchRecord<'_>) -> serde_json::Value {
         },
         "exit_code": record.exit_code,
         "duration_s": record.duration.as_millis() as f64 / 1000.0,
-    })
+    });
+    // Secret fields already carry key names only (`Widening.granted`).
+    if let Some(profile) = record.profile
+        && let Some(object) = value.as_object_mut()
+    {
+        let widenings: Vec<serde_json::Value> = profile
+            .widenings
+            .iter()
+            .map(
+                |w| serde_json::json!({"field": w.field, "granted": w.granted}),
+            )
+            .collect();
+        object.insert(
+            "profile".into(),
+            serde_json::json!({"name": profile.name, "widenings": widenings}),
+        );
+    }
+    value
 }
 
 /// One proxy CONNECT verdict record (filtered egress only).
@@ -865,6 +885,7 @@ mod tests {
             project_grants: false,
             project_constraints: true,
             global_config: true,
+            profile: None,
             exit_code: 0,
             duration: std::time::Duration::from_millis(1500),
         };
@@ -894,6 +915,56 @@ mod tests {
         assert_eq!(lines[1]["host"], "api.anthropic.com");
         assert_eq!(lines[1]["verdict"], "allow");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn launch_record_adds_profile_only_when_selected() {
+        use crate::config::{ProfileReport, Widening};
+        let base = LaunchRecord {
+            command: &[],
+            network_mode: "off",
+            allow_hosts: &[],
+            lockdown: false,
+            agent_state: false,
+            gpu: false,
+            display: false,
+            audio: false,
+            kvm: false,
+            browser_profile: None,
+            project_config: false,
+            project_trusted: false,
+            project_source: "none",
+            project_grants: false,
+            project_constraints: false,
+            global_config: true,
+            profile: None,
+            exit_code: 0,
+            duration: std::time::Duration::ZERO,
+        };
+        let old = launch_record(&base);
+        assert!(old.get("profile").is_none(), "{old}");
+        let report = ProfileReport {
+            name: "agent-test".into(),
+            widenings: vec![Widening {
+                field: "env_pass".into(),
+                granted: vec!["AJ047_SECRET".into()],
+            }],
+        };
+        let new = launch_record(&LaunchRecord {
+            profile: Some(&report),
+            ..base
+        });
+        assert_eq!(new["profile"]["name"], "agent-test");
+        assert_eq!(
+            new["profile"]["widenings"],
+            serde_json::json!([{"field": "env_pass", "granted": ["AJ047_SECRET"]}])
+        );
+        // Every pre-existing key is unchanged.
+        for (key, value) in old.as_object().unwrap() {
+            if key != "ts" && key != "duration_s" {
+                assert_eq!(&new[key], value, "{key}");
+            }
+        }
     }
 
     fn probe(log: &AuditLog, n: u64) {

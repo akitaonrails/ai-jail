@@ -402,7 +402,7 @@ pub struct Config {
     pub audit_log: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) struct GlobalConfig {
     #[serde(flatten)]
     pub(crate) base: Config,
@@ -412,6 +412,144 @@ pub(crate) struct GlobalConfig {
     /// trusted and never read from a project `.ai-jail`.
     #[serde(default, skip_serializing_if = "ProjectStrategy::is_basename")]
     pub(crate) project_strategy: ProjectStrategy,
+    /// Named `[profiles.NAME]` tables, selected only by `--profile NAME`.
+    /// Kept as raw tables so a malformed profile that no launch selects
+    /// cannot break a launch; `select_profile` validates the chosen one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) profiles: BTreeMap<String, toml::Table>,
+}
+
+/// The only profile format this build reads (`profile_version = 1`).
+const PROFILE_VERSION: i64 = 1;
+
+/// `Config` keys a profile may not carry (see `select_profile`).
+const PROFILE_REFUSED_KEYS: &[&str] = &[
+    "command",
+    "no_status_bar",
+    "status_bar_style",
+    "resize_redraw_key",
+];
+
+/// `Config` fields that are deserialized but never serialized. A
+/// serialize round trip drops them, so the unknown-key check must not
+/// read their absence as a typo. The test
+/// `profile_accepts_every_unserialised_field_and_alias_in_config_rs`
+/// keeps this list in step with the struct.
+const NEVER_SERIALIZED: &[&str] =
+    &["env_pass", "env_from_file", "secret_hosts"];
+
+/// Profile names: `^[a-z0-9][a-z0-9_-]{0,63}$`. Written by hand so no
+/// regex crate is needed; nothing is normalised, so `agent-test` and
+/// `agent_test` stay two names.
+fn valid_profile_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let first_ok = bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    first_ok
+        && bytes.len() <= 64
+        && bytes[1..].iter().all(|b| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || *b == b'_'
+                || *b == b'-'
+        })
+}
+
+/// Select and validate one `[profiles.NAME]` table from the trusted
+/// global config. A profile is untrusted-shaped input even though it
+/// lives in a trusted file: a typo in a restriction must fail the launch
+/// rather than be dropped, so every check here fails closed.
+pub(crate) fn select_profile(
+    profiles: &BTreeMap<String, toml::Table>,
+    name: &str,
+) -> Result<Config, String> {
+    if !valid_profile_name(name) {
+        return Err(format!(
+            "invalid profile name {:?}: must match [a-z0-9][a-z0-9_-]{{0,63}}",
+            output::escape_control_bytes(name)
+        ));
+    }
+    let Some(table) = profiles.get(name) else {
+        let defined: Vec<&str> = profiles.keys().map(String::as_str).collect();
+        let defined = if defined.is_empty() {
+            "none".to_string()
+        } else {
+            defined.join(", ")
+        };
+        return Err(format!(
+            "profile '{name}' is not defined in the global config \
+             (defined profiles: {defined})"
+        ));
+    };
+    let mut table = table.clone();
+    match table.remove("profile_version") {
+        Some(toml::Value::Integer(PROFILE_VERSION)) => {}
+        Some(other) => {
+            return Err(format!(
+                "profile '{name}': profile_version = {other} is not \
+                 supported; this ai-jail reads profile_version = \
+                 {PROFILE_VERSION}"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "profile '{name}': profile_version is missing; add \
+                 profile_version = {PROFILE_VERSION}"
+            ));
+        }
+    }
+    if table.contains_key("trust_project_config") {
+        return Err(format!(
+            "profile '{name}': trust_project_config is only read from the \
+             global base config, never from a profile"
+        ));
+    }
+    // `command` would switch programs after the command table was chosen,
+    // so the new program would run under the old program's table; the UI
+    // preferences are never applied from a trusted layer. Refusing all
+    // four is the honest answer to a key that would otherwise do nothing
+    // or the wrong thing.
+    if let Some(key) = PROFILE_REFUSED_KEYS
+        .iter()
+        .find(|key| table.contains_key(**key))
+    {
+        return Err(format!(
+            "profile '{name}': {key} cannot be set in a profile; set it in \
+             the global config or on the command line"
+        ));
+    }
+    let config: Config = toml::Value::Table(table.clone())
+        .try_into()
+        .map_err(|e| format!("profile '{name}': {e}"))?;
+    let known = toml::Table::try_from(&config)
+        .map_err(|e| format!("profile '{name}': {e}"))?;
+    let unknown: Vec<&str> = table
+        .iter()
+        .filter(|(key, value)| {
+            !known.contains_key(key.as_str())
+                && !NEVER_SERIALIZED.contains(&key.as_str())
+                && !is_empty_toml_value(value)
+        })
+        .map(|(key, _)| key.as_str())
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "profile '{name}': unknown key(s) {}; a misspelt restriction \
+             would otherwise be dropped",
+            unknown.join(", ")
+        ));
+    }
+    Ok(config)
+}
+
+/// An empty array or table carries nothing, and a round trip drops it.
+fn is_empty_toml_value(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Array(items) => items.is_empty(),
+        toml::Value::Table(table) => table.is_empty(),
+        _ => false,
+    }
 }
 
 /// How the global config identifies a project.
@@ -1213,7 +1351,40 @@ pub(crate) fn redact_env_assignments(text: &str) -> String {
 }
 
 fn load_from_path(path: &Path) -> Result<Config, String> {
-    load_toml_from_path(path, parse_toml)
+    load_toml_from_path(path, |text| {
+        warn_if_project_selects_profile(text, &[]);
+        parse_toml(text)
+    })
+}
+
+/// The warning printed when a project policy names a profile.
+pub(crate) const PROJECT_PROFILE_IGNORED: &str = "project .ai-jail profile ignored: only the CLI (--profile) selects a \
+     profile";
+
+/// Whether a project policy document tries to select or define a
+/// profile: a `profile` key or a `[profiles]` table at the top level, or
+/// inside one of the tables named by `nested` (the store document keeps
+/// its policy under `[grants]` and `[constraints]`). `Config` ignores
+/// both keys, so the only effect is this warning (R6.6).
+pub(crate) fn project_selects_profile(text: &str, nested: &[&str]) -> bool {
+    let Ok(root) = text.parse::<toml::Table>() else {
+        return false;
+    };
+    let names = |table: &toml::Table| {
+        table.contains_key("profile") || table.contains_key("profiles")
+    };
+    names(&root)
+        || nested.iter().any(|key| {
+            root.get(*key)
+                .and_then(toml::Value::as_table)
+                .is_some_and(names)
+        })
+}
+
+pub(crate) fn warn_if_project_selects_profile(text: &str, nested: &[&str]) {
+    if project_selects_profile(text, nested) {
+        output::warn(PROJECT_PROFILE_IGNORED);
+    }
 }
 
 fn load_global_from_path(path: &Path) -> Result<GlobalConfig, String> {
@@ -1249,37 +1420,106 @@ pub fn load() -> Result<Config, String> {
 pub(crate) struct GlobalCommandSelection {
     pub config: Config,
     pub ignored_command_tables: Vec<String>,
+    /// The profile `--profile` selected, with what it widened.
+    pub profile: Option<ProfileReport>,
+}
+
+/// A selected profile and every access it granted beyond the layers
+/// beneath it (global base and command table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProfileReport {
+    pub name: String,
+    pub widenings: Vec<Widening>,
+}
+
+/// One widening: the field and only the values the profile added. Key
+/// names only for the secret fields (`env_pass`, `env_from_file`,
+/// `secret_hosts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Widening {
+    pub field: String,
+    pub granted: Vec<String>,
+}
+
+impl ProfileReport {
+    /// The stderr lines, one per widening:
+    /// `profile=NAME widens=FIELD granted="v1,v2"`.
+    pub(crate) fn lines(&self) -> Vec<String> {
+        self.widenings
+            .iter()
+            .map(|w| {
+                format!(
+                    "profile={} widens={} granted=\"{}\"",
+                    self.name,
+                    w.field,
+                    quote_granted(&w.granted)
+                )
+            })
+            .collect()
+    }
+}
+
+/// The `granted="…"` payload: values joined by `,`, with `\\`, `"` and
+/// `,` inside a value backslash-escaped and control bytes neutralised,
+/// so a crafted path cannot forge a second field or a second value.
+fn quote_granted(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| {
+            let mut out = String::with_capacity(value.len());
+            for ch in output::escape_control_bytes(value).chars() {
+                if matches!(ch, '\\' | '"' | ',') {
+                    out.push('\\');
+                }
+                out.push(ch);
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub(crate) fn load_global_for_command_report(
     cli: &CliArgs,
     project: &Config,
 ) -> Result<GlobalCommandSelection, String> {
-    match global_config_path() {
-        Some(path) => {
-            let global = load_global_from_path(&path)?;
-            Ok(global_config_for_command_report(global, cli, project))
-        }
-        None => Ok(GlobalCommandSelection {
-            config: Config::default(),
-            ignored_command_tables: Vec::new(),
-        }),
-    }
+    let global = match global_config_path() {
+        Some(path) => load_global_from_path(&path)?,
+        None => GlobalConfig::default(),
+    };
+    global_config_for_command_report(global, cli, project)
+}
+
+/// Load the global config at `path` and select as a launch does: the
+/// command table, then the profile `cli` names. The path-taking twin of
+/// the store loader, so a test can point it at a fixture.
+#[cfg(test)]
+pub(crate) fn load_global_for_command_from_path(
+    path: &Path,
+    cli: &CliArgs,
+    project: &Config,
+) -> Result<(Config, Option<ProfileReport>), String> {
+    let selection = global_config_for_command_report(
+        load_global_from_path(path)?,
+        cli,
+        project,
+    )?;
+    Ok((selection.config, selection.profile))
 }
 
 pub(crate) fn global_config_for_command(
     global: GlobalConfig,
     cli: &CliArgs,
     _project: &Config,
-) -> Config {
-    global_config_for_command_report(global, cli, _project).config
+) -> Result<Config, String> {
+    Ok(global_config_for_command_report(global, cli, _project)?.config)
 }
 
 pub(crate) fn global_config_for_command_report(
     global: GlobalConfig,
     cli: &CliArgs,
     _project: &Config,
-) -> GlobalCommandSelection {
+) -> Result<GlobalCommandSelection, String> {
     let selected_command = if !cli.command.is_empty() {
         cli.command.clone()
     } else {
@@ -1287,7 +1527,10 @@ pub(crate) fn global_config_for_command_report(
     };
 
     let GlobalConfig {
-        mut base, commands, ..
+        mut base,
+        commands,
+        profiles,
+        ..
     } = global;
     let mut ignored_command_tables = Vec::new();
     let mut apply = |name: &str, base: &mut Config| {
@@ -1315,10 +1558,41 @@ pub(crate) fn global_config_for_command_report(
     {
         apply(harness.name, &mut base);
     }
-    GlobalCommandSelection {
+    // The profile is the last trusted layer before the CLI. Only the CLI
+    // selects one, so a malformed profile no launch names stays inert.
+    let profile = match cli.profile.as_deref() {
+        Some(name) => {
+            let layer = select_profile(&profiles, name)?;
+            let project_dir = std::env::current_dir().map_err(|e| {
+                format!(
+                    "profile '{name}': cannot read the launch directory: {e}"
+                )
+            })?;
+            let (_, refusals) = merge_layer_report(
+                base.clone(),
+                layer.clone(),
+                &project_dir,
+                &format!("profile '{name}'"),
+            );
+            base = merge_trusted(base, layer);
+            Some(ProfileReport {
+                name: name.to_string(),
+                widenings: refusals
+                    .into_iter()
+                    .map(|r| Widening {
+                        field: r.field,
+                        granted: r.granted,
+                    })
+                    .collect(),
+            })
+        }
+        None => None,
+    };
+    Ok(GlobalCommandSelection {
         config: base,
         ignored_command_tables,
-    }
+        profile,
+    })
 }
 
 /// Merge two trusted configuration layers, such as global base and a global
@@ -1539,11 +1813,61 @@ fn same_map(left: &Path, right: &Path, project_dir: &Path) -> bool {
         && resolve(left.destination) == resolve(right.destination)
 }
 
+/// One thing a layer asked for that its baseline did not grant. For the
+/// untrusted project it is refused and `text` is printed; for a profile
+/// the same record is a widening that is applied, printed and audited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// The `Config` field, as spelt in TOML.
+    pub field: String,
+    /// What was asked for: hosts, paths, ports, `true`/`false` for a
+    /// switch. Key names only when `secret`.
+    pub granted: Vec<String>,
+    /// The field names or carries secrets, so `granted` holds keys only.
+    pub secret: bool,
+    /// The project-facing warning, unchanged from before refusals had a
+    /// structure.
+    pub text: String,
+}
+
+impl Refusal {
+    fn new(field: &str, granted: Vec<String>, text: String) -> Self {
+        Self {
+            field: field.to_string(),
+            granted,
+            secret: false,
+            text,
+        }
+    }
+
+    fn secret(field: &str, granted: Vec<String>, text: String) -> Self {
+        Self {
+            secret: true,
+            ..Self::new(field, granted, text)
+        }
+    }
+}
+
+fn path_strings(paths: &[PathBuf]) -> Vec<String> {
+    paths.iter().map(|p| p.display().to_string()).collect()
+}
+
+/// The name of an `env_pass` entry, never its value: `NAME=VALUE` gives
+/// `NAME`, and a bare `NAME` gives itself.
+fn env_entry_key(entry: &str) -> String {
+    entry
+        .split_once('=')
+        .map_or(entry, |(key, _)| key)
+        .to_string()
+}
+
 fn append_project_maps(
     baseline: &mut Vec<PathBuf>,
     project: Vec<PathBuf>,
     project_dir: &Path,
-    warnings: &mut Vec<String>,
+    field: &str,
+    layer: &str,
+    refusals: &mut Vec<Refusal>,
 ) {
     for map in project {
         let map = match MapSpec::parse(&map) {
@@ -1570,9 +1894,13 @@ fn append_project_maps(
             || !resolves_inside_project(&destination, project_dir))
             && !trusted_same_map
         {
-            warnings.push(format!(
-                "project .ai-jail map {} outside project ignored (use --rw-map/--ro-map or global config)",
-                source.display()
+            refusals.push(Refusal::new(
+                field,
+                vec![source.display().to_string()],
+                format!(
+                    "{layer} map {} outside project ignored (use --rw-map/--ro-map or global config)",
+                    source.display()
+                ),
             ));
             continue;
         }
@@ -1627,16 +1955,35 @@ pub fn merge_with_global_report(
     baseline: Config,
     local: Config,
     project_dir: &Path,
-) -> (Config, Vec<String>) {
+) -> (Config, Vec<Refusal>) {
+    merge_layer_report(baseline, local, project_dir, PROJECT_LAYER)
+}
+
+/// The label the project merge has always printed in front of a refusal.
+const PROJECT_LAYER: &str = "project .ai-jail";
+
+/// [`merge_with_global_report`] for any layer that must not widen
+/// `baseline` silently. `layer` heads every refusal text: the project
+/// passes [`PROJECT_LAYER`], so its messages stay byte-identical, and a
+/// profile passes `profile 'NAME'`, whose refusals are its widenings.
+pub(crate) fn merge_layer_report(
+    baseline: Config,
+    local: Config,
+    project_dir: &Path,
+    layer: &str,
+) -> (Config, Vec<Refusal>) {
     let mut c = baseline;
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<Refusal> = Vec::new();
     // A project cannot nominate itself, or anything else, as trusted.
     if !local.trust_project_config.is_empty() {
-        warnings.push(
-            "project .ai-jail trust_project_config ignored: only the global \
-             config can mark a directory trusted"
-                .into(),
-        );
+        warnings.push(Refusal::new(
+            "trust_project_config",
+            path_strings(&local.trust_project_config),
+            format!(
+                "{layer} trust_project_config ignored: only the global \
+                 config can mark a directory trusted"
+            ),
+        ));
     }
     if c.command.is_empty() && !local.command.is_empty() {
         c.command = local.command;
@@ -1646,12 +1993,16 @@ pub fn merge_with_global_report(
         &mut c.ro_maps,
         local.ro_maps,
         project_dir,
+        "ro_maps",
+        layer,
         &mut warnings,
     );
     append_project_maps(
         &mut c.rw_maps,
         local.rw_maps,
         project_dir,
+        "rw_maps",
+        layer,
         &mut warnings,
     );
     c.rw_maps.retain(|map| {
@@ -1669,9 +2020,13 @@ pub fn merge_with_global_report(
             return true;
         }
         if overlaps_ro {
-            warnings.push(format!(
-                "project .ai-jail rw map {} ignored because it overlaps a trusted read-only map",
-                destination.display()
+            warnings.push(Refusal::new(
+                "rw_maps",
+                vec![destination.display().to_string()],
+                format!(
+                    "{layer} rw map {} ignored because it overlaps a trusted read-only map",
+                    destination.display()
+                ),
             ));
             return false;
         }
@@ -1681,6 +2036,8 @@ pub fn merge_with_global_report(
         &mut c.overlay_maps,
         local.overlay_maps,
         project_dir,
+        "overlay_maps",
+        layer,
         &mut warnings,
     );
     c.hide_dotdirs.extend(local.hide_dotdirs);
@@ -1690,15 +2047,20 @@ pub fn merge_with_global_report(
     c.deny_paths.extend(local.deny_paths);
     dedup_paths(&mut c.deny_paths);
     for exception in local.mask_exceptions {
-        warnings.push(format!(
-            "project .ai-jail mask exception {} ignored",
-            exception.display()
+        warnings.push(Refusal::new(
+            "mask_exceptions",
+            vec![exception.display().to_string()],
+            format!("{layer} mask exception {} ignored", exception.display()),
         ));
     }
     for exception in local.deny_path_exceptions {
-        warnings.push(format!(
-            "project .ai-jail deny-path exception {} ignored",
-            exception.display()
+        warnings.push(Refusal::new(
+            "deny_path_exceptions",
+            vec![exception.display().to_string()],
+            format!(
+                "{layer} deny-path exception {} ignored",
+                exception.display()
+            ),
         ));
     }
     dedup_paths(&mut c.mask_exceptions);
@@ -1711,9 +2073,13 @@ pub fn merge_with_global_report(
                 if !$enabled(&candidate) || $enabled(&c) {
                     c.$field = Some(value);
                 } else {
-                    warnings.push(format!(
-                        "project .ai-jail {} ignored because it weakens the baseline sandbox",
-                        stringify!($field)
+                    warnings.push(Refusal::new(
+                        stringify!($field),
+                        vec![value.to_string()],
+                        format!(
+                            "{layer} {} ignored because it weakens the baseline sandbox",
+                            stringify!($field)
+                        ),
                     ));
                 }
             }
@@ -1776,23 +2142,37 @@ pub fn merge_with_global_report(
     monotonic!(update_check, |config: &Config| config
         .update_check_enabled());
     monotonic!(audit_log, |config: &Config| config.audit_log_enabled());
+    // These three name or carry secrets: `granted` holds key names only
+    // and the text holds none, so neither can leak a value.
     if !local.env_pass.is_empty() {
-        warnings.push(
-            "project .ai-jail env_pass ignored (use --env or global config)"
-                .into(),
-        );
+        let keys = local
+            .env_pass
+            .iter()
+            .map(|entry| env_entry_key(entry))
+            .collect();
+        warnings.push(Refusal::secret(
+            "env_pass",
+            keys,
+            format!("{layer} env_pass ignored (use --env or global config)"),
+        ));
     }
     if !local.env_from_file.is_empty() {
-        warnings.push(
-            "project .ai-jail env_from_file ignored (use --env-from-file or global config)"
-                .into(),
-        );
+        warnings.push(Refusal::secret(
+            "env_from_file",
+            path_strings(&local.env_from_file),
+            format!(
+                "{layer} env_from_file ignored (use --env-from-file or global config)"
+            ),
+        ));
     }
     if !local.secret_hosts.is_empty() {
-        warnings.push(
-            "project .ai-jail secret_hosts ignored (use --secret or global config)"
-                .into(),
-        );
+        warnings.push(Refusal::secret(
+            "secret_hosts",
+            local.secret_hosts.keys().cloned().collect(),
+            format!(
+                "{layer} secret_hosts ignored (use --secret or global config)"
+            ),
+        ));
     }
     if local.no_save_config.is_some() {
         c.no_save_config = local.no_save_config;
@@ -1800,10 +2180,13 @@ pub fn merge_with_global_report(
     if let Some(profile) = local.browser_profile
         && c.browser_profile.as_deref() != Some(profile.as_str())
     {
-        warnings.push(
-            "project .ai-jail browser_profile ignored because it weakens the baseline sandbox"
-                .into(),
-        );
+        warnings.push(Refusal::new(
+            "browser_profile",
+            vec![profile],
+            format!(
+                "{layer} browser_profile ignored because it weakens the baseline sandbox"
+            ),
+        ));
     }
     let dropped_ports: Vec<_> = local
         .allow_tcp_ports
@@ -1811,14 +2194,11 @@ pub fn merge_with_global_report(
         .filter(|port| !c.allow_tcp_ports.contains(port))
         .collect();
     if !dropped_ports.is_empty() {
-        warnings.push(format!(
-            "project .ai-jail allow_tcp_ports ignored: {}",
-            dropped_ports
-                .iter()
-                .map(u16::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        let granted: Vec<String> =
+            dropped_ports.iter().map(u16::to_string).collect();
+        let text =
+            format!("{layer} allow_tcp_ports ignored: {}", granted.join(", "));
+        warnings.push(Refusal::new("allow_tcp_ports", granted, text));
     }
     // Filtered egress is shrink-only from an untrusted project: entries
     // already in the baseline survive (the project may narrow by
@@ -1829,10 +2209,11 @@ pub fn merge_with_global_report(
         .filter(|host| !c.allow_hosts.contains(host))
         .collect();
     if !dropped_hosts.is_empty() {
-        warnings.push(format!(
-            "project .ai-jail allow_hosts ignored: {}",
+        let text = format!(
+            "{layer} allow_hosts ignored: {}",
             dropped_hosts.join(", ")
-        ));
+        );
+        warnings.push(Refusal::new("allow_hosts", dropped_hosts, text));
     }
     let dropped_private_hosts: Vec<_> = local
         .allow_private_hosts
@@ -1840,9 +2221,14 @@ pub fn merge_with_global_report(
         .filter(|host| !c.allow_private_hosts.contains(host))
         .collect();
     if !dropped_private_hosts.is_empty() {
-        warnings.push(format!(
-            "project .ai-jail allow_private_hosts ignored: {}",
+        let text = format!(
+            "{layer} allow_private_hosts ignored: {}",
             dropped_private_hosts.join(", ")
+        );
+        warnings.push(Refusal::new(
+            "allow_private_hosts",
+            dropped_private_hosts,
+            text,
         ));
     }
     // Port forwarding is shrink-only from an untrusted project, like
@@ -1853,14 +2239,11 @@ pub fn merge_with_global_report(
         .filter(|port| !c.forward_ports.contains(port))
         .collect();
     if !dropped_forwards.is_empty() {
-        warnings.push(format!(
-            "project .ai-jail forward_ports ignored: {}",
-            dropped_forwards
-                .iter()
-                .map(u16::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        let granted: Vec<String> =
+            dropped_forwards.iter().map(u16::to_string).collect();
+        let text =
+            format!("{layer} forward_ports ignored: {}", granted.join(", "));
+        warnings.push(Refusal::new("forward_ports", granted, text));
     }
     // Publishing is shrink-only too: a project cannot expose a jailed
     // service on the host's loopback.
@@ -1870,17 +2253,20 @@ pub fn merge_with_global_report(
         .filter(|port| !c.publish_ports.contains(port))
         .collect();
     if !dropped_publishes.is_empty() {
-        warnings.push(format!(
-            "project .ai-jail publish_ports ignored: {}",
-            dropped_publishes
-                .iter()
-                .map(u16::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        let granted: Vec<String> =
+            dropped_publishes.iter().map(u16::to_string).collect();
+        let text =
+            format!("{layer} publish_ports ignored: {}", granted.join(", "));
+        warnings.push(Refusal::new("publish_ports", granted, text));
     }
-    if local.claude_dir.is_some() {
-        warnings.push("project .ai-jail claude_dir ignored (set it in global config or --claude-dir)".into());
+    if let Some(dir) = local.claude_dir {
+        warnings.push(Refusal::new(
+            "claude_dir",
+            vec![dir.display().to_string()],
+            format!(
+                "{layer} claude_dir ignored (set it in global config or --claude-dir)"
+            ),
+        ));
     }
     (c, warnings)
 }
@@ -2943,7 +3329,7 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("macos_trustd"))
+                .any(|warning| warning.text.contains("macos_trustd"))
         );
 
         // A trusted layer may enable it, and the project may still
@@ -3028,7 +3414,11 @@ mod tests {
             Path::new("/project"),
         );
         assert!(!merged.allow_pty_enabled());
-        assert!(warnings.iter().any(|warning| warning.contains("allow_pty")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.text.contains("allow_pty"))
+        );
 
         // A trusted layer may enable it, and the project may still tighten
         // it back off.
@@ -3071,7 +3461,7 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("allow_loopback_listen"))
+                .any(|warning| warning.text.contains("allow_loopback_listen"))
         );
 
         let global = Config {
@@ -3110,11 +3500,9 @@ mod tests {
             Path::new("/project"),
         );
         assert!(!merged.allow_loopback_connect_enabled());
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| { warning.contains("allow_loopback_connect") })
-        );
+        assert!(warnings.iter().any(|warning| {
+            warning.text.contains("allow_loopback_connect")
+        }));
 
         let enabled = Config {
             allow_loopback_connect: Some(true),
@@ -3158,7 +3546,7 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("macos_chromium"))
+                .any(|warning| warning.text.contains("macos_chromium"))
         );
 
         let enabled = Config {
@@ -3185,7 +3573,7 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("macos_host_ipc"))
+                .any(|warning| warning.text.contains("macos_host_ipc"))
         );
 
         let enabled = Config {
@@ -3210,7 +3598,11 @@ mod tests {
         let (merged, warnings) =
             merge_with_global_report(baseline, project, Path::new("/project"));
         assert!(!merged.audio_enabled());
-        assert!(warnings.iter().any(|warning| warning.contains("audio")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.text.contains("audio"))
+        );
 
         let enabled = Config {
             audio: Some(true),
@@ -3230,7 +3622,11 @@ mod tests {
         let (merged, warnings) =
             merge_with_global_report(baseline, project, Path::new("/project"));
         assert!(!merged.github_enabled());
-        assert!(warnings.iter().any(|warning| warning.contains("github")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.text.contains("github"))
+        );
 
         let enabled = Config {
             github: Some(true),
@@ -3254,7 +3650,7 @@ mod tests {
         let (merged, warnings) =
             merge_with_global_report(baseline, project, Path::new("/project"));
         assert!(!merged.aws_enabled());
-        assert!(warnings.iter().any(|warning| warning.contains("aws")));
+        assert!(warnings.iter().any(|warning| warning.text.contains("aws")));
 
         let enabled = Config {
             aws: Some(true),
@@ -3274,7 +3670,7 @@ mod tests {
         let (merged, warnings) =
             merge_with_global_report(baseline, project, Path::new("/project"));
         assert!(!merged.kube_enabled());
-        assert!(warnings.iter().any(|warning| warning.contains("kube")));
+        assert!(warnings.iter().any(|warning| warning.text.contains("kube")));
 
         let enabled = Config {
             kube: Some(true),
@@ -3294,7 +3690,11 @@ mod tests {
         let (merged, warnings) =
             merge_with_global_report(baseline, project, Path::new("/project"));
         assert!(!merged.gcloud_enabled());
-        assert!(warnings.iter().any(|warning| warning.contains("gcloud")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.text.contains("gcloud"))
+        );
 
         let enabled = Config {
             gcloud: Some(true),
@@ -3321,7 +3721,7 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("docker_config"))
+                .any(|warning| warning.text.contains("docker_config"))
         );
 
         let enabled = Config {
@@ -3349,7 +3749,7 @@ mod tests {
             Path::new("/project"),
         );
         assert!(!merged.kvm_enabled());
-        assert!(warnings.iter().any(|warning| warning.contains("kvm")));
+        assert!(warnings.iter().any(|warning| warning.text.contains("kvm")));
 
         let enabled = Config {
             kvm: Some(true),
@@ -3384,7 +3784,7 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("prompt_hosts"))
+                .any(|warning| warning.text.contains("prompt_hosts"))
         );
 
         let enabled = Config {
@@ -3553,7 +3953,7 @@ lockdown = false
         assert!(!merged.update_check_enabled());
         for field in ["inherit_env", "update_check"] {
             assert!(
-                warnings.iter().any(|warning| warning.contains(field)),
+                warnings.iter().any(|warning| warning.text.contains(field)),
                 "missing warning for {field}"
             );
         }
@@ -3597,7 +3997,7 @@ lockdown = false
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("env_pass ignored"))
+                .any(|warning| warning.text.contains("env_pass ignored"))
         );
     }
 
@@ -3616,7 +4016,8 @@ env_pass = ["ANTHROPIC_API_KEY"]
             ..CliArgs::default()
         };
         let selected =
-            global_config_for_command(global, &cli, &Config::default());
+            global_config_for_command(global, &cli, &Config::default())
+                .unwrap();
         assert!(selected.agent_state_enabled());
         assert_eq!(selected.env_pass, vec!["ANTHROPIC_API_KEY".to_string()]);
     }
@@ -3778,7 +4179,8 @@ env_pass = ["MODE=first"]
             ..CliArgs::default()
         };
         let selected =
-            global_config_for_command(global, &cli, &Config::default());
+            global_config_for_command(global, &cli, &Config::default())
+                .unwrap();
         assert_eq!(
             filtered_child_env(&selected.env_pass, &[]),
             vec![("MODE".into(), "first".into())]
@@ -3959,12 +4361,12 @@ rw_maps = ["/home/user/.ssh"]
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("claude_dir ignored"))
+                .any(|warning| warning.text.contains("claude_dir ignored"))
         );
         assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("outside project ignored"))
+            warnings.iter().any(|warning| warning
+                .text
+                .contains("outside project ignored"))
         );
     }
 
@@ -4003,7 +4405,7 @@ rw_maps = ["/home/user/.ssh"]
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("allow_tcp_ports"))
+                .any(|warning| warning.text.contains("allow_tcp_ports"))
         );
     }
 
@@ -4031,17 +4433,17 @@ rw_maps = ["/home/user/.ssh"]
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("outside project"))
+                .any(|warning| warning.text.contains("outside project"))
         );
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("read-only map"))
+                .any(|warning| warning.text.contains("read-only map"))
         );
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("mask exception"))
+                .any(|warning| warning.text.contains("mask exception"))
         );
     }
 
@@ -5385,7 +5787,8 @@ tailscale = false
         };
 
         let selected =
-            global_config_for_command(global, &cli, &Config::default());
+            global_config_for_command(global, &cli, &Config::default())
+                .unwrap();
 
         assert_eq!(
             selected.rw_maps,
@@ -5416,7 +5819,8 @@ ssh = true
             ..Config::default()
         };
         let selected =
-            global_config_for_command(global, &CliArgs::default(), &project);
+            global_config_for_command(global, &CliArgs::default(), &project)
+                .unwrap();
         assert!(!selected.ssh_enabled());
     }
 
@@ -5451,7 +5855,8 @@ tailscale = false
         };
 
         let selected =
-            global_config_for_command(global, &cli, &Config::default());
+            global_config_for_command(global, &cli, &Config::default())
+                .unwrap();
 
         assert_eq!(
             selected.rw_maps,
@@ -5485,7 +5890,8 @@ tailscale = true
             ..CliArgs::default()
         };
         let selected =
-            global_config_for_command_report(global, &cli, &Config::default());
+            global_config_for_command_report(global, &cli, &Config::default())
+                .unwrap();
         assert_eq!(selected.ignored_command_tables, ["ai-memory", "codex"]);
         assert_eq!(selected.config.command, vec!["ignored-harness", "secret"]);
     }
@@ -5507,7 +5913,8 @@ no_gpu = true
             ..CliArgs::default()
         };
         let selected =
-            global_config_for_command_report(global, &cli, &Config::default());
+            global_config_for_command_report(global, &cli, &Config::default())
+                .unwrap();
         assert!(selected.ignored_command_tables.is_empty());
 
         let global = parse_global_toml(
@@ -5518,7 +5925,8 @@ no_gpu = true
             global,
             &CliArgs::default(),
             &Config::default(),
-        );
+        )
+        .unwrap();
         assert!(selected.ignored_command_tables.is_empty());
     }
 
@@ -5575,7 +5983,8 @@ no_gpu = true
             ..CliArgs::default()
         };
         let selected =
-            global_config_for_command_report(global, &cli, &Config::default());
+            global_config_for_command_report(global, &cli, &Config::default())
+                .unwrap();
         assert_eq!(selected.ignored_command_tables.len(), 1);
         assert!(!selected.ignored_command_tables[0].contains('\u{1b}'));
         assert!(!selected.ignored_command_tables[0].contains('\u{7}'));
@@ -5600,7 +6009,8 @@ tailscale = true
         };
 
         let selected =
-            global_config_for_command(global, &cli, &Config::default());
+            global_config_for_command(global, &cli, &Config::default())
+                .unwrap();
 
         assert_eq!(selected.no_docker, Some(true));
         assert_eq!(selected.tailscale, None);
@@ -5629,7 +6039,8 @@ tailscale = true
         };
 
         let selected =
-            global_config_for_command(global, &CliArgs::default(), &project);
+            global_config_for_command(global, &CliArgs::default(), &project)
+                .unwrap();
 
         assert_eq!(selected.no_docker, None);
         assert_eq!(selected.tailscale, None);
@@ -5653,7 +6064,8 @@ tailscale = true
         };
 
         let selected =
-            global_config_for_command(global, &CliArgs::default(), &project);
+            global_config_for_command(global, &CliArgs::default(), &project)
+                .unwrap();
 
         assert_eq!(selected.rw_maps, vec![PathBuf::from("~/common")]);
         assert_eq!(selected.tailscale, None);
@@ -5677,7 +6089,8 @@ tailscale = true
             global,
             &CliArgs::default(),
             &Config::default(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(selected.command, vec!["pi"]);
         assert_eq!(
@@ -5712,7 +6125,8 @@ rw_maps = ["~/.pi"]
             ..Config::default()
         };
 
-        let selected = global_config_for_command(global, &cli, &project);
+        let selected =
+            global_config_for_command(global, &cli, &project).unwrap();
         let merged = merge_with_global(selected, project);
 
         assert_eq!(merged.no_gpu, Some(true));
@@ -5991,8 +6405,8 @@ allow_tcp_ports = []
         );
         assert!(merged.allow_private_hosts.is_empty());
         assert!(warnings.iter().any(|warning| {
-            warning.contains("allow_private_hosts")
-                && warning.contains("git.internal.example")
+            warning.text.contains("allow_private_hosts")
+                && warning.text.contains("git.internal.example")
         }));
     }
 
@@ -6030,7 +6444,7 @@ allow_tcp_ports = []
             merged.allow_hosts,
             vec!["api.anthropic.com".to_string(), "github.com".to_string()]
         );
-        assert!(!warnings.iter().any(|w| w.contains("allow_hosts")));
+        assert!(!warnings.iter().any(|w| w.text.contains("allow_hosts")));
     }
 
     #[test]
@@ -6047,9 +6461,8 @@ allow_tcp_ports = []
             merge_with_global_report(baseline, project, Path::new("/project"));
         assert_eq!(merged.allow_hosts, vec!["api.anthropic.com".to_string()]);
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("allow_hosts") && w.contains("evil.com"))
+            warnings.iter().any(|w| w.text.contains("allow_hosts")
+                && w.text.contains("evil.com"))
         );
     }
 
@@ -6154,6 +6567,28 @@ ro_maps = []
     }
 
     #[test]
+    fn regression_v3_3_0_global_without_profiles() {
+        // Global files written before [profiles] existed must parse to
+        // the same base and command tables, and must not gain a
+        // `profiles` key when written back.
+        let toml = r#"
+allow_hosts = ["api.anthropic.com"]
+
+[commands.claude]
+ssh = true
+mask = ["/usr/bin/ssh"]
+"#;
+        let global = parse_global_toml(toml).unwrap();
+        assert_eq!(global.base.allow_hosts, ["api.anthropic.com"]);
+        let claude = global.commands.get("claude").expect("command table");
+        assert_eq!(claude.ssh, Some(true));
+        assert_eq!(claude.mask, [PathBuf::from("/usr/bin/ssh")]);
+        let written = toml::to_string(&global).unwrap();
+        assert!(!written.contains("profiles"), "{written}");
+        assert_eq!(parse_global_toml(&written).unwrap(), global);
+    }
+
+    #[test]
     fn project_publish_ports_cannot_extend_baseline() {
         let baseline = Config {
             publish_ports: vec![4096],
@@ -6166,11 +6601,9 @@ ro_maps = []
         let (merged, warnings) =
             merge_with_global_report(baseline, project, Path::new("/project"));
         assert_eq!(merged.publish_ports, vec![4096]);
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("publish_ports") && w.contains("3000"))
-        );
+        assert!(warnings.iter().any(
+            |w| w.text.contains("publish_ports") && w.text.contains("3000")
+        ));
     }
 
     #[test]
@@ -6185,7 +6618,7 @@ ro_maps = []
             Path::new("/project"),
         );
         assert!(merged.publish_ports.is_empty());
-        assert!(warnings.iter().any(|w| w.contains("publish_ports")));
+        assert!(warnings.iter().any(|w| w.text.contains("publish_ports")));
     }
 
     #[test]
@@ -6251,6 +6684,7 @@ publish_ports = [4096]
                 &cli,
                 &Config::default(),
             )
+            .unwrap()
             .publish_ports
         };
         assert_eq!(for_command("openchamber"), vec![3000, 4096]);
@@ -6270,11 +6704,9 @@ publish_ports = [4096]
         let (merged, warnings) =
             merge_with_global_report(baseline, project, Path::new("/project"));
         assert_eq!(merged.forward_ports, vec![49374]);
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("forward_ports") && w.contains("5432"))
-        );
+        assert!(warnings.iter().any(
+            |w| w.text.contains("forward_ports") && w.text.contains("5432")
+        ));
     }
 
     #[test]
@@ -6314,7 +6746,7 @@ publish_ports = [4096]
             Path::new("/project"),
         );
         assert!(merged.forward_ports.is_empty());
-        assert!(warnings.iter().any(|w| w.contains("forward_ports")));
+        assert!(warnings.iter().any(|w| w.text.contains("forward_ports")));
     }
 
     #[test]
@@ -6368,7 +6800,7 @@ update_check = false
             Path::new("/project"),
         );
         assert!(!merged.audit_log_enabled());
-        assert!(warnings.iter().any(|w| w.contains("audit_log")));
+        assert!(warnings.iter().any(|w| w.text.contains("audit_log")));
 
         let (merged, warnings) = merge_with_global_report(
             Config {
@@ -6382,7 +6814,7 @@ update_check = false
             Path::new("/project"),
         );
         assert!(!merged.audit_log_enabled());
-        assert!(!warnings.iter().any(|w| w.contains("audit_log")));
+        assert!(!warnings.iter().any(|w| w.text.contains("audit_log")));
     }
 
     #[test]
@@ -6421,7 +6853,7 @@ env_from_file = ["/run/secrets/anthropic"]
             Path::new("/project"),
         );
         assert!(merged.env_from_file.is_empty());
-        assert!(warnings.iter().any(|w| w.contains("env_from_file")));
+        assert!(warnings.iter().any(|w| w.text.contains("env_from_file")));
     }
 
     #[test]
@@ -6897,7 +7329,7 @@ mask = ["/project/.env"]
         assert_eq!(merged.mask, vec![PathBuf::from("/project/.env")]);
         for field in ["pictures", "no_display", "claude_dir", "/etc/hostname"] {
             assert!(
-                warnings.iter().any(|w| w.contains(field)),
+                warnings.iter().any(|w| w.text.contains(field)),
                 "no warning for {field}: {warnings:?}"
             );
         }
@@ -6933,7 +7365,7 @@ ANTHROPIC_API_KEY = "api.anthropic.com"
             Path::new("/project"),
         );
         assert!(merged.secret_hosts.is_empty());
-        assert!(warnings.iter().any(|w| w.contains("secret_hosts")));
+        assert!(warnings.iter().any(|w| w.text.contains("secret_hosts")));
     }
 
     #[test]
@@ -7760,7 +8192,7 @@ network = true
         );
         assert!(!untrusted.network_enabled());
         assert!(
-            warnings.iter().any(|w| w.contains("network")),
+            warnings.iter().any(|w| w.text.contains("network")),
             "{warnings:?}"
         );
 
@@ -7786,7 +8218,9 @@ network = true
         assert!(merged.trust_project_config.is_empty());
         assert!(!merged.network_enabled());
         assert!(
-            warnings.iter().any(|w| w.contains("trust_project_config")),
+            warnings
+                .iter()
+                .any(|w| w.text.contains("trust_project_config")),
             "{warnings:?}"
         );
     }
@@ -8568,5 +9002,809 @@ claude_dir = "/home/user/.claude-example"
         };
         let serialized = toml::to_string_pretty(&config).unwrap();
         assert!(!serialized.contains("claude_dir"));
+    }
+}
+
+// Story 047, Task 3.1 — selecting and validating one profile
+// (R6.2, R6.3, R6.4, R7.2, R7.3, R7.4, R7.5).
+//
+// Materialization: append this whole file to the end of `src/config.rs`
+// on `feat/profiles` (or `include!("config_story047_profile_select.rs");`).
+// The module name starts with `profile` so `cargo test config::profile`
+// selects it.
+//
+// Contract (design.md §C8):
+// `fn select_profile(profiles: &BTreeMap<String, toml::Table>, name: &str)
+//     -> Result<Config, String>`, checking in order: name grammar
+// `^[a-z0-9][a-z0-9_-]{0,63}$`, existence (error lists the defined names),
+// `profile_version` present and integer 1, no `trust_project_config`,
+// no unknown key (serde aliases, `skip_serializing` fields and empty
+// arrays/tables are not unknown), then the parser's type errors prefixed
+// with the profile name. Fixtures use only keys upstream/master knows.
+#[cfg(test)]
+mod profile_story047_select_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    /// Build the profiles map from a TOML document of `[name]` tables.
+    fn profiles(doc: &str) -> BTreeMap<String, toml::Table> {
+        let root: toml::Table = doc.parse().expect("fixture TOML");
+        root.into_iter()
+            .map(|(k, v)| (k, v.as_table().expect("table").clone()))
+            .collect()
+    }
+
+    /// One profile named `name` (inserted verbatim, never re-parsed as
+    /// TOML, so hostile names stay intact) with `profile_version = 1` plus
+    /// the keys of `body`.
+    fn one(name: &str, body: &str) -> BTreeMap<String, toml::Table> {
+        let mut table: toml::Table = body.parse().expect("fixture TOML");
+        table.insert("profile_version".into(), toml::Value::Integer(1));
+        BTreeMap::from([(name.to_string(), table)])
+    }
+
+    fn refused(map: &BTreeMap<String, toml::Table>, name: &str) -> String {
+        match select_profile(map, name) {
+            Ok(c) => panic!("profile {name:?} must be refused, got {c:?}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn profile_names_off_the_grammar_are_refused_naming_the_rule() {
+        // Hostile half first: near misses of a valid name. Each is put in
+        // the map, so only the grammar can refuse it.
+        let long = "a".repeat(65);
+        for bad in [
+            "Agent",
+            "-agent",
+            "_agent",
+            "agent.test",
+            "agent test",
+            "../x",
+            "agent/x",
+            "agent-test\n",
+            long.as_str(),
+        ] {
+            let map = one(bad, "no_gpu = true\n");
+            let err = refused(&map, bad);
+            assert!(
+                err.contains("a-z0-9"),
+                "{bad:?}: must name the rule: {err}"
+            );
+        }
+        assert!(refused(&BTreeMap::new(), "").contains("a-z0-9"));
+    }
+
+    #[test]
+    fn profile_names_on_the_grammar_are_accepted() {
+        let max = "a".repeat(64);
+        for good in [
+            "a",
+            "0",
+            "agent-test",
+            "agent_test",
+            "a1-b2_c3",
+            max.as_str(),
+        ] {
+            let map = one(good, "no_gpu = true\n");
+            assert!(select_profile(&map, good).is_ok(), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn profile_names_are_not_normalised_into_each_other() {
+        // `agent-test` and `agent_test` are two profiles, never one.
+        let map = profiles(
+            "[agent-test]\nprofile_version = 1\nallow_hosts = [\"a.example\"]\n\
+             [agent_test]\nprofile_version = 1\nallow_hosts = [\"b.example\"]\n",
+        );
+        assert_eq!(
+            select_profile(&map, "agent-test").unwrap().allow_hosts,
+            ["a.example"]
+        );
+        assert_eq!(
+            select_profile(&map, "agent_test").unwrap().allow_hosts,
+            ["b.example"]
+        );
+        assert!(select_profile(&map, "agenttest").is_err());
+    }
+
+    #[test]
+    fn profile_missing_lists_the_defined_names() {
+        let map = profiles(
+            "[alpha]\nprofile_version = 1\n[beta]\nprofile_version = 1\n",
+        );
+        let err = refused(&map, "gamma");
+        for needle in ["gamma", "alpha", "beta"] {
+            assert!(err.contains(needle), "missing {needle}: {err}");
+        }
+    }
+
+    #[test]
+    fn profile_version_must_be_the_integer_one() {
+        for body in [
+            "no_gpu = true\n",
+            "profile_version = 2\n",
+            "profile_version = 0\n",
+            "profile_version = \"1\"\n",
+            "profile_version = 1.0\n",
+        ] {
+            let map = profiles(&format!("[agent-test]\n{body}"));
+            let err = refused(&map, "agent-test");
+            assert!(err.contains("agent-test"), "names the profile: {err}");
+            assert!(err.contains("profile_version"), "{body}: {err}");
+            assert!(err.contains('1'), "names the supported version: {err}");
+        }
+    }
+
+    #[test]
+    fn profile_version_is_not_reported_as_an_unknown_key() {
+        let map = one("agent-test", "allow_hosts = [\"a.example\"]\n");
+        let config = select_profile(&map, "agent-test").unwrap();
+        assert_eq!(config.allow_hosts, ["a.example"]);
+    }
+
+    #[test]
+    fn profile_carrying_trust_project_config_is_refused() {
+        let map = one("agent-test", "trust_project_config = [\"/srv/x\"]\n");
+        let err = refused(&map, "agent-test");
+        assert!(err.contains("trust_project_config"), "{err}");
+        assert!(
+            err.contains("global"),
+            "trust comes from the global base: {err}"
+        );
+    }
+
+    #[test]
+    fn profile_unknown_keys_are_refused_naming_profile_and_key() {
+        // Hostile half first: a typo in a restriction must not be dropped.
+        for (key, body) in [
+            ("allow_host", "allow_host = [\"a.example\"]\n"),
+            ("mask_exept", "mask_exept = [\"/x\"]\n"),
+            ("no_gpus", "no_gpus = true\n"),
+            ("profile", "profile = \"other\"\n"),
+        ] {
+            let map = one("agent-test", body);
+            let err = refused(&map, "agent-test");
+            assert!(err.contains("agent-test"), "{key}: {err}");
+            assert!(err.contains(key), "{key}: must name the key: {err}");
+        }
+    }
+
+    #[test]
+    fn profile_known_keys_with_empty_or_unserialised_values_are_accepted() {
+        // The other half: known keys that a serialize round trip drops
+        // must not look unknown.
+        let map = one(
+            "agent-test",
+            "mask = []\nallow_hosts = []\nno_gpu = false\n\
+             env_pass = [\"AJ047_NAME\"]\nenv_from_file = [\"/tmp/aj047.env\"]\n\
+             [secret_hosts]\nAJ047_TOKEN = \"api.example.com\"\n",
+        );
+        let config = select_profile(&map, "agent-test").unwrap();
+        assert_eq!(config.env_pass, ["AJ047_NAME"]);
+        assert_eq!(config.no_gpu, Some(false));
+        assert_eq!(
+            config.secret_hosts.get("AJ047_TOKEN").map(String::as_str),
+            Some("api.example.com")
+        );
+    }
+
+    /// Guard over the exclusion list: every `skip_serializing` field and
+    /// every serde alias of `Config` must be accepted in a profile. The
+    /// source is scanned so a field added later cannot become a false
+    /// "unknown key". Each key is tried with values of several types; it
+    /// passes when one of them is accepted.
+    #[test]
+    fn profile_accepts_every_unserialised_field_and_alias_in_config_rs() {
+        let src = include_str!("config.rs");
+        let skip_attr = concat!("skip_serial", "izing)]");
+        let alias_attr = concat!("alias", " = \"");
+        let mut keys: Vec<String> = Vec::new();
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("#[serde(") && line.contains(skip_attr) {
+                let field = lines[i + 1..]
+                    .iter()
+                    .map(|l| l.trim())
+                    .find(|l| l.starts_with("pub "))
+                    .and_then(|l| l.strip_prefix("pub "))
+                    .and_then(|l| l.split(':').next())
+                    .expect("field after skip_serializing");
+                keys.push(field.trim().to_string());
+            }
+            let mut rest = *line;
+            while let Some(at) = rest.find(alias_attr) {
+                let tail = &rest[at + alias_attr.len()..];
+                let end = tail.find('"').expect("closing quote");
+                keys.push(tail[..end].to_string());
+                rest = &tail[end..];
+            }
+        }
+        assert!(
+            ["env_pass", "env_from_file", "secret_hosts"]
+                .iter()
+                .all(|k| keys.iter().any(|x| x == k)),
+            "scanner missed a known skip_serializing field: {keys:?}"
+        );
+        let candidates = [
+            "true",
+            "1",
+            "\"x\"",
+            "[\"x\"]",
+            "[\"/tmp/x\"]",
+            "{ x = \"y\" }",
+        ];
+        for key in &keys {
+            let accepted = candidates.iter().any(|value| {
+                let map = one("guard", &format!("{key} = {value}\n"));
+                select_profile(&map, "guard").is_ok()
+            });
+            assert!(accepted, "{key} is reported unknown for every value type");
+        }
+    }
+
+    #[test]
+    fn profile_type_errors_carry_the_profile_name() {
+        let map = one("agent-test", "allow_hosts = \"not-a-list\"\n");
+        let err = refused(&map, "agent-test");
+        assert!(err.contains("agent-test"), "{err}");
+        assert!(
+            err.contains("allow_hosts") || err.contains("sequence"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn profile_reads_the_same_keys_as_a_command_table() {
+        let map = one(
+            "agent-test",
+            "allow_hosts = [\"registry.npmjs.org\"]\nmask = [\"/usr/bin/ssh\"]\n\
+             ssh = true\n",
+        );
+        let config = select_profile(&map, "agent-test").unwrap();
+        assert_eq!(config.allow_hosts, ["registry.npmjs.org"]);
+        assert_eq!(config.mask, [PathBuf::from("/usr/bin/ssh")]);
+        assert_eq!(config.ssh, Some(true));
+    }
+}
+
+// Story 047, Task 3.2 — merge order and widenings (R6.1, R7.1, R8.3).
+//
+// Materialization: append this whole file to the end of `src/config.rs`
+// on `feat/profiles` (or `include!("config_story047_profile_merge.rs");`).
+// Module name starts with `profile` so `cargo test config::profile` runs it.
+//
+// Contract (design.md §C8 as revised 2026-10-10, renamed and re-anchored
+// to upstream v3.3.0 fe4dfe0 on 2026-11-08):
+// - `merge_with_global_report(baseline, local, project_dir)
+//     -> (Config, Vec<Refusal>)`, with
+//   `Refusal { field: String, granted: Vec<String>, secret: bool,
+//   text: String }`; `text` is today's exact warning string;
+// - `load_global_for_command_from_path(path, cli, project)
+//     -> Result<(Config, Option<ProfileReport>), String>` (the path-taking
+//   twin of the global loader), with
+//   `ProfileReport { name: String, widenings: Vec<Widening> }` and
+//   `Widening { field: String, granted: Vec<String> }`;
+// - order: global base, `[commands.<name>]`, profile (then CLI, then
+//   project, in main). For secret fields `granted` holds key names only.
+// The fixture is the trusted global config as v3.3.0 stores it:
+// `<XDG_CONFIG_HOME>/ai-jail/config.toml`, directory 0700, file 0600
+// (`config_store::StorePaths.global`); `~/.ai-jail` is only the legacy
+// file the store migration consumes.
+// Fixtures use only keys upstream/master knows.
+#[cfg(test)]
+mod profile_story047_merge_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    fn cli(args: &[&str]) -> CliArgs {
+        crate::cli::parse_from(lexopt::Parser::from_args(
+            args.iter().map(std::ffi::OsString::from),
+        ))
+        .expect("test CLI parses")
+    }
+
+    /// Write a trusted global config where v3.3.0 keeps it — a fresh
+    /// `<tmp>/xdg/ai-jail/config.toml`, owner-only — and return
+    /// (temp root, config path).
+    fn global_file(body: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "aj047-profile-merge-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = root.join("xdg").join("ai-jail");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::set_permissions(
+            &store,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let path = store.join("config.toml");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        (root, path)
+    }
+
+    fn load(body: &str, args: &[&str]) -> (Config, Option<ProfileReport>) {
+        let (root, path) = global_file(body);
+        let got = load_global_for_command_from_path(
+            &path,
+            &cli(args),
+            &Config::default(),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        got.expect("global config with profile loads")
+    }
+
+    fn widening<'a>(
+        report: &'a ProfileReport,
+        field: &str,
+    ) -> Option<&'a Widening> {
+        report.widenings.iter().find(|w| w.field == field)
+    }
+
+    #[test]
+    fn profile_refusal_text_is_todays_exact_warning() {
+        let local = Config {
+            ssh: Some(true),
+            allow_hosts: vec!["b.example".into()],
+            ..Config::default()
+        };
+        let (_, refusals) = merge_with_global_report(
+            Config::default(),
+            local,
+            Path::new("/tmp"),
+        );
+        let texts: Vec<&str> =
+            refusals.iter().map(|r| r.text.as_str()).collect();
+        assert!(
+            texts.contains(
+                &"project .ai-jail ssh ignored because it weakens the baseline sandbox"
+            ),
+            "{texts:?}"
+        );
+        assert!(
+            texts.contains(&"project .ai-jail allow_hosts ignored: b.example"),
+            "{texts:?}"
+        );
+        let hosts = refusals.iter().find(|r| r.field == "allow_hosts").unwrap();
+        assert_eq!(hosts.granted, ["b.example"]);
+        assert!(!hosts.secret);
+    }
+
+    #[test]
+    fn profile_secret_refusals_carry_key_names_never_values() {
+        let local = Config {
+            env_pass: vec!["AJ047_SECRET=topsecret-value".into()],
+            ..Config::default()
+        };
+        let (_, refusals) = merge_with_global_report(
+            Config::default(),
+            local,
+            Path::new("/tmp"),
+        );
+        let env = refusals
+            .iter()
+            .find(|r| r.field == "env_pass")
+            .expect("env_pass");
+        assert!(env.secret);
+        assert_eq!(env.granted, ["AJ047_SECRET"]);
+        for r in &refusals {
+            assert!(
+                !r.text.contains("topsecret")
+                    && !r.granted.iter().any(|g| g.contains("topsecret")),
+                "secret value leaked: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_that_only_tightens_reports_no_widening() {
+        // Hostile half first: tightening must never be called a widening.
+        let (config, report) = load(
+            "[profiles.tight]\nprofile_version = 1\nno_gpu = true\nmask = [\"/usr/bin/ssh\"]\n",
+            &["--profile", "tight", "bash"],
+        );
+        let report = report.expect("a selected profile yields a report");
+        assert_eq!(report.name, "tight");
+        assert!(
+            report.widenings.is_empty(),
+            "{:?}",
+            report
+                .widenings
+                .iter()
+                .map(|w| &w.field)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(config.no_gpu, Some(true));
+    }
+
+    #[test]
+    fn profile_widenings_name_capability_hosts_and_outside_maps() {
+        let (config, report) = load(
+            "allow_hosts = [\"a.example\"]\n\
+             [profiles.wide]\nprofile_version = 1\nssh = true\n\
+             allow_hosts = [\"a.example\", \"b.example\"]\n\
+             rw_maps = [\"/opt/aj047-outside\"]\n",
+            &["--profile", "wide", "bash"],
+        );
+        let report = report.unwrap();
+        assert!(widening(&report, "ssh").is_some(), "capability widening");
+        // Only what the base did not already grant is a widening.
+        let hosts = widening(&report, "allow_hosts").expect("host widening");
+        assert_eq!(hosts.granted, ["b.example"]);
+        let maps = widening(&report, "rw_maps").expect("outside-map widening");
+        assert!(
+            maps.granted
+                .iter()
+                .any(|g| g.contains("/opt/aj047-outside")),
+            "{:?}",
+            maps.granted
+        );
+        // And the profile was applied as a trusted layer.
+        assert_eq!(config.ssh, Some(true));
+        assert!(config.allow_hosts.iter().any(|h| h == "b.example"));
+    }
+
+    #[test]
+    fn profile_secret_widening_lists_keys_only() {
+        let (_, report) = load(
+            "[profiles.sec]\nprofile_version = 1\n\
+             env_pass = [\"AJ047_SECRET=topsecret-value\"]\n",
+            &["--profile", "sec", "bash"],
+        );
+        let report = report.unwrap();
+        let env = widening(&report, "env_pass").expect("env_pass widening");
+        assert_eq!(env.granted, ["AJ047_SECRET"]);
+    }
+
+    #[test]
+    fn profile_applies_after_the_command_table_and_before_the_cli() {
+        let body = "[commands.bash]\nssh = true\nno_gpu = true\n\
+                    [profiles.nossh]\nprofile_version = 1\nssh = false\n";
+        let (config, _) = load(body, &["--profile", "nossh", "bash"]);
+        assert_eq!(
+            config.ssh,
+            Some(false),
+            "profile overrides the command table"
+        );
+        assert_eq!(
+            config.no_gpu,
+            Some(true),
+            "untouched command-table keys stay"
+        );
+        let with_cli =
+            merge(&cli(&["--profile", "nossh", "--ssh", "bash"]), config);
+        assert_eq!(with_cli.ssh, Some(true), "the CLI overrides the profile");
+    }
+
+    #[test]
+    fn profile_absent_means_no_report_even_with_a_malformed_table() {
+        let (config, report) = load(
+            "no_gpu = true\n[profiles.bad]\nprofile_version = \"x\"\nallow_hosts = 3\n",
+            &["bash"],
+        );
+        assert!(report.is_none());
+        assert_eq!(config.no_gpu, Some(true));
+    }
+}
+
+#[cfg(test)]
+mod profile_story047_field_coverage_tests {
+    use std::path::Path;
+
+    use super::*;
+
+    /// `Config` fields that cannot widen the jail, so no refusal rule is
+    /// owed: restrictions a layer may only add, what runs, and UI or
+    /// persistence preferences. `runtime_harnesses` is `serde(skip)` and
+    /// cannot come from a file at all.
+    const NEVER_WIDENS: &[&str] = &[
+        "runtime_harnesses",
+        "command",
+        "hide_dotdirs",
+        "mask",
+        "deny_paths",
+        "no_status_bar",
+        "status_bar_style",
+        "resize_redraw_key",
+        "no_save_config",
+    ];
+
+    fn config_fields() -> Vec<String> {
+        let src = include_str!("config.rs");
+        let body = src
+            .split_once("pub struct Config {")
+            .expect("struct Config")
+            .1;
+        let body = &body[..body.find("\n}").expect("end of struct Config")];
+        body.lines()
+            .filter_map(|l| l.trim().strip_prefix("pub "))
+            .filter_map(|l| l.split_once(':').map(|(name, _)| name))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A field is covered when some value of it, asked for by a layer over
+    /// a default baseline, comes back as a refusal naming that field. A
+    /// new field with no rule fails here, so a profile can never widen
+    /// through a field the report does not see.
+    #[test]
+    fn profile_every_config_field_is_refused_or_never_widens() {
+        let candidates = [
+            "true",
+            "false",
+            "\"x\"",
+            "\"/opt/aj047-outside\"",
+            "[\"/opt/aj047-outside\"]",
+            "[\"x.example\"]",
+            "[4242]",
+            "{ AJ047 = \"x.example\" }",
+        ];
+        let fields = config_fields();
+        assert!(fields.len() > 40, "scanner found {fields:?}");
+        let mut uncovered = Vec::new();
+        for field in &fields {
+            if NEVER_WIDENS.contains(&field.as_str()) {
+                continue;
+            }
+            // Default-on switches widen only over a baseline that turned
+            // them off, so every parsable value is also tried as baseline.
+            let values: Vec<Config> = candidates
+                .iter()
+                .filter_map(|v| parse_toml(&format!("{field} = {v}\n")).ok())
+                .collect();
+            let baselines =
+                std::iter::once(Config::default()).chain(values.clone());
+            let refused = baselines.into_iter().any(|baseline| {
+                values.iter().any(|local| {
+                    let (_, refusals) = merge_layer_report(
+                        baseline.clone(),
+                        local.clone(),
+                        Path::new("/project"),
+                        "profile 'coverage'",
+                    );
+                    refusals.iter().any(|r| r.field == *field)
+                })
+            });
+            if !refused {
+                uncovered.push(field.clone());
+            }
+        }
+        assert!(
+            uncovered.is_empty(),
+            "no refusal rule and not in NEVER_WIDENS: {uncovered:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod profile_story047_review_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn one(body: &str) -> BTreeMap<String, toml::Table> {
+        let mut table: toml::Table = body.parse().unwrap();
+        table.insert("profile_version".into(), toml::Value::Integer(1));
+        BTreeMap::from([("p".to_string(), table)])
+    }
+
+    #[test]
+    fn profile_refuses_command_and_ui_preferences() {
+        for (key, body) in [
+            ("command", "command = [\"codex\"]\n"),
+            ("no_status_bar", "no_status_bar = true\n"),
+            ("status_bar_style", "status_bar_style = \"light\"\n"),
+            ("resize_redraw_key", "resize_redraw_key = \"ctrl-l\"\n"),
+        ] {
+            let err = select_profile(&one(body), "p").unwrap_err();
+            assert!(err.contains(key) && err.contains("'p'"), "{err}");
+        }
+    }
+
+    #[test]
+    fn profile_widening_line_cannot_be_forged_by_a_value() {
+        let report = ProfileReport {
+            name: "p".into(),
+            widenings: vec![Widening {
+                field: "rw_maps".into(),
+                granted: vec![
+                    "/x\" widens=network granted=\"y".into(),
+                    "a,b".into(),
+                ],
+            }],
+        };
+        let line = &report.lines()[0];
+        assert_eq!(
+            line,
+            r#"profile=p widens=rw_maps granted="/x\" widens=network granted=\"y,a\,b""#
+        );
+        assert_eq!(
+            line.matches("widens=").count()
+                - line.matches("\\\" widens=").count(),
+            1
+        );
+    }
+}
+
+// Story 047, Task 3.3 — a global rewrite keeps every profile (R6.7, R6.8,
+// Q16).
+//
+// Materialization: append this whole file to the end of `src/config.rs`
+// on `feat/profiles` (or `include!("config_story047_profile_save.rs");`).
+// Module name starts with `profile` so `cargo test config::profile` runs it.
+//
+// Contract: every path that rewrites the trusted global config round-trips
+// `[profiles.*]` tables with every key and value. On upstream v3.3.0
+// (fe4dfe0) those paths are `config_store::save_global_preferences` (the
+// status-bar preference save) and `config_store::migrate` (the legacy
+// `~/.ai-jail` moved to `$XDG_CONFIG_HOME/ai-jail/config.toml`).
+// Values are compared, not bytes: comments and table order may be lost by
+// a rewrite.
+#[cfg(test)]
+mod profile_story047_save_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::config_store::{self, StorePaths};
+
+    use super::*;
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    /// A private temp root with `home/`, `project/` and an owner-only
+    /// store at `xdg/ai-jail`, and the `StorePaths` that `discover` would
+    /// build for it (built by hand: no process environment is touched).
+    struct Fixture {
+        root: PathBuf,
+        paths: StorePaths,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "aj047-profile-save-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let home = root.join("home");
+            let project = root.join("project");
+            let store = root.join("xdg").join("ai-jail");
+            for dir in [&home, &project, &store] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            std::fs::set_permissions(
+                &store,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            let canonical_project = std::fs::canonicalize(&project).unwrap();
+            let paths = StorePaths {
+                available: true,
+                root: store.clone(),
+                global: store.join("config.toml"),
+                global_provenance: store.join("global-migration.toml"),
+                project: store.join("projects").join("aj047-profile-save.toml"),
+                legacy_global: home.join(".ai-jail"),
+                legacy_project: canonical_project.join(".ai-jail"),
+                policy_root: canonical_project.clone(),
+                canonical_project,
+                project_strategy: ProjectStrategy::Basename,
+            };
+            Self { root, paths }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn write_owner_only(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
+
+    fn table(path: &Path) -> toml::Table {
+        std::fs::read_to_string(path).unwrap().parse().unwrap()
+    }
+
+    const GLOBAL: &str = "\
+allow_hosts = [\"platform.claude.com\"]
+
+[commands.claude]
+agent_state = true
+
+[profiles.agent-test]
+profile_version = 1
+allow_hosts = [\"registry.npmjs.org\", \"api.example.com\"]
+mask = [\"/usr/bin/ssh\", \"/usr/bin/scp\"]
+no_gpu = true
+some_future_key = { nested = [1, 2, 3], flag = true }
+
+[profiles.empty_one]
+profile_version = 1
+
+[profiles.malformed]
+profile_version = \"not-an-int\"
+allow_hosts = 3
+";
+
+    #[test]
+    fn profile_tables_survive_a_status_bar_rewrite_key_for_key() {
+        let fx = Fixture::new();
+        write_owner_only(&fx.paths.global, GLOBAL);
+        let before = table(&fx.paths.global);
+        config_store::save_global_preferences(&fx.paths, None, Some("dark"))
+            .expect("rewrite succeeds");
+        let after = table(&fx.paths.global);
+
+        // The rewrite did happen.
+        assert_eq!(
+            after.get("status_bar_style").and_then(|v| v.as_str()),
+            Some("dark")
+        );
+        // Every profile, malformed or not, keeps every key and value.
+        assert_eq!(after.get("profiles"), before.get("profiles"), "{after:#?}");
+        // The rest of the file is untouched in value.
+        assert_eq!(after.get("commands"), before.get("commands"));
+        assert_eq!(after.get("allow_hosts"), before.get("allow_hosts"));
+    }
+
+    #[test]
+    fn profile_tables_survive_the_legacy_global_migration_key_for_key() {
+        let fx = Fixture::new();
+        write_owner_only(&fx.paths.legacy_global, GLOBAL);
+        let before = table(&fx.paths.legacy_global);
+        let mut notices = Vec::new();
+        config_store::migrate(&fx.paths, false, &mut notices)
+            .expect("migration succeeds");
+        let after = table(&fx.paths.global);
+
+        // The migration did happen.
+        assert!(!fx.paths.legacy_global.exists(), "legacy file still there");
+        // Every profile, malformed or not, keeps every key and value.
+        assert_eq!(after.get("profiles"), before.get("profiles"), "{after:#?}");
+        assert_eq!(after.get("commands"), before.get("commands"));
+        assert_eq!(after.get("allow_hosts"), before.get("allow_hosts"));
+    }
+}
+
+#[cfg(test)]
+mod profile_story047_project_tests {
+    use super::*;
+
+    #[test]
+    fn profile_keys_in_a_project_document_are_detected() {
+        assert!(project_selects_profile("profile = \"wide\"\n", &[]));
+        assert!(project_selects_profile(
+            "[profiles.evil]\nnetwork = true\n",
+            &[]
+        ));
+        let store = "[grants]\nprofile = \"wide\"\n";
+        assert!(!project_selects_profile(store, &[]));
+        assert!(project_selects_profile(store, &["grants", "constraints"]));
+        assert!(!project_selects_profile("no_gpu = true\n", &["grants"]));
+        assert!(!project_selects_profile("not toml [", &[]));
+    }
+
+    #[test]
+    fn a_project_profile_key_changes_nothing_in_the_policy() {
+        let with = parse_toml("no_gpu = true\nprofile = \"wide\"\n").unwrap();
+        assert_eq!(with, parse_toml("no_gpu = true\n").unwrap());
     }
 }

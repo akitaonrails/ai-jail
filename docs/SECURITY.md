@@ -189,6 +189,22 @@ policy document. Every checkout's automatic save merges restrictions into the
 shared document rather than replacing them, so a launch in one checkout cannot
 remove restrictions saved from another.
 
+Named profiles (`[profiles.NAME]` in the global `config.toml`) are trusted
+policy, but they are written by hand and selected per launch, so they are
+parsed as if untrusted. Only `--profile` selects one; a project policy cannot,
+and a profile can never set `trust_project_config`. The selected table must
+declare `profile_version = 1`; unknown keys, wrong types, `command` and
+status-bar preferences fail the launch instead of being dropped, because a
+misspelt restriction would otherwise run without it. A profile is applied as
+a trusted layer and may widen the jail, so every widening is printed on
+stderr before launch and under `--dry-run`, and recorded in the audit launch
+record as `profile.widenings`. The widening check reuses the project merge's
+monotonic rules; a field-coverage test fails when a new `Config` field has no
+rule and is not listed as never widening. Secret-bearing fields report key
+names only. A profile is never written to a project policy. Note that a
+profile with `private_home = false` exposes the whole host home, exactly as
+`--no-private-home` does; it is printed as a widening like any other.
+
 Private home is on by default. ai-jail exposes only state needed by the
 invoked agent. The first-run developer preset visibly selects agent credential
 state; disabling it or passing `--no-agent-state` keeps the harness logged out.
