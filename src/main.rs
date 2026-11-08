@@ -1733,6 +1733,7 @@ fn run(
                     project: &invocation_cwd,
                     policy_path: store.policy_root(),
                     profile_present: stored_project.present,
+                    named_profile: cli.profile.as_deref(),
                     onboarding_complete,
                     harnesses: &resolved_harnesses,
                     config: &config,
@@ -1756,6 +1757,10 @@ fn run(
             "Project constraints",
             if provenance.constraints { "yes" } else { "no" },
         );
+        // R8.5: name the --profile in force; nothing when none is.
+        if let Some(name) = cli.profile.as_deref() {
+            output::status_header("Named profile", &format!("profile={name}"));
+        }
         let legacy_status_path = invocation_cwd.join(".ai-jail");
         let contributing_path = match provenance.source {
             "external_store" => Some(store.project.as_path()),

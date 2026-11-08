@@ -416,8 +416,77 @@ pub(crate) struct GlobalConfig {
     /// Kept as raw values, not even required to be tables, so a stray or
     /// malformed entry that no launch selects cannot break a launch;
     /// `select_profile` validates the chosen one.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) profiles: BTreeMap<String, toml::Value>,
+    #[serde(default, skip_serializing_if = "ProfilesKey::is_empty")]
+    pub(crate) profiles: ProfilesKey,
+}
+
+/// The top-level `profiles` key as found. Upstream has no such key and
+/// ignores an unknown `profiles = 5`, so a value that is not a table is
+/// kept raw instead of failing the whole file, and refused only when
+/// `--profile` asks for an entry in it (R7.11, R7.12). Kept, not dropped,
+/// so a rewrite of the global config does not lose it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ProfilesKey {
+    Tables(BTreeMap<String, toml::Value>),
+    NotATable(toml::Value),
+}
+
+impl Default for ProfilesKey {
+    fn default() -> Self {
+        ProfilesKey::Tables(BTreeMap::new())
+    }
+}
+
+impl ProfilesKey {
+    pub(crate) fn is_empty(&self) -> bool {
+        matches!(self, ProfilesKey::Tables(map) if map.is_empty())
+    }
+
+    /// The entries `--profile` selects from, or the refusal when the key
+    /// cannot hold any.
+    pub(crate) fn tables(
+        &self,
+    ) -> Result<&BTreeMap<String, toml::Value>, String> {
+        match self {
+            ProfilesKey::Tables(map) => Ok(map),
+            ProfilesKey::NotATable(value) => Err(format!(
+                "--profile: `profiles` in the global config is a {}, not \
+                 a table: write each profile as [profiles.NAME]",
+                value.type_str()
+            )),
+        }
+    }
+
+    /// Stable text for comparing two configs; raw TOML so a `nan` in an
+    /// unselected profile still equals itself.
+    fn policy_text(&self) -> Option<String> {
+        match self {
+            ProfilesKey::Tables(map) => toml::to_string(map).ok(),
+            ProfilesKey::NotATable(value) => Some(value.to_string()),
+        }
+    }
+}
+
+impl Serialize for ProfilesKey {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ProfilesKey::Tables(map) => map.serialize(s),
+            ProfilesKey::NotATable(value) => value.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProfilesKey {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> Result<Self, D::Error> {
+        Ok(match toml::Value::deserialize(d)? {
+            toml::Value::Table(table) => {
+                ProfilesKey::Tables(table.into_iter().collect())
+            }
+            other => ProfilesKey::NotATable(other),
+        })
+    }
 }
 
 impl GlobalConfig {
@@ -427,9 +496,9 @@ impl GlobalConfig {
     /// the global config look like a loss (profiles stay inert unless
     /// selected).
     pub(crate) fn same_policy(&self, other: &GlobalConfig) -> bool {
-        let text = |g: &GlobalConfig| toml::to_string(&g.profiles).ok();
+        let text = |g: &GlobalConfig| g.profiles.policy_text();
         let strip = |g: &GlobalConfig| GlobalConfig {
-            profiles: BTreeMap::new(),
+            profiles: ProfilesKey::default(),
             ..g.clone()
         };
         strip(self) == strip(other)
@@ -1641,7 +1710,7 @@ pub(crate) fn global_config_for_command_report(
     // selects one, so a malformed profile no launch names stays inert.
     let profile = match cli.profile.as_deref() {
         Some(name) => {
-            let layer = select_profile(&profiles, name)?;
+            let layer = select_profile(profiles.tables()?, name)?;
             let project_dir = std::env::current_dir().map_err(|e| {
                 format!(
                     "profile '{name}': cannot read the launch directory: {e}"
@@ -10271,5 +10340,196 @@ mod profile_review_regression_tests {
         let c = parse_global_toml("no_gpu = false\n[profiles]\nstray = nan\n")
             .unwrap();
         assert!(!a.same_policy(&c), "a base difference is still seen");
+    }
+}
+
+// Sub-task 6.4 (appended to `src/config.rs` on `feat/profiles`): the
+// `[profiles]` container itself is lenient. Upstream fe4dfe0 has no
+// `profiles` field, so a top-level `profiles = 5` is an unknown key it
+// ignores; a launch that names no profile must keep ignoring it (R7.11,
+// R6.8, R6.9), and only `--profile` refuses it, saying `profiles` must be
+// a table (R7.12). And the effective-access review of a launch that
+// selects no profile carries no named-profile line at all (R5.6), so it
+// reads as it did before profiles existed. Fixtures are the trusted global
+// config `<root>/xdg/ai-jail/config.toml` (dir 0700, file 0600) under the
+// test temp dir, loaded through `load_global_for_command_from_path`, as a
+// launch loads it.
+#[cfg(test)]
+mod profile_gatefix2_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    fn cli(args: &[&str]) -> CliArgs {
+        crate::cli::parse_from(lexopt::Parser::from_args(
+            args.iter().map(std::ffi::OsString::from),
+        ))
+        .expect("test CLI parses")
+    }
+
+    fn scratch_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aj-profile-gatefix2-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn load(
+        body: &str,
+        args: &[&str],
+    ) -> Result<(Config, Option<ProfileReport>), String> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root();
+        let store = root.join("xdg").join("ai-jail");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::set_permissions(
+            &store,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let path = store.join("config.toml");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let got = load_global_for_command_from_path(
+            &path,
+            &cli(args),
+            &Config::default(),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        got
+    }
+
+    /// Top-level `profiles` values that are not a table. `[[profiles]]`
+    /// is an array of tables: table-shaped entries, still not a table.
+    const NOT_A_TABLE: [&str; 5] = [
+        "profiles = 5\n",
+        "profiles = \"agent-test\"\n",
+        "profiles = true\n",
+        "profiles = [\"agent-test\"]\n",
+        "[[profiles]]\nprofile_version = 1\npictures = true\n",
+    ];
+
+    // ── R7.11 — inert without --profile ──────────────────────────────
+
+    #[test]
+    fn gatefix2_non_table_profiles_key_is_inert_without_profile() {
+        // Hostile half first: an upstream config that happens to carry an
+        // unknown `profiles` key must launch exactly as upstream does,
+        // base policy intact, with no profile reported.
+        for stray in NOT_A_TABLE {
+            let body = format!(
+                "no_gpu = true\nallow_hosts = [\"a.example\"]\n{stray}"
+            );
+            let (config, report) =
+                load(&body, &["claude"]).unwrap_or_else(|e| {
+                    panic!("{stray:?} must not break a plain launch: {e}")
+                });
+            assert!(report.is_none(), "{stray:?}: a profile was reported");
+            assert_eq!(config.no_gpu, Some(true), "{stray:?}: base lost");
+            assert_eq!(config.allow_hosts, ["a.example"], "{stray:?}");
+            assert_ne!(
+                config.pictures,
+                Some(true),
+                "{stray:?}: an unselected entry leaked into the policy"
+            );
+        }
+    }
+
+    // ── R7.12 — refused with --profile, naming `profiles` and "table" ─
+
+    #[test]
+    fn gatefix2_non_table_profiles_key_is_refused_with_profile() {
+        for stray in NOT_A_TABLE {
+            let body = format!("no_gpu = true\n{stray}");
+            let err = load(&body, &["--profile", "x", "claude"])
+                .expect_err("a non-table `profiles` cannot hold profile x");
+            assert!(err.contains("profiles"), "{stray:?}: {err}");
+            assert!(
+                err.contains("table"),
+                "{stray:?}: must say `profiles` must be a table: {err}"
+            );
+            // The refusal is the selection's, not a parse failure of the
+            // whole file: the same file loads without --profile.
+            assert!(
+                !err.contains("parse error"),
+                "{stray:?}: refused at parse time, not at selection: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn gatefix2_table_profiles_still_select_through_the_lenient_container() {
+        // The converse: leniency must not swallow a real table, in either
+        // spelling, nor turn a missing name into the "must be a table"
+        // refusal.
+        for body in [
+            "[profiles.w]\nprofile_version = 1\npictures = true\n",
+            "profiles = { w = { profile_version = 1, pictures = true } }\n",
+        ] {
+            let (config, report) = load(body, &["--profile", "w", "claude"])
+                .unwrap_or_else(|e| panic!("{body:?} must select w: {e}"));
+            assert_eq!(report.expect("report").name, "w", "{body:?}");
+            assert_eq!(config.pictures, Some(true), "{body:?}");
+        }
+        let err = load(
+            "[profiles.w]\nprofile_version = 1\n",
+            &["--profile", "x", "claude"],
+        )
+        .expect_err("x is not defined");
+        assert!(err.contains("profile 'x'"), "{err}");
+        assert!(err.contains("defined"), "not an existence refusal: {err}");
+    }
+
+    // ── R5.6 — the review names no profile when none is selected ─────
+
+    fn review(named: Option<&str>) -> String {
+        let project = Path::new("/var/empty/aj-gatefix2-project");
+        crate::onboarding::render_effective_access_with_profile(
+            &Config::default(),
+            project,
+            "claude",
+            None,
+            &[],
+            named,
+        )
+        .expect("review renders")
+    }
+
+    #[test]
+    fn gatefix2_review_without_a_profile_has_no_named_profile_line() {
+        let plain = crate::onboarding::render_effective_access(
+            &Config::default(),
+            Path::new("/var/empty/aj-gatefix2-project"),
+            "claude",
+            None,
+            &[],
+        )
+        .expect("review renders");
+        assert!(
+            !plain.contains("Named profile"),
+            "a launch with no profile gained a profile line:\n{plain}"
+        );
+        assert_eq!(plain, review(None), "the two entry points disagree");
+    }
+
+    #[test]
+    fn gatefix2_review_with_a_profile_still_names_it() {
+        // The converse: dropping the "none" line must not drop the line
+        // that names a selected profile (R5.6, 5.4's interface test).
+        let named = review(Some("w"));
+        assert!(named.contains("profile=w"), "{named}");
+        // And a selected profile is the only difference: one extra line.
+        let plain = review(None);
+        let extra: Vec<&str> = named
+            .lines()
+            .filter(|l| !plain.lines().any(|p| p == *l))
+            .collect();
+        assert_eq!(extra.len(), 1, "{extra:?}");
+        assert!(extra[0].contains("profile=w"), "{extra:?}");
     }
 }

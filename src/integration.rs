@@ -80,6 +80,10 @@ pub(crate) struct StatusReport {
     version: &'static str,
     schema_version: u32,
     project: StatusProject,
+    /// The `--profile` in force (R8.5). Absent when none is selected;
+    /// `project.profile_present` is the onboarding profile, not this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    named_profile: Option<String>,
     harnesses: Vec<StatusHarness>,
     grants: StatusGrants,
     requests: StatusRequests,
@@ -90,6 +94,7 @@ pub(crate) struct StatusInput<'a> {
     pub(crate) project: &'a Path,
     pub(crate) policy_path: &'a Path,
     pub(crate) profile_present: bool,
+    pub(crate) named_profile: Option<&'a str>,
     pub(crate) onboarding_complete: bool,
     pub(crate) harnesses: &'a [String],
     pub(crate) config: &'a crate::config::Config,
@@ -188,6 +193,7 @@ impl StatusReport {
             project,
             policy_path,
             profile_present,
+            named_profile,
             onboarding_complete,
             harnesses,
             config,
@@ -253,6 +259,7 @@ impl StatusReport {
                 policy_path: policy_path.to_string_lossy().into_owned(),
                 profile_present,
             },
+            named_profile: named_profile.map(str::to_string),
             harnesses: harnesses
                 .iter()
                 .map(|name| StatusHarness {
@@ -619,6 +626,7 @@ mod tests {
             project: Path::new("/project"),
             policy_path: Path::new("/project"),
             profile_present: true,
+            named_profile: None,
             onboarding_complete: true,
             harnesses: &["claude".into()],
             config: &config,
