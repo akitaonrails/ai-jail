@@ -863,6 +863,16 @@ disable mise activation, so neither maps these paths. You can still add extra
 `ro_maps` from trusted global config if a tool lives elsewhere, or use
 `--no-private-home` when you deliberately want the whole host home.
 
+With mise command wrappers configured (`[wrappers.<name>]`; Omarchy 4.5
+declares `claude`, `codex` and `grok` that way), mise takes a lock at
+`<mise data dir>/command-wrappers/bin.lock` every time a shim or a wrapper
+runs, which the read-only data dir would refuse. On Linux ai-jail binds a
+jail-owned empty file over that one path
+(`~/.local/share/ai-jail/cache/mise/command-wrappers.lock`), so mise's shims
+and wrappers run while its data dir stays read-only and the host's lock is
+never touched. A wrapper needs mise's dirs, so with `--no-mise` ai-jail warns
+that a command that is a mise wrapper will likely fail to start.
+
 ## Herdr
 
 [Herdr](https://herdr.dev/) runs outside the sandbox, one `ai-jail` per pane,

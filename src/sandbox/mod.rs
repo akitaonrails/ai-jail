@@ -619,18 +619,7 @@ pub(crate) fn command_paths_under(
     config: &Config,
     root: &Path,
 ) -> Vec<PathBuf> {
-    let path_env = if config.lockdown_enabled() {
-        LOCKDOWN_PATH.to_string()
-    } else {
-        // PATH is allowlisted even without --inherit-env. Apply the same
-        // explicit overrides as the child before choosing its executable.
-        let host: Vec<_> = std::env::vars().collect();
-        crate::config::filtered_child_env(config.env_pass(), &host)
-            .into_iter()
-            .find(|(key, _)| key == "PATH")
-            .map(|(_, value)| value)
-            .unwrap_or_default()
-    };
+    let path_env = child_path_env(config);
     let mut paths = Vec::new();
     for executable in crate::command::executable_candidates(&config.command) {
         for path in command_paths_under_impl(executable, root, &path_env) {
@@ -642,11 +631,26 @@ pub(crate) fn command_paths_under(
     paths
 }
 
-fn command_paths_under_impl(
-    cmd: &str,
-    root: &Path,
-    path_env: &str,
-) -> Vec<PathBuf> {
+/// The `PATH` the sandboxed command is looked up on: the lockdown `PATH`
+/// under `--lockdown`, else the host's after the child's own overrides.
+pub(crate) fn child_path_env(config: &Config) -> String {
+    if config.lockdown_enabled() {
+        LOCKDOWN_PATH.to_string()
+    } else {
+        // PATH is allowlisted even without --inherit-env. Apply the same
+        // explicit overrides as the child before choosing its executable.
+        let host: Vec<_> = std::env::vars().collect();
+        crate::config::filtered_child_env(config.env_pass(), &host)
+            .into_iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value)
+            .unwrap_or_default()
+    }
+}
+
+/// `cmd` as exec would find it: as given when it holds a `/`, else the first
+/// executable file named `cmd` in `path_env`.
+fn find_executable(cmd: &str, path_env: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     let is_executable_file = |p: &Path| {
@@ -655,17 +659,23 @@ fn command_paths_under_impl(
             .unwrap_or(false)
     };
 
-    let start = if cmd.contains('/') {
-        PathBuf::from(cmd)
+    if cmd.contains('/') {
+        Some(PathBuf::from(cmd))
     } else {
-        match path_env
+        path_env
             .split(':')
             .map(|d| Path::new(d).join(cmd))
             .find(|c| is_executable_file(c))
-        {
-            Some(p) => p,
-            None => return vec![],
-        }
+    }
+}
+
+fn command_paths_under_impl(
+    cmd: &str,
+    root: &Path,
+    path_env: &str,
+) -> Vec<PathBuf> {
+    let Some(start) = find_executable(cmd, path_env) else {
+        return vec![];
     };
 
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -1266,7 +1276,7 @@ fn mise_auto_map_dirs_from(
         }
     };
 
-    push(data_override.unwrap_or_else(|| home.join(".local/share/mise")));
+    push(mise_data_dir(home, data_override));
     push(config_override.unwrap_or_else(|| home.join(".config/mise")));
 
     // The mise binary must be executable inside the sandbox for activation to
@@ -1282,6 +1292,101 @@ fn mise_auto_map_dirs_from(
     }
 
     dirs
+}
+
+/// mise's data dir: `MISE_DATA_DIR`, else `~/.local/share/mise` (the same
+/// default [`mise_auto_map_dirs`] maps).
+fn mise_data_dir(home: &Path, data_override: Option<PathBuf>) -> PathBuf {
+    data_override.unwrap_or_else(|| home.join(".local/share/mise"))
+}
+
+/// The jail-owned file to bind over mise's command-wrapper lock, and the
+/// lock's path: `(source, destination)`.
+///
+/// With command wrappers configured (`[wrappers.<name>]` in mise config;
+/// Omarchy 4.5 declares `claude`, `codex` and `grok` that way, to run them as
+/// the selected subscription account), mise creates and locks
+/// `<data dir>/command-wrappers/bin.lock` every time any shim or command
+/// wrapper runs, and writes nothing else there. [`mise_auto_map_dirs`] maps
+/// the data dir read-only, so that lock fails (`Read-only file system`, from
+/// mise's `lock_file.rs`) and every mise shim and wrapper exits 1: `ai-jail
+/// claude` never starts the agent, and `python3` or `node` from mise fails
+/// inside the sandbox.
+///
+/// A jail-owned empty file bound over the lock lets mise take it while the
+/// data dir stays read-only. The lock only serialises mise's own rewrites of
+/// the wrapper links, which the sandbox cannot make anyway, so a lock apart
+/// from the host's loses nothing. `None` unless the host's lock file exists
+/// (mise makes it on its first run with wrappers configured), since bwrap
+/// needs it as the mount point. `create` makes the jail-owned file (a launch,
+/// not a dry run).
+pub(crate) fn mise_wrappers_lock(create: bool) -> Option<(PathBuf, PathBuf)> {
+    mise_wrappers_lock_from(
+        &mise_data_dir(
+            &home_dir(),
+            std::env::var_os("MISE_DATA_DIR").map(PathBuf::from),
+        ),
+        &toolchain_cache_root(),
+        create,
+    )
+}
+
+fn mise_wrappers_lock_from(
+    data_dir: &Path,
+    cache_root: &Path,
+    create: bool,
+) -> Option<(PathBuf, PathBuf)> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dest = data_dir.join("command-wrappers/bin.lock");
+    let is_file = dest
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_file());
+    if !is_file {
+        return None;
+    }
+    let src = cache_root.join("mise/command-wrappers.lock");
+    if create {
+        std::fs::create_dir_all(src.parent()?).ok()?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&src)
+            .ok()?;
+    }
+    Some((src, dest))
+}
+
+/// Whether `config`'s command, as exec will find it, is a mise command
+/// wrapper: a symlink in a `command-wrappers/bin` directory whose target is a
+/// file named `mise`. mise reads its `argv[0]` and runs the wrapper's
+/// configured command, so it needs mise's dirs in the sandbox.
+pub(crate) fn command_is_mise_wrapper(config: &Config) -> bool {
+    config
+        .command
+        .first()
+        .and_then(|cmd| find_executable(cmd, &child_path_env(config)))
+        .is_some_and(|path| is_mise_command_wrapper(&path))
+}
+
+fn is_mise_command_wrapper(path: &Path) -> bool {
+    let is_link = path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink());
+    let in_wrappers = path.parent().is_some_and(|dir| {
+        dir.file_name() == Some(OsStr::new("bin"))
+            && dir
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == "command-wrappers")
+    });
+    is_link
+        && in_wrappers
+        && path.file_name() != Some(OsStr::new("mise"))
+        && path.canonicalize().is_ok_and(|target| {
+            target.is_file() && target.file_name() == Some(OsStr::new("mise"))
+        })
 }
 
 /// Encoded map specs for dev-toolchain cache persistence (issue: Part A).
@@ -3775,5 +3880,99 @@ mod tests {
         )
         .unwrap();
         assert!(main_repo_root(&fixture.project_dir).is_err());
+    }
+
+    /// A mise data dir with a command wrapper `claude` linked to a `mise`
+    /// file, and that wrapper dir's `bin.lock`, as mise leaves them once
+    /// wrappers are configured. Returns the fixture root (data dir under
+    /// `data/`, `mise` under `bin/`).
+    fn mise_wrappers_fixture(tag: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-mise-wrappers-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let wrappers = root.join("data/command-wrappers/bin");
+        std::fs::create_dir_all(&wrappers).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let mise = root.join("bin/mise");
+        std::fs::write(&mise, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&mise, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::os::unix::fs::symlink(&mise, wrappers.join("claude")).unwrap();
+        std::fs::write(root.join("data/command-wrappers/bin.lock"), "")
+            .unwrap();
+        root
+    }
+
+    #[test]
+    fn mise_wrappers_lock_binds_a_jail_owned_file_over_the_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = mise_wrappers_fixture("lock");
+        let (data, cache) = (root.join("data"), root.join("cache"));
+        let lock = data.join("command-wrappers/bin.lock");
+        let own = cache.join("mise/command-wrappers.lock");
+
+        // A dry run names the bind and creates nothing.
+        assert_eq!(
+            mise_wrappers_lock_from(&data, &cache, false),
+            Some((own.clone(), lock.clone()))
+        );
+        assert!(!own.exists());
+        // A launch creates the jail-owned file, private to the user.
+        assert_eq!(
+            mise_wrappers_lock_from(&data, &cache, true),
+            Some((own.clone(), lock.clone()))
+        );
+        let mode = own.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // No lock file (no wrappers configured): nothing to bind.
+        std::fs::remove_file(&lock).unwrap();
+        assert_eq!(mise_wrappers_lock_from(&data, &cache, true), None);
+        // A lock that is a symlink is not mise's file: left alone.
+        std::os::unix::fs::symlink(&own, &lock).unwrap();
+        assert_eq!(mise_wrappers_lock_from(&data, &cache, true), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mise_command_wrapper_is_a_link_to_mise_in_command_wrappers() {
+        let root = mise_wrappers_fixture("wrapper");
+        let wrappers = root.join("data/command-wrappers/bin");
+        assert!(is_mise_command_wrapper(&wrappers.join("claude")));
+        // The same link elsewhere, a link there to another program, and a
+        // plain file there are not.
+        std::os::unix::fs::symlink(root.join("bin/mise"), root.join("claude"))
+            .unwrap();
+        assert!(!is_mise_command_wrapper(&root.join("claude")));
+        std::os::unix::fs::symlink("/bin/sh", wrappers.join("other")).unwrap();
+        assert!(!is_mise_command_wrapper(&wrappers.join("other")));
+        std::fs::write(wrappers.join("plain"), "").unwrap();
+        assert!(!is_mise_command_wrapper(&wrappers.join("plain")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn command_is_mise_wrapper_looks_the_command_up_on_the_child_path() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = mise_wrappers_fixture("path");
+        let wrappers = root.join("data/command-wrappers/bin");
+        let _path = EnvVarGuard::set(
+            "PATH",
+            format!("{}:/usr/bin:/bin", wrappers.display()),
+        );
+        let config = |cmd: &str| Config {
+            command: vec![cmd.into()],
+            ..Config::default()
+        };
+        assert!(command_is_mise_wrapper(&config("claude")));
+        assert!(command_is_mise_wrapper(&config(
+            &wrappers.join("claude").display().to_string()
+        )));
+        assert!(!command_is_mise_wrapper(&config("sh")));
+        assert!(!command_is_mise_wrapper(&Config::default()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
