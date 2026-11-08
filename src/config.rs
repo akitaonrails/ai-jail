@@ -413,10 +413,29 @@ pub(crate) struct GlobalConfig {
     #[serde(default, skip_serializing_if = "ProjectStrategy::is_basename")]
     pub(crate) project_strategy: ProjectStrategy,
     /// Named `[profiles.NAME]` tables, selected only by `--profile NAME`.
-    /// Kept as raw tables so a malformed profile that no launch selects
-    /// cannot break a launch; `select_profile` validates the chosen one.
+    /// Kept as raw values, not even required to be tables, so a stray or
+    /// malformed entry that no launch selects cannot break a launch;
+    /// `select_profile` validates the chosen one.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) profiles: BTreeMap<String, toml::Table>,
+    pub(crate) profiles: BTreeMap<String, toml::Value>,
+}
+
+impl GlobalConfig {
+    /// Whether two global configs carry the same policy. Profiles are
+    /// raw TOML compared as text: a `nan` in an unselected profile is
+    /// never equal to itself as a value, and must not make a rewrite of
+    /// the global config look like a loss (profiles stay inert unless
+    /// selected).
+    pub(crate) fn same_policy(&self, other: &GlobalConfig) -> bool {
+        let text = |g: &GlobalConfig| toml::to_string(&g.profiles).ok();
+        let strip = |g: &GlobalConfig| GlobalConfig {
+            profiles: BTreeMap::new(),
+            ..g.clone()
+        };
+        strip(self) == strip(other)
+            && text(self).is_some()
+            && text(self) == text(other)
+    }
 }
 
 /// The only profile format this build reads (`profile_version = 1`).
@@ -437,6 +456,58 @@ const PROFILE_REFUSED_KEYS: &[&str] = &[
 /// keeps this list in step with the struct.
 const NEVER_SERIALIZED: &[&str] =
     &["env_pass", "env_from_file", "secret_hosts"];
+
+/// The fields whose values are secrets, and the TOML shape each takes.
+const SECRET_FIELD_TYPES: &[(&str, &str)] = &[
+    ("env_pass", "an array of strings"),
+    ("env_from_file", "an array of strings"),
+    ("secret_hosts", "a table of strings"),
+];
+
+/// Refuse a secret field of the wrong shape before serde sees it: serde's
+/// message quotes the value, and the value is the secret.
+fn check_secret_field_types(
+    name: &str,
+    table: &toml::Table,
+) -> Result<(), String> {
+    for (field, expected) in SECRET_FIELD_TYPES {
+        let Some(value) = table.get(*field) else {
+            continue;
+        };
+        let ok = match value {
+            toml::Value::Array(items) => {
+                *field != "secret_hosts" && items.iter().all(|v| v.is_str())
+            }
+            toml::Value::Table(items) => {
+                *field == "secret_hosts" && items.values().all(|v| v.is_str())
+            }
+            _ => false,
+        };
+        if !ok {
+            return Err(secret_type_error(name, field, expected));
+        }
+    }
+    Ok(())
+}
+
+fn secret_type_error(name: &str, field: &str, expected: &str) -> String {
+    format!(
+        "profile '{name}': {field} must be {expected}; the value is not \
+         shown because it may hold a secret"
+    )
+}
+
+/// A deserialization error that names a secret field loses the parser's
+/// message, which may quote the value.
+fn secret_safe_error(name: &str, error: String) -> String {
+    match SECRET_FIELD_TYPES
+        .iter()
+        .find(|(field, _)| error.contains(&format!("`{field}`")))
+    {
+        Some((field, expected)) => secret_type_error(name, field, expected),
+        None => format!("profile '{name}': {error}"),
+    }
+}
 
 /// Profile names: `^[a-z0-9][a-z0-9_-]{0,63}$`. Written by hand so no
 /// regex crate is needed; nothing is normalised, so `agent-test` and
@@ -461,7 +532,7 @@ fn valid_profile_name(name: &str) -> bool {
 /// lives in a trusted file: a typo in a restriction must fail the launch
 /// rather than be dropped, so every check here fails closed.
 pub(crate) fn select_profile(
-    profiles: &BTreeMap<String, toml::Table>,
+    profiles: &BTreeMap<String, toml::Value>,
     name: &str,
 ) -> Result<Config, String> {
     if !valid_profile_name(name) {
@@ -470,7 +541,7 @@ pub(crate) fn select_profile(
             output::escape_control_bytes(name)
         ));
     }
-    let Some(table) = profiles.get(name) else {
+    let Some(value) = profiles.get(name) else {
         let defined: Vec<&str> = profiles.keys().map(String::as_str).collect();
         let defined = if defined.is_empty() {
             "none".to_string()
@@ -482,7 +553,15 @@ pub(crate) fn select_profile(
              (defined profiles: {defined})"
         ));
     };
+    let Some(table) = value.as_table() else {
+        return Err(format!(
+            "profile '{name}' is a {}, not a table: write it as \
+             [profiles.{name}]",
+            value.type_str()
+        ));
+    };
     let mut table = table.clone();
+    check_secret_field_types(name, &table)?;
     match table.remove("profile_version") {
         Some(toml::Value::Integer(PROFILE_VERSION)) => {}
         Some(other) => {
@@ -521,7 +600,7 @@ pub(crate) fn select_profile(
     }
     let config: Config = toml::Value::Table(table.clone())
         .try_into()
-        .map_err(|e| format!("profile '{name}': {e}"))?;
+        .map_err(|e| secret_safe_error(name, e.to_string()))?;
     let known = toml::Table::try_from(&config)
         .map_err(|e| format!("profile '{name}': {e}"))?;
     let unknown: Vec<&str> = table
@@ -1365,7 +1444,7 @@ pub(crate) const PROJECT_PROFILE_IGNORED: &str = "project .ai-jail profile ignor
 /// profile: a `profile` key or a `[profiles]` table at the top level, or
 /// inside one of the tables named by `nested` (the store document keeps
 /// its policy under `[grants]` and `[constraints]`). `Config` ignores
-/// both keys, so the only effect is this warning (R6.6).
+/// both keys, so the only effect is this warning.
 pub(crate) fn project_selects_profile(text: &str, nested: &[&str]) -> bool {
     let Ok(root) = text.parse::<toml::Table>() else {
         return false;
@@ -1568,12 +1647,12 @@ pub(crate) fn global_config_for_command_report(
                     "profile '{name}': cannot read the launch directory: {e}"
                 )
             })?;
-            let (_, refusals) = merge_layer_report(
-                base.clone(),
-                layer.clone(),
+            let refusals = profile_widenings(
+                &base,
+                &layer,
                 &project_dir,
                 &format!("profile '{name}'"),
-            );
+            )?;
             base = merge_trusted(base, layer);
             Some(ProfileReport {
                 name: name.to_string(),
@@ -1593,6 +1672,75 @@ pub(crate) fn global_config_for_command_report(
         ignored_command_tables,
         profile,
     })
+}
+
+/// Every field `layer` widens over `base`. The untrusted-layer filter
+/// keeps a refused field at the baseline, which can hide a widening in
+/// another field: a refused `lockdown = false` leaves lockdown on, so an
+/// `agent_state = true` beside it reads as no change, while the trusted
+/// merge applies both. Each round therefore moves the refused switches to
+/// their merged values and asks again, until no new field appears.
+fn profile_widenings(
+    base: &Config,
+    layer: &Config,
+    project_dir: &Path,
+    label: &str,
+) -> Result<Vec<Refusal>, String> {
+    let as_table = |config: &Config| {
+        toml::Table::try_from(config)
+            .map_err(|e| format!("{label}: cannot compare layers: {e}"))
+    };
+    let merged = as_table(&merge_trusted(base.clone(), layer.clone()))?;
+    let mut baseline = base.clone();
+    let mut found: Vec<Refusal> = Vec::new();
+    loop {
+        let (_, refusals) = merge_layer_report(
+            baseline.clone(),
+            layer.clone(),
+            project_dir,
+            label,
+        );
+        let new: Vec<Refusal> = refusals
+            .into_iter()
+            .filter(|r| !found.iter().any(|f| f.field == r.field))
+            .collect();
+        if new.is_empty() {
+            return Ok(found);
+        }
+        // Only a switch can mask another field (lockdown, private_home …);
+        // moving a map or a host list into the baseline would make the
+        // profile's own entries look like widenings of each other.
+        let switches: Vec<&Refusal> = new
+            .iter()
+            .filter(|r| matches!(r.granted.as_slice(), [v] if v == "true" || v == "false"))
+            .collect();
+        if switches.is_empty() {
+            found.extend(new);
+            return Ok(found);
+        }
+        let mut table = as_table(&baseline)?;
+        for refusal in switches {
+            match merged.get(&refusal.field) {
+                Some(value) => {
+                    table.insert(refusal.field.clone(), value.clone());
+                }
+                None => {
+                    table.remove(&refusal.field);
+                }
+            }
+        }
+        let next: Config = toml::Value::Table(table)
+            .try_into()
+            .map_err(|e| format!("{label}: cannot compare layers: {e}"))?;
+        // Fields that do not serialise (secrets) keep their merged form.
+        baseline = Config {
+            env_pass: baseline.env_pass,
+            env_from_file: baseline.env_from_file,
+            secret_hosts: baseline.secret_hosts,
+            ..next
+        };
+        found.extend(new);
+    }
 }
 
 /// Merge two trusted configuration layers, such as global base and a global
@@ -9005,16 +9153,13 @@ claude_dir = "/home/user/.claude-example"
     }
 }
 
-// Story 047, Task 3.1 — selecting and validating one profile
-// (R6.2, R6.3, R6.4, R7.2, R7.3, R7.4, R7.5).
+// Selecting and validating one profile.
 //
-// Materialization: append this whole file to the end of `src/config.rs`
-// on `feat/profiles` (or `include!("config_story047_profile_select.rs");`).
 // The module name starts with `profile` so `cargo test config::profile`
 // selects it.
 //
-// Contract (design.md §C8):
-// `fn select_profile(profiles: &BTreeMap<String, toml::Table>, name: &str)
+// Contract:
+// `fn select_profile(profiles: &BTreeMap<String, toml::Value>, name: &str)
 //     -> Result<Config, String>`, checking in order: name grammar
 // `^[a-z0-9][a-z0-9_-]{0,63}$`, existence (error lists the defined names),
 // `profile_version` present and integer 1, no `trust_project_config`,
@@ -9022,29 +9167,27 @@ claude_dir = "/home/user/.claude-example"
 // arrays/tables are not unknown), then the parser's type errors prefixed
 // with the profile name. Fixtures use only keys upstream/master knows.
 #[cfg(test)]
-mod profile_story047_select_tests {
+mod profile_select_tests {
     use std::collections::BTreeMap;
 
     use super::*;
 
     /// Build the profiles map from a TOML document of `[name]` tables.
-    fn profiles(doc: &str) -> BTreeMap<String, toml::Table> {
+    fn profiles(doc: &str) -> BTreeMap<String, toml::Value> {
         let root: toml::Table = doc.parse().expect("fixture TOML");
-        root.into_iter()
-            .map(|(k, v)| (k, v.as_table().expect("table").clone()))
-            .collect()
+        root.into_iter().collect()
     }
 
     /// One profile named `name` (inserted verbatim, never re-parsed as
     /// TOML, so hostile names stay intact) with `profile_version = 1` plus
     /// the keys of `body`.
-    fn one(name: &str, body: &str) -> BTreeMap<String, toml::Table> {
+    fn one(name: &str, body: &str) -> BTreeMap<String, toml::Value> {
         let mut table: toml::Table = body.parse().expect("fixture TOML");
         table.insert("profile_version".into(), toml::Value::Integer(1));
-        BTreeMap::from([(name.to_string(), table)])
+        BTreeMap::from([(name.to_string(), toml::Value::Table(table))])
     }
 
-    fn refused(map: &BTreeMap<String, toml::Table>, name: &str) -> String {
+    fn refused(map: &BTreeMap<String, toml::Value>, name: &str) -> String {
         match select_profile(map, name) {
             Ok(c) => panic!("profile {name:?} must be refused, got {c:?}"),
             Err(e) => e,
@@ -9271,14 +9414,11 @@ mod profile_story047_select_tests {
     }
 }
 
-// Story 047, Task 3.2 — merge order and widenings (R6.1, R7.1, R8.3).
+// Merge order and widenings.
 //
-// Materialization: append this whole file to the end of `src/config.rs`
-// on `feat/profiles` (or `include!("config_story047_profile_merge.rs");`).
 // Module name starts with `profile` so `cargo test config::profile` runs it.
 //
-// Contract (design.md §C8 as revised 2026-10-10, renamed and re-anchored
-// to upstream v3.3.0 fe4dfe0 on 2026-11-08):
+// Contract:
 // - `merge_with_global_report(baseline, local, project_dir)
 //     -> (Config, Vec<Refusal>)`, with
 //   `Refusal { field: String, granted: Vec<String>, secret: bool,
@@ -9296,7 +9436,7 @@ mod profile_story047_select_tests {
 // file the store migration consumes.
 // Fixtures use only keys upstream/master knows.
 #[cfg(test)]
-mod profile_story047_merge_tests {
+mod profile_merge_tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -9500,7 +9640,7 @@ mod profile_story047_merge_tests {
 }
 
 #[cfg(test)]
-mod profile_story047_field_coverage_tests {
+mod profile_field_coverage_tests {
     use std::path::Path;
 
     use super::*;
@@ -9589,15 +9729,15 @@ mod profile_story047_field_coverage_tests {
 }
 
 #[cfg(test)]
-mod profile_story047_review_tests {
+mod profile_review_tests {
     use std::collections::BTreeMap;
 
     use super::*;
 
-    fn one(body: &str) -> BTreeMap<String, toml::Table> {
+    fn one(body: &str) -> BTreeMap<String, toml::Value> {
         let mut table: toml::Table = body.parse().unwrap();
         table.insert("profile_version".into(), toml::Value::Integer(1));
-        BTreeMap::from([("p".to_string(), table)])
+        BTreeMap::from([("p".to_string(), toml::Value::Table(table))])
     }
 
     #[test]
@@ -9638,11 +9778,8 @@ mod profile_story047_review_tests {
     }
 }
 
-// Story 047, Task 3.3 — a global rewrite keeps every profile (R6.7, R6.8,
-// Q16).
+// A global rewrite keeps every profile.
 //
-// Materialization: append this whole file to the end of `src/config.rs`
-// on `feat/profiles` (or `include!("config_story047_profile_save.rs");`).
 // Module name starts with `profile` so `cargo test config::profile` runs it.
 //
 // Contract: every path that rewrites the trusted global config round-trips
@@ -9653,7 +9790,7 @@ mod profile_story047_review_tests {
 // Values are compared, not bytes: comments and table order may be lost by
 // a rewrite.
 #[cfg(test)]
-mod profile_story047_save_tests {
+mod profile_save_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9785,7 +9922,7 @@ allow_hosts = 3
 }
 
 #[cfg(test)]
-mod profile_story047_project_tests {
+mod profile_project_tests {
     use super::*;
 
     #[test]
@@ -9809,15 +9946,11 @@ mod profile_story047_project_tests {
     }
 }
 
-// Story 047, Task 4.1 — a profile table and a `[commands.<name>]` table
-// with the same keys produce the same Config (R6.2: same keys and types),
-// and that Config survives a serialize/parse round trip.
-//
-// Materialization: append this whole file to the end of `src/config.rs`
-// on `feat/profiles` (and keep it on `integration`). Test names contain
-// `roundtrip`. Fixtures use only keys upstream/master knows.
+// A profile table and a `[commands.<name>]` table with the same keys
+// produce the same Config, and that Config survives a serialize/parse
+// round trip. Test names contain `roundtrip`. Fixtures use only keys upstream/master knows.
 #[cfg(test)]
-mod story047_roundtrip_profiles_tests {
+mod roundtrip_profiles_tests {
     use std::collections::BTreeMap;
 
     use super::*;
@@ -9838,7 +9971,10 @@ hide_dotdirs = [\".secrets\"]
     fn roundtrip_profile_equals_the_same_keys_as_a_command_table() {
         let mut profile: toml::Table = KEYS.parse().unwrap();
         profile.insert("profile_version".into(), toml::Value::Integer(1));
-        let profiles = BTreeMap::from([("agent-test".to_string(), profile)]);
+        let profiles = BTreeMap::from([(
+            "agent-test".to_string(),
+            toml::Value::Table(profile),
+        )]);
         let from_profile = select_profile(&profiles, "agent-test").unwrap();
         let global =
             parse_global_toml(&format!("[commands.bash]\n{KEYS}")).unwrap();
@@ -9850,10 +9986,290 @@ hide_dotdirs = [\".secrets\"]
     fn roundtrip_selected_profile_serializes_and_parses_back_unchanged() {
         let mut profile: toml::Table = KEYS.parse().unwrap();
         profile.insert("profile_version".into(), toml::Value::Integer(1));
-        let profiles = BTreeMap::from([("p".to_string(), profile)]);
+        let profiles =
+            BTreeMap::from([("p".to_string(), toml::Value::Table(profile))]);
         let config = select_profile(&profiles, "p").unwrap();
         let body = toml::to_string(&config).unwrap();
         assert!(!body.contains("profile_version"), "{body}");
         assert_eq!(as_toml(&parse_toml(&body).unwrap()), as_toml(&config));
+    }
+}
+
+// A stray non-table entry under `[profiles]` is inert unless selected and refused
+// naming the profile when it is; a wrong-typed secret field
+// is refused naming profile, field and expected type, never the value
+//; and a field the profile-layer filter refuses cannot hide a
+// widening in another field. Fixtures are the trusted global config
+// `<XDG_CONFIG_HOME>/ai-jail/config.toml` (dir 0700, file 0600), loaded
+// through `load_global_for_command_from_path`, as a launch loads it.
+#[cfg(test)]
+mod profile_gatefix_tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    fn cli(args: &[&str]) -> CliArgs {
+        crate::cli::parse_from(lexopt::Parser::from_args(
+            args.iter().map(std::ffi::OsString::from),
+        ))
+        .expect("test CLI parses")
+    }
+
+    fn global_file(body: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "aj-profile-gatefix-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = root.join("xdg").join("ai-jail");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::set_permissions(
+            &store,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let path = store.join("config.toml");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        (root, path)
+    }
+
+    fn load(
+        body: &str,
+        args: &[&str],
+    ) -> Result<(Config, Option<ProfileReport>), String> {
+        let (root, path) = global_file(body);
+        let got = load_global_for_command_from_path(
+            &path,
+            &cli(args),
+            &Config::default(),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        got
+    }
+
+    fn fields(report: &ProfileReport) -> Vec<&str> {
+        report.widenings.iter().map(|w| w.field.as_str()).collect()
+    }
+
+    const WIDE: &str = "\
+[profiles.wide]
+profile_version = 1
+allow_hosts = [\"api.example.com\"]
+";
+
+    // ── Non-table entries under [profiles] ────────────
+
+    #[test]
+    fn stray_non_table_profiles_entry_is_inert_without_profile() {
+        // Hostile half first: entries a user plausibly writes by mistake.
+        // Each must leave a launch that names no profile untouched.
+        for stray in [
+            "default = \"agent-test\"",
+            "default = 1",
+            "default = [\"agent-test\"]",
+            "enabled = true",
+        ] {
+            let body = format!("no_gpu = true\n[profiles]\n{stray}\n");
+            let (config, report) =
+                load(&body, &["claude"]).unwrap_or_else(|e| {
+                    panic!("{stray:?} must not break a plain launch: {e}")
+                });
+            assert!(report.is_none(), "{stray:?}");
+            assert_eq!(config.no_gpu, Some(true), "{stray:?}: base lost");
+        }
+    }
+
+    #[test]
+    fn stray_entry_does_not_stop_a_sibling_profile_from_selecting() {
+        let body = format!("[profiles]\ndefault = \"wide\"\n\n{WIDE}");
+        let (config, report) = load(&body, &["--profile", "wide", "claude"])
+            .unwrap_or_else(|e| panic!("sibling must select: {e}"));
+        assert_eq!(report.expect("report").name, "wide");
+        assert_eq!(config.allow_hosts, ["api.example.com"]);
+    }
+
+    #[test]
+    fn selected_non_table_profiles_entry_is_refused_naming_the_profile() {
+        let body = format!("[profiles]\ndefault = \"wide\"\n\n{WIDE}");
+        let err = load(&body, &["--profile", "default", "claude"])
+            .expect_err("a non-table entry cannot be a profile");
+        assert!(err.contains("profile 'default'"), "{err}");
+        assert!(err.contains("table"), "must say a table is needed: {err}");
+    }
+
+    // ── Wrong-typed secret fields ──────────────────────
+
+    /// Every fragment of a fixture value; none may reach the message.
+    const LEAK: [&str; 4] = ["API_KEY", "sk-live", "TOPSECRET", "SECRETPATH"];
+
+    fn secret_refusal(field_line: &str) -> String {
+        let body = format!("[profiles.p]\nprofile_version = 1\n{field_line}\n");
+        let err = load(&body, &["--profile", "p", "claude"])
+            .expect_err("a wrong-typed secret field must refuse the launch");
+        for fragment in LEAK {
+            assert!(
+                !err.contains(fragment),
+                "secret fragment {fragment:?} echoed: {err}"
+            );
+        }
+        assert!(err.contains("profile 'p'"), "{err}");
+        err
+    }
+
+    fn names_one_of(err: &str, words: &[&str]) -> bool {
+        let lower = err.to_lowercase();
+        words.iter().any(|w| lower.contains(w))
+    }
+
+    #[test]
+    fn env_pass_of_the_wrong_type_is_refused_without_its_value() {
+        // Brackets forgotten: the most likely mistake, and the leaky one.
+        let err = secret_refusal("env_pass = \"API_KEY=sk-live-TOPSECRET\"");
+        assert!(err.contains("env_pass"), "{err}");
+        assert!(
+            names_one_of(&err, &["array", "sequence", "list"]),
+            "must name the expected type: {err}"
+        );
+    }
+
+    #[test]
+    fn env_from_file_of_the_wrong_type_is_refused_without_its_value() {
+        let err = secret_refusal(
+            "env_from_file = \"/home/u/API_KEY/sk-live-TOPSECRET/SECRETPATH\"",
+        );
+        assert!(err.contains("env_from_file"), "{err}");
+        assert!(
+            names_one_of(&err, &["array", "sequence", "list"]),
+            "must name the expected type: {err}"
+        );
+    }
+
+    #[test]
+    fn secret_hosts_of_the_wrong_type_is_refused_without_its_value() {
+        let err =
+            secret_refusal("secret_hosts = \"API_KEY=sk-live-TOPSECRET\"");
+        assert!(err.contains("secret_hosts"), "{err}");
+        assert!(
+            names_one_of(&err, &["table", "map"]),
+            "must name the expected type: {err}"
+        );
+    }
+
+    #[test]
+    fn non_secret_type_error_keeps_the_parser_message() {
+        // The converse: the secret-safe rewrite is for the three secret
+        // fields only; any other field keeps the parser's message.
+        let body = "[profiles.p]\nprofile_version = 1\nallow_hosts = 3\n";
+        let err = load(body, &["--profile", "p", "claude"])
+            .expect_err("wrong type refuses");
+        assert!(err.contains("profile 'p'"), "{err}");
+        assert!(err.contains("allow_hosts"), "{err}");
+        assert!(err.contains("invalid type"), "parser message lost: {err}");
+    }
+
+    // ── Widenings against the merged result ───────────────────
+
+    #[test]
+    fn refused_lockdown_does_not_hide_the_agent_state_widening() {
+        let body = "\
+lockdown = true
+agent_state = false
+[profiles.open]
+profile_version = 1
+lockdown = false
+agent_state = true
+pictures = true
+";
+        let (config, report) = load(body, &["--profile", "open", "claude"])
+            .expect("profile loads");
+        // What actually applies: the profile opened agent state ...
+        assert!(config.agent_state_enabled(), "fixture premise");
+        let report = report.expect("report");
+        let got = fields(&report);
+        // ... so every field it opened has a line, not just the first.
+        for field in ["lockdown", "agent_state", "pictures"] {
+            assert!(got.contains(&field), "{field} hidden: {got:?}");
+        }
+    }
+
+    #[test]
+    fn profile_restating_the_base_reports_no_widening() {
+        // The rule must not fire wrongly: a profile that grants nothing
+        // the base did not already have prints nothing.
+        let body = "\
+lockdown = true
+agent_state = false
+[profiles.same]
+profile_version = 1
+lockdown = true
+agent_state = false
+";
+        let (_, report) = load(body, &["--profile", "same", "claude"])
+            .expect("profile loads");
+        let report = report.expect("report");
+        assert!(report.widenings.is_empty(), "{:?}", fields(&report));
+    }
+}
+
+// Review regressions: a map the profile adds is not a widening of
+// another map it adds, and a `nan` in an unselected profile does not make
+// a global rewrite look like a loss.
+#[cfg(test)]
+mod profile_review_regression_tests {
+    use super::*;
+
+    #[test]
+    fn profile_in_project_rw_map_under_its_own_ro_parent_is_not_a_widening() {
+        let cwd = std::env::current_dir().unwrap();
+        let parent = cwd.parent().unwrap().display().to_string();
+        let inside = cwd.join("src").display().to_string();
+        let root = std::env::temp_dir()
+            .join(format!("aj-profile-review-{}", std::process::id()));
+        let store = root.join("xdg").join("ai-jail");
+        std::fs::create_dir_all(&store).unwrap();
+        let path = store.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[profiles.p]\nprofile_version = 1\nro_maps = [{parent:?}]\n\
+                 rw_maps = [{inside:?}]\n"
+            ),
+        )
+        .unwrap();
+        let cli = crate::cli::parse_from(lexopt::Parser::from_args(
+            ["--profile", "p", "bash"]
+                .iter()
+                .map(std::ffi::OsString::from),
+        ))
+        .unwrap();
+        let got =
+            load_global_for_command_from_path(&path, &cli, &Config::default());
+        std::fs::remove_dir_all(&root).unwrap();
+        let (_, report) = got.expect("profile loads");
+        let fields: Vec<String> = report
+            .expect("report")
+            .widenings
+            .into_iter()
+            .map(|w| w.field)
+            .collect();
+        assert!(fields.contains(&"ro_maps".to_string()), "{fields:?}");
+        assert!(!fields.contains(&"rw_maps".to_string()), "{fields:?}");
+    }
+
+    #[test]
+    fn nan_in_an_unselected_profile_still_compares_equal() {
+        let text = "no_gpu = true\n[profiles]\nstray = nan\n";
+        let a = parse_global_toml(text).unwrap();
+        let b = parse_global_toml(text).unwrap();
+        assert!(a.same_policy(&b));
+        let c = parse_global_toml("no_gpu = false\n[profiles]\nstray = nan\n")
+            .unwrap();
+        assert!(!a.same_policy(&c), "a base difference is still seen");
     }
 }

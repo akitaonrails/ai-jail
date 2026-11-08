@@ -1423,11 +1423,12 @@ fn run(
             table
         ));
     }
-    // Printed on every launch, `--dry-run` included and without
-    // `--verbose`: a profile may widen the jail only where it is seen.
+    // Printed on every launch, `--dry-run` and `--exec` included and
+    // without `--verbose`: a profile may widen the jail only where it is
+    // seen, so quiet mode does not silence it.
     if let Some(profile) = &global_selection.profile {
         for line in profile.lines() {
-            output::warn(&line);
+            output::security_warn(&line);
         }
     }
     let profile_report = global_selection.profile;
@@ -2024,12 +2025,13 @@ fn run(
     {
         eprintln!(
             "{}",
-            onboarding::render_effective_access(
+            onboarding::render_effective_access_with_profile(
                 config,
                 &invocation_cwd,
                 &harness,
                 saved,
                 &approved_env_names,
+                cli.profile.as_deref(),
             )?
         );
     }

@@ -891,7 +891,10 @@ then the project's saved policy. Trust rules:
   printed before the sandbox starts, without `--verbose` and under
   `--dry-run`, as `profile=NAME widens=FIELD granted="…"`, and recorded in
   the audit log. Tightening (`mask`, `no_gpu = true`, …) prints nothing.
-  `env_pass`, `env_from_file` and `secret_hosts` show key names only.
+  `env_pass` and `secret_hosts` show key names only, and `env_from_file`
+  shows file paths, never their contents. Printed with security warnings, so
+  `--exec` does not silence them. A wrong-typed secret field is refused
+  naming the field and the expected type, never the value.
 - Names match `[a-z0-9][a-z0-9_-]{0,63}`; nothing is normalised.
 - `profile_version = 1` is required. An unknown key (a typo such as
   `allow_host`), a wrong type, `trust_project_config`, `command` or a

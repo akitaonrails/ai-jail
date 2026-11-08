@@ -919,7 +919,7 @@ fn migrate_global(
         durable_write(&paths.global, &raw)?;
     }
     let installed = load_global(paths)?;
-    if !prior_digest_matches && installed != parsed {
+    if !prior_digest_matches && !installed.same_policy(&parsed) {
         return Err(format!(
             "Global migration verification failed at {}; legacy source retained at {}",
             paths.global.display(),
@@ -2047,12 +2047,12 @@ pub(crate) fn save_global_preferences(
         .map_err(|e| format!("Cannot serialize global config: {e}"))?;
     let encoded = config::parse_global_toml(&body)
         .map_err(|e| format!("Cannot verify updated global config: {e}"))?;
-    if encoded != expected {
+    if !encoded.same_policy(&expected) {
         return Err(format!("Cannot preserve {}", paths.global.display()));
     }
     durable_write(&paths.global, body.as_bytes())?;
     let checked = load_global(paths)?;
-    if checked != expected {
+    if !checked.same_policy(&expected) {
         return Err(format!("Failed to verify {}", paths.global.display()));
     }
     Ok(())

@@ -2899,3 +2899,231 @@ mod tests {
         assert!(capabilities.capabilities && capabilities.json);
     }
 }
+
+// The
+// interface-synchronization contract for `--profile`. The documents name
+// it an advanced CLI/config-only control: the user guide as a
+// "named profile (`[profiles.NAME]`)", kept apart from the onboarding
+// access profile; the TUI design with the reason it has no onboarding
+// control; the onboarding provenance with an entry in its existing
+// shape. And a drift test: every `Config` field and every
+// `SANDBOX_LONG_FLAGS` entry appears in `docs/USER_GUIDE.md` as a whole
+// token, or is allowlisted. The allowlist has two parts: fields that are
+// internal, and the names already undocumented at upstream fe4dfe0, so the
+// test is a ratchet — nothing new may land undocumented, and a name
+// leaves the baseline once the guide documents it.
+#[cfg(test)]
+mod interface_profile_tests {
+    use super::SANDBOX_LONG_FLAGS;
+
+    const GUIDE: &str = include_str!("../docs/USER_GUIDE.md");
+    const TUI_DESIGN: &str = include_str!("../docs/TUI_DESIGN.md");
+    const PROVENANCE: &str = include_str!("../docs/onboarding-provenance.toml");
+    const CONFIG_RS: &str = include_str!("config.rs");
+
+    /// `Config` fields that no user sets: runtime state, never parsed.
+    const INTERNAL_FIELDS: &[&str] = &["runtime_harnesses"];
+
+    /// `Config` fields already missing from the guide at upstream fe4dfe0.
+    const UNDOCUMENTED_FIELDS_AT_FE4DFE0: &str = r"
+    rw_maps overlay_maps hide_dotdirs mask deny_paths mask_exceptions
+    deny_path_exceptions no_gpu no_docker tailscale no_display audio
+    aws kube gcloud docker_config kvm prompt_hosts macos_host_ipc
+    macos_chromium macos_trustd allow_pty allow_loopback_listen
+    allow_loopback_connect x11 host_shm terminal_passthrough
+    no_worktree no_mise no_toolchains no_save_config no_hide_config
+    pictures browser_profile private_home no_landlock no_status_bar
+    status_bar_style resize_redraw_key no_seccomp no_rlimits
+    systemd_user allow_tcp_ports allow_hosts allow_private_hosts
+    forward_ports publish_ports claude_dir inherit_env env_pass
+    env_from_file secret_hosts trust_project_config update_check
+    audit_log
+";
+
+    /// Sandbox long flags already missing from the guide at fe4dfe0.
+    const UNDOCUMENTED_FLAGS_AT_FE4DFE0: &str = r"
+    --harness --request-file --request --private-home
+    --no-private-home --lockdown --no-lockdown --no-display --display
+    --audio --no-audio --no-github --aws --no-aws --kube --no-kube
+    --gcloud --no-gcloud --docker-config --no-docker-config --kvm
+    --no-kvm --prompt-hosts --no-prompt-hosts --network --no-network
+    --macos-host-ipc --no-macos-host-ipc --macos-chromium
+    --no-macos-chromium --macos-trustd --no-macos-trustd --allow-pty
+    --no-allow-pty --allow-loopback-listen --no-allow-loopback-listen
+    --allow-loopback-connect --no-allow-loopback-connect --no-gpu
+    --gpu --no-docker --docker --tailscale --no-tailscale --landlock
+    --no-landlock --seccomp --no-seccomp --rlimits --no-rlimits --ssh
+    --no-ssh --pictures --no-pictures --clean --exec --dry-run
+    --rw-map --ro-map --overlay-map --map --mask --deny-path
+    --mask-except --deny-path-except --hide-dotdir --allow-tcp-port
+    --allow-host --allow-private-host --systemd-user --no-systemd-user
+    --worktree --no-worktree --browser --no-browser --claude-dir --x11
+    --no-x11 --host-shm --no-host-shm --terminal-passthrough
+    --no-terminal-passthrough --agent-state --no-agent-state
+    --publish-port --inherit-env --no-inherit-env --update-check
+    --no-update-check --audit-log --no-audit-log --audit-verify
+    --env-from-file --secret --mise --no-mise --toolchains
+    --no-toolchains --save-config --no-save-config --hide-config
+    --no-hide-config --status-bar --no-status-bar --bootstrap
+    --verbose
+";
+
+    /// A name counts as documented only as a whole token: the bytes on
+    /// either side are not `[A-Za-z0-9_-]`, so `--map` inside `--ro-map`
+    /// or `profile` inside `browser_profile` documents nothing.
+    fn documented(name: &str, doc: &str) -> bool {
+        let is_word =
+            |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+        let bytes = doc.as_bytes();
+        doc.match_indices(name).any(|(at, _)| {
+            let before = at.checked_sub(1).map(|i| bytes[i]);
+            let after = bytes.get(at + name.len()).copied();
+            !before.is_some_and(is_word) && !after.is_some_and(is_word)
+        })
+    }
+
+    /// The names neither documented in `doc` nor allowlisted.
+    fn undocumented<'a>(
+        names: &[&'a str],
+        doc: &str,
+        allowed: &[&str],
+    ) -> Vec<&'a str> {
+        names
+            .iter()
+            .copied()
+            .filter(|n| !allowed.contains(n) && !documented(n, doc))
+            .collect()
+    }
+
+    /// The `pub` fields of `pub struct Config`, read from its source.
+    fn config_fields() -> Vec<&'static str> {
+        let body = CONFIG_RS
+            .split_once("\npub struct Config {\n")
+            .expect("pub struct Config in config.rs")
+            .1
+            .split_once("\n}\n")
+            .expect("end of struct Config")
+            .0;
+        body.lines()
+            .filter_map(|l| l.strip_prefix("    pub "))
+            .filter_map(|l| l.split_once(':').map(|(n, _)| n))
+            .map(|n| n.trim_start_matches("r#"))
+            .collect()
+    }
+
+    #[test]
+    fn drift_check_fires_for_a_name_that_appears_only_inside_another() {
+        // Hostile half first: a near-identical documented name must not
+        // count for the undocumented one, in either direction.
+        let guide = "Use `--ro-map PATH` and `browser_profile = \"soft\"`.";
+        assert_eq!(undocumented(&["--map"], guide, &[]), ["--map"]);
+        assert_eq!(undocumented(&["profile"], guide, &[]), ["profile"]);
+        assert_eq!(undocumented(&["--ro"], guide, &[]), ["--ro"]);
+        // A new field nobody wrote down fails ...
+        assert_eq!(
+            undocumented(&["brand_new_field"], guide, &[]),
+            ["brand_new_field"]
+        );
+        // ... unless allowlisted, and a whole-token mention documents.
+        assert!(
+            undocumented(&["brand_new_field"], guide, &["brand_new_field"])
+                .is_empty()
+        );
+        assert!(
+            undocumented(&["--ro-map", "browser_profile"], guide, &[])
+                .is_empty()
+        );
+        assert!(
+            undocumented(&["--profile"], "`--profile NAME`", &[]).is_empty()
+        );
+    }
+
+    #[test]
+    fn every_config_field_and_sandbox_flag_is_in_the_user_guide() {
+        let fields = config_fields();
+        assert!(fields.contains(&"allow_hosts"), "field parse: {fields:?}");
+        let baseline_fields: Vec<&str> =
+            UNDOCUMENTED_FIELDS_AT_FE4DFE0.split_whitespace().collect();
+        let mut allowed_fields = INTERNAL_FIELDS.to_vec();
+        allowed_fields.extend(&baseline_fields);
+        let missing_fields = undocumented(&fields, GUIDE, &allowed_fields);
+        let baseline_flags: Vec<&str> =
+            UNDOCUMENTED_FLAGS_AT_FE4DFE0.split_whitespace().collect();
+        let missing_flags =
+            undocumented(SANDBOX_LONG_FLAGS, GUIDE, &baseline_flags);
+        assert!(
+            missing_fields.is_empty() && missing_flags.is_empty(),
+            "missing from docs/USER_GUIDE.md: fields {missing_fields:?}, \
+             flags {missing_flags:?}"
+        );
+    }
+
+    #[test]
+    fn drift_baseline_holds_only_names_that_exist_and_are_undocumented() {
+        // The ratchet only tightens: a name documented since, or removed,
+        // must leave the baseline.
+        let fields = config_fields();
+        for name in UNDOCUMENTED_FIELDS_AT_FE4DFE0.split_whitespace() {
+            assert!(fields.contains(&name), "{name} is no longer a field");
+            assert!(!documented(name, GUIDE), "{name} is documented now");
+        }
+        for name in UNDOCUMENTED_FLAGS_AT_FE4DFE0.split_whitespace() {
+            assert!(
+                SANDBOX_LONG_FLAGS.contains(&name),
+                "{name} is no longer a sandbox flag"
+            );
+            assert!(!documented(name, GUIDE), "{name} is documented now");
+        }
+    }
+
+    #[test]
+    fn user_guide_introduces_the_named_profile_apart_from_onboarding() {
+        assert!(documented("--profile", GUIDE), "--profile not in the guide");
+        assert!(GUIDE.contains("[profiles.NAME]"), "[profiles.NAME] missing");
+        assert!(
+            GUIDE.to_lowercase().contains("named profile"),
+            "the guide must say \"named profile\" to keep it apart from \
+             the onboarding access profile"
+        );
+    }
+
+    #[test]
+    fn tui_design_names_profile_cli_config_only_with_its_reason() {
+        let paragraph = TUI_DESIGN
+            .split("\n\n")
+            .find(|p| documented("--profile", p))
+            .expect("docs/TUI_DESIGN.md has no --profile entry");
+        let lower = paragraph.to_lowercase();
+        assert!(lower.contains("config-only"), "{paragraph}");
+        assert!(lower.contains("onboarding"), "reason missing: {paragraph}");
+    }
+
+    #[test]
+    fn onboarding_provenance_covers_the_profile_selection() {
+        let doc: toml::Table = PROVENANCE.parse().expect("provenance TOML");
+        let claims = doc["claim"].as_array().expect("[[claim]] entries");
+        let claim = claims
+            .iter()
+            .find(|c| {
+                let text = toml::to_string(c).unwrap_or_default();
+                documented("--profile", &text)
+                    || text.contains("select_profile")
+                    || text.contains("[profiles")
+            })
+            .expect("no provenance claim for the profile selection");
+        // The file's existing shape.
+        for key in ["policy", "enforced_by", "verified_by", "guide_sections"] {
+            assert!(claim.get(key).is_some(), "claim lacks {key}: {claim:?}");
+        }
+        for section in claim["guide_sections"].as_array().unwrap() {
+            let heading = section.as_str().unwrap();
+            assert!(
+                GUIDE.lines().any(|l| {
+                    l.trim_start_matches('#').trim() == heading
+                        && l.starts_with('#')
+                }),
+                "guide section {heading:?} is not a heading in USER_GUIDE.md"
+            );
+        }
+    }
+}

@@ -1,5 +1,4 @@
-// Story 047 — `--profile NAME` through the built binary (Tasks 3.2, 3.3,
-// 3.4): the widening lines, refusals at launch, the project file's
+// `--profile NAME` through the built binary: the widening lines, refusals at launch, the project file's
 // inability to select a profile, saving, and the audit record.
 //
 // Each test gets a temporary HOME, XDG_CONFIG_HOME and project directory
@@ -185,7 +184,7 @@ fn line_for<'a>(
     lines.iter().find(|l| l.contains(&needle))
 }
 
-// ── Task 3.2 — the widening lines (R7.1, R7.6, R8.3) ─────────────────
+// ── The widening lines ─────────────────
 
 #[test]
 fn widening_lines_name_profile_field_and_values_without_verbose() {
@@ -236,7 +235,7 @@ fn dry_run_prints_the_same_widening_lines_as_a_real_launch() {
     assert_eq!(dry_lines, widening_lines(&real, "wide"));
 }
 
-// ── Selection and refusals at launch (R6.1, R6.3, R6.5, R6.9, R7.3) ──
+// ── Selection and refusals at launch ──
 
 #[test]
 fn profile_given_twice_is_refused() {
@@ -288,7 +287,7 @@ fn malformed_unselected_profile_is_harmless_and_a_sibling_still_selects() {
     assert!(err.contains("bad"), "{err}");
 }
 
-// ── Task 3.3 — the project file and saving (R6.6, R7.7) ──────────────
+// ── The project file and saving ──────────────
 
 #[test]
 fn project_file_cannot_select_a_profile_and_is_warned() {
@@ -356,7 +355,7 @@ fn auto_save_never_writes_a_profile_key_into_the_project_file() {
     }
 }
 
-// ── Task 3.4 — the audit launch record (R8.1, R8.3) ──────────────────
+// ── The audit launch record ──────────────────
 
 #[test]
 fn audit_record_carries_the_profile_and_its_widenings() {

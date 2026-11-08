@@ -558,6 +558,36 @@ Linux diagnostics distinguish a signal inferred from an exit code from a
 directly observed signal. For `SIGXFSZ`, the diagnostic includes the
 `--lockdown` file-size limit if ai-jail set one. The exit code is unchanged.
 
+## Named profiles
+
+A named profile (`[profiles.NAME]`) is a set of grants and restrictions kept
+in the trusted global config and selected per launch with `--profile NAME`.
+It is not the onboarding access profile: onboarding edits one project's saved
+grants, while a named profile is written by hand, applies to any project, and
+is never saved into a project policy. It is an advanced CLI/config-only
+control, so the onboarding screens do not offer it.
+
+```toml
+# ~/.config/ai-jail/config.toml
+[profiles.web]
+profile_version = 1
+github = true
+```
+
+- Only `--profile NAME` selects a profile. An entry under `[profiles]` that no
+  launch selects is ignored, whatever it contains.
+- `profile_version = 1` is required; a typo, an unknown key or a wrong type in
+  the selected profile refuses the launch. A secret-bearing field of the
+  wrong type is refused without showing its value.
+- Every field the profile widens beyond the global base and the command table
+  is printed before the launch, even when other warnings are quiet, as
+  `profile=NAME widens=FIELD granted="…"`.
+
+The final `Complete effective access` review names the selected profile as
+`Named profile: profile=NAME`. The README section
+[Named profiles](../README.md#named-profiles---profile-name) lists the merge
+order and the trust rules in full.
+
 ## Migration and reapproval
 
 Legacy repository `.ai-jail` files contribute restrictions only. Commands,

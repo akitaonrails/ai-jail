@@ -494,12 +494,13 @@ pub(crate) fn prepare_profile(
             .ok_or_else(|| "Cannot group OPEN review disclosure".to_string())?;
         let mut allowed = allowed.trim().to_string();
         let mut open = open.trim().to_string();
-        let mut effective_access = render_effective_access(
+        let mut effective_access = render_effective_access_with_profile(
             &finalized.config,
             project,
             _harness,
             None,
             &selection.env_names,
+            effective.cli.profile.as_deref(),
         )?;
         if let Some(preview) = &forge_preview {
             let line = preview.summary_line();
@@ -1577,12 +1578,13 @@ fn run_sequential(
     )?;
     eprintln!(
         "{}",
-        render_effective_access(
+        render_effective_access_with_profile(
             &finalized.config,
             project,
             harness,
             None,
             &selection.env_names,
+            effective.cli.profile.as_deref(),
         )?
     );
     if effective_has_open_authority(&finalized.config, project)?
@@ -2436,12 +2438,36 @@ pub(crate) fn summary_text(
     output
 }
 
+/// The review with no named profile, for callers that select none.
+#[cfg(test)]
 pub(crate) fn render_effective_access(
     config: &Config,
     project: &Path,
     harness: &str,
     saved: Option<bool>,
     approved_env_names: &[String],
+) -> Result<String, String> {
+    render_effective_access_with_profile(
+        config,
+        project,
+        harness,
+        saved,
+        approved_env_names,
+        None,
+    )
+}
+
+/// The review, naming the `--profile` the launch selected. `--profile`
+/// has no onboarding control (advanced CLI/config-only,
+/// docs/TUI_DESIGN.md), so this line is where its use is shown; its
+/// widenings are already part of the effective policy below.
+pub(crate) fn render_effective_access_with_profile(
+    config: &Config,
+    project: &Path,
+    harness: &str,
+    saved: Option<bool>,
+    approved_env_names: &[String],
+    named_profile: Option<&str>,
 ) -> Result<String, String> {
     let project_label = safe_path(project)?;
     // Launch-scoped SSH paths contain a PID and sequence number. Show stable,
@@ -2506,6 +2532,13 @@ pub(crate) fn render_effective_access(
         format!("Duration: {}", duration(saved)),
         format!("Project: {project_label} (read and write)"),
         "Scope: global policy, proposed project grants, command-line grants, project constraints, and derived platform defaults".into(),
+        match named_profile {
+            Some(name) => format!(
+                "Named profile: profile={} (a trusted global layer)",
+                escape_control_bytes(name)
+            ),
+            None => "Named profile: none".into(),
+        },
         "Effective policy (every nondefault field):".into(),
         policy
             .trim_end()

@@ -197,11 +197,15 @@ declare `profile_version = 1`; unknown keys, wrong types, `command` and
 status-bar preferences fail the launch instead of being dropped, because a
 misspelt restriction would otherwise run without it. A profile is applied as
 a trusted layer and may widen the jail, so every widening is printed on
-stderr before launch and under `--dry-run`, and recorded in the audit launch
+stderr before launch, under `--dry-run` and under `--exec`, and recorded in the audit launch
 record as `profile.widenings`. The widening check reuses the project merge's
 monotonic rules; a field-coverage test fails when a new `Config` field has no
-rule and is not listed as never widening. Secret-bearing fields report key
-names only. A profile is never written to a project policy. Note that a
+rule and is not listed as never widening. Each widening is judged against
+the fully merged result, so a refused field cannot hide another. `env_pass`
+and `secret_hosts` report key names only and `env_from_file` reports file
+paths, never their contents; a wrong-typed secret field is refused without
+its value. An entry under `[profiles]` that no launch selects is ignored,
+whatever its type. A profile is never written to a project policy. Note that a
 profile with `private_home = false` exposes the whole host home, exactly as
 `--no-private-home` does; it is printed as a widening like any other.
 
