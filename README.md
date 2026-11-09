@@ -891,14 +891,20 @@ then the project's saved policy. Trust rules:
   printed before the sandbox starts, without `--verbose` and under
   `--dry-run`, as `profile=NAME widens=FIELD granted="…"`, and recorded in
   the audit log. Tightening (`mask`, `no_gpu = true`, …) prints nothing.
-  `env_pass` and `secret_hosts` show key names only, and `env_from_file`
-  shows file paths, never their contents. Printed with security warnings, so
-  `--exec` does not silence them. A wrong-typed secret field is refused
-  naming the field and the expected type, never the value.
+  Printed with security warnings, so `--exec` does not silence them.
+- Secret values stay out of what profiles print and save: the widening
+  lines, the audit record, `status`, the effective-access review, refusals
+  and saved files. There `env_pass` and `secret_hosts` show key names only,
+  `env_from_file` shows file paths, never their contents, and a wrong-typed
+  secret field is refused naming the field and the expected type, never the
+  value. The bwrap command line that `--dry-run` prints predates profiles
+  and is not covered: it still shows `--setenv NAME VALUE` literally.
 - Names match `[a-z0-9][a-z0-9_-]{0,63}`; nothing is normalised.
 - `profile_version = 1` is required. An unknown key (a typo such as
   `allow_host`), a wrong type, `trust_project_config`, `command` or a
-  status-bar preference fails the launch and names the profile.
+  status-bar preference fails the launch and names the profile. An unknown
+  key whose value is empty (`[]`, `{}`, `""`) carries no restriction and is
+  accepted.
 - A malformed profile that the launch does not select is ignored.
 - Only the CLI selects a profile. A `profile` key or `[profiles]` table in a
   project policy is ignored with a warning, and a profile is never saved into

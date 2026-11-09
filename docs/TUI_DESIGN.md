@@ -219,8 +219,8 @@ must still appear in the final `Complete effective access` review.
   offering it there would let the onboarding screen select trusted authority
   it cannot show in full. It is unrelated to the onboarding access profile
   (the per-project grants these screens edit). The review shows
-  `Named profile: profile=NAME`, and every field it widens is printed as a
-  `profile=NAME widens=FIELD` line before the launch.
+  `Named profile: profile=NAME (a trusted global layer)`, and every field it
+  widens is printed as a `profile=NAME widens=FIELD` line before the launch.
 
 ## Plain-terminal fallback
 

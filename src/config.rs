@@ -420,7 +420,7 @@ pub(crate) struct GlobalConfig {
     pub(crate) profiles: ProfilesKey,
 }
 
-/// The top-level `profiles` key as found. Upstream has no such key and
+/// The top-level `profiles` key as found. v3.3.0 has no such key and
 /// ignores an unknown `profiles = 5`, so a value that is not a table is
 /// kept raw instead of failing the whole file, and refused only when
 /// `--profile` asks for an entry in it. Kept, not dropped,
@@ -1506,8 +1506,10 @@ fn load_from_path(path: &Path) -> Result<Config, String> {
 }
 
 /// The warning printed when a project policy names a profile.
-pub(crate) const PROJECT_PROFILE_IGNORED: &str = "project .ai-jail profile ignored: only the CLI (--profile) selects a \
-     profile";
+pub(crate) const PROJECT_PROFILE_IGNORED: &str = concat!(
+    "project .ai-jail profile ignored: ",
+    "only the CLI (--profile) selects a profile",
+);
 
 /// Whether a project policy document tries to select or define a
 /// profile: a `profile` key or a `[profiles]` table at the top level, or
@@ -1749,6 +1751,12 @@ pub(crate) fn global_config_for_command_report(
 /// `agent_state = true` beside it reads as no change, while the trusted
 /// merge applies both. Each round therefore moves the refused switches to
 /// their merged values and asks again, until no new field appears.
+/// A refusal whose single granted value is a boolean: a switch such as
+/// `lockdown` or `private_home`, the only kind that can mask another field.
+fn is_switch(r: &Refusal) -> bool {
+    matches!(r.granted.as_slice(), [v] if v == "true" || v == "false")
+}
+
 fn profile_widenings(
     base: &Config,
     layer: &Config,
@@ -1779,10 +1787,8 @@ fn profile_widenings(
         // Only a switch can mask another field (lockdown, private_home …);
         // moving a map or a host list into the baseline would make the
         // profile's own entries look like widenings of each other.
-        let switches: Vec<&Refusal> = new
-            .iter()
-            .filter(|r| matches!(r.granted.as_slice(), [v] if v == "true" || v == "false"))
-            .collect();
+        let switches: Vec<&Refusal> =
+            new.iter().filter(|r| is_switch(r)).collect();
         if switches.is_empty() {
             found.extend(new);
             return Ok(found);
@@ -2115,7 +2121,8 @@ fn append_project_maps(
                 field,
                 vec![source.display().to_string()],
                 format!(
-                    "{layer} map {} outside project ignored (use --rw-map/--ro-map or global config)",
+                    "{layer} map {} outside project ignored \
+                     (use --rw-map/--ro-map or global config)",
                     source.display()
                 ),
             ));
@@ -2223,13 +2230,19 @@ pub(crate) fn merge_layer_report(
         &mut warnings,
     );
     c.rw_maps.retain(|map| {
-        let destination = to_absolute(MapSpec::parse(map)
-            .map(|spec| spec.destination)
-            .unwrap_or_else(|_| map.clone()), project_dir);
-        let overlaps_ro = c.ro_maps.iter().any(|ro| {
-            let ro_destination = to_absolute(MapSpec::parse(ro)
+        let destination = to_absolute(
+            MapSpec::parse(map)
                 .map(|spec| spec.destination)
-                .unwrap_or_else(|_| ro.clone()), project_dir);
+                .unwrap_or_else(|_| map.clone()),
+            project_dir,
+        );
+        let overlaps_ro = c.ro_maps.iter().any(|ro| {
+            let ro_destination = to_absolute(
+                MapSpec::parse(ro)
+                    .map(|spec| spec.destination)
+                    .unwrap_or_else(|_| ro.clone()),
+                project_dir,
+            );
             destination.starts_with(&ro_destination)
                 || ro_destination.starts_with(&destination)
         });
@@ -2241,7 +2254,8 @@ pub(crate) fn merge_layer_report(
                 "rw_maps",
                 vec![destination.display().to_string()],
                 format!(
-                    "{layer} rw map {} ignored because it overlaps a trusted read-only map",
+                    "{layer} rw map {} ignored because it overlaps a \
+                     trusted read-only map",
                     destination.display()
                 ),
             ));
@@ -2286,7 +2300,10 @@ pub(crate) fn merge_layer_report(
     macro_rules! monotonic {
         ($field:ident, $enabled:expr) => {
             if let Some(value) = local.$field {
-                let candidate = Config { $field: Some(value), ..c.clone() };
+                let candidate = Config {
+                    $field: Some(value),
+                    ..c.clone()
+                };
                 if !$enabled(&candidate) || $enabled(&c) {
                     c.$field = Some(value);
                 } else {
@@ -2294,7 +2311,8 @@ pub(crate) fn merge_layer_report(
                         stringify!($field),
                         vec![value.to_string()],
                         format!(
-                            "{layer} {} ignored because it weakens the baseline sandbox",
+                            "{layer} {} ignored because it weakens the \
+                             baseline sandbox",
                             stringify!($field)
                         ),
                     ));
@@ -2378,7 +2396,8 @@ pub(crate) fn merge_layer_report(
             "env_from_file",
             path_strings(&local.env_from_file),
             format!(
-                "{layer} env_from_file ignored (use --env-from-file or global config)"
+                "{layer} env_from_file ignored \
+                 (use --env-from-file or global config)"
             ),
         ));
     }
@@ -2401,7 +2420,8 @@ pub(crate) fn merge_layer_report(
             "browser_profile",
             vec![profile],
             format!(
-                "{layer} browser_profile ignored because it weakens the baseline sandbox"
+                "{layer} browser_profile ignored because it weakens the \
+                 baseline sandbox"
             ),
         ));
     }
@@ -2481,7 +2501,8 @@ pub(crate) fn merge_layer_report(
             "claude_dir",
             vec![dir.display().to_string()],
             format!(
-                "{layer} claude_dir ignored (set it in global config or --claude-dir)"
+                "{layer} claude_dir ignored \
+                 (set it in global config or --claude-dir)"
             ),
         ));
     }
@@ -9234,7 +9255,7 @@ claude_dir = "/home/user/.claude-example"
 // `profile_version` present and integer 1, no `trust_project_config`,
 // no unknown key (serde aliases, `skip_serializing` fields and empty
 // arrays/tables are not unknown), then the parser's type errors prefixed
-// with the profile name. Fixtures use only keys upstream/master knows.
+// with the profile name. Fixtures use only keys a v3.3.0 config can hold.
 #[cfg(test)]
 mod profile_select_tests {
     use std::collections::BTreeMap;
@@ -9265,7 +9286,7 @@ mod profile_select_tests {
 
     #[test]
     fn profile_names_off_the_grammar_are_refused_naming_the_rule() {
-        // Hostile half first: near misses of a valid name. Each is put in
+        // Near misses of a valid name. Each is put in
         // the map, so only the grammar can refuse it.
         let long = "a".repeat(65);
         for bad in [
@@ -9310,7 +9331,8 @@ mod profile_select_tests {
         // `agent-test` and `agent_test` are two profiles, never one.
         let map = profiles(
             "[agent-test]\nprofile_version = 1\nallow_hosts = [\"a.example\"]\n\
-             [agent_test]\nprofile_version = 1\nallow_hosts = [\"b.example\"]\n",
+             [agent_test]\nprofile_version = 1\n\
+             allow_hosts = [\"b.example\"]\n",
         );
         assert_eq!(
             select_profile(&map, "agent-test").unwrap().allow_hosts,
@@ -9371,7 +9393,7 @@ mod profile_select_tests {
 
     #[test]
     fn profile_unknown_keys_are_refused_naming_profile_and_key() {
-        // Hostile half first: a typo in a restriction must not be dropped.
+        // A typo in a restriction must not be dropped.
         for (key, body) in [
             ("allow_host", "allow_host = [\"a.example\"]\n"),
             ("mask_exept", "mask_exept = [\"/x\"]\n"),
@@ -9392,14 +9414,18 @@ mod profile_select_tests {
         let map = one(
             "agent-test",
             "mask = []\nallow_hosts = []\nno_gpu = false\n\
-             env_pass = [\"AJ047_NAME\"]\nenv_from_file = [\"/tmp/aj047.env\"]\n\
-             [secret_hosts]\nAJ047_TOKEN = \"api.example.com\"\n",
+             env_pass = [\"AJ_PROFILE_NAME\"]\n\
+             env_from_file = [\"/tmp/aj-profile.env\"]\n\
+             [secret_hosts]\nAJ_PROFILE_TOKEN = \"api.example.com\"\n",
         );
         let config = select_profile(&map, "agent-test").unwrap();
-        assert_eq!(config.env_pass, ["AJ047_NAME"]);
+        assert_eq!(config.env_pass, ["AJ_PROFILE_NAME"]);
         assert_eq!(config.no_gpu, Some(false));
         assert_eq!(
-            config.secret_hosts.get("AJ047_TOKEN").map(String::as_str),
+            config
+                .secret_hosts
+                .get("AJ_PROFILE_TOKEN")
+                .map(String::as_str),
             Some("api.example.com")
         );
     }
@@ -9473,7 +9499,8 @@ mod profile_select_tests {
     fn profile_reads_the_same_keys_as_a_command_table() {
         let map = one(
             "agent-test",
-            "allow_hosts = [\"registry.npmjs.org\"]\nmask = [\"/usr/bin/ssh\"]\n\
+            "allow_hosts = [\"registry.npmjs.org\"]\n\
+             mask = [\"/usr/bin/ssh\"]\n\
              ssh = true\n",
         );
         let config = select_profile(&map, "agent-test").unwrap();
@@ -9503,7 +9530,7 @@ mod profile_select_tests {
 // `<XDG_CONFIG_HOME>/ai-jail/config.toml`, directory 0700, file 0600
 // (`config_store::StorePaths.global`); `~/.ai-jail` is only the legacy
 // file the store migration consumes.
-// Fixtures use only keys upstream/master knows.
+// Fixtures use only keys a v3.3.0 config can hold.
 #[cfg(test)]
 mod profile_merge_tests {
     use std::path::{Path, PathBuf};
@@ -9526,7 +9553,7 @@ mod profile_merge_tests {
     fn global_file(body: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!(
-            "aj047-profile-merge-{}-{}",
+            "ai-jail-profile-merge-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -9578,7 +9605,8 @@ mod profile_merge_tests {
             refusals.iter().map(|r| r.text.as_str()).collect();
         assert!(
             texts.contains(
-                &"project .ai-jail ssh ignored because it weakens the baseline sandbox"
+                &"project .ai-jail ssh ignored because it weakens the \
+                  baseline sandbox"
             ),
             "{texts:?}"
         );
@@ -9594,7 +9622,7 @@ mod profile_merge_tests {
     #[test]
     fn profile_secret_refusals_carry_key_names_never_values() {
         let local = Config {
-            env_pass: vec!["AJ047_SECRET=topsecret-value".into()],
+            env_pass: vec!["AJ_PROFILE_SECRET=topsecret-value".into()],
             ..Config::default()
         };
         let (_, refusals) = merge_with_global_report(
@@ -9607,7 +9635,7 @@ mod profile_merge_tests {
             .find(|r| r.field == "env_pass")
             .expect("env_pass");
         assert!(env.secret);
-        assert_eq!(env.granted, ["AJ047_SECRET"]);
+        assert_eq!(env.granted, ["AJ_PROFILE_SECRET"]);
         for r in &refusals {
             assert!(
                 !r.text.contains("topsecret")
@@ -9619,9 +9647,10 @@ mod profile_merge_tests {
 
     #[test]
     fn profile_that_only_tightens_reports_no_widening() {
-        // Hostile half first: tightening must never be called a widening.
+        // Tightening must never be called a widening.
         let (config, report) = load(
-            "[profiles.tight]\nprofile_version = 1\nno_gpu = true\nmask = [\"/usr/bin/ssh\"]\n",
+            "[profiles.tight]\nprofile_version = 1\nno_gpu = true\n\
+             mask = [\"/usr/bin/ssh\"]\n",
             &["--profile", "tight", "bash"],
         );
         let report = report.expect("a selected profile yields a report");
@@ -9644,7 +9673,7 @@ mod profile_merge_tests {
             "allow_hosts = [\"a.example\"]\n\
              [profiles.wide]\nprofile_version = 1\nssh = true\n\
              allow_hosts = [\"a.example\", \"b.example\"]\n\
-             rw_maps = [\"/opt/aj047-outside\"]\n",
+             rw_maps = [\"/opt/aj-outside\"]\n",
             &["--profile", "wide", "bash"],
         );
         let report = report.unwrap();
@@ -9654,9 +9683,7 @@ mod profile_merge_tests {
         assert_eq!(hosts.granted, ["b.example"]);
         let maps = widening(&report, "rw_maps").expect("outside-map widening");
         assert!(
-            maps.granted
-                .iter()
-                .any(|g| g.contains("/opt/aj047-outside")),
+            maps.granted.iter().any(|g| g.contains("/opt/aj-outside")),
             "{:?}",
             maps.granted
         );
@@ -9669,12 +9696,12 @@ mod profile_merge_tests {
     fn profile_secret_widening_lists_keys_only() {
         let (_, report) = load(
             "[profiles.sec]\nprofile_version = 1\n\
-             env_pass = [\"AJ047_SECRET=topsecret-value\"]\n",
+             env_pass = [\"AJ_PROFILE_SECRET=topsecret-value\"]\n",
             &["--profile", "sec", "bash"],
         );
         let report = report.unwrap();
         let env = widening(&report, "env_pass").expect("env_pass widening");
-        assert_eq!(env.granted, ["AJ047_SECRET"]);
+        assert_eq!(env.granted, ["AJ_PROFILE_SECRET"]);
     }
 
     #[test]
@@ -9700,7 +9727,8 @@ mod profile_merge_tests {
     #[test]
     fn profile_absent_means_no_report_even_with_a_malformed_table() {
         let (config, report) = load(
-            "no_gpu = true\n[profiles.bad]\nprofile_version = \"x\"\nallow_hosts = 3\n",
+            "no_gpu = true\n[profiles.bad]\nprofile_version = \"x\"\n\
+             allow_hosts = 3\n",
             &["bash"],
         );
         assert!(report.is_none());
@@ -9754,11 +9782,11 @@ mod profile_field_coverage_tests {
             "true",
             "false",
             "\"x\"",
-            "\"/opt/aj047-outside\"",
-            "[\"/opt/aj047-outside\"]",
+            "\"/opt/aj-outside\"",
+            "[\"/opt/aj-outside\"]",
             "[\"x.example\"]",
             "[4242]",
-            "{ AJ047 = \"x.example\" }",
+            "{ AJ_PROFILE_KEY = \"x.example\" }",
         ];
         let fields = config_fields();
         assert!(fields.len() > 40, "scanner found {fields:?}");
@@ -9837,7 +9865,10 @@ mod profile_review_tests {
         let line = &report.lines()[0];
         assert_eq!(
             line,
-            r#"profile=p widens=rw_maps granted="/x\" widens=network granted=\"y,a\,b""#
+            concat!(
+                r#"profile=p widens=rw_maps granted="/x\" "#,
+                r#"widens=network granted=\"y,a\,b""#,
+            )
         );
         assert_eq!(
             line.matches("widens=").count()
@@ -9852,8 +9883,8 @@ mod profile_review_tests {
 // Module name starts with `profile` so `cargo test config::profile` runs it.
 //
 // Contract: every path that rewrites the trusted global config round-trips
-// `[profiles.*]` tables with every key and value. On upstream v3.3.0
-// (fe4dfe0) those paths are `config_store::save_global_preferences` (the
+// `[profiles.*]` tables with every key and value. In v3.3.0 (fe4dfe0)
+// those paths are `config_store::save_global_preferences` (the
 // status-bar preference save) and `config_store::migrate` (the legacy
 // `~/.ai-jail` moved to `$XDG_CONFIG_HOME/ai-jail/config.toml`).
 // Values are compared, not bytes: comments and table order may be lost by
@@ -9881,7 +9912,7 @@ mod profile_save_tests {
     impl Fixture {
         fn new() -> Self {
             let root = std::env::temp_dir().join(format!(
-                "aj047-profile-save-{}-{}",
+                "ai-jail-profile-save-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
@@ -9902,7 +9933,9 @@ mod profile_save_tests {
                 root: store.clone(),
                 global: store.join("config.toml"),
                 global_provenance: store.join("global-migration.toml"),
-                project: store.join("projects").join("aj047-profile-save.toml"),
+                project: store
+                    .join("projects")
+                    .join("ai-jail-profile-save.toml"),
                 legacy_global: home.join(".ai-jail"),
                 legacy_project: canonical_project.join(".ai-jail"),
                 policy_root: canonical_project.clone(),
@@ -10017,7 +10050,8 @@ mod profile_project_tests {
 
 // A profile table and a `[commands.<name>]` table with the same keys
 // produce the same Config, and that Config survives a serialize/parse
-// round trip. Test names contain `roundtrip`. Fixtures use only keys upstream/master knows.
+// round trip. Test names contain `roundtrip`. Fixtures use only keys a
+// v3.3.0 config can hold.
 #[cfg(test)]
 mod roundtrip_profiles_tests {
     use std::collections::BTreeMap;
@@ -10064,11 +10098,11 @@ hide_dotdirs = [\".secrets\"]
     }
 }
 
-// A stray non-table entry under `[profiles]` is inert unless selected and refused
-// naming the profile when it is; a wrong-typed secret field
-// is refused naming profile, field and expected type, never the value
-//; and a field the profile-layer filter refuses cannot hide a
-// widening in another field. Fixtures are the trusted global config
+// A stray non-table entry under `[profiles]` is inert unless selected, and
+// refused naming the profile when it is; a wrong-typed secret field is
+// refused naming profile, field and expected type, never the value; and a
+// field the profile-layer filter refuses cannot hide a widening in another
+// field. Fixtures are the trusted global config
 // `<XDG_CONFIG_HOME>/ai-jail/config.toml` (dir 0700, file 0600), loaded
 // through `load_global_for_command_from_path`, as a launch loads it.
 #[cfg(test)]
@@ -10136,7 +10170,7 @@ allow_hosts = [\"api.example.com\"]
 
     #[test]
     fn stray_non_table_profiles_entry_is_inert_without_profile() {
-        // Hostile half first: entries a user plausibly writes by mistake.
+        // Entries a user plausibly writes by mistake.
         // Each must leave a launch that names no profile untouched.
         for stray in [
             "default = \"agent-test\"",
@@ -10417,8 +10451,8 @@ mod profile_stray_key_tests {
 
     #[test]
     fn non_table_profiles_key_is_inert_without_profile() {
-        // Hostile half first: an upstream config that happens to carry an
-        // unknown `profiles` key must launch exactly as upstream does,
+        // An existing config that happens to carry an unknown `profiles`
+        // key must launch exactly as it does without profile support,
         // base policy intact, with no profile reported.
         for stray in NOT_A_TABLE {
             let body = format!(

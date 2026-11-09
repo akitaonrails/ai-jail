@@ -947,7 +947,7 @@ mod tests {
             name: "agent-test".into(),
             widenings: vec![Widening {
                 field: "env_pass".into(),
-                granted: vec!["AJ047_SECRET".into()],
+                granted: vec!["AJ_PROFILE_SECRET".into()],
             }],
         };
         let new = launch_record(&LaunchRecord {
@@ -957,7 +957,10 @@ mod tests {
         assert_eq!(new["profile"]["name"], "agent-test");
         assert_eq!(
             new["profile"]["widenings"],
-            serde_json::json!([{"field": "env_pass", "granted": ["AJ047_SECRET"]}])
+            serde_json::json!([{
+                "field": "env_pass",
+                "granted": ["AJ_PROFILE_SECRET"],
+            }])
         );
         // Every pre-existing key is unchanged.
         for (key, value) in old.as_object().unwrap() {

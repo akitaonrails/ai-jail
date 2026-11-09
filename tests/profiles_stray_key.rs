@@ -143,8 +143,8 @@ fn has_token(line: &str, word: &str) -> bool {
 
 #[test]
 fn plain_launch_with_a_non_table_profiles_key_exits_zero() {
-    // Hostile half first: the shapes an upstream user could already
-    // have, none of which upstream refuses.
+    // The shapes an existing v3.3.0 config could already carry, none of
+    // which v3.3.0 refuses.
     for (tag, global) in [
         ("int", "profiles = 5\n"),
         ("str", "profiles = \"x\"\n"),

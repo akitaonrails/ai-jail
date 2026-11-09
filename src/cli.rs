@@ -44,8 +44,9 @@ OPTIONS:
     --landlock / --no-landlock     Enable/disable Landlock LSM (Linux 5.13+, default: on)
     --seccomp / --no-seccomp       Enable/disable seccomp syscall filter (Linux, default: on)
     --rlimits / --no-rlimits       Enable/disable resource limits (default: on)
-    --profile <NAME>               Apply [profiles.NAME] from the global config (once;
-                                   every access it widens is printed before launch)
+    --profile <NAME>               Apply [profiles.NAME] from the global
+                                   config (once; every access it widens is
+                                   printed before launch)
     --systemd-user / --no-systemd-user
                                    Expose host systemd --user bus (dangerous; default: off)
     --no-gpu / --gpu               Disable/enable GPU device passthrough (Linux only)
@@ -2900,16 +2901,15 @@ mod tests {
     }
 }
 
-// The
-// interface-synchronization contract for `--profile`. The documents name
-// it an advanced CLI/config-only control: the user guide as a
+// The interface-synchronization contract for `--profile`. The documents
+// name it an advanced CLI/config-only control: the user guide as a
 // "named profile (`[profiles.NAME]`)", kept apart from the onboarding
 // access profile; the TUI design with the reason it has no onboarding
 // control; the onboarding provenance with an entry in its existing
 // shape. And a drift test: every `Config` field and every
 // `SANDBOX_LONG_FLAGS` entry appears in `docs/USER_GUIDE.md` as a whole
 // token, or is allowlisted. The allowlist has two parts: fields that are
-// internal, and the names already undocumented at upstream fe4dfe0, so the
+// internal, and the names already undocumented in v3.3.0 (fe4dfe0), so the
 // test is a ratchet — nothing new may land undocumented, and a name
 // leaves the baseline once the guide documents it.
 #[cfg(test)]
@@ -2924,7 +2924,7 @@ mod interface_profile_tests {
     /// `Config` fields that no user sets: runtime state, never parsed.
     const INTERNAL_FIELDS: &[&str] = &["runtime_harnesses"];
 
-    /// `Config` fields already missing from the guide at upstream fe4dfe0.
+    /// `Config` fields already missing from the guide in v3.3.0 (fe4dfe0).
     const UNDOCUMENTED_FIELDS_AT_FE4DFE0: &str = r"
     rw_maps overlay_maps hide_dotdirs mask deny_paths mask_exceptions
     deny_path_exceptions no_gpu no_docker tailscale no_display audio
@@ -3013,7 +3013,7 @@ mod interface_profile_tests {
 
     #[test]
     fn drift_check_fires_for_a_name_that_appears_only_inside_another() {
-        // Hostile half first: a near-identical documented name must not
+        // A near-identical documented name must not
         // count for the undocumented one, in either direction.
         let guide = "Use `--ro-map PATH` and `browser_profile = \"soft\"`.";
         assert_eq!(undocumented(&["--map"], guide, &[]), ["--map"]);

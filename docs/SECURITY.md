@@ -197,17 +197,22 @@ declare `profile_version = 1`; unknown keys, wrong types, `command` and
 status-bar preferences fail the launch instead of being dropped, because a
 misspelt restriction would otherwise run without it. A profile is applied as
 a trusted layer and may widen the jail, so every widening is printed on
-stderr before launch, under `--dry-run` and under `--exec`, and recorded in the audit launch
-record as `profile.widenings`. The widening check reuses the project merge's
-monotonic rules; a field-coverage test fails when a new `Config` field has no
-rule and is not listed as never widening. Each widening is judged against
-the fully merged result, so a refused field cannot hide another. `env_pass`
-and `secret_hosts` report key names only and `env_from_file` reports file
-paths, never their contents; a wrong-typed secret field is refused without
-its value. An entry under `[profiles]` that no launch selects is ignored,
-whatever its type. A profile is never written to a project policy. Note that a
-profile with `private_home = false` exposes the whole host home, exactly as
-`--no-private-home` does; it is printed as a widening like any other.
+stderr before launch, under `--dry-run` and under `--exec`, and recorded in
+the audit launch record as `profile.widenings`. The widening check reuses the
+project merge's monotonic rules; a field-coverage test fails when a new
+`Config` field has no rule and is not listed as never widening. Each
+widening is judged against the fully merged result, so a refused field
+cannot hide another. On the widening lines, the audit record, `status`, the
+effective-access review, refusals and saved files, `env_pass` and
+`secret_hosts` report key names only and `env_from_file` reports file paths,
+never their contents; a wrong-typed secret field is refused without its
+value. The bwrap command line that `--dry-run` prints predates profiles and
+is not covered: it still shows `--setenv NAME VALUE` literally, whether the
+variable comes from a profile or not. An entry under `[profiles]` that no
+launch selects is ignored, whatever its type. A profile is never written to a
+project policy. Note that a profile with `private_home = false` exposes the
+whole host home, exactly as `--no-private-home` does; it is printed as a
+widening like any other.
 
 Private home is on by default. ai-jail exposes only state needed by the
 invoked agent. The first-run developer preset visibly selects agent credential

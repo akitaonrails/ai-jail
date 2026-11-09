@@ -3,14 +3,14 @@
 //
 // Each test gets a temporary HOME, XDG_CONFIG_HOME and project directory
 // under CARGO_TARGET_TMPDIR. The `[profiles.*]` tables live in the trusted
-// global config `$XDG_CONFIG_HOME/ai-jail/config.toml` (upstream v3.3.0;
+// global config `$XDG_CONFIG_HOME/ai-jail/config.toml` (since v3.3.0;
 // `~/.ai-jail` is only the legacy file it migrates), and the project
 // policy that `--init` and auto-save write is the per-project document
 // under `$XDG_CONFIG_HOME/ai-jail/projects/`. --dry-run tests need no
 // sandbox; real launches need bwrap with network namespaces and skip with
 // a message when it is unavailable (`require_bwrap_net!` from
-// `tests/common/mod.rs`). Fixtures use only keys upstream/master knows
-// (no cpus/rlimit), so this suite stands alone on feat/profiles.
+// `tests/common/mod.rs`). Fixtures use only keys a v3.3.0 config can hold
+// (no cpus or rlimit keys), so this suite depends on no other change.
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -32,7 +32,7 @@ profile_version = 1
 allow_hosts = [\"registry.npmjs.org\", \"api.example.com\"]
 pictures = true
 no_gpu = true
-env_pass = [\"AJ047_SECRET=topsecret-value\"]
+env_pass = [\"AJ_PROFILE_SECRET=topsecret-value\"]
 ";
 
 struct Tree {
@@ -46,7 +46,7 @@ impl Tree {
     fn new(name: &str, global: &str) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("aj047-prof-{name}-{}-{id}", std::process::id()));
+            .join(format!("ai-jail-prof-{name}-{}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let project = root.join("project");
         let home = root.join("home");
@@ -219,7 +219,7 @@ fn widening_lines_never_carry_a_secret_value() {
     let lines = widening_lines(&out, "wide");
     let env =
         line_for(&lines, "env_pass").expect("env_pass line names the key");
-    assert!(env.contains("AJ047_SECRET"), "{env}");
+    assert!(env.contains("AJ_PROFILE_SECRET"), "{env}");
 }
 
 #[test]
@@ -318,8 +318,12 @@ fn init_never_writes_a_profile_key_into_the_project_file() {
     assert_ok(&out);
     let body = tree.saved_project_policy();
     assert!(!body.is_empty(), "--init writes the project policy");
-    for leaked in ["registry.npmjs.org", "pictures", "profile", "AJ047_SECRET"]
-    {
+    for leaked in [
+        "registry.npmjs.org",
+        "pictures",
+        "profile",
+        "AJ_PROFILE_SECRET",
+    ] {
         assert!(
             !body.contains(leaked),
             "{leaked} leaked into the project policy:\n{body}"
@@ -346,8 +350,12 @@ fn auto_save_never_writes_a_profile_key_into_the_project_file() {
     ]);
     assert_ok(&out);
     let body = tree.saved_project_policy();
-    for leaked in ["registry.npmjs.org", "pictures", "profile", "AJ047_SECRET"]
-    {
+    for leaked in [
+        "registry.npmjs.org",
+        "pictures",
+        "profile",
+        "AJ_PROFILE_SECRET",
+    ] {
         assert!(
             !body.contains(leaked),
             "{leaked} leaked into the project policy:\n{body}"
@@ -393,5 +401,5 @@ fn audit_record_carries_the_profile_and_its_widenings() {
         .iter()
         .find(|w| w["field"] == "env_pass")
         .expect("env_pass widening");
-    assert_eq!(env["granted"], serde_json::json!(["AJ047_SECRET"]));
+    assert_eq!(env["granted"], serde_json::json!(["AJ_PROFILE_SECRET"]));
 }
