@@ -88,7 +88,23 @@ impl Drop for HandledSignalMask {
 pub fn wrap_supervised_command(
     command: &mut Command,
 ) -> Result<SupervisionGate, String> {
+    // The write end must not survive the exec into the supervisor, or the
+    // sandboxed command inherits a stray writable descriptor. Only the read
+    // end is handed to the supervisor, so only it has CLOEXEC cleared.
     let (read, write) = nix::unistd::pipe().map_err(|e| e.to_string())?;
+    let write_flags =
+        unsafe { nix::libc::fcntl(write.as_raw_fd(), nix::libc::F_GETFD) };
+    if write_flags < 0
+        || unsafe {
+            nix::libc::fcntl(
+                write.as_raw_fd(),
+                nix::libc::F_SETFD,
+                write_flags | nix::libc::FD_CLOEXEC,
+            )
+        } < 0
+    {
+        return Err("Cannot prepare supervised execution gate".into());
+    }
     let flags =
         unsafe { nix::libc::fcntl(read.as_raw_fd(), nix::libc::F_GETFD) };
     if flags < 0
@@ -289,6 +305,27 @@ mod tests {
         set_child_pid(0);
         assert_eq!(CHILD_PID.load(Ordering::SeqCst), 0);
         CHILD_PID.store(saved, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn supervision_gate_write_end_does_not_survive_exec() {
+        let mut command = Command::new("/usr/bin/true");
+        let gate = wrap_supervised_command(&mut command).unwrap();
+        let write_flags = unsafe {
+            nix::libc::fcntl(gate.write.as_raw_fd(), nix::libc::F_GETFD)
+        };
+        assert!(write_flags >= 0);
+        assert_ne!(
+            write_flags & nix::libc::FD_CLOEXEC,
+            0,
+            "the gate write end would leak into the sandboxed command"
+        );
+        // The supervisor needs the read end after exec.
+        let read_flags = unsafe {
+            nix::libc::fcntl(gate.read.as_raw_fd(), nix::libc::F_GETFD)
+        };
+        assert!(read_flags >= 0);
+        assert_eq!(read_flags & nix::libc::FD_CLOEXEC, 0);
     }
 
     #[test]
