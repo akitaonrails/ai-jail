@@ -194,7 +194,7 @@ The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs`
 16. SSH agent socket and `~/.ssh` exemption mounts
 17. Pictures mount
 18. Browser profile state mount
-19. Extra user mounts (`--map`, `--rw-map`)
+19. Extra user mounts (`--map`, `--rw-map`), then the mise command-wrapper lock (a jail-owned empty file bound writable over `<mise data dir>/command-wrappers/bin.lock`, only when a read-only map holds that path; it is not a user map, so the rule that no RW map may sit under a RO one does not apply: it exposes no host data)
 20. Overlay maps (`--overlay-map` — copy-on-write `--overlay-src`/`--overlay`)
 21. Project directory (pwd, rw or ro depending on mode)
 22. In-project agent-state mounts, then in-project user mounts (after the project bind; masks and deny overlays still follow both)

@@ -2040,10 +2040,9 @@ fn discover_mounts_full(
     let (extra_outside, extra_inside) = if lockdown || browser_mode {
         (vec![], vec![])
     } else {
-        split_by_project(
-            extra_mounts(&config.rw_maps, &config.ro_maps),
-            project_dir,
-        )
+        let mut extra = extra_mounts(&config.rw_maps, &config.ro_maps);
+        extra.extend(mise_wrappers_lock_mount(&extra, sources.create_dirs));
+        split_by_project(extra, project_dir)
     };
     let (overlay_outside, overlay_inside) =
         split_by_project(overlay_mounts_v, project_dir);
@@ -3644,6 +3643,23 @@ fn git_worktree_mounts(
         mounts.push(mount(paths.git_dir));
     }
     mounts
+}
+
+/// A writable, jail-owned file over mise's command-wrapper lock, when a
+/// read-only map in `extra` holds the lock's path (see
+/// [`super::mise_wrappers_lock`]).
+///
+/// This is not a user `--rw-map`, so it skips their rule that no read-write
+/// map may sit under a read-only one: that rule keeps a map from re-exposing
+/// read-only host data as writable, and this bind exposes no host data, only
+/// an empty file ai-jail owns. It follows the read-only map in `extra`, so it
+/// is emitted after it and wins, and Landlock grants write to that one file.
+fn mise_wrappers_lock_mount(extra: &[Mount], create: bool) -> Option<Mount> {
+    let (src, dest) = super::mise_wrappers_lock(create)?;
+    let under_read_only = extra.iter().any(|mount| {
+        matches!(mount, Mount::RoBind { dest: ro, .. } if dest.starts_with(ro))
+    });
+    under_read_only.then_some(Mount::Bind { src, dest })
 }
 
 fn extra_mounts(rw_maps: &[PathBuf], ro_maps: &[PathBuf]) -> Vec<Mount> {
@@ -9087,5 +9103,62 @@ nameserver 8.8.8.8
             "CLAUDE_CONFIG_DIR must not appear when \
              claude_dir is None"
         );
+    }
+
+    #[test]
+    fn mise_wrappers_lock_is_bound_writable_after_the_read_only_data_map() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-bwrap-mise-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("mise");
+        std::fs::create_dir_all(data.join("command-wrappers/bin")).unwrap();
+        let lock = data.join("command-wrappers/bin.lock");
+        std::fs::write(&lock, "").unwrap();
+        let _data = EnvVarGuard::set("MISE_DATA_DIR", &data);
+        let _xdg = EnvVarGuard::set("XDG_DATA_HOME", root.join("share"));
+        let own = root.join("share/ai-jail/cache/mise/command-wrappers.lock");
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let project = PathBuf::from("/home/user/project");
+        let args_for = |config: &Config| {
+            build_dry_run_args(
+                config,
+                &project,
+                guard.hosts_mount(),
+                guard.resolv_mount(),
+                guard.empty_path(),
+                false,
+            )
+            .unwrap()
+        };
+        let position = |args: &[String], flag: &str, a: &Path, b: &Path| {
+            let (a, b) = (a.display().to_string(), b.display().to_string());
+            args.windows(3)
+                .position(|w| w[0] == flag && w[1] == a && w[2] == b)
+        };
+
+        let mut config = minimal_test_config();
+        config.ro_maps = vec![data.clone()];
+        let args = args_for(&config);
+        let ro = position(&args, "--ro-bind", &data, &data)
+            .expect("the data dir is mapped read-only");
+        let rw = position(&args, "--bind", &own, &lock)
+            .expect("the lock is bound writable");
+        assert!(rw > ro, "the lock bind must follow the data map: {args:?}");
+        assert!(
+            args.windows(2).any(|w| w[0] == "--landlock-rw-path"
+                && w[1] == lock.display().to_string()),
+            "Landlock must let mise write the lock: {args:?}"
+        );
+
+        // Without a read-only map over it (mise not mapped), no bind.
+        config.ro_maps.clear();
+        assert_eq!(position(&args_for(&config), "--bind", &own, &lock), None);
+        // Without the host lock (no wrappers configured), no bind.
+        config.ro_maps = vec![data.clone()];
+        std::fs::remove_file(&lock).unwrap();
+        assert_eq!(position(&args_for(&config), "--bind", &own, &lock), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
