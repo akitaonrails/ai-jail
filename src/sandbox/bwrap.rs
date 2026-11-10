@@ -1735,7 +1735,8 @@ pub fn dry_run(
         proxy_socket,
         bridge_sockets,
     )?;
-    Ok(format_dry_run_args(&args))
+    let secret_names = crate::config::env_pass_names(&config.env_pass);
+    Ok(format_dry_run_args_redacting(&args, &secret_names))
 }
 
 #[cfg(test)]
@@ -1820,7 +1821,16 @@ fn build_dry_run_args_forwarded(
     Ok(args)
 }
 
-fn format_dry_run_args(args: &[String]) -> String {
+/// Render a launch command for `--dry-run`.
+///
+/// Values of variables the user supplied through `env_pass` (config,
+/// `--env`, `--env-from-file`) are masked: passing a secret into the
+/// sandbox must not print it into scrollback or CI logs. Names stay, and
+/// values the sandbox derives itself (allowlist, proxy, mise) are shown.
+fn format_dry_run_args_redacting(
+    args: &[String],
+    secret_names: &[String],
+) -> String {
     if args.is_empty() {
         return String::new();
     }
@@ -1843,6 +1853,26 @@ fn format_dry_run_args(args: &[String]) -> String {
             }
             out.push('\n');
             break;
+        }
+
+        // `--setenv NAME VALUE`: keep the name, mask a user-supplied value.
+        if arg == "--setenv" && i + 2 < args.len() {
+            out.push_str("  --setenv ");
+            out.push_str(&super::quote_shell_arg(&args[i + 1]));
+            out.push(' ');
+            // Phantom placeholders are not secrets and stay readable; they
+            // show that substitution is in effect.
+            let is_placeholder = args[i + 2].starts_with("AIJAIL-PHANTOM-");
+            if secret_names.iter().any(|name| name == &args[i + 1])
+                && !is_placeholder
+            {
+                out.push_str("<redacted>");
+            } else {
+                out.push_str(&super::quote_shell_arg(&args[i + 2]));
+            }
+            out.push_str(" \\\n");
+            i += 3;
+            continue;
         }
 
         if arg.starts_with("--") {
@@ -6357,9 +6387,34 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_masks_user_supplied_env_values() {
+        let args: Vec<String> = [
+            "/usr/bin/bwrap",
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            "/usr/local/bin:/usr/bin",
+            "--setenv",
+            "API_TOKEN",
+            "s3cr3t-value",
+            "--",
+            "/bin/bash",
+        ]
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+        let output =
+            format_dry_run_args_redacting(&args, &["API_TOKEN".to_string()]);
+        assert!(output.contains("API_TOKEN <redacted>"), "{output}");
+        assert!(!output.contains("s3cr3t-value"), "{output}");
+        // Values the sandbox derives (the inherited PATH) stay visible.
+        assert!(output.contains("/usr/local/bin:/usr/bin"), "{output}");
+    }
+
+    #[test]
     fn format_dry_run_empty() {
         let args: Vec<String> = vec![];
-        let output = format_dry_run_args(&args);
+        let output = format_dry_run_args_redacting(&args, &[]);
         assert!(output.is_empty());
     }
 

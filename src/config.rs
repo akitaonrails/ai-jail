@@ -1082,11 +1082,72 @@ fn load_toml_with_policy<T: Default>(
     }
     let path = path.as_path();
     match std::fs::read_to_string(path) {
-        Ok(contents) => parse(&contents)
-            .map_err(|e| format!("Failed to parse {}: {e}", path.display())),
+        Ok(contents) => parse(&contents).map_err(|e| {
+            format!(
+                "Failed to parse {}: {}",
+                path.display(),
+                redact_env_assignments(&e)
+            )
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
         Err(e) => Err(format!("Failed to read {}: {e}", path.display())),
     }
+}
+
+/// Variable names carried by `env_pass` entries, without their values.
+///
+/// Diagnostics (`status`, `--dry-run`) show names only: an entry is how a
+/// secret enters the sandbox, so its value must not reach terminal
+/// scrollback or CI logs.
+pub(crate) fn env_pass_names(entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| {
+            parse_env_entry(entry)
+                .map(|(name, _)| name.to_string())
+                .unwrap_or_else(|_| entry.clone())
+        })
+        .collect()
+}
+
+/// Mask the value half of every `NAME=VALUE` token in `text`.
+///
+/// Used for diagnostics that quote user configuration: an `env_pass`
+/// entry carries a secret by design, so a parse error must never echo it
+/// into terminal scrollback or CI logs. Variable names stay, because they
+/// are what the user needs to find the line.
+pub(crate) fn redact_env_assignments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(eq) = rest.find('=') {
+        let (before, after) = rest.split_at(eq);
+        let name_start = before
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let name = &before[name_start..];
+        let value_and_rest = &after[1..];
+        let value_len = value_and_rest
+            .find(|c: char| {
+                c.is_whitespace()
+                    || matches!(c, '"' | '\'' | ',' | ']' | '}' | '|')
+            })
+            .unwrap_or(value_and_rest.len());
+        let is_assignment = !name.is_empty()
+            && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        out.push_str(&before[..name_start]);
+        if is_assignment && value_len > 0 {
+            out.push_str(name);
+            out.push_str("=<redacted>");
+        } else {
+            out.push_str(&before[name_start..]);
+            out.push('=');
+        }
+        rest = &value_and_rest[value_len..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn load_from_path(path: &Path) -> Result<Config, String> {
@@ -2426,7 +2487,9 @@ pub fn display_status(config: &Config, stored_path: Option<&Path>) {
     print_opt_in_enabled("  Terminal passthrough", config.terminal_passthrough);
     print_default_on_enabled("  Agent state", config.agent_state);
     print_opt_in_enabled("  Full env inherit", config.inherit_env);
-    print_string_list("  Env passthrough", &config.env_pass);
+    // Names only: an env_pass entry is how a secret enters the sandbox, so
+    // `status` must never print its value.
+    print_string_list("  Env passthrough", &env_pass_names(&config.env_pass));
     print_path_list("  Env from file", &config.env_from_file);
     print_opt_in_enabled("  Update check", config.update_check);
     print_opt_in_enabled("  Audit log", config.audit_log);
@@ -2620,6 +2683,31 @@ fn print_network_mode(config: &Config) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redaction_masks_env_values_but_keeps_names() {
+        let text = "Failed to parse /x/config.toml: TOML parse error at line 1\n1 | env_pass = [\"API_TOKEN=s3cr3t-value\"]\n  |  ^\n";
+        let redacted = super::redact_env_assignments(text);
+        assert!(redacted.contains("API_TOKEN=<redacted>"), "{redacted}");
+        assert!(!redacted.contains("s3cr3t-value"), "{redacted}");
+        assert!(redacted.contains("Failed to parse /x/config.toml"));
+        // A bare token that is not an assignment is left alone.
+        assert_eq!(
+            super::redact_env_assignments("a = 1 and b=2"),
+            "a = 1 and b=<redacted>"
+        );
+    }
+
+    #[test]
+    fn env_pass_names_hide_values_and_survive_malformed_entries() {
+        let names = super::env_pass_names(&[
+            "API_TOKEN=s3cr3t".into(),
+            "PLAIN".into(),
+            "=broken".into(),
+        ]);
+        assert_eq!(names, vec!["API_TOKEN", "PLAIN", "=broken"]);
+        assert!(!names.iter().any(|name| name.contains("s3cr3t")));
+    }
+
     use super::*;
     use crate::cli::CliArgs;
     use crate::test_utils::{ENV_LOCK, EnvVarGuard};

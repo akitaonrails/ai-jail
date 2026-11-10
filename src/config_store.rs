@@ -706,8 +706,13 @@ fn read_project(
     };
     let text = std::str::from_utf8(&raw)
         .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
-    let doc: ProjectPolicyDocument = toml::from_str(text)
-        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+    let doc: ProjectPolicyDocument = toml::from_str(text).map_err(|e| {
+        format!(
+            "Failed to parse {}: {}",
+            path.display(),
+            config::redact_env_assignments(&e.to_string())
+        )
+    })?;
     if doc.schema_version != MIGRATION_VERSION {
         return Err(format!(
             "Unsupported project policy schema {} in {}",
@@ -773,8 +778,13 @@ pub(crate) fn load_global(paths: &StorePaths) -> Result<GlobalConfig, String> {
     let text = std::str::from_utf8(&raw).map_err(|e| {
         format!("Failed to parse {}: {e}", paths.global.display())
     })?;
-    config::parse_global_toml(text)
-        .map_err(|e| format!("Failed to parse {}: {e}", paths.global.display()))
+    config::parse_global_toml(text).map_err(|e| {
+        format!(
+            "Failed to parse {}: {}",
+            paths.global.display(),
+            config::redact_env_assignments(&e)
+        )
+    })
 }
 
 pub(crate) fn migrate(
@@ -1832,8 +1842,13 @@ fn read_project_document(
         .ok_or_else(|| format!("Config disappeared: {}", path.display()))?;
     let text = std::str::from_utf8(&raw)
         .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
-    let doc: ProjectPolicyDocument = toml::from_str(text)
-        .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+    let doc: ProjectPolicyDocument = toml::from_str(text).map_err(|e| {
+        format!(
+            "Failed to parse {}: {}",
+            path.display(),
+            config::redact_env_assignments(&e.to_string())
+        )
+    })?;
     if doc.schema_version != MIGRATION_VERSION || &doc.project != identity {
         return Err(format!(
             "Project identity/schema mismatch in {}",

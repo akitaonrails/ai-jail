@@ -741,7 +741,11 @@ the new file. If `.ai-jail` was tracked, its deletion remains visible in
 external profile.
 
 Read-only commands such as `status` and `--dry-run` do not migrate. They retain
-a compatibility read path until a writable launch can complete the move.
+a compatibility read path until a writable launch can complete the move. Both
+report environment variable names without their values: an `env_pass` entry is
+how a secret enters the sandbox, so `status` prints the name, `--dry-run` prints
+`--setenv NAME <redacted>`, and a config parse error masks every `NAME=VALUE`
+value while naming the file, line, and column.
 
 A `[commands.<name>]` table merges over the global base: scalar fields it sets
 override the base (status-bar fields stay from the base), list fields (maps,
