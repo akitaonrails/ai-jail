@@ -2192,6 +2192,9 @@ fn main() {
     for notice in &migration_notices {
         output::migration_notice(notice.id, &notice.text, notice.warning);
     }
+    // Unanswered prompt notifications are closed here: a killed notify-send
+    // leaves its notification behind, and ai-jail is about to exit.
+    proxy::close_pending_prompts();
     match result {
         Ok(code) => std::process::exit(code),
         Err(msg) => {

@@ -91,7 +91,11 @@ only that answer set; loopback, link-local, multicast, unspecified, and cloud
 metadata addresses are always refused without prompting. Private, unique-local,
 and carrier-grade NAT answers are identified in the prompt and require an
 explicit approval. A missing notification helper, dismissal, timeout, or any
-prompt error fails closed for that connection. The helper is accepted only
+prompt error fails closed for that connection. The waiting helper is closed
+with SIGINT at that deadline, and any prompt still waiting at exit is
+interrupted the same way, because a killed helper leaves a critical
+notification behind that the desktop never expires; the timeout passed to the
+helper also outlives ai-jail's own deadline so the daemon cannot answer for it. The helper is accepted only
 from a fixed system directory with trusted ownership and permissions.
 
 Read-only for the five legacy credential flags above protects the file from

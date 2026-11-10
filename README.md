@@ -324,7 +324,9 @@ connection until you answer. Each answer holds for the rest of the session and
 is never saved; a denied host is refused without asking again until the next
 launch. Dismissing the notification, no answer within 60 seconds, or a missing
 `notify-send` refuses only the waiting connection: the next connection to that
-host asks again. The host is resolved before asking, and the
+host asks again. An unanswered prompt is closed when its deadline expires, and
+any prompt still waiting when ai-jail exits is closed too, so no dead prompt is
+left in the notification list. The host is resolved before asking, and the
 connection dials exactly those answers. When some resolve to private, ULA, or
 carrier-grade NAT addresses, the notification flags an **internal** host and
 lists them; approving it opens those classes for that host for the session,

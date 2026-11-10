@@ -153,14 +153,69 @@ pub(crate) struct NotifySendPrompt {
 }
 
 const NOTIFY_POLL: Duration = Duration::from_millis(100);
+/// How long a prompted `notify-send` gets to close its notification after
+/// SIGINT before it is killed outright.
+const NOTIFY_CLOSE_GRACE: Duration = Duration::from_millis(300);
+
+/// `notify-send` processes currently waiting for an answer.
+///
+/// SIGINT makes libnotify close its notification through its own daemon
+/// connection ("Wait cancelled, closing notification"); SIGKILL does not,
+/// which is why an unanswered critical prompt otherwise stays in the
+/// notification list until it is dismissed by hand.
+static PENDING_PROMPTS: std::sync::Mutex<Vec<nix::unistd::Pid>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn register_prompt(pid: nix::unistd::Pid) {
+    if let Ok(mut pending) = PENDING_PROMPTS.lock() {
+        pending.push(pid);
+    }
+}
+
+fn unregister_prompt(pid: nix::unistd::Pid) {
+    if let Ok(mut pending) = PENDING_PROMPTS.lock() {
+        pending.retain(|candidate| *candidate != pid);
+    }
+}
+
+/// Close the notifications of prompts still waiting when ai-jail exits, so
+/// no dead prompt is left behind for the session's operator.
+pub(crate) fn close_pending_prompts() {
+    let Ok(mut pending) = PENDING_PROMPTS.lock() else {
+        return;
+    };
+    for pid in pending.drain(..) {
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT);
+    }
+}
+
+/// Ask a prompted process to close its notification, then wait out the grace
+/// period before killing it.
+fn interrupt_then_kill(child: &mut std::process::Child) {
+    let pid =
+        nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap_or(0));
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT);
+    let deadline = Instant::now() + NOTIFY_CLOSE_GRACE;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        thread::sleep(NOTIFY_POLL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
 impl HostPrompt for NotifySendPrompt {
     fn ask(&self, host: &str, port: u16, internal: &[IpAddr]) -> PromptAnswer {
         let (summary, body) = notify_text(&self.label, host, port, internal);
+        // Outlive ai-jail's own deadline: the daemon must not expire the
+        // prompt before the connection it belongs to is decided.
+        let expire = self.timeout.saturating_add(NOTIFY_CLOSE_GRACE * 10);
         let spawned = Command::new(&self.program)
             .arg("--app-name=ai-jail")
             .arg("--urgency=critical")
-            .arg(format!("--expire-time={}", self.timeout.as_millis()))
+            .arg(format!("--expire-time={}", expire.as_millis()))
             .arg("--wait")
             .arg("--action=allow=Allow")
             .arg("--action=deny=Deny")
@@ -173,6 +228,9 @@ impl HostPrompt for NotifySendPrompt {
         let Ok(mut child) = spawned else {
             return PromptAnswer::NoAnswer;
         };
+        let pid =
+            nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap_or(0));
+        register_prompt(pid);
         let deadline = Instant::now() + self.timeout;
         loop {
             match child.try_wait() {
@@ -181,12 +239,13 @@ impl HostPrompt for NotifySendPrompt {
                     thread::sleep(NOTIFY_POLL);
                 }
                 _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    interrupt_then_kill(&mut child);
+                    unregister_prompt(pid);
                     return PromptAnswer::NoAnswer;
                 }
             }
         }
+        unregister_prompt(pid);
         let mut reply = String::new();
         if let Some(mut stdout) = child.stdout.take() {
             let _ = stdout.read_to_string(&mut reply);
@@ -2376,6 +2435,91 @@ mod tests {
             notify_text("claude", "gitlab.lan", 443, &internal);
         assert!(summary.contains("INTERNAL"));
         assert_eq!(body, "gitlab.lan:443\nInternal address: 10.0.0.5, fd00::5");
+    }
+
+    fn fake_notify_trapping_int(
+        tag: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-notify-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("notify-send");
+        let closed = root.join("closed");
+        let ready = root.join("ready");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntrap 'printf closed > \"{}\" ; exit 3' INT\nprintf ready > \"{}\"\nwhile :; do sleep 0.05; done\n",
+                closed.display(),
+                ready.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &script,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        (script, closed, ready)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unanswered_prompt_is_closed_with_sigint_not_killed() {
+        let (script, closed, _ready) = fake_notify_trapping_int("deadline");
+        let prompt = NotifySendPrompt {
+            program: script,
+            label: "claude".into(),
+            timeout: Duration::from_millis(300),
+        };
+        let started = Instant::now();
+        let answer = prompt.ask("example.test", 443, &[]);
+        assert_eq!(answer, PromptAnswer::NoAnswer);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // libnotify closes its notification on SIGINT; SIGKILL would not,
+        // so the trap firing is the assertion that matters.
+        assert!(closed.is_file(), "notify-send did not receive SIGINT");
+        let _ = std::fs::remove_dir_all(closed.parent().unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exit_closes_notifications_still_waiting() {
+        use std::os::unix::fs::PermissionsExt;
+        let (script, closed, ready) = fake_notify_trapping_int("shutdown");
+        let mut child = Command::new(&script).spawn().unwrap();
+        // Wait for the trap to be installed: a SIGINT that arrives first
+        // kills the shell by default action and writes nothing.
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.is_file() && Instant::now() < ready_deadline {
+            thread::sleep(NOTIFY_POLL);
+        }
+        assert!(ready.is_file(), "fake notify-send did not start");
+        register_prompt(nix::unistd::Pid::from_raw(child.id() as i32));
+        close_pending_prompts();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let exited = loop {
+            if let Ok(Some(_)) = child.try_wait() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(NOTIFY_POLL);
+        };
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::set_permissions(
+            &script,
+            std::fs::Permissions::from_mode(0o700),
+        );
+        assert!(exited, "pending notify-send was not interrupted on exit");
+        assert!(closed.is_file(), "notification was not closed on exit");
+        let _ = std::fs::remove_dir_all(closed.parent().unwrap());
     }
 
     #[test]
