@@ -1320,7 +1320,7 @@ fn mise_data_dir(home: &Path, data_override: Option<PathBuf>) -> PathBuf {
 /// (mise makes it on its first run with wrappers configured), since bwrap
 /// needs it as the mount point. `create` makes the jail-owned file (a launch,
 /// not a dry run).
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(crate) fn mise_wrappers_lock(create: bool) -> Option<(PathBuf, PathBuf)> {
     mise_wrappers_lock_from(
         &mise_data_dir(
