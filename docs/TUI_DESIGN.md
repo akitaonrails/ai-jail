@@ -121,6 +121,16 @@ The interface is dense, restrained, and optimized for careful review.
   screen. It shows only platform-relevant entries, never changes a preset, and
   uses the same immediate ALLOWED toggles and explicit OPEN dialogs as the main
   checklist.
+- Terminal appearance is a separate ALLOWED, default-off Additional choice.
+  It permits only OSC 11 terminal-background queries/replies (including exact
+  tmux-wrapped refreshes), DA1 terminal-identity sentinel queries/replies,
+  Mode 2031 support probes/replies (DECRQM), enable/disable controls, and
+  theme-change notifications in the interactive ai-jail PTY. The program
+  can learn terminal color and identity. It does not turn on raw passthrough,
+  clipboard, unrelated queries, exec, or non-TTY output.
+  Reviewed disabled choices persist as constraints; the CLI preview names
+  `--terminal-appearance` or `--no-terminal-appearance`. The complete
+  effective-access review names enabled and closed terminal-appearance states.
 
 ## Directory chooser
 
@@ -200,3 +210,8 @@ The interface is dense, restrained, and optimized for careful review.
 `TERM=dumb` keeps the sequential text interface. Noninteractive execution
 continues to fail closed or use restricted one-run defaults as documented. The
 fallback is a compatibility path, not a partial TUI mixed with raw prompts.
+
+The fallback reviews its sequential core choices but does not have an
+Additional-capabilities picker. Users needing terminal appearance in a
+plain-terminal session can pass `--terminal-appearance` explicitly; the
+complete effective-access review reports whether that permission is active.

@@ -13,6 +13,7 @@ pub(super) enum Capability {
     X11,
     HostShm,
     RawTerminal,
+    TerminalAppearance,
     Aws,
     Kubernetes,
     Gcloud,
@@ -29,7 +30,7 @@ pub(super) enum Capability {
 }
 
 impl Capability {
-    const ALL: [Self; 24] = [
+    const ALL: [Self; 25] = [
         Self::ShareHostHome,
         Self::Lockdown,
         Self::SystemdUser,
@@ -41,6 +42,7 @@ impl Capability {
         Self::X11,
         Self::HostShm,
         Self::RawTerminal,
+        Self::TerminalAppearance,
         Self::Aws,
         Self::Kubernetes,
         Self::Gcloud,
@@ -93,6 +95,7 @@ impl Capability {
             Self::X11 => "X11 display",
             Self::HostShm => "Host shared memory",
             Self::RawTerminal => "Raw terminal protocol",
+            Self::TerminalAppearance => "Terminal appearance",
             Self::Aws => "AWS credentials",
             Self::Kubernetes => "Kubernetes credentials",
             Self::Gcloud => "Google Cloud credentials",
@@ -112,6 +115,7 @@ impl Capability {
     pub(super) const fn risk(self) -> Risk {
         match self {
             Self::Lockdown
+            | Self::TerminalAppearance
             | Self::MacosChromium
             | Self::MacosTrustd
             | Self::MacosLoopbackListen
@@ -134,6 +138,7 @@ impl Capability {
             Self::X11 => s.x11,
             Self::HostShm => s.host_shm,
             Self::RawTerminal => s.terminal_passthrough,
+            Self::TerminalAppearance => s.terminal_appearance,
             Self::Aws => s.aws,
             Self::Kubernetes => s.kube,
             Self::Gcloud => s.gcloud,
@@ -163,6 +168,7 @@ impl Capability {
             Self::X11 => s.x11 = value,
             Self::HostShm => s.host_shm = value,
             Self::RawTerminal => s.terminal_passthrough = value,
+            Self::TerminalAppearance => s.terminal_appearance = value,
             Self::Aws => s.aws = value,
             Self::Kubernetes => s.kube = value,
             Self::Gcloud => s.gcloud = value,
@@ -213,6 +219,9 @@ impl Capability {
             }
             Self::RawTerminal => {
                 "Allows\nSend raw terminal control sequences without ai-jail's VT filtering.\n\nRisk\nThis exposes clipboard, terminal queries, and terminal-parser attack surface."
+            }
+            Self::TerminalAppearance => {
+                "Allows\nThe interactive PTY forwards OSC 11 background-color queries/replies (including tmux-wrapped refreshes), DA1 terminal-identity queries/replies, Mode 2031 support probes (DECRQM), enable/disable controls and theme-change notifications.\n\nPrivacy\nThe program learns your terminal color and identity. Other queries, clipboard and raw passthrough are not granted; exec and non-TTY output are unchanged."
             }
             Self::Aws => {
                 "Shares\nYour read-only ~/.aws files.\n\nRisk\nRead-only files still let the harness copy credentials and act with their AWS authority."
@@ -291,6 +300,9 @@ impl Capability {
             Self::RawTerminal => {
                 "A trusted interactive program requires terminal features blocked by VT filtering."
             }
+            Self::TerminalAppearance => {
+                "An interactive CLI needs to choose and update its theme to match your terminal."
+            }
             Self::Aws => {
                 "The task must inspect or change AWS resources using your configured identity."
             }
@@ -368,7 +380,7 @@ mod tests {
 
     #[test]
     fn catalog_is_unique_and_every_detail_is_short_and_explicit() {
-        assert_eq!(Capability::ALL.len(), 24);
+        assert_eq!(Capability::ALL.len(), 25);
         let mut labels = Capability::ALL
             .into_iter()
             .map(Capability::label)
@@ -405,5 +417,42 @@ mod tests {
             assert!(!capability.enabled(&selection), "{capability:?}");
         }
         assert_eq!(selection, AdditionalSelection::default());
+    }
+
+    #[test]
+    fn terminal_appearance_capability_and_documented_surfaces_cannot_drift() {
+        let choice = Capability::TerminalAppearance;
+        assert!(Capability::available().contains(&choice));
+        assert_eq!(choice.risk(), Risk::Allowed);
+        assert!(!choice.enabled(&AdditionalSelection::default()));
+        let detail = choice.detail();
+        for boundary in [
+            "OSC 11",
+            "Mode 2031",
+            "DECRQM",
+            "DA1",
+            "clipboard",
+            "exec",
+            "non-TTY",
+        ] {
+            assert!(
+                detail.contains(boundary),
+                "{boundary} missing from {detail}"
+            );
+        }
+        let parity = include_str!("../../../docs/CLI_TUI_PARITY.md");
+        let design = include_str!("../../../docs/TUI_DESIGN.md");
+        let guide = include_str!("../../../docs/USER_GUIDE.md");
+        let readme = include_str!("../../../README.md");
+        let security = include_str!("../../../docs/SECURITY.md");
+        for flag in ["--terminal-appearance", "--no-terminal-appearance"] {
+            assert!(parity.contains(flag));
+            assert!(design.contains(flag));
+            assert!(guide.contains(flag));
+            assert!(readme.contains(flag));
+            assert!(security.contains(flag));
+        }
+        assert!(design.contains("effective-access review names"));
+        assert!(guide.contains("plain-terminal"));
     }
 }

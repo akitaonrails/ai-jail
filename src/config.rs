@@ -268,6 +268,11 @@ pub struct Config {
     pub host_shm: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_passthrough: Option<bool>,
+    /// Opt in to narrow terminal appearance discovery and live background
+    /// change notifications in the PTY proxy. Independent of full terminal
+    /// passthrough; untrusted project config may only disable it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_appearance: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_worktree: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -500,6 +505,9 @@ impl Config {
     }
     pub fn terminal_passthrough_enabled(&self) -> bool {
         self.terminal_passthrough == Some(true)
+    }
+    pub fn terminal_appearance_enabled(&self) -> bool {
+        self.terminal_appearance == Some(true)
     }
     pub fn network_enabled(&self) -> bool {
         self.network == Some(true)
@@ -1316,6 +1324,7 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(x11);
     take!(host_shm);
     take!(terminal_passthrough);
+    take!(terminal_appearance);
     take!(no_mise);
     take!(no_toolchains);
     take!(no_worktree);
@@ -1686,6 +1695,9 @@ pub fn merge_with_global_report(
     monotonic!(host_shm, |config: &Config| config.host_shm_enabled());
     monotonic!(terminal_passthrough, |config: &Config| {
         config.terminal_passthrough_enabled()
+    });
+    monotonic!(terminal_appearance, |config: &Config| {
+        config.terminal_appearance_enabled()
     });
     monotonic!(no_hide_config, |config: &Config| !config
         .hide_config_enabled());
@@ -2293,6 +2305,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     direct!(x11);
     direct!(host_shm);
     direct!(terminal_passthrough);
+    direct!(terminal_appearance);
     direct!(agent_state);
     direct!(inherit_env);
     direct!(update_check);
@@ -2485,6 +2498,7 @@ pub fn display_status(config: &Config, stored_path: Option<&Path>) {
     print_opt_in_enabled("  X11", config.x11);
     print_opt_in_enabled("  Host shared memory", config.host_shm);
     print_opt_in_enabled("  Terminal passthrough", config.terminal_passthrough);
+    print_opt_in_enabled("  Terminal appearance", config.terminal_appearance);
     print_default_on_enabled("  Agent state", config.agent_state);
     print_opt_in_enabled("  Full env inherit", config.inherit_env);
     // Names only: an env_pass entry is how a secret enters the sandbox, so
@@ -3926,17 +3940,28 @@ rw_maps = ["/home/user/.ssh"]
         assert!(!config.x11_enabled());
         assert!(!config.host_shm_enabled());
         assert!(!config.terminal_passthrough_enabled());
+        assert_eq!(config.terminal_appearance, None);
+        assert!(!config.terminal_appearance_enabled());
         let enabled = Config {
             no_gpu: Some(false),
             x11: Some(true),
             host_shm: Some(true),
             terminal_passthrough: Some(true),
+            terminal_appearance: Some(true),
             ..Config::default()
         };
         assert!(enabled.gpu_enabled());
         assert!(enabled.x11_enabled());
         assert!(enabled.host_shm_enabled());
         assert!(enabled.terminal_passthrough_enabled());
+        assert!(enabled.terminal_appearance_enabled());
+        assert!(
+            !Config {
+                terminal_appearance: Some(false),
+                ..Config::default()
+            }
+            .terminal_appearance_enabled()
+        );
     }
 
     #[test]
@@ -4001,6 +4026,80 @@ lockdown = true
 
     // ── Backward compatibility regression tests ────────────────
     // NEVER DELETE THESE. Add new ones when the format changes.
+
+    #[test]
+    fn regression_global_command_table_without_terminal_appearance_parses() {
+        let global = parse_global_toml(
+            r#"
+terminal_passthrough = true
+[commands.claude]
+terminal_passthrough = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(global.base.terminal_passthrough, Some(true));
+        assert_eq!(global.commands["claude"].terminal_passthrough, Some(false));
+        assert_eq!(global.base.terminal_appearance, None);
+        assert_eq!(global.commands["claude"].terminal_appearance, None);
+    }
+
+    #[test]
+    fn terminal_appearance_trusted_command_cli_and_project_precedence() {
+        let global = parse_global_toml(
+            r#"
+terminal_appearance = false
+[commands.claude]
+terminal_appearance = true
+"#,
+        )
+        .unwrap();
+        let cli = CliArgs {
+            command: vec!["claude".into()],
+            ..CliArgs::default()
+        };
+        let selected =
+            global_config_for_command(global, &cli, &Config::default());
+        assert!(selected.terminal_appearance_enabled());
+        assert_eq!(
+            merge(
+                &CliArgs {
+                    terminal_appearance: Some(false),
+                    ..CliArgs::default()
+                },
+                selected.clone(),
+            )
+            .terminal_appearance,
+            Some(false)
+        );
+        let cli_grant = merge(
+            &CliArgs {
+                terminal_appearance: Some(true),
+                ..CliArgs::default()
+            },
+            Config::default(),
+        );
+        assert!(cli_grant.terminal_appearance_enabled());
+        let (restricted, warnings) = merge_with_global_report(
+            cli_grant,
+            Config {
+                terminal_appearance: Some(false),
+                ..Config::default()
+            },
+            Path::new("/project"),
+        );
+        assert_eq!(restricted.terminal_appearance, Some(false));
+        assert!(warnings.is_empty());
+        let (ignored, warnings) = merge_with_global_report(
+            Config::default(),
+            Config {
+                terminal_appearance: Some(true),
+                ..Config::default()
+            },
+            Path::new("/project"),
+        );
+        assert!(!ignored.terminal_appearance_enabled());
+        assert!(warnings.iter().any(|w| w.contains("terminal_appearance")));
+    }
 
     #[test]
     fn regression_pre_alternate_destination_map_format() {
@@ -4419,6 +4518,7 @@ no_gpu = true
             x11: Some(true),
             host_shm: Some(true),
             terminal_passthrough: Some(true),
+            terminal_appearance: Some(true),
             no_worktree: Some(false),
             no_mise: None,
             no_toolchains: None,
@@ -4474,6 +4574,10 @@ no_gpu = true
         assert_eq!(deserialized.no_docker, config.no_docker);
         assert_eq!(deserialized.tailscale, config.tailscale);
         assert_eq!(deserialized.no_display, config.no_display);
+        assert_eq!(
+            deserialized.terminal_appearance,
+            config.terminal_appearance
+        );
         assert_eq!(deserialized.no_worktree, config.no_worktree);
         assert_eq!(deserialized.no_mise, config.no_mise);
         assert_eq!(deserialized.no_save_config, config.no_save_config);
@@ -4519,6 +4623,13 @@ no_gpu = true
             serialized.trim().is_empty(),
             "default config should not write empty/default fields: {serialized:?}"
         );
+        assert!(!serialized.contains("terminal_appearance"));
+        let serialized = serialize_config(&Config {
+            terminal_appearance: Some(true),
+            ..Config::default()
+        })
+        .unwrap();
+        assert!(serialized.contains("terminal_appearance = true"));
     }
 
     // ── Merge tests ────────────────────────────────────────────
@@ -7794,6 +7905,7 @@ hide_dotdirs = [".my_secrets"]
             x11: None,
             host_shm: None,
             terminal_passthrough: None,
+            terminal_appearance: None,
             no_worktree: None,
             no_mise: None,
             no_toolchains: None,

@@ -51,11 +51,15 @@ verified_by = [
   "onboarding::tui::app::tests::cli_equivalent_is_shell_safe_and_names_profile_only_choices",
   "onboarding::tui::app::tests::container_engine_is_closed_by_every_preset_and_requires_open_confirmation",
   "onboarding::tui::app::tests::additional_capabilities_are_outside_presets_and_open_grants_confirm",
+  "onboarding::tui::additional::tests::terminal_appearance_capability_and_documented_surfaces_cannot_drift",
+  "onboarding::tui::app::tests::terminal_appearance_is_an_immediate_allowed_additional_toggle",
+  "onboarding::tui::app::tests::terminal_appearance_cli_preview_tracks_reviewed_grant_and_constraint",
   "onboarding::tui::view::tests::additional_capability_screen_keeps_platform_relevant_controls_discoverable",
   "onboarding::tui::view::tests::cli_panel_shows_copy_help_without_repeating_config_path",
   "onboarding::tui::view::tests::detail_highlights_selected_environment_names_and_directory_paths",
   "onboarding::tests::tui_container_and_additional_choices_map_to_the_same_config_fields_as_cli",
   "onboarding::tests::every_additional_tui_choice_round_trips_through_config",
+  "onboarding::tests::terminal_appearance_is_opt_in_and_reviewed_false_is_a_constraint",
 ]
 guide_sections = ["What the screen shows", "Capability review"]
 
@@ -156,6 +160,7 @@ enforced_by = [
 verified_by = [
   "tests::actual_sandbox_and_proxy_handoffs_receive_finalized_launch_unchanged",
   "onboarding::tests::effective_output_escapes_inline_terminal_controls",
+  "onboarding::tests::effective_review_names_terminal_appearance_when_open_and_closed",
   "scripted_pty_confirms_recommended_github_and_saves_without_final_review",
 ]
 guide_sections = ["Saving and leaving"]

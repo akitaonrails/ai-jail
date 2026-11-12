@@ -32,7 +32,8 @@ or integration rather than saved sandbox authority.
     `--no-gpu`, `--tailscale`, `--no-tailscale`, `--display`, `--no-display`,
     `--audio`, `--no-audio`, `--kvm`, `--no-kvm`, `--x11`, `--no-x11`,
     `--host-shm`, `--no-host-shm`, `--terminal-passthrough`,
-    `--no-terminal-passthrough`
+    `--no-terminal-passthrough`, `--terminal-appearance`,
+    `--no-terminal-appearance`
   - Read-only credential stores: `--aws`, `--no-aws`, `--kube`, `--no-kube`,
     `--gcloud`, `--no-gcloud`, `--docker-config`, `--no-docker-config`
   - macOS compatibility: `--macos-host-ipc`, `--no-macos-host-ipc`,

@@ -187,6 +187,20 @@ Only controls relevant to the current operating system are shown. No preset
 enables anything on this screen; every OPEN item uses the same confirmation
 dialog and remains visibly marked OPEN in the access summary.
 
+`Terminal appearance` is an ALLOWED, off-by-default Additional choice. When
+enabled, interactive programs running through ai-jail's PTY can query your
+terminal's background color with OSC 11 (including tmux-wrapped refreshes),
+receive a DA1 terminal-identity reply to complete the probe, check Mode 2031
+support (DECRQM), enable or disable that mode, and receive live theme-change
+notifications. This reveals terminal color and identity to the program;
+unrelated terminal queries, clipboard access, and raw passthrough remain separate.
+Kitty's DA1 reply can end in `;`; ai-jail accepts it so later
+theme-change queries are not held behind an unfinished probe.
+Exec and non-TTY output are unaffected. The complete effective-access review
+shows whether this permission is enabled or closed; a reviewed disabled choice
+persists as a constraint. The equivalent flags are `--terminal-appearance`
+and `--no-terminal-appearance`.
+
 Pressing `Space` or `Enter` toggles an ALLOWED choice immediately. An OPEN
 choice uses the same dialog everywhere:
 
@@ -447,9 +461,12 @@ access overview; it does not mistake ordinary navigation for an exit request.
 ## Plain-terminal and noninteractive behavior
 
 `TERM=dumb` uses a sequential text fallback instead of the alternate-screen
-TUI. It covers the same decisions and security disclosures, and prints no
-internal provenance identifiers. The fallback is intended for real terminals
-that cannot support cursor addressing; it is not mixed into a Ratatui session.
+TUI. It reviews its core access choices and prints no internal provenance
+identifiers, but it has no Additional-capabilities picker. Pass
+`--terminal-appearance` explicitly when using that fallback if an interactive
+CLI needs theme discovery; check the complete effective-access review before
+saving. The fallback is intended for real terminals that cannot support cursor
+addressing; it is not mixed into a Ratatui session.
 
 When no terminal is attached, a first run starts once with restricted defaults
 and saves no profile. Noninteractive `ai-jail configure HARNESS` exits without
