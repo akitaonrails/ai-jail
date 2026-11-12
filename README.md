@@ -767,6 +767,11 @@ Common fields: `command`, `rw_maps`, `ro_maps`, `overlay_maps`, `mask`,
 `private_home`, `lockdown`, `browser_profile`, `claude_dir`, `allow_tcp_ports`,
 `status_bar_style`.
 
+A `ro_maps` or `rw_maps` entry whose source does not exist is skipped with a
+warning at launch, so one config can list service paths that only some hosts
+have; a missing source never counts as a credential path. `overlay_maps` still
+refuse a missing source, because a copy-on-write layer needs one to copy.
+
 Global config also accepts `env_pass` (see Environment policy above) and the
 legacy `trust_project_config` field. The latter affects only a legacy
 repository `.ai-jail` while it is waiting to migrate:

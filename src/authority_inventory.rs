@@ -291,11 +291,30 @@ pub(crate) fn is_protected(path: &Path, home: &Path) -> Result<bool, String> {
     )
 }
 
+/// Canonical path of a directory grant, or `None` when the source does not
+/// exist.
+///
+/// A grant whose source is missing grants nothing: the mount builder warns
+/// and skips it, so it can neither expose nor alias a credential path. Any
+/// other resolution failure still fails closed.
+fn canonical_grant(path: &Path) -> Result<Option<PathBuf>, String> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "Cannot establish directory grant identity {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 pub(crate) fn is_protected_with(
     path: &Path,
     roots: &ProtectedRoots,
 ) -> Result<bool, String> {
-    let path = canonical_required(path, "directory grant")?;
+    let Some(path) = canonical_grant(path)? else {
+        return Ok(false);
+    };
     let normalized = ProtectedRoots {
         home: if roots.home.exists() {
             canonical_required(&roots.home, "HOME")?
@@ -435,6 +454,42 @@ mod tests {
                 "alias {entry:?}"
             );
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_map_source_is_not_a_credential_path() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-jail-authority-missing-grant-{}",
+            std::process::id()
+        ));
+        let home = root.join("home");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/config"), b"").unwrap();
+        let roots = ProtectedRoots {
+            home: home.clone(),
+            xdg_config: None,
+            xdg_data: None,
+        };
+
+        // A migrated legacy map may name a service directory that does not
+        // exist on this host. The mount builder warns and skips it, so the
+        // identity classification must not fail the launch over it (#233).
+        assert!(
+            !is_protected_with(
+                Path::new("/var/run/ai-jail-missing-grant"),
+                &roots
+            )
+            .unwrap()
+        );
+        assert!(
+            !is_protected_with(&home.join(".ssh/missing"), &roots).unwrap()
+        );
+
+        // Existing credential paths stay protected, with and without an alias.
+        assert!(is_protected_with(&home.join(".ssh"), &roots).unwrap());
+        assert!(is_protected_with(&home.join(".ssh/config"), &roots).unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 
