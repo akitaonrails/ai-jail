@@ -18,8 +18,10 @@
 //!
 //! By default output is rendered safely: terminal control queries and string
 //! commands are not passed from the sandbox to the host terminal, except a
-//! window title (OSC 0/1/2), which is rebuilt from printable text only. The
-//! `--terminal-passthrough` opt-in restores raw TUI terminal behavior.
+//! window title (OSC 0/1/2), which is rebuilt from printable text only.
+//! `--terminal-appearance` additionally permits OSC 11 background queries,
+//! Mode 2031 support probes and light/dark notifications;
+//! `--terminal-passthrough` restores raw TUI terminal behavior.
 
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::termios::{self, SetArg, Termios};
@@ -223,6 +225,7 @@ struct IoLoop<'a> {
     /// re-render (which drops them).
     osc: OscForwarder,
     terminal_passthrough: bool,
+    appearance: TerminalAppearance,
     primary_filter: TerminalFilter,
     status_bar: bool,
     /// `CSI 6 n` split across reads of the child PTY.
@@ -236,6 +239,7 @@ impl<'a> IoLoop<'a> {
         init_cols: u16,
         resize_redraw_key: Option<&'a [u8]>,
         terminal_passthrough: bool,
+        terminal_appearance: bool,
         status_bar: bool,
     ) -> Self {
         let content_rows = if status_bar { init_rows - 1 } else { init_rows };
@@ -255,8 +259,11 @@ impl<'a> IoLoop<'a> {
             init_rows,
             init_cols,
             resize_redraw_key,
-            osc: OscForwarder::new(terminal_passthrough),
+            osc: OscForwarder::new(terminal_passthrough, terminal_appearance),
             terminal_passthrough,
+            appearance: TerminalAppearance::new(
+                terminal_appearance && !terminal_passthrough,
+            ),
             primary_filter: TerminalFilter::new(),
             status_bar,
             cursor_requests: CursorRequestParser::default(),
@@ -381,16 +388,19 @@ impl<'a> IoLoop<'a> {
             forward_terminal_queries(self.stdout, buf);
         }
 
-        // Forward OSC sequences the same way. vt100 parses the OSC
-        // string but never re-emits it via state_diff / state_formatted,
-        // so on the alt screen a fullscreen TUI loses its window-title
-        // updates (OSC 0/1/2 — the tab keeps showing the launch command
-        // instead of "opencode", #57), clipboard writes (OSC 52), and
-        // color queries (OSC 10/11/12). The primary screen's raw
-        // pass-through carries these natively; without passthrough the
-        // primary filter strips every OSC, so the forwarder runs there
-        // too and puts back the sanitized window title.
-        if now_alt || !self.terminal_passthrough {
+        // vt100 drops OSC strings and unrecognized CSI modes on the alt
+        // screen. With the narrow appearance opt-in, scan both screens:
+        // the primary filter removes Mode 2031 controls and probes
+        // before the scanner puts back only their exact forms.
+        if self.appearance.allowed {
+            for &b in buf {
+                self.osc.push(self.stdout, b);
+                if self.osc.take_appearance_query() {
+                    self.appearance.query_sent();
+                }
+                self.appearance.child_byte(self.stdout, b);
+            }
+        } else if now_alt || !self.terminal_passthrough {
             self.osc.feed(self.stdout, buf);
         }
 
@@ -471,6 +481,14 @@ impl<'a> IoLoop<'a> {
         }
     }
 
+    /// Deliver a lone Escape key after a short grace period for a
+    /// terminal response split across adjacent reads.
+    fn flush_input_escape(&mut self) {
+        if let Some(prefix) = self.appearance.host.flush_escape() {
+            write_all_raw(self.master_raw, prefix);
+        }
+    }
+
     /// Status bar / pending redraw-key flush, run when the child is
     /// quiet (no POLLIN on master).
     fn flush_when_idle(&mut self) {
@@ -478,6 +496,7 @@ impl<'a> IoLoop<'a> {
             crate::statusbar::redraw();
             self.pending_redraw = false;
         }
+        self.flush_input_escape();
         self.maybe_inject_resize_key();
     }
 
@@ -496,10 +515,10 @@ impl<'a> IoLoop<'a> {
 
 fn io_loop(
     master: &OwnedFd,
-    init_rows: u16,
-    init_cols: u16,
+    dimensions: (u16, u16),
     resize_redraw_key: Option<&[u8]>,
     terminal_passthrough: bool,
+    terminal_appearance: bool,
     status_bar: bool,
     stdin_is_tty: bool,
 ) {
@@ -511,10 +530,11 @@ fn io_loop(
 
     let mut state = IoLoop::new(
         master_raw,
-        init_rows,
-        init_cols,
+        dimensions.0,
+        dimensions.1,
         resize_redraw_key,
         terminal_passthrough,
+        terminal_appearance,
         status_bar,
     );
     if status_bar {
@@ -530,6 +550,7 @@ fn io_loop(
     }
     loop {
         state.handle_sigwinch();
+        state.flush_input_escape();
 
         if status_bar && crate::statusbar::take_requests() {
             state.pending_redraw = true;
@@ -590,9 +611,12 @@ fn io_loop(
                 Ok(0) => break,
                 Ok(n) => {
                     if terminal_passthrough
-                        || !looks_like_terminal_reply(&buf[..n])
+                        || state.appearance.can_forward_input_raw(&buf[..n])
                     {
                         write_all_raw(master_raw, &buf[..n]);
+                    } else {
+                        let input = state.appearance.host_input(&buf[..n]);
+                        write_all_raw(master_raw, &input);
                     }
                 }
                 Err(nix::errno::Errno::EINTR) => {}
@@ -601,6 +625,13 @@ fn io_loop(
         }
     }
 
+    if state.appearance.mode_enabled
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        // A child can crash after subscribing. Never leave the host sending
+        // unsolicited light/dark notifications into the next shell.
+        write_all_raw(nix::libc::STDOUT_FILENO, b"\x1b[?2031l");
+    }
     // Defensive terminal-mode reset (issue #40). The raw-mode guard
     // restores termios separately on Drop.
     crate::output::terminal_reset();
@@ -854,15 +885,424 @@ fn forward_terminal_queries(fd: i32, data: &[u8]) {
     }
 }
 
-/// Conservative recognition of terminal replies read from the real terminal.
-/// These are only useful after a query was deliberately forwarded.
-fn looks_like_terminal_reply(data: &[u8]) -> bool {
-    (data.starts_with(b"\x1b[") || data.starts_with(&[0x9b]))
-        && data.last().is_some_and(|b| matches!(b, b'R' | b'c' | b'n'))
-        || data.starts_with(b"\x1bP")
-        || data
-            .first()
-            .is_some_and(|b| matches!(b, 0x90 | 0x9d | 0x9e | 0x9f))
+/// Only the appearance protocol gets a narrow exception to the default
+/// terminal-reply filter. OMP sends DA1 sentinels before and after OSC 11:
+/// keep their replies in order so its probe FIFO can complete.
+struct TerminalAppearance {
+    allowed: bool,
+    mode_enabled: bool,
+    awaiting_color: bool,
+    da1_outstanding: u8,
+    mode_query_outstanding: u8,
+    utf8_remaining: u8,
+    child_state: AppearanceChildState,
+    host: HostInputFilter,
+}
+
+#[derive(Default)]
+enum AppearanceChildState {
+    #[default]
+    Ground,
+    Esc,
+    Csi(usize),
+    ModeQuery,
+    SkipCsi,
+    String,
+    StringEsc,
+}
+
+impl TerminalAppearance {
+    fn new(allowed: bool) -> Self {
+        Self {
+            allowed,
+            mode_enabled: false,
+            awaiting_color: false,
+            da1_outstanding: 0,
+            mode_query_outstanding: 0,
+            utf8_remaining: 0,
+            child_state: AppearanceChildState::Ground,
+            host: HostInputFilter::new(),
+        }
+    }
+
+    fn query_sent(&mut self) {
+        self.awaiting_color = true;
+    }
+
+    fn child_byte(&mut self, fd: i32, b: u8) {
+        use self::AppearanceChildState as State;
+        // UTF-8 continuation bytes can equal C1 control introducers.
+        // Keep the scanner aligned with the primary-screen filter.
+        if matches!(self.child_state, State::Ground) {
+            if self.utf8_remaining > 0 && (0x80..=0xbf).contains(&b) {
+                self.utf8_remaining -= 1;
+                return;
+            }
+            self.utf8_remaining = match b {
+                0xc2..=0xdf => 1,
+                0xe0..=0xef => 2,
+                0xf0..=0xf4 => 3,
+                _ => 0,
+            };
+            if self.utf8_remaining > 0 {
+                return;
+            }
+        }
+        self.child_state = match self.child_state {
+            State::Ground => match b {
+                0x1b => State::Esc,
+                0x90 | 0x9d | 0x9e | 0x9f => State::String,
+                0x9b => State::SkipCsi,
+                _ => State::Ground,
+            },
+            State::Esc => match b {
+                b'[' => State::Csi(0),
+                b']' | b'P' | b'X' | b'^' | b'_' => State::String,
+                0x1b => State::Esc,
+                _ => State::Ground,
+            },
+            State::Csi(index) => {
+                const MODE: &[u8] = b"?2031";
+                if b == 0x1b {
+                    State::Esc
+                } else if index == 0 && b == b'c' {
+                    write_all_raw(fd, b"\x1b[c");
+                    self.da1_outstanding =
+                        self.da1_outstanding.saturating_add(1);
+                    State::Ground
+                } else if index == MODE.len() && matches!(b, b'h' | b'l') {
+                    let seq = if b == b'h' {
+                        b"\x1b[?2031h"
+                    } else {
+                        b"\x1b[?2031l"
+                    };
+                    write_all_raw(fd, seq);
+                    self.mode_enabled = b == b'h';
+                    State::Ground
+                } else if index == MODE.len() && b == b'$' {
+                    State::ModeQuery
+                } else if MODE.get(index) == Some(&b) {
+                    State::Csi(index + 1)
+                } else if (0x40..=0x7e).contains(&b) {
+                    State::Ground
+                } else {
+                    State::SkipCsi
+                }
+            }
+            State::ModeQuery => match b {
+                b'p' => {
+                    write_all_raw(fd, b"\x1b[?2031$p");
+                    self.mode_query_outstanding =
+                        self.mode_query_outstanding.saturating_add(1);
+                    State::Ground
+                }
+                0x1b => State::Esc,
+                0x40..=0x7e => State::Ground,
+                _ => State::SkipCsi,
+            },
+            State::SkipCsi => match b {
+                0x1b => State::Esc,
+                0x40..=0x7e => State::Ground,
+                _ => State::SkipCsi,
+            },
+            State::String => match b {
+                0x07 | 0x9c => State::Ground,
+                0x1b => State::StringEsc,
+                _ => State::String,
+            },
+            State::StringEsc => match b {
+                b'\\' | 0x9c => State::Ground,
+                0x1b => State::StringEsc,
+                _ => State::String,
+            },
+        };
+    }
+
+    fn can_forward_input_raw(&self, data: &[u8]) -> bool {
+        matches!(self.host.state, HostInputState::Ground)
+            && self.host.utf8_remaining == 0
+            && data.iter().all(|&b| b < 0x80 && b != 0x1b)
+    }
+
+    fn host_input(&mut self, data: &[u8]) -> Vec<u8> {
+        self.host.feed(
+            data,
+            self.allowed && self.mode_enabled,
+            &mut self.awaiting_color,
+            &mut self.da1_outstanding,
+            &mut self.mode_query_outstanding,
+        )
+    }
+}
+
+#[derive(Default)]
+enum HostInputState {
+    #[default]
+    Ground,
+    Esc,
+    Csi,
+    Osc,
+    OscEsc,
+    String,
+    StringEsc,
+    SkipCsi,
+}
+
+/// Split-read-safe host reply filter: preserve ordinary input and key
+/// sequences, but never pass an arbitrary OSC or a terminal reply through.
+struct HostInputFilter {
+    state: HostInputState,
+    pending: Vec<u8>,
+    utf8_remaining: u8,
+    escape_at: Instant,
+}
+
+impl HostInputFilter {
+    fn new() -> Self {
+        Self {
+            state: HostInputState::Ground,
+            pending: Vec::new(),
+            utf8_remaining: 0,
+            escape_at: Instant::now(),
+        }
+    }
+
+    fn flush_escape(&mut self) -> Option<&'static [u8]> {
+        // A lone Escape or Meta+[ key can be a fragmented reply.
+        // Release only those exact prefixes after one poll interval.
+        let prefix = match (&self.state, self.pending.as_slice()) {
+            (HostInputState::Esc, b"\x1b") => b"\x1b".as_slice(),
+            (HostInputState::Csi, b"\x1b[") => b"\x1b[".as_slice(),
+            _ => return None,
+        };
+        if self.escape_at.elapsed() < Duration::from_millis(100) {
+            return None;
+        }
+        self.state = HostInputState::Ground;
+        self.pending.clear();
+        Some(prefix)
+    }
+
+    fn feed(
+        &mut self,
+        data: &[u8],
+        notifications: bool,
+        awaiting_color: &mut bool,
+        da1_outstanding: &mut u8,
+        mode_query_outstanding: &mut u8,
+    ) -> Vec<u8> {
+        use self::HostInputState as State;
+        let mut out = Vec::with_capacity(data.len());
+        for &b in data {
+            if matches!(self.state, State::Ground) {
+                if self.utf8_remaining > 0 && (0x80..=0xbf).contains(&b) {
+                    self.utf8_remaining -= 1;
+                    out.push(b);
+                    continue;
+                }
+                self.utf8_remaining = match b {
+                    0xc2..=0xdf => 1,
+                    0xe0..=0xef => 2,
+                    0xf0..=0xf4 => 3,
+                    _ => 0,
+                };
+            }
+            self.state = match self.state {
+                State::Ground => match b {
+                    0x1b => {
+                        self.pending.push(b);
+                        self.escape_at = Instant::now();
+                        State::Esc
+                    }
+                    0x9b => {
+                        self.pending.push(b);
+                        State::Csi
+                    }
+                    0x90 | 0x9d | 0x9e | 0x9f => State::String,
+                    _ => {
+                        out.push(b);
+                        State::Ground
+                    }
+                },
+                State::Esc => match b {
+                    b'[' => {
+                        self.pending.push(b);
+                        State::Csi
+                    }
+                    b']' => {
+                        self.pending.push(b);
+                        State::Osc
+                    }
+                    b'P' | b'X' | b'^' | b'_' => {
+                        self.pending.clear();
+                        State::String
+                    }
+                    _ => {
+                        out.push(0x1b);
+                        self.pending.clear();
+                        if b == 0x1b {
+                            self.pending.push(b);
+                            self.escape_at = Instant::now();
+                            State::Esc
+                        } else {
+                            out.push(b);
+                            State::Ground
+                        }
+                    }
+                },
+                State::Csi => {
+                    if b == 0x1b {
+                        self.pending.clear();
+                        self.pending.push(b);
+                        self.escape_at = Instant::now();
+                        State::Esc
+                    } else {
+                        self.pending.push(b);
+                        if (0x40..=0x7e).contains(&b) {
+                            if notifications
+                                && matches!(
+                                    self.pending.as_slice(),
+                                    b"\x1b[?997;1n" | b"\x1b[?997;2n"
+                                )
+                            {
+                                out.extend_from_slice(&self.pending);
+                            } else if b == b'c'
+                                && *da1_outstanding > 0
+                                && is_da1_reply(&self.pending)
+                            {
+                                out.extend_from_slice(&self.pending);
+                                *da1_outstanding -= 1;
+                            } else if b == b'y'
+                                && *mode_query_outstanding > 0
+                                && is_mode_report(&self.pending)
+                            {
+                                out.extend_from_slice(&self.pending);
+                                *mode_query_outstanding -= 1;
+                            } else if !matches!(b, b'R' | b'c' | b'n')
+                                && !(b == b'y' && self.pending.contains(&b'$'))
+                            {
+                                out.extend_from_slice(&self.pending);
+                            }
+                            self.pending.clear();
+                            State::Ground
+                        } else if self.pending.len() > 128 {
+                            self.pending.clear();
+                            State::SkipCsi
+                        } else {
+                            State::Csi
+                        }
+                    }
+                }
+                State::Osc | State::OscEsc => {
+                    if matches!(self.state, State::OscEsc) && b == b'\\'
+                        || matches!(self.state, State::Osc) && b == 0x07
+                    {
+                        self.pending.push(b);
+                        if *awaiting_color && is_osc11_reply(&self.pending) {
+                            out.extend_from_slice(&self.pending);
+                            *awaiting_color = false;
+                        }
+                        self.pending.clear();
+                        State::Ground
+                    } else if b == 0x1b {
+                        if self.pending.len() <= 128 {
+                            self.pending.push(b);
+                        }
+                        State::OscEsc
+                    } else if b == 0x9c {
+                        self.pending.clear();
+                        State::Ground
+                    } else {
+                        if self.pending.len() <= 128 {
+                            self.pending.push(b);
+                        }
+                        State::Osc
+                    }
+                }
+                State::String => match b {
+                    0x07 | 0x9c => State::Ground,
+                    0x1b => State::StringEsc,
+                    _ => State::String,
+                },
+                State::StringEsc => match b {
+                    b'\\' | 0x9c => State::Ground,
+                    0x1b => State::StringEsc,
+                    _ => State::String,
+                },
+                State::SkipCsi => match b {
+                    0x40..=0x7e => State::Ground,
+                    _ => State::SkipCsi,
+                },
+            };
+        }
+        out
+    }
+}
+
+fn is_da1_reply(seq: &[u8]) -> bool {
+    let params = seq
+        .strip_prefix(b"\x1b[?")
+        .and_then(|seq| seq.strip_suffix(b"c"));
+    params.is_some_and(|params| {
+        params.first().is_some_and(u8::is_ascii_digit)
+            && params.iter().all(|&b| b.is_ascii_digit() || b == b';')
+    })
+}
+
+fn is_osc11_reply(seq: &[u8]) -> bool {
+    let Some(body) = seq.strip_prefix(b"\x1b]11;") else {
+        return false;
+    };
+    let Some(color) = body
+        .strip_suffix(b"\x07")
+        .or_else(|| body.strip_suffix(b"\x1b\\"))
+    else {
+        return false;
+    };
+    let rgb = color
+        .strip_prefix(b"rgb:")
+        .or_else(|| color.strip_prefix(b"rgba:"));
+    let Some(rgb) = rgb else {
+        return false;
+    };
+    let mut parts = rgb.split(|&b| b == b'/');
+    (0..3).all(|_| {
+        parts.next().is_some_and(|part| {
+            (1..=4).contains(&part.len())
+                && part.iter().all(u8::is_ascii_hexdigit)
+        })
+    }) && parts.next().is_none()
+}
+
+fn is_mode_report(seq: &[u8]) -> bool {
+    seq.strip_prefix(b"\x1b[?2031;")
+        .and_then(|seq| seq.strip_suffix(b"$y"))
+        .is_some_and(|status| {
+            matches!(status, b"0" | b"1" | b"2" | b"3" | b"4")
+        })
+}
+
+/// A terminal treats zero-padded and grouped private-mode params as modes
+/// too; suppress Mode 2031 controls and DECRQM probes before the
+/// exact-sequence forwarder puts back only the opted-in forms.
+fn contains_appearance_mode(seq: &[u8]) -> bool {
+    let params = seq
+        .strip_prefix(b"\x1b[?")
+        .or_else(|| seq.strip_prefix(b"\x9b?"));
+    let Some(params) = params else {
+        return false;
+    };
+    let params = if matches!(params.last(), Some(b'h' | b'l')) {
+        &params[..params.len() - 1]
+    } else if let Some(params) = params.strip_suffix(b"$p") {
+        params
+    } else {
+        return false;
+    };
+    params.split(|&b| b == b';' || b == b':').any(|part| {
+        let value = part.iter().copied().skip_while(|&b| b == b'0');
+        value.eq(b"2031".iter().copied())
+    })
 }
 
 enum FilterState {
@@ -1059,7 +1499,10 @@ impl TerminalFilter {
                             .get(2)
                             .copied()
                             .filter(|p| matches!(p, b'>' | b'<' | b'?'));
-                        if !csi_final_forwardable(b, prefix) && b != b'n' {
+                        if !csi_final_forwardable(b, prefix)
+                            && b != b'n'
+                            && !contains_appearance_mode(&self.pending)
+                        {
                             out.extend_from_slice(&self.pending);
                         }
                         self.pending.clear();
@@ -1126,6 +1569,9 @@ enum OscState {
     Body,
     /// Saw `ESC` in the body — maybe the start of an ST (`ESC \`).
     BodyEsc,
+    /// Ignore DCS bodies, except one exact tmux-wrapped OSC 11 query.
+    Dcs,
+    DcsEsc,
 }
 
 /// Streaming extractor for OSC sequences that vt100 drops.
@@ -1142,21 +1588,27 @@ enum OscState {
 /// can easily exceed a single 8 KiB read, so a stateless per-read scan
 /// (like [`forward_terminal_queries`]) would miss split sequences.
 ///
-/// Without `--terminal-passthrough` only window titles get through, and
-/// only as rebuilt by [`OscForwarder::sanitized_title`]: clipboard
-/// access and color queries stay behind the opt-in.
+/// Without `--terminal-passthrough` window titles are rebuilt by
+/// [`OscForwarder::sanitized_title`]. `--terminal-appearance` additionally
+/// admits only the exact OSC 11 query; clipboard and other color commands
+/// remain blocked.
 struct OscForwarder {
     state: OscState,
     buf: Vec<u8>,
     passthrough: bool,
+    appearance: bool,
+    appearance_query_sent: bool,
 }
+const TMUX_APPEARANCE_QUERY: &[u8] = b"\x1bPtmux;\x1b\x1b]11;?\x07\x1b\\";
 
 impl OscForwarder {
-    fn new(passthrough: bool) -> Self {
+    fn new(passthrough: bool, appearance: bool) -> Self {
         Self {
             state: OscState::Ground,
             buf: Vec::new(),
             passthrough,
+            appearance,
+            appearance_query_sent: false,
         }
     }
 
@@ -1173,10 +1625,21 @@ impl OscForwarder {
             if Self::is_forwardable(&self.buf) {
                 write_all_raw(fd, &self.buf);
             }
+        } else if self.appearance && Self::is_appearance_query(&self.buf) {
+            write_all_raw(fd, &self.buf);
+            self.appearance_query_sent = true;
         } else if let Some(title) = Self::sanitized_title(&self.buf) {
             write_all_raw(fd, &title);
         }
         self.reset();
+    }
+
+    fn take_appearance_query(&mut self) -> bool {
+        std::mem::take(&mut self.appearance_query_sent)
+    }
+
+    fn is_appearance_query(seq: &[u8]) -> bool {
+        matches!(seq, b"\x1b]11;?\x07" | b"\x1b]11;?\x1b\\")
     }
 
     /// A complete OSC 0/1/2 (set icon name / window title) rebuilt as
@@ -1256,6 +1719,9 @@ impl OscForwarder {
                 if b == b']' {
                     self.buf.push(b);
                     self.state = OscState::Body;
+                } else if b == b'P' && self.appearance {
+                    self.buf.push(b);
+                    self.state = OscState::Dcs;
                 } else if b == 0x1b {
                     // Another ESC — keep waiting for the ']'.
                     self.buf.clear();
@@ -1292,6 +1758,26 @@ impl OscForwarder {
                 } else {
                     // Stray ESC, not a terminator: malformed, drop.
                     self.reset();
+                }
+            }
+            OscState::Dcs | OscState::DcsEsc => {
+                if matches!(self.state, OscState::DcsEsc) && b == b'\\' {
+                    if self.buf.len() < TMUX_APPEARANCE_QUERY.len() {
+                        self.buf.push(b);
+                    }
+                    if self.buf == TMUX_APPEARANCE_QUERY {
+                        write_all_raw(fd, &self.buf);
+                    }
+                    self.reset();
+                } else {
+                    if self.buf.len() < TMUX_APPEARANCE_QUERY.len() {
+                        self.buf.push(b);
+                    }
+                    self.state = if b == 0x1b {
+                        OscState::DcsEsc
+                    } else {
+                        OscState::Dcs
+                    };
                 }
             }
         }
@@ -1408,6 +1894,7 @@ pub fn run_with_config(
         cmd,
         resize_redraw_key,
         config.terminal_passthrough_enabled(),
+        config.terminal_appearance_enabled(),
         status_bar,
         supervision_gate,
     )
@@ -1418,6 +1905,7 @@ fn run_with_passthrough(
     cmd: &mut std::process::Command,
     resize_redraw_key: Option<&[u8]>,
     terminal_passthrough: bool,
+    terminal_appearance: bool,
     status_bar: bool,
     supervision_gate: crate::signals::SupervisionGate,
 ) -> Result<i32, String> {
@@ -1493,10 +1981,10 @@ fn run_with_passthrough(
     // Run IO loop (blocks until child exits / master HUP)
     io_loop(
         &master,
-        rows,
-        cols,
+        (rows, cols),
         resize_redraw_key,
         terminal_passthrough,
+        terminal_appearance,
         status_bar,
         stdin_is_tty,
     );
@@ -1776,7 +2264,7 @@ mod tests {
 
     fn capture_osc52(chunks: &[&[u8]]) -> Vec<u8> {
         let (r, w) = nix::unistd::pipe().unwrap();
-        let mut fwd = super::OscForwarder::new(true);
+        let mut fwd = super::OscForwarder::new(true, false);
         for chunk in chunks {
             fwd.feed(w.as_raw_fd(), chunk);
         }
@@ -1875,7 +2363,7 @@ mod tests {
 
     fn capture_filtered_osc(chunks: &[&[u8]]) -> Vec<u8> {
         let (r, w) = nix::unistd::pipe().unwrap();
-        let mut fwd = super::OscForwarder::new(false);
+        let mut fwd = super::OscForwarder::new(false, false);
         for chunk in chunks {
             fwd.feed(w.as_raw_fd(), chunk);
         }
@@ -1951,9 +2439,12 @@ mod tests {
         assert_eq!(filter.feed(b"x"), b"\xc2x");
     }
 
-    /// Run one child-output chunk through the IO loop and return what
-    /// reaches the real terminal.
-    fn rendered_output(passthrough: bool, chunk: &[u8]) -> Vec<u8> {
+    /// Run child-output chunks through the real IO-loop rendering path.
+    fn rendered_appearance(
+        passthrough: bool,
+        appearance: bool,
+        chunks: &[&[u8]],
+    ) -> Vec<u8> {
         let (master_r, master_w) = nix::unistd::pipe().unwrap();
         let (out_r, out_w) = nix::unistd::pipe().unwrap();
         let mut io = super::IoLoop::new(
@@ -1962,16 +2453,329 @@ mod tests {
             80,
             None,
             passthrough,
+            appearance,
             false,
         );
         io.stdout = out_w.as_raw_fd();
-        let _ = io.handle_master_read(chunk);
+        for chunk in chunks {
+            let _ = io.handle_master_read(chunk);
+        }
         drop(out_w);
         drop((master_r, master_w));
         let mut out = vec![0u8; 8192];
         let n = nix::unistd::read(out_r.as_raw_fd(), &mut out).unwrap_or(0);
         out.truncate(n);
         out
+    }
+
+    fn rendered_output(passthrough: bool, chunk: &[u8]) -> Vec<u8> {
+        rendered_appearance(passthrough, false, &[chunk])
+    }
+
+    #[test]
+    fn appearance_default_blocks_queries_and_mode_on_both_screens() {
+        for prefix in [&b""[..], b"\x1b[?1049h"] {
+            let mut child = prefix.to_vec();
+            child.extend_from_slice(
+                b"\x1b]11;?\x07\x1b[?2031$p\x1b[?2031h\x1b[?2031l",
+            );
+            let out = rendered_appearance(false, false, &[&child]);
+            assert!(!out.windows(4).any(|w| w == b"11;?"), "{out:?}");
+            assert!(!out.windows(4).any(|w| w == b"2031"), "{out:?}");
+        }
+        // Existing raw passthrough is not restricted by this new option.
+        assert_eq!(
+            rendered_appearance(
+                true,
+                false,
+                &[b"\x1b]11;?\x07\x1b[?2031$p\x1b[?2031h"],
+            ),
+            b"\x1b]11;?\x07\x1b[?2031$p\x1b[?2031h"
+        );
+    }
+
+    #[test]
+    fn appearance_forwards_exact_query_and_mode_across_reads() {
+        for prefix in [&b""[..], b"\x1b[?1049h"] {
+            let out = rendered_appearance(
+                false,
+                true,
+                &[
+                    prefix,
+                    b"\x1b]11;",
+                    b"?\x1b",
+                    b"\\\x1b[?20",
+                    b"31h\x1b[?2031",
+                    b"l",
+                ],
+            );
+            assert_eq!(
+                out.windows(b"\x1b]11;?\x1b\\".len())
+                    .filter(|w| *w == b"\x1b]11;?\x1b\\")
+                    .count(),
+                1,
+                "{out:?}"
+            );
+            for mode in [b"\x1b[?2031h", b"\x1b[?2031l"] {
+                assert_eq!(
+                    out.windows(mode.len()).filter(|w| *w == mode).count(),
+                    1,
+                    "{out:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn appearance_decrqm_query_and_report_are_exact_and_split_safe() {
+        for prefix in [&b""[..], b"\x1b[?1049h"] {
+            let out = rendered_appearance(
+                false,
+                true,
+                &[prefix, b"\x1b[?20", b"31$", b"p"],
+            );
+            assert_eq!(
+                out.windows(b"\x1b[?2031$p".len())
+                    .filter(|w| *w == b"\x1b[?2031$p")
+                    .count(),
+                1,
+                "{out:?}"
+            );
+        }
+        let (read, write) = nix::unistd::pipe().unwrap();
+        let mut appearance = super::TerminalAppearance::new(true);
+        for &b in b"\x1b[?2031$p" {
+            appearance.child_byte(write.as_raw_fd(), b);
+        }
+        assert!(appearance.host_input(b"\x1b[?2031;").is_empty());
+        assert_eq!(appearance.host_input(b"2$y"), b"\x1b[?2031;2$y");
+        assert!(appearance.host_input(b"\x1b[?2031;2$y").is_empty());
+        assert!(appearance.host_input(b"\x1b[?999;2$y").is_empty());
+        for &b in b"\x1b[?2031$p" {
+            appearance.child_byte(write.as_raw_fd(), b);
+        }
+        assert_eq!(appearance.host_input(b"\x1b[?2031;0$y"), b"\x1b[?2031;0$y");
+        drop(write);
+        let mut buf = [0u8; 64];
+        let n = nix::unistd::read(read.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"\x1b[?2031$p\x1b[?2031$p");
+    }
+
+    #[test]
+    fn appearance_does_not_admit_other_color_clipboard_or_mode_controls() {
+        let out = rendered_appearance(
+            false,
+            true,
+            &[
+                b"\x1b]10;?\x07\x1b]12;?\x07\x1b]52;c;?\x07",
+                b"\x1b]11;?junk\x07\x1b]11;rgb:ff/ff/ff\x07",
+                b"\x1b[?02031h\x1b[?25;2031h\x1b[?2031;1h",
+                b"\x1b[?02031$p\x1b[?25;2031$p\x9b?2031hvisible",
+            ],
+        );
+        assert!(!out.windows(3).any(|w| w == b"]10" || w == b"]12"));
+        assert!(!out.windows(3).any(|w| w == b"]52" || w == b"]11"));
+        assert!(!out.windows(4).any(|w| w == b"2031"), "{out:?}");
+        assert!(out.ends_with(b"visible"), "{out:?}");
+    }
+
+    #[test]
+    fn appearance_reply_and_notification_are_split_read_safe() {
+        let mut appearance = super::TerminalAppearance::new(true);
+        assert!(
+            appearance
+                .host_input(b"\x1b]11;rgb:ff/00/00\x07")
+                .is_empty()
+        );
+        appearance.query_sent();
+        assert_eq!(appearance.host_input(b"key\x1b[A"), b"key\x1b[A");
+        assert!(appearance.host_input(b"\x1b]11;rgba:f/0/").is_empty());
+        assert_eq!(
+            appearance.host_input(b"f\x1b\\x"),
+            b"\x1b]11;rgba:f/0/f\x1b\\x"
+        );
+        assert!(
+            appearance
+                .host_input(b"\x1b]11;rgb:aa/bb/cc\x07")
+                .is_empty()
+        );
+        assert!(appearance.host_input(b"\x1b[?997;1n").is_empty());
+        appearance.mode_enabled = true;
+        assert!(appearance.host_input(b"\x1b[?997;").is_empty());
+        assert_eq!(
+            appearance.host_input(b"2n\x1b[?997;1n"),
+            b"\x1b[?997;2n\x1b[?997;1n"
+        );
+        appearance.mode_enabled = false;
+        assert!(appearance.host_input(b"\x1b[?997;1n").is_empty());
+    }
+
+    #[test]
+    fn appearance_drops_unrelated_and_malformed_host_replies() {
+        let mut appearance = super::TerminalAppearance::new(true);
+        appearance.query_sent();
+        appearance.mode_enabled = true;
+        for input in [
+            &b"\x1b]10;rgb:ff/ff/ff\x07"[..],
+            b"\x1b]12;rgb:ff/ff/ff\x1b\\",
+            b"\x1b]52;c;secret\x07",
+            b"\x1b]11;rgb:ff/zz/ff\x07",
+            b"\x1b]11;rgb:ff/ff/ff;extra\x07",
+            b"\x1b[?997;3n",
+            b"\x1b[?997;1;2n",
+            b"\x1b[?999;1n",
+            b"\x1b[?1;2c",
+            b"\x1b[?2031;2$y",
+            b"\x1b[12;34R",
+        ] {
+            assert!(appearance.host_input(input).is_empty(), "{input:?}");
+        }
+        assert_eq!(appearance.host_input(b"\x1b[Bz"), b"\x1b[Bz");
+        assert_eq!(
+            appearance.host_input(b"\x1b]11;rgb:ff/ff/ff\x07"),
+            b"\x1b]11;rgb:ff/ff/ff\x07"
+        );
+    }
+
+    #[test]
+    fn appearance_da1_sentinels_preserve_omp_probe_fifo() {
+        let (read, write) = nix::unistd::pipe().unwrap();
+        let mut appearance = super::TerminalAppearance::new(true);
+        for &b in b"\x1b[?u\x1b[c" {
+            appearance.child_byte(write.as_raw_fd(), b);
+        }
+        // Kitty includes an empty final DA1 parameter.
+        assert_eq!(appearance.host_input(b"\x1b[?62;52;c"), b"\x1b[?62;52;c");
+        appearance.query_sent();
+        for &b in b"\x1b[c\x1b[?2031h" {
+            appearance.child_byte(write.as_raw_fd(), b);
+        }
+        assert!(appearance.host_input(b"\x1b[?1;").is_empty());
+        assert_eq!(
+            appearance.host_input(b"2c\x1b[?997;1n"),
+            b"\x1b[?1;2c\x1b[?997;1n"
+        );
+        assert!(appearance.host_input(b"\x1b[?1;2c").is_empty());
+        drop(write);
+        let mut buf = [0u8; 64];
+        let n = nix::unistd::read(read.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"\x1b[c\x1b[c\x1b[?2031h");
+    }
+
+    #[test]
+    fn appearance_query_and_reply_round_trip_through_io_loop() {
+        let (master_r, master_w) = nix::unistd::pipe().unwrap();
+        let (out_r, out_w) = nix::unistd::pipe().unwrap();
+        let mut io = super::IoLoop::new(
+            master_w.as_raw_fd(),
+            24,
+            80,
+            None,
+            false,
+            true,
+            false,
+        );
+        io.stdout = out_w.as_raw_fd();
+        let _ = io.handle_master_read(b"\x1b[c\x1b]11;?");
+        let _ = io.handle_master_read(b"\x07\x1b[c\x1b[?2031h");
+        assert!(
+            io.appearance
+                .host_input(b"\x1b[?1;2c\x1b]11;rgb")
+                .starts_with(b"\x1b[?1;2c")
+        );
+        assert_eq!(
+            io.appearance
+                .host_input(b":ffff/0000/0000\x07\x1b[?1;2c\x1b[?997;1n"),
+            b"\x1b]11;rgb:ffff/0000/0000\x07\x1b[?1;2c\x1b[?997;1n"
+        );
+        drop(out_w);
+        drop(master_w);
+        let mut buf = [0u8; 128];
+        let n = nix::unistd::read(out_r.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"\x1b[c\x1b]11;?\x07\x1b[c\x1b[?2031h");
+        let n = nix::unistd::read(master_r.as_raw_fd(), &mut buf).unwrap_or(0);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn appearance_keeps_utf8_keys_and_standalone_escape() {
+        let mut appearance = super::TerminalAppearance::new(true);
+        assert_eq!(
+            appearance.host_input(&"▐".as_bytes()[..2]),
+            &"▐".as_bytes()[..2]
+        );
+        assert_eq!(
+            appearance.host_input(&"▐".as_bytes()[2..]),
+            &"▐".as_bytes()[2..]
+        );
+        assert!(appearance.host_input(b"\x1b").is_empty());
+        appearance.host.escape_at =
+            super::Instant::now() - super::Duration::from_millis(101);
+        assert_eq!(appearance.host.flush_escape(), Some(b"\x1b".as_slice()));
+        assert_eq!(appearance.host_input(b"a"), b"a");
+    }
+
+    #[test]
+    fn appearance_preserves_utf8_before_mode_controls() {
+        for prefix in [&b""[..], b"\x1b[?1049h"] {
+            let out = rendered_appearance(
+                false,
+                true,
+                &[
+                    prefix,
+                    &"▐".as_bytes()[..2],
+                    &"▐".as_bytes()[2..],
+                    b"\x1b[?2031h",
+                ],
+            );
+            assert!(out.windows(8).any(|w| w == b"\x1b[?2031h"), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn appearance_releases_incomplete_keyboard_csi_but_holds_replies() {
+        let mut appearance = super::TerminalAppearance::new(true);
+        assert!(appearance.host_input(b"\x1b[").is_empty());
+        appearance.host.escape_at =
+            super::Instant::now() - super::Duration::from_millis(101);
+        assert_eq!(appearance.host.flush_escape(), Some(b"\x1b[".as_slice()));
+        assert_eq!(appearance.host_input(b"x"), b"x");
+        assert!(appearance.host_input(b"\x1b[?997;").is_empty());
+        appearance.host.escape_at =
+            super::Instant::now() - super::Duration::from_millis(101);
+        assert_eq!(appearance.host.flush_escape(), None);
+        assert!(appearance.host_input(b"1n").is_empty());
+    }
+
+    #[test]
+    fn appearance_forwards_only_complete_tmux_color_refresh() {
+        let wrapped = super::TMUX_APPEARANCE_QUERY;
+        for prefix in [&b""[..], b"\x1b[?1049h"] {
+            let out = rendered_appearance(
+                false,
+                true,
+                &[prefix, &wrapped[..9], &wrapped[9..16], &wrapped[16..]],
+            );
+            assert_eq!(
+                out.windows(wrapped.len()).filter(|w| *w == wrapped).count(),
+                1,
+                "{out:?}"
+            );
+            assert_eq!(
+                out.windows(b"\x1b]11;?\x07".len())
+                    .filter(|w| *w == b"\x1b]11;?\x07")
+                    .count(),
+                1,
+                "{out:?}"
+            );
+        }
+        let bad = b"\x1bPtmux;\x1b\x1b]11;?\x07extra\x1b\\";
+        let clipboard = b"\x1bPtmux;\x1b\x1b]52;c;?\x07\x1b\\";
+        let out = rendered_appearance(false, true, &[bad, clipboard]);
+        assert!(
+            !out.windows(4).any(|w| w == b"11;?" || w == b"52;c"),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -2019,8 +2823,9 @@ mod tests {
         let mut filter = super::TerminalFilter::new();
         let out = filter.feed(b"text\x9d52;c;data\x07\x9b?1;2cvisible");
         assert_eq!(out, b"textvisible");
-        assert!(super::looks_like_terminal_reply(b"\x9b12;4R"));
-        assert!(super::looks_like_terminal_reply(b"\x9d52;c;reply\x07"));
+        let mut host = super::TerminalAppearance::new(false);
+        assert!(host.host_input(b"\x9b12;4R").is_empty());
+        assert!(host.host_input(b"\x9d52;c;reply\x07").is_empty());
     }
 
     #[test]
@@ -2172,8 +2977,9 @@ mod tests {
 
     #[test]
     fn terminal_reply_detection_is_conservative() {
-        assert!(super::looks_like_terminal_reply(b"\x1b[12;4R"));
-        assert!(!super::looks_like_terminal_reply(b"\x1b[A"));
+        let mut host = super::TerminalAppearance::new(false);
+        assert!(host.host_input(b"\x1b[12;4R").is_empty());
+        assert_eq!(host.host_input(b"\x1b[A"), b"\x1b[A");
     }
 
     fn cursor_replies(chunks: &[&[u8]], synthesize: bool) -> Vec<u8> {
@@ -2258,8 +3064,15 @@ mod tests {
     #[test]
     fn child_pty_receives_the_cursor_report() {
         let (read, write) = nix::unistd::pipe().unwrap();
-        let mut io =
-            super::IoLoop::new(write.as_raw_fd(), 24, 80, None, false, false);
+        let mut io = super::IoLoop::new(
+            write.as_raw_fd(),
+            24,
+            80,
+            None,
+            false,
+            false,
+            false,
+        );
         let _ = io.handle_master_read(b"\x1b[4;2H\x1b[6n");
         drop(write);
         let mut buf = [0u8; 32];

@@ -215,16 +215,18 @@ developers`. See [Dev toolchains](#dev-toolchains).
 ### Off by default
 
 network, GPU, KVM, display (Wayland), X11, audio, host shared memory, raw
-terminal passthrough, the Docker socket, Tailscale, the systemd user bus,
-SSH agent/key sharing, Pictures, linked Git worktree metadata,
-`--inherit-env`, the update check, macOS host IPC, and four of the five
+terminal passthrough, terminal appearance (OSC 11 background-color and DA1
+terminal-identity queries, Mode 2031 support probe, enable/disable, and theme
+notifications in the interactive ai-jail PTY), the Docker socket, Tailscale,
+the systemd user bus, SSH agent/key sharing, Pictures,
+linked Git worktree metadata, `--inherit-env`, the update check,
+macOS host IPC, and four of the five
 legacy credential flags (`--aws`, `--kube`, `--gcloud`,
 `--docker-config`). The raw `--github` default is also off, but first-run
 `For developers` visibly preselects it as OPEN — see
-[Tool credentials](#tool-credentials). Mounting
-agent state or any of these exposes that material to everything running in
-the sandbox, which is why the first-run review keeps them as separate choices.
-Use `--no-private-home`
+[Tool credentials](#tool-credentials). Each choice can expose host resources,
+information, or behavior to programs running inside the sandbox, which is why
+the first-run review keeps them as separate choices. Use `--no-private-home`
 only when deliberately granting broad host-home access; `--map` and
 `--rw-map` remain explicit, narrow alternatives.
 
@@ -243,6 +245,7 @@ is required. Completed profiles retain their saved choices.
 | `--kvm` / `--no-kvm`                                       | Enables/disables `/dev/kvm` (Linux only) for hardware-accelerated VMs; exposes the host kernel's KVM ioctl interface. No `/dev/net/tun` or vhost devices; guests get only the sandbox's network.                                                                                                                                                                                                                            |
 | `--host-shm` / `--no-host-shm`                             | Enables/disables host `/dev/shm`; enabling it opens host cross-process IPC.                                                                                                                                                                                                                                                                                                                                                 |
 | `--terminal-passthrough` / `--no-terminal-passthrough`     | Enables/disables raw terminal forwarding. Output is filtered through a VT parser by default (window titles still pass, as printable text only); raw forwarding exposes terminal clipboard, query, and parser surface.                                                                                                                                                                                                       |
+| `--terminal-appearance` / `--no-terminal-appearance`       | Off by default. In the interactive ai-jail PTY, permits OSC 11 background-color queries and replies, a DA1 terminal-identity query and reply (including the Kitty trailing-semicolon form), and Mode 2031 support probing, enable/disable, and light/dark appearance notifications. Separate from raw terminal passthrough: it does not enable clipboard or unrelated terminal queries, and has no effect for non-TTY or `--exec` launches. |
 | `--agent-state` / `--no-agent-state`                       | The raw CLI/config default is off; first-run `For developers` preselects it visibly. When approved or passed explicitly, mounts the invoked command's credential state read-write (for example `~/.claude`, `~/.codex`) and copies its known API-key environment variable when set. Anything in the jail can use those credentials. `--no-agent-state` forces an isolated, logged-out run; `--lockdown` disables the grant. |
 | `--inherit-env` / `--no-inherit-env`                       | Default is a minimal environment allowlist. `--inherit-env` passes the full parent environment, secrets included.                                                                                                                                                                                                                                                                                                           |
 | `--update-check` / `--no-update-check`                     | Enables the status bar's outbound GitHub version check, run in a background thread while the interactive status bar is active (default off; all other launches make no network requests).                                                                                                                                                                                                                                   |
@@ -758,8 +761,9 @@ table without printing either command's arguments.
 
 Common fields: `command`, `rw_maps`, `ro_maps`, `overlay_maps`, `mask`,
 `deny_paths`, `mask_exceptions`, `deny_path_exceptions`, `hide_dotdirs`,
-`network`, `x11`, `host_shm`, `terminal_passthrough`, `macos_host_ipc`,
-`macos_chromium`, `macos_trustd`, `allow_loopback_connect`, `systemd_user`, `kvm`, `ssh`, `pictures`,
+`network`, `x11`, `host_shm`, `terminal_passthrough`, `terminal_appearance`,
+`macos_host_ipc`, `macos_chromium`, `macos_trustd`,
+`allow_loopback_connect`, `systemd_user`, `kvm`, `ssh`, `pictures`,
 `private_home`, `lockdown`, `browser_profile`, `claude_dir`, `allow_tcp_ports`,
 `status_bar_style`.
 

@@ -1326,6 +1326,7 @@ enum DirectionalAuthority {
     X11,
     HostShm,
     Terminal,
+    TerminalAppearance,
     HideConfig,
     Ssh,
     Pictures,
@@ -1460,6 +1461,11 @@ const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
         Terminal,
         "terminal-passthrough"
     ),
+    directional_policy!(
+        "terminal_appearance",
+        TerminalAppearance,
+        "terminal-appearance"
+    ),
     directional_policy!("no_worktree", Worktree, "worktree-metadata"),
     directional_policy!("no_mise", Mise, "mise-state"),
     directional_policy!("no_toolchains", Toolchains, "toolchain-state"),
@@ -1545,6 +1551,10 @@ impl DirectionalAuthority {
             Self::Terminal => {
                 c.terminal_passthrough == Some(true)
                     && b.terminal_passthrough != Some(true)
+            }
+            Self::TerminalAppearance => {
+                c.terminal_appearance == Some(true)
+                    && b.terminal_appearance != Some(true)
             }
             Self::HideConfig => {
                 c.no_hide_config == Some(true) && b.no_hide_config != Some(true)
@@ -2438,6 +2448,7 @@ mod tests {
             x11: Some(false),
             host_shm: Some(false),
             terminal_passthrough: Some(false),
+            terminal_appearance: Some(false),
             no_hide_config: Some(false),
             ssh: Some(false),
             pictures: Some(false),
@@ -2480,6 +2491,7 @@ mod tests {
             x11: Some(true),
             host_shm: Some(true),
             terminal_passthrough: Some(true),
+            terminal_appearance: Some(true),
             no_hide_config: Some(true),
             ssh: Some(true),
             pictures: Some(true),
@@ -2642,22 +2654,26 @@ mod tests {
         let global = Config {
             github: Some(false),
             no_gpu: Some(false),
+            terminal_appearance: Some(false),
             ..Config::default()
         };
         let grants = Config {
             github: Some(true),
+            terminal_appearance: Some(true),
             ..Config::default()
         };
         let trusted = config::merge_trusted_project(global, grants);
         let cli = crate::cli::CliArgs {
             github: Some(false),
             audio: Some(true),
+            terminal_appearance: Some(true),
             ..crate::cli::CliArgs::default()
         };
         let baseline = config::merge(&cli, trusted);
         let constraints = Config {
             no_gpu: Some(true),
             audio: Some(false),
+            terminal_appearance: Some(false),
             ..Config::default()
         };
         let effective =
@@ -2676,6 +2692,11 @@ mod tests {
             effective.audio,
             Some(false),
             "constraints must override CLI grant"
+        );
+        assert_eq!(
+            effective.terminal_appearance,
+            Some(false),
+            "project constraint must override trusted project and CLI grant"
         );
     }
 
@@ -2707,12 +2728,22 @@ mod tests {
             command: vec!["sh".into()],
             github: Some(true),
             no_gpu: Some(true),
+            terminal_appearance: Some(true),
             ..Config::default()
         };
         let projected = config::monotonic_project_constraints(&source, project);
         assert!(projected.command.is_empty());
         assert_ne!(projected.github, Some(true));
         assert_eq!(projected.no_gpu, Some(true));
+        assert_eq!(projected.terminal_appearance, None);
+        let restriction = config::monotonic_project_constraints(
+            &Config {
+                terminal_appearance: Some(false),
+                ..Config::default()
+            },
+            project,
+        );
+        assert_eq!(restriction.terminal_appearance, Some(false));
     }
 
     #[test]
@@ -2790,6 +2821,7 @@ mod tests {
         let grants = Config {
             agent_state: Some(false),
             github: Some(true),
+            terminal_appearance: Some(true),
             ..Config::default()
         };
         let wrapper_approval = crate::integration::RequestApproval {
@@ -2819,6 +2851,7 @@ mod tests {
         assert_eq!(loaded.approved_env_names, vec!["CUSTOM_MODE"]);
         let serialized = fs::read_to_string(&paths.project).unwrap();
         assert!(serialized.contains("CUSTOM_MODE"));
+        assert!(serialized.contains("terminal_appearance = true"));
         assert!(!serialized.contains("secret-value"));
         let _ = fs::remove_dir_all(base);
     }
@@ -2852,6 +2885,7 @@ mod tests {
         let constraints = Config {
             lockdown: Some(true),
             mask: vec!["/host/private".into()],
+            terminal_appearance: Some(false),
             ..Config::default()
         };
         save_project_constraints(&paths, constraints.clone()).unwrap();

@@ -676,6 +676,11 @@ impl<'a> App<'a> {
         enabled_flag(additional.x11, "--x11");
         enabled_flag(additional.host_shm, "--host-shm");
         enabled_flag(additional.terminal_passthrough, "--terminal-passthrough");
+        enabled_flag(additional.terminal_appearance, "--terminal-appearance");
+        enabled_flag(
+            additional.explicit && !additional.terminal_appearance,
+            "--no-terminal-appearance",
+        );
         enabled_flag(additional.aws, "--aws");
         enabled_flag(additional.kube, "--kube");
         enabled_flag(additional.gcloud, "--gcloud");
@@ -2246,6 +2251,19 @@ mod tests {
     }
 
     #[test]
+    fn terminal_appearance_cli_preview_tracks_reviewed_grant_and_constraint() {
+        let mut selection = Selection::default();
+        let app = app(&mut selection);
+        assert!(!app.cli_equivalent().contains("terminal-appearance"));
+        app.selection.additional.explicit = true;
+        assert!(app.cli_equivalent().contains("--no-terminal-appearance"));
+        app.selection.additional.terminal_appearance = true;
+        let command = app.cli_equivalent();
+        assert!(command.contains("--terminal-appearance"));
+        assert!(!command.contains("--no-terminal-appearance"));
+    }
+
+    #[test]
     fn mostly_open_preset_requires_explicit_dialog_confirmation() {
         let mut selection = Selection {
             env_names: vec!["GH_TOKEN".into()],
@@ -2408,6 +2426,35 @@ mod tests {
         app.handle_key(KeyCode::Enter);
         assert!(app.selection.additional.share_host_home);
         assert_eq!(app.active_preset(), None);
+    }
+
+    #[test]
+    fn terminal_appearance_is_an_immediate_allowed_additional_toggle() {
+        let mut selection = Selection::default();
+        let mut app = app(&mut selection);
+        app.handle_key(KeyCode::Char('a'));
+        let state = app.additional.as_mut().unwrap();
+        state.selected = state
+            .capabilities
+            .iter()
+            .position(|entry| {
+                *entry == AdditionalCapability::TerminalAppearance
+            })
+            .unwrap();
+        assert_eq!(state.selected().risk(), Risk::Allowed);
+        assert!(
+            app.additional
+                .as_ref()
+                .unwrap()
+                .selected()
+                .detail()
+                .contains("OSC 11")
+        );
+        app.handle_key(KeyCode::Enter);
+        assert!(app.selection.additional.terminal_appearance);
+        assert!(app.confirmation.is_none());
+        app.handle_key(KeyCode::Enter);
+        assert!(!app.selection.additional.terminal_appearance);
     }
     #[test]
     fn disclosure_scroll_remains_available_during_confirmation() {

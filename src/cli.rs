@@ -98,6 +98,11 @@ OPTIONS:
     --host-shm / --no-host-shm     Enable/disable host shared-memory passthrough (default: off)
     --terminal-passthrough / --no-terminal-passthrough
                                      Enable/disable terminal passthrough (default: off)
+    --terminal-appearance / --no-terminal-appearance
+                                    Allow OSC 11 background-color discovery, DA1
+                                    terminal identity, and Mode 2031 live appearance
+                                    changes (PTY only; default: off; independent
+                                    of raw terminal passthrough)
     --agent-state / --no-agent-state
                                     Enable/disable mounting the agent's own state
                                     dirs (~/.claude, ~/.codex, ~/.claude.json, ...;
@@ -225,6 +230,7 @@ pub struct CliArgs {
     pub x11: Option<bool>,
     pub host_shm: Option<bool>,
     pub terminal_passthrough: Option<bool>,
+    pub terminal_appearance: Option<bool>,
     pub worktree: Option<bool>,
     pub mise: Option<bool>,
     pub toolchains: Option<bool>,
@@ -551,6 +557,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("terminal-passthrough" | "no-terminal-passthrough")) => {
                 args.terminal_passthrough = Some(s == "terminal-passthrough");
+            }
+            Long(s @ ("terminal-appearance" | "no-terminal-appearance")) => {
+                args.terminal_appearance = Some(s == "terminal-appearance");
             }
             Long(s @ ("agent-state" | "no-agent-state")) => {
                 args.agent_state = Some(s == "agent-state");
@@ -1096,6 +1105,8 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-host-shm",
     "--terminal-passthrough",
     "--no-terminal-passthrough",
+    "--terminal-appearance",
+    "--no-terminal-appearance",
     "--agent-state",
     "--no-agent-state",
     "--forward-port",
@@ -1675,6 +1686,26 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.terminal_passthrough, Some(false));
+    }
+
+    #[test]
+    fn parse_terminal_appearance_and_help() {
+        assert!(
+            HELP.contains("--terminal-appearance / --no-terminal-appearance")
+        );
+        let args = parse_test(&["--terminal-appearance", "bash"]).unwrap();
+        assert_eq!(args.terminal_appearance, Some(true));
+        let args = parse_test(&[
+            "--terminal-appearance",
+            "--no-terminal-appearance",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.terminal_appearance, Some(false));
+        for flag in ["--terminal-appearance", "--no-terminal-appearance"] {
+            let error = parse_test(&["claude", flag]).unwrap_err();
+            assert!(error.contains("after command"), "{error}");
+        }
     }
 
     #[test]

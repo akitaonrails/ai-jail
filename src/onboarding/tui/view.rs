@@ -1185,6 +1185,20 @@ mod tests {
         assert!(rendered.contains("Additional capabilities"));
         assert!(rendered.contains("Entire host home directory"));
         assert!(rendered.contains("OPEN grants require"));
+        assert!(rendered.contains("Terminal appearance"));
+        let state = app.additional.as_mut().unwrap();
+        state.selected = state
+            .capabilities
+            .iter()
+            .position(|entry| {
+                *entry
+                    == super::super::additional::Capability::TerminalAppearance
+            })
+            .unwrap();
+        let details = buffer_text(140, 36, &mut app);
+        assert!(details.contains("OSC 11"));
+        assert!(details.contains("DA1"));
+        assert!(details.contains("Mode 2031"));
         #[cfg(target_os = "linux")]
         assert!(rendered.contains("systemd user manager"));
         #[cfg(target_os = "linux")]

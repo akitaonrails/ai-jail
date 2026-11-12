@@ -64,6 +64,7 @@ pub(crate) struct AdditionalSelection {
     pub x11: bool,
     pub host_shm: bool,
     pub terminal_passthrough: bool,
+    pub terminal_appearance: bool,
     pub aws: bool,
     pub kube: bool,
     pub gcloud: bool,
@@ -92,6 +93,7 @@ impl AdditionalSelection {
             || self.x11
             || self.host_shm
             || self.terminal_passthrough
+            || self.terminal_appearance
             || self.aws
             || self.kube
             || self.gcloud
@@ -121,6 +123,7 @@ impl AdditionalSelection {
             x11: config.x11_enabled(),
             host_shm: config.host_shm_enabled(),
             terminal_passthrough: config.terminal_passthrough_enabled(),
+            terminal_appearance: config.terminal_appearance_enabled(),
             aws: config.aws_enabled(),
             kube: config.kube_enabled(),
             gcloud: config.gcloud_enabled(),
@@ -152,6 +155,7 @@ impl AdditionalSelection {
             config.x11 = Some(self.x11);
             config.host_shm = Some(self.host_shm);
             config.terminal_passthrough = Some(self.terminal_passthrough);
+            config.terminal_appearance = Some(self.terminal_appearance);
             config.aws = Some(self.aws);
             config.kube = Some(self.kube);
             config.gcloud = Some(self.gcloud);
@@ -180,6 +184,7 @@ impl AdditionalSelection {
         config.x11 = self.x11.then_some(true);
         config.host_shm = self.host_shm.then_some(true);
         config.terminal_passthrough = self.terminal_passthrough.then_some(true);
+        config.terminal_appearance = self.terminal_appearance.then_some(true);
         config.aws = self.aws.then_some(true);
         config.kube = self.kube.then_some(true);
         config.gcloud = self.gcloud.then_some(true);
@@ -1445,7 +1450,7 @@ fn run_sequential(
     approved_wrapper_requests: Vec<crate::integration::RequestApproval>,
 ) -> Result<Outcome, String> {
     eprintln!(
-        "Plain-terminal mode: each access choice is reviewed in order.\n"
+        "Plain-terminal mode: core access choices are reviewed in order. Additional capabilities require explicit CLI options.\n"
     );
     let Some(review) =
         review_choice("Review filtered model API access? [y/N/q] ")?
@@ -2508,6 +2513,14 @@ pub(crate) fn render_effective_access(
             crate::config::DEFAULT_ENV_ALLOWLIST.join(", "),
             crate::config::DEFAULT_ENV_PREFIXES.join(", ")
         ),
+        format!(
+            "Terminal appearance (interactive ai-jail PTY only): {}",
+            if config.terminal_appearance_enabled() {
+                "ALLOWED: OSC 11 background-color query/reply, DA1 terminal-identity sentinel query/reply, Mode 2031 support probe/reply (DECRQM), enable/disable and theme-change notifications"
+            } else {
+                "CLOSED: this grant does not forward OSC 11, DA1, or Mode 2031 appearance probes/controls/notifications; raw passthrough is separate"
+            }
+        ),
         "Authority details (resource; access; scope/limits; consequence):".into(),
     ];
     let mut authority = |enabled: bool, text: &str| {
@@ -2613,6 +2626,10 @@ pub(crate) fn render_effective_access(
     authority(
         config.terminal_passthrough_enabled(),
         "real terminal device; direct terminal I/O; invoking terminal session; jailed processes can change terminal modes and exchange input/output",
+    );
+    authority(
+        config.terminal_appearance_enabled(),
+        "ALLOWED: terminal appearance in the ai-jail PTY; query the host terminal's background color (OSC 11), receive a DA1 terminal-identity reply for the probe sentinel, probe Mode 2031 support (DECRQM), enable/disable Mode 2031 and receive theme-change notifications; interactive PTY session only, not exec or non-TTY output; the harness can learn the terminal color and identity, but this grant does not permit unrelated terminal queries, clipboard, or raw passthrough",
     );
     authority(
         config.macos_host_ipc_enabled(),
@@ -3101,6 +3118,88 @@ mod tests {
     }
 
     #[test]
+    fn terminal_appearance_is_opt_in_and_reviewed_false_is_a_constraint() {
+        let mut config = Config::default();
+        assert!(!config.terminal_appearance_enabled());
+        assert!(!AdditionalSelection::default().terminal_appearance);
+        let mut selected = AdditionalSelection {
+            terminal_appearance: true,
+            ..AdditionalSelection::default()
+        };
+        selected.apply_to(&mut config);
+        assert_eq!(config.terminal_appearance, Some(true));
+        assert!(config.terminal_appearance_enabled());
+
+        selected.explicit = true;
+        selected.terminal_appearance = false;
+        selected.apply_to(&mut config);
+        assert_eq!(config.terminal_appearance, Some(false));
+        assert!(!config.terminal_appearance_enabled());
+        assert!(!AdditionalSelection::from_config(&config).terminal_appearance);
+        let grants = Selection {
+            additional: selected,
+            ..Selection::default()
+        }
+        .grants("claude");
+        assert_eq!(grants.terminal_appearance, Some(false));
+    }
+
+    #[test]
+    fn effective_review_names_terminal_appearance_when_open_and_closed() {
+        let project = Path::new("/work/project");
+        let closed = render_effective_access(
+            &Config::default(),
+            project,
+            "claude",
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(closed.contains(
+            "Terminal appearance (interactive ai-jail PTY only): CLOSED"
+        ));
+        assert!(
+            !closed.contains("ALLOWED: terminal appearance in the ai-jail PTY")
+        );
+        let constrained = render_effective_access(
+            &Config {
+                terminal_appearance: Some(false),
+                ..Config::default()
+            },
+            project,
+            "claude",
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(constrained.contains("terminal_appearance = false"));
+        assert!(constrained.contains(
+            "Terminal appearance (interactive ai-jail PTY only): CLOSED"
+        ));
+
+        let open = render_effective_access(
+            &Config {
+                terminal_appearance: Some(true),
+                ..Config::default()
+            },
+            project,
+            "claude",
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(open.contains(
+            "Terminal appearance (interactive ai-jail PTY only): ALLOWED"
+        ));
+        assert!(
+            open.contains("ALLOWED: terminal appearance in the ai-jail PTY")
+        );
+        assert!(open.contains("OSC 11"));
+        assert!(open.contains("DA1 terminal-identity"));
+        assert!(open.contains("Mode 2031"));
+    }
+
+    #[test]
     fn empty_project_grants_stay_empty_until_baseline_is_explicitly_applied() {
         let selection = Selection::from_project_grants(
             &Config::default(),
@@ -3209,6 +3308,7 @@ mod tests {
             x11: true,
             host_shm: true,
             terminal_passthrough: true,
+            terminal_appearance: true,
             aws: true,
             kube: true,
             gcloud: true,
