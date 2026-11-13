@@ -29,6 +29,7 @@ fn run(project: &PathBuf, home: &PathBuf, args: &[&str]) -> Output {
         .args(args)
         .current_dir(project)
         .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.with_file_name("xdg"))
         .env_remove("AI_JAIL_QUIET")
         .output()
         .expect("failed to run ai-jail")
