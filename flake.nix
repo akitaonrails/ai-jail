@@ -104,10 +104,13 @@
           ];
 
           # Integration tests drive fixture traffic with curl and exercise
-          # the real Git credential helper.
+          # the real Git credential helper. Launches that keep the caller's
+          # HOME create the trusted config store under it, which the
+          # builder's /homeless-shelter cannot hold.
           nativeCheckInputs = [
             pkgs.curl
             pkgs.git
+            pkgs.writableTmpDirAsHomeHook
           ];
 
           BWRAP_BIN = "${pkgs.bubblewrap}/bin/bwrap";
