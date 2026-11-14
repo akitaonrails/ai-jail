@@ -414,7 +414,14 @@ impl<'a> IoLoop<'a> {
                 }
             }
             write_all_raw(self.stdout, b"\x1b[H\x1b[J");
-            let output = screen.state_formatted();
+            // `state_formatted` writes input modes as changes from the
+            // terminal defaults, so a mode the child just turned off (the
+            // mouse on leaving a picker) emits nothing and stays on in the
+            // outer terminal. Rebuild the contents instead and diff the
+            // input modes against the screen the terminal is showing.
+            let mut output = screen.contents_formatted();
+            output
+                .extend_from_slice(&screen.input_mode_diff(&self.prev_screen));
             write_all_raw(self.stdout, &output);
             self.was_alt_screen = now_alt;
         } else if now_alt {
@@ -2470,6 +2477,30 @@ mod tests {
 
     fn rendered_output(passthrough: bool, chunk: &[u8]) -> Vec<u8> {
         rendered_appearance(passthrough, false, &[chunk])
+    }
+
+    #[test]
+    fn alt_screen_transition_restores_input_modes_on_the_outer_terminal() {
+        // omp's picker enables mouse tracking inside the alternate screen and
+        // disables it as it leaves. The transition drops the raw chunk and
+        // re-renders, so the disables have to come from the mode diff (#237).
+        let out = rendered_appearance(
+            false,
+            false,
+            &[
+                b"\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[?1049h",
+                b"\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[?1049l",
+            ],
+        );
+        // vt100 keeps one mouse protocol, so `?1003l` (which turns every
+        // tracking mode off) and the encoding reset are what the diff emits.
+        for seq in [&b"\x1b[?1003l"[..], b"\x1b[?1006l"] {
+            assert!(
+                out.windows(seq.len()).any(|w| w == seq),
+                "missing {:?} in {out:?}",
+                String::from_utf8_lossy(seq)
+            );
+        }
     }
 
     #[test]
