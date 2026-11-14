@@ -838,11 +838,31 @@ fn render_config(identity_agent: &str, config_root: &str) -> String {
 fn ssh_add_supports_destination_constraints(
     executable: &Path,
 ) -> Result<bool, String> {
-    let output = Command::new(executable)
-        .arg("-?")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("Cannot inspect ssh-add capabilities: {e}"))?;
+    // A concurrent fork can keep a freshly written executable open for
+    // writing, which makes the first exec fail with ETXTBSY even though this
+    // process has closed it. Retry briefly instead of failing setup.
+    let mut attempt = 0;
+    let output = loop {
+        match Command::new(executable)
+            .arg("-?")
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(output) => break output,
+            Err(error)
+                if error.raw_os_error() == Some(nix::libc::ETXTBSY)
+                    && attempt < 5 =>
+            {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Cannot inspect ssh-add capabilities: {error}"
+                ));
+            }
+        }
+    };
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -878,6 +898,35 @@ mod tests {
         let path = home.join(".ssh/known_hosts");
         fs::write(&path, "example.test ssh-ed25519 AAAATEST\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn capability_inspection_retries_an_executable_busy_with_writers() {
+        let root =
+            test_tmp().join(format!("ai-jail-ssh-busy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("ssh-add");
+        fs::write(
+            &executable,
+            "#!/bin/sh\necho '-h destination_constraint -H hostkey_file'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .unwrap();
+        // A writer in this process makes exec fail with ETXTBSY; the retry
+        // loop must outlast it instead of failing the launch setup.
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(writer);
+        });
+        assert!(ssh_add_supports_destination_constraints(&executable).unwrap());
+        release.join().unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
