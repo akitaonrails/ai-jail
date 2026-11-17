@@ -91,10 +91,11 @@ pub(crate) struct DirectoryGrantIdentity {
     pub(crate) writable: bool,
     pub(crate) dev: u64,
     pub(crate) ino: u64,
-    /// `statfs(2)` filesystem id, stable across remounts. Absent in profiles
-    /// saved before this field existed.
+    /// `statfs(2)` filesystem id, stable across remounts, as its two kernel
+    /// words (TOML integers are signed). Absent in profiles saved before
+    /// this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) fsid: Option<u64>,
+    pub(crate) fsid: Option<[i32; 2]>,
     pub(crate) open_scope: bool,
 }
 
@@ -1299,26 +1300,40 @@ pub(crate) fn validate_directory_grants(
 /// overlay mounts get a number the kernel allocates at mount time, so it
 /// changes across boots. `f_fsid` is derived from the filesystem (on btrfs,
 /// its UUID and subvolume id) and survives a remount.
-fn filesystem_id(path: &Path) -> Option<u64> {
+fn filesystem_id(path: &Path) -> Option<[i32; 2]> {
     let fsid = nix::sys::statfs::statfs(path).ok()?.filesystem_id();
-    if std::mem::size_of_val(&fsid) != std::mem::size_of::<u64>() {
+    if std::mem::size_of_val(&fsid) != 8 {
         return None;
     }
     // SAFETY: `fsid_t` is libc's plain `#[repr(C)]` pair of `i32`s, nix
-    // exposes no accessor for the value, and the length is checked above.
+    // exposes no accessor for the value, and the size is checked above.
     let bytes = unsafe {
         std::slice::from_raw_parts(
             (&fsid as *const nix::sys::statfs::fsid_t).cast::<u8>(),
-            std::mem::size_of::<u64>(),
+            8,
         )
     };
-    Some(u64::from_ne_bytes(bytes.try_into().ok()?))
+    let mut words = [0_i32; 2];
+    for (index, word) in words.iter_mut().enumerate() {
+        let start = index * 4;
+        *word = i32::from_ne_bytes(bytes[start..start + 4].try_into().ok()?);
+    }
+    Some(words)
 }
 
 /// Whether `dev` is a kernel-allocated anonymous device (major 0), which is
 /// what btrfs subvolumes and other remounted filesystems report.
+#[cfg(target_os = "linux")]
 fn is_anonymous_device(dev: u64) -> bool {
-    nix::sys::stat::major(dev as nix::sys::stat::dev_t) == 0
+    // glibc's gnu_dev_major, without depending on a per-platform helper.
+    ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff) == 0
+}
+
+/// Device numbers are stable on the other platforms ai-jail supports, where
+/// anonymous devices are a Linux concept.
+#[cfg(not(target_os = "linux"))]
+fn is_anonymous_device(_dev: u64) -> bool {
+    false
 }
 
 /// Whether a freshly captured grant still names the approved directory.
@@ -3182,7 +3197,7 @@ mod tests {
     fn grant_fixture(
         dev: u64,
         ino: u64,
-        fsid: Option<u64>,
+        fsid: Option<[i32; 2]>,
     ) -> DirectoryGrantIdentity {
         DirectoryGrantIdentity {
             path: PathBuf::from("/home/user/Documents/other-repo"),
@@ -3198,30 +3213,31 @@ mod tests {
     fn anonymous_device_change_with_the_same_filesystem_id_keeps_a_grant() {
         // btrfs subvolumes report a new major-0 st_dev after a reboot while
         // the inode and the filesystem id stay the same (#238).
-        let saved = grant_fixture(58, 80404862, Some(0x01234567_89abcdef));
-        let rebooted = grant_fixture(56, 80404862, Some(0x01234567_89abcdef));
+        let saved = grant_fixture(58, 80404862, Some([0x01234567, 0x01234567]));
+        let rebooted =
+            grant_fixture(56, 80404862, Some([0x01234567, 0x01234567]));
         assert!(same_directory_grant(&rebooted, &saved));
 
         // A different filesystem or inode is still a different directory.
         assert!(!same_directory_grant(
-            &grant_fixture(56, 80404862, Some(0x0fedcba9_87654321)),
+            &grant_fixture(56, 80404862, Some([0x0fedcba9, 0x76543210])),
             &saved
         ));
         assert!(!same_directory_grant(
-            &grant_fixture(56, 80404863, Some(0x01234567_89abcdef)),
+            &grant_fixture(56, 80404863, Some([0x01234567, 0x01234567])),
             &saved
         ));
         // A profile saved before filesystem ids existed keeps the strict
         // device check until it is configured once more.
         assert!(!same_directory_grant(
-            &grant_fixture(56, 80404862, Some(0x01234567_89abcdef)),
+            &grant_fixture(56, 80404862, Some([0x01234567, 0x01234567])),
             &grant_fixture(58, 80404862, None)
         ));
         // Real block devices keep a stable dev, so a change means a
         // different mount even when the filesystem id happens to match.
         assert!(!same_directory_grant(
-            &grant_fixture(0x0802, 80404862, Some(0x01234567_89abcdef)),
-            &grant_fixture(0x0801, 80404862, Some(0x01234567_89abcdef))
+            &grant_fixture(0x0802, 80404862, Some([0x01234567, 0x01234567])),
+            &grant_fixture(0x0801, 80404862, Some([0x01234567, 0x01234567]))
         ));
         // Unchanged grants validate in every case.
         assert!(same_directory_grant(&saved, &saved));
@@ -3268,6 +3284,39 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&grant);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_filesystem_id_with_the_high_bit_set_round_trips() {
+        // tmpfs and overlayfs can hand out a filesystem id whose words do
+        // not fit a positive TOML integer; it is stored as the kernel's two
+        // signed words so saving a project never fails on it.
+        let identity = DirectoryGrantIdentity {
+            path: PathBuf::from("/home/user/Documents/other-repo"),
+            writable: false,
+            dev: 58,
+            ino: 80404862,
+            fsid: Some([i32::MIN, -1]),
+            open_scope: false,
+        };
+        let doc = ProjectPolicyDocument {
+            schema_version: MIGRATION_VERSION,
+            project: ProjectIdentity {
+                canonical_path: "/work/project".into(),
+                key: "project-fixture".into(),
+            },
+            grants: Config::default(),
+            constraints: Config::default(),
+            onboarding_complete: true,
+            directory_grants: vec![identity.clone()],
+            approved_env_names: Vec::new(),
+            approved_wrapper_requests: Vec::new(),
+            restricted_ssh: None,
+            migration: None,
+        };
+        let text = toml::to_string_pretty(&doc).unwrap();
+        let parsed: ProjectPolicyDocument = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.directory_grants, vec![identity]);
     }
 
     #[cfg(target_os = "linux")]
