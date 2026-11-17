@@ -967,12 +967,29 @@ fn mint_github_token(
         }
         permissions.insert(name.into(), access.into());
     }
-    let body = serde_json::json!({
-        "repositories": [binding.repository],
-        "permissions": permissions
-    });
+    let mut body = serde_json::Map::new();
+    if binding.repository_id != 0 {
+        // The numeric ID is immutable and already verified, so a rename
+        // cannot redirect the token.
+        body.insert(
+            "repository_ids".into(),
+            serde_json::json!([binding.repository_id]),
+        );
+    } else {
+        // Setup mints before the repository ID is known. GitHub wants the
+        // name alone here: the installation already fixes the owner, and
+        // `repositories` takes names, not `OWNER/REPO` (HTTP 422 otherwise).
+        let name = binding
+            .repository
+            .rsplit_once('/')
+            .map(|(_, name)| name)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| "Invalid stored repository".to_string())?;
+        body.insert("repositories".into(), serde_json::json!([name]));
+    }
+    body.insert("permissions".into(), permissions.into());
     let authorization = Zeroizing::new(format!("Bearer {}", jwt.as_str()));
-    let body = Zeroizing::new(body.to_string());
+    let body = Zeroizing::new(serde_json::Value::Object(body).to_string());
     let response = request_with_authorization(
         &binding.origin,
         binding.allow_private,
@@ -982,10 +999,30 @@ fn mint_github_token(
         Some(body.as_bytes()),
     )?;
     if response.status != 201 {
-        return Err(format!(
-            "GitHub App token creation failed (HTTP {})",
-            response.status
-        ));
+        let detail =
+            serde_json::from_slice::<serde_json::Value>(&response.body)
+                .ok()
+                .and_then(|value| {
+                    value.get("message").and_then(|text| text.as_str()).map(
+                        |text| {
+                            crate::output::escape_control_bytes(text)
+                                .chars()
+                                .take(300)
+                                .collect::<String>()
+                        },
+                    )
+                })
+                .filter(|text| !text.is_empty());
+        return Err(match detail {
+            Some(message) => format!(
+                "GitHub App token creation failed (HTTP {}): {message}",
+                response.status
+            ),
+            None => format!(
+                "GitHub App token creation failed (HTTP {})",
+                response.status
+            ),
+        });
     }
     #[derive(Deserialize)]
     struct TokenResponse {
@@ -2027,6 +2064,88 @@ mod tests {
             Origin::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
             receive,
         )
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn fake_http_mint() -> (Origin, std::sync::mpsc::Receiver<String>) {
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (send, receive) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 4096];
+            let mut needed = None;
+            loop {
+                let count = stream.read(&mut buf).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..count]);
+                if needed.is_none()
+                    && let Some(head_end) =
+                        request.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let head = String::from_utf8_lossy(&request[..head_end]);
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length: ")
+                                .or_else(|| {
+                                    line.strip_prefix("content-length: ")
+                                })
+                                .and_then(|value| value.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    needed = Some(head_end + 4 + length);
+                }
+                if needed.is_some_and(|needed| request.len() >= needed) {
+                    break;
+                }
+            }
+            send.send(String::from_utf8_lossy(&request).into_owned())
+                .unwrap();
+            let body = br#"{"token":"ghs_test_token"}"#;
+            let head = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        });
+        (
+            Origin::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+            receive,
+        )
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn github_app_token_request_uses_repository_name_then_id() {
+        let pem = include_str!("../tests/fixtures/test-only-key.pem");
+        let (origin, request) = fake_http_mint();
+        let mut provisional = binding(Provider::GithubApp);
+        provisional.origin = origin;
+        provisional.repository = "owner/repo".into();
+        provisional.repository_id = 0;
+        provisional.scopes = vec!["contents:write".into()];
+        mint_github_token(&provisional, 123, 456, pem).unwrap();
+        let sent = request.recv().unwrap();
+        assert!(sent.contains(r#""repositories":["repo"]"#), "{sent}");
+        assert!(!sent.contains("owner/repo"), "{sent}");
+
+        let (origin, request) = fake_http_mint();
+        let mut launch = binding(Provider::GithubApp);
+        launch.origin = origin;
+        launch.repository_id = 42;
+        launch.scopes = vec!["contents:write".into()];
+        mint_github_token(&launch, 123, 456, pem).unwrap();
+        let sent = request.recv().unwrap();
+        assert!(sent.contains(r#""repository_ids":[42]"#), "{sent}");
+        assert!(!sent.contains(r#""repositories""#), "{sent}");
     }
 
     fn binding(provider: Provider) -> Binding {
