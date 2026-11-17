@@ -3209,6 +3209,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn anonymous_device_change_with_the_same_filesystem_id_keeps_a_grant() {
         // btrfs subvolumes report a new major-0 st_dev after a reboot while
