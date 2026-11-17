@@ -3194,6 +3194,7 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
+    #[cfg(target_os = "linux")]
     fn grant_fixture(
         dev: u64,
         ino: u64,
