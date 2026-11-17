@@ -132,7 +132,12 @@ are under `projects/`. The store and its parents reject symlink components,
 files are owner-only, and the whole store is masked from the sandbox. A project
 document records its canonical path, separates grants from constraints, and
 keeps migration provenance. Saved directory grants also record filesystem
-identity and fail closed if the target moves, disappears, or changes identity.
+identity (the inode plus `statfs(2)`'s filesystem id) and fail closed if the
+target moves, disappears, or changes identity. The filesystem id is what keeps
+a grant valid across a reboot on filesystems whose `st_dev` is an anonymous
+device allocated at mount time, such as btrfs subvolumes, tmpfs and overlay
+mounts; a profile saved before that field existed is checked by the older
+device-and-inode pair until it is configured once more.
 
 Repository `.ai-jail` and `~/.ai-jail` are legacy inputs. A writable launch
 copies a safe global file into the trusted store. It projects a repository file

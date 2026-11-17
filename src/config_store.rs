@@ -91,6 +91,10 @@ pub(crate) struct DirectoryGrantIdentity {
     pub(crate) writable: bool,
     pub(crate) dev: u64,
     pub(crate) ino: u64,
+    /// `statfs(2)` filesystem id, stable across remounts. Absent in profiles
+    /// saved before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fsid: Option<u64>,
     pub(crate) open_scope: bool,
 }
 
@@ -1234,11 +1238,13 @@ pub(crate) fn capture_directory_grants(
             }
             reject_onboarding_credential_path(&path)?;
             let open_scope = onboarding_path_is_broad(&path, project);
+            let fsid = filesystem_id(&path);
             identities.push(DirectoryGrantIdentity {
                 path,
                 writable,
                 dev: metadata.dev(),
                 ino: metadata.ino(),
+                fsid,
                 open_scope,
             });
         }
@@ -1264,7 +1270,11 @@ pub(crate) fn validate_directory_grants(
         capture_directory_grants(grants, project).map_err(|error| {
             format!("{} {error}", crate::onboarding::messages::PATH_DRIFT_ID)
         })?;
-    if expected != identities {
+    if !expected
+        .iter()
+        .zip(identities)
+        .all(|(expected, saved)| same_directory_grant(expected, saved))
+    {
         return Err(format!(
             "{} A saved directory grant moved, disappeared, or changed identity; access was refused",
             crate::onboarding::messages::PATH_DRIFT_ID
@@ -1281,6 +1291,56 @@ pub(crate) fn validate_directory_grants(
         .map(|item| item.path.clone())
         .collect();
     Ok(())
+}
+
+/// `statfs(2)`'s filesystem id, or `None` where it is unavailable.
+///
+/// `st_dev` is not stable for anonymous devices: btrfs subvolumes, tmpfs and
+/// overlay mounts get a number the kernel allocates at mount time, so it
+/// changes across boots. `f_fsid` is derived from the filesystem (on btrfs,
+/// its UUID and subvolume id) and survives a remount.
+fn filesystem_id(path: &Path) -> Option<u64> {
+    let fsid = nix::sys::statfs::statfs(path).ok()?.filesystem_id();
+    if std::mem::size_of_val(&fsid) != std::mem::size_of::<u64>() {
+        return None;
+    }
+    // SAFETY: `fsid_t` is libc's plain `#[repr(C)]` pair of `i32`s, nix
+    // exposes no accessor for the value, and the length is checked above.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&fsid as *const nix::sys::statfs::fsid_t).cast::<u8>(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    Some(u64::from_ne_bytes(bytes.try_into().ok()?))
+}
+
+/// Whether `dev` is a kernel-allocated anonymous device (major 0), which is
+/// what btrfs subvolumes and other remounted filesystems report.
+fn is_anonymous_device(dev: u64) -> bool {
+    nix::sys::stat::major(dev as nix::sys::stat::dev_t) == 0
+}
+
+/// Whether a freshly captured grant still names the approved directory.
+///
+/// The inode and the grant's own fields must match, and either the device is
+/// unchanged or both sides are anonymous devices of the same filesystem
+/// (see [`filesystem_id`]). A profile saved before filesystem ids existed
+/// only has `dev`, so it keeps the strict check until it is configured once
+/// more.
+fn same_directory_grant(
+    expected: &DirectoryGrantIdentity,
+    saved: &DirectoryGrantIdentity,
+) -> bool {
+    expected.path == saved.path
+        && expected.writable == saved.writable
+        && expected.open_scope == saved.open_scope
+        && expected.ino == saved.ino
+        && (expected.dev == saved.dev
+            || (expected.fsid.is_some()
+                && expected.fsid == saved.fsid
+                && is_anonymous_device(expected.dev)
+                && is_anonymous_device(saved.dev)))
 }
 
 fn onboarding_path_is_broad(path: &Path, project: &Path) -> bool {
@@ -3117,6 +3177,122 @@ mod tests {
             assert!(error.contains("UTF-8"));
         }
         let _ = fs::remove_dir_all(base);
+    }
+
+    fn grant_fixture(
+        dev: u64,
+        ino: u64,
+        fsid: Option<u64>,
+    ) -> DirectoryGrantIdentity {
+        DirectoryGrantIdentity {
+            path: PathBuf::from("/home/user/Documents/other-repo"),
+            writable: false,
+            dev,
+            ino,
+            fsid,
+            open_scope: false,
+        }
+    }
+
+    #[test]
+    fn anonymous_device_change_with_the_same_filesystem_id_keeps_a_grant() {
+        // btrfs subvolumes report a new major-0 st_dev after a reboot while
+        // the inode and the filesystem id stay the same (#238).
+        let saved = grant_fixture(58, 80404862, Some(0x01234567_89abcdef));
+        let rebooted = grant_fixture(56, 80404862, Some(0x01234567_89abcdef));
+        assert!(same_directory_grant(&rebooted, &saved));
+
+        // A different filesystem or inode is still a different directory.
+        assert!(!same_directory_grant(
+            &grant_fixture(56, 80404862, Some(0x0fedcba9_87654321)),
+            &saved
+        ));
+        assert!(!same_directory_grant(
+            &grant_fixture(56, 80404863, Some(0x01234567_89abcdef)),
+            &saved
+        ));
+        // A profile saved before filesystem ids existed keeps the strict
+        // device check until it is configured once more.
+        assert!(!same_directory_grant(
+            &grant_fixture(56, 80404862, Some(0x01234567_89abcdef)),
+            &grant_fixture(58, 80404862, None)
+        ));
+        // Real block devices keep a stable dev, so a change means a
+        // different mount even when the filesystem id happens to match.
+        assert!(!same_directory_grant(
+            &grant_fixture(0x0802, 80404862, Some(0x01234567_89abcdef)),
+            &grant_fixture(0x0801, 80404862, Some(0x01234567_89abcdef))
+        ));
+        // Unchanged grants validate in every case.
+        assert!(same_directory_grant(&saved, &saved));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_saved_grant_survives_an_anonymous_device_change() {
+        // /dev/shm is a tmpfs with a major-0 device, like a btrfs subvolume.
+        let shm = Path::new("/dev/shm");
+        if !shm.is_dir() {
+            return;
+        }
+        let base = canonical_temp_dir()
+            .join(format!("ai-jail-grant-reboot-{}", std::process::id()));
+        let grant = shm.join(format!("ai-jail-grant-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&grant);
+        fs::create_dir_all(&grant).unwrap();
+        fs::create_dir_all(&base).unwrap();
+        let grants = Config {
+            ro_maps: vec![grant.clone()],
+            ..Config::default()
+        };
+        let captured =
+            capture_directory_grants(&grants, &base.join("project")).unwrap();
+        if !is_anonymous_device(captured[0].dev) {
+            // A host whose /dev/shm is not anonymous cannot show this case.
+            let _ = fs::remove_dir_all(&grant);
+            let _ = fs::remove_dir_all(&base);
+            return;
+        }
+        let mut saved = captured.clone();
+        saved[0].dev ^= 1;
+        assert_ne!(saved[0].dev, captured[0].dev);
+        let mut reloaded = grants.clone();
+        validate_directory_grants(&mut reloaded, &saved, &base).unwrap();
+        assert_eq!(reloaded.ro_maps, vec![grant.clone()]);
+        // A changed inode still refuses.
+        let mut moved = saved.clone();
+        moved[0].ino += 1;
+        assert!(
+            validate_directory_grants(&mut reloaded, &moved, &base).is_err()
+        );
+        let _ = fs::remove_dir_all(&grant);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_records_a_filesystem_id() {
+        let base = canonical_temp_dir()
+            .join(format!("ai-jail-grant-fsid-{}", std::process::id()));
+        let grant = base.join("docs");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&grant).unwrap();
+        let identities = capture_directory_grants(
+            &Config {
+                ro_maps: vec![grant],
+                ..Config::default()
+            },
+            &base.join("project"),
+        )
+        .unwrap();
+        assert_eq!(identities.len(), 1);
+        assert!(identities[0].fsid.is_some());
+        assert_eq!(
+            identities[0].ino,
+            fs::metadata(&identities[0].path).unwrap().ino()
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

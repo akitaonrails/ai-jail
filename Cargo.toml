@@ -54,6 +54,7 @@ nix = { version = "0.29", features = [
   "term",
   "resource",
   "user",
+  "fs",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
