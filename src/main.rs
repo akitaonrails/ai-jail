@@ -2224,7 +2224,7 @@ fn run(
         &child_status,
         &exit_reason::LimitsInForce::read_back(file_size_set),
     );
-    if let Some(line) = reason.explanation(exit_reason::HostTraits::CURRENT) {
+    if let Some(line) = reason.explanation() {
         output::security_warn(&line);
     }
 

@@ -708,8 +708,10 @@ saying which, and the limit behind it when one is known, also under `--exec`:
 ⚠ sandbox exited with 153: killed by SIGXFSZ: the file-size rlimit was reached (1.0 GiB) (inferred from exit code 153)
 ```
 
-A `SIGKILL` no ai-jail limit explains points at the host OOM killer, with the
-`journalctl` command to check on Linux. A normal exit, and a deliberate
+A limit is named only when ai-jail knows it is in force: today that is the
+lockdown file-size ceiling. Any other signal, `SIGKILL` and `SIGXCPU`
+included, is named alone (`killed by SIGKILL`), because the status cannot say
+who sent it or why. A normal exit, and a deliberate
 `SIGHUP`, `SIGINT`, `SIGPIPE` or `SIGTERM`, print nothing. On Linux bwrap
 reports a signal death as an exit code `128 + N`; a signal decoded from one
 rather than seen directly says so (`inferred from exit code N`). On macOS an

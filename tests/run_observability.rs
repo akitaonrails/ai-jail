@@ -410,33 +410,34 @@ fn exit_file_size_limit_is_named_under_lockdown() {
 }
 
 #[test]
-fn exit_cpu_time_limit_is_named() {
+fn exit_cpu_time_signal_names_no_limit() {
     require_bwrap_net!();
     // Soft limit only: with soft == hard (`ulimit -t 1`) the kernel
-    // sends SIGKILL, not SIGXCPU (measured: exit 137).
+    // sends SIGKILL, not SIGXCPU (measured: exit 137). The limit is the
+    // command's own, not ai-jail's, so the line names the signal alone.
     let out = run(
         "xcpu",
         &["--exec", "sh", "-c", "ulimit -S -t 1; while :; do :; done"],
     );
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(152), "{stderr}");
-    assert!(stderr.contains("SIGXCPU"), "{stderr}");
-    assert!(stderr.to_lowercase().contains("cpu"), "{stderr}");
+    assert!(stderr.contains("killed by SIGXCPU"), "{stderr}");
+    assert!(!stderr.contains("rlimit"), "no limit claimed: {stderr}");
+    assert_eq!(stderr.lines().count(), 1, "one line: {stderr}");
 }
 
 #[test]
-fn exit_unattributed_sigkill_points_at_the_host_oom_killer() {
+fn exit_sigkill_names_the_signal_alone() {
     require_bwrap_net!();
     let out = run("kill9", &["--exec", "sh", "-c", "kill -9 $$"]);
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(137), "{stderr}");
-    assert!(stderr.contains("SIGKILL"), "{stderr}");
-    assert!(stderr.to_lowercase().contains("oom"), "{stderr}");
     assert!(
-        stderr.contains("journalctl -k"),
-        "kernel-log hint: {stderr}"
+        stderr.contains("sandbox exited with 137: killed by SIGKILL"),
+        "{stderr}"
     );
-    assert_eq!(stderr.matches("journalctl").count(), 1, "{stderr}");
+    assert!(!stderr.to_lowercase().contains("oom"), "no cause: {stderr}");
+    assert!(!stderr.contains("journalctl"), "{stderr}");
     assert_eq!(stderr.lines().count(), 1, "one line: {stderr}");
 }
 

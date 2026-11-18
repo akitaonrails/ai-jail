@@ -13,8 +13,6 @@ use nix::sys::signal::Signal;
 
 // Signal numbers come from nix (libc), not literals, so the table holds
 // on both Linux and macOS.
-const SIGKILL: i32 = Signal::SIGKILL as i32;
-const SIGXCPU: i32 = Signal::SIGXCPU as i32;
 const SIGXFSZ: i32 = Signal::SIGXFSZ as i32;
 
 /// Signals a user or a harness sends on purpose; a death by one of them
@@ -53,19 +51,16 @@ pub struct ChildStatus {
 }
 
 /// What the host does to a child's end. Only bwrap folds a child's
-/// signal death into an exit code `128 + N`, and only Linux has the
-/// kernel log `journalctl -k` reads; it is passed in, rather than read
-/// from `cfg` here, so both kinds of host are testable on either.
+/// signal death into an exit code `128 + N`; it is passed in, rather than
+/// read from `cfg` here, so both kinds of host are testable on either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostTraits {
     pub folds_signals: bool,
-    pub kernel_log_hint: bool,
 }
 
 impl HostTraits {
     pub const CURRENT: HostTraits = HostTraits {
         folds_signals: cfg!(target_os = "linux"),
-        kernel_log_hint: cfg!(target_os = "linux"),
     };
 }
 
@@ -107,9 +102,11 @@ impl LimitsInForce {
     }
 }
 
+/// A limit ai-jail itself put in force. Only the lockdown FSIZE ceiling
+/// can be one today: ai-jail sets no CPU-time limit, so a SIGXCPU is
+/// reported as the signal alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Limit {
-    CpuTime,
     FileSize,
 }
 
@@ -153,8 +150,10 @@ pub fn from_exit_code(code: i32, host: HostTraits) -> ChildStatus {
     }
 }
 
-/// Apply the rules in order: SIGXCPU, SIGXFSZ, SIGKILL, then every
-/// other signal.
+/// A limit is named only when ai-jail knows it is in force: a SIGXFSZ
+/// with the lockdown FSIZE ceiling read back. Every other signal,
+/// SIGKILL and SIGXCPU included, is reported as the signal alone, since
+/// the cause cannot be proven from the status.
 pub fn classify(status: &ChildStatus, limits: &LimitsInForce) -> ExitReason {
     let (signal, core) = match status.termination {
         Termination::Exited(_) => (None, false),
@@ -175,23 +174,18 @@ pub fn classify(status: &ChildStatus, limits: &LimitsInForce) -> ExitReason {
 impl ExitReason {
     /// The one stderr line, or `None` when there is nothing to say: a
     /// normal exit, or a deliberate signal no limit explains.
-    pub fn explanation(&self, host: HostTraits) -> Option<String> {
+    pub fn explanation(&self) -> Option<String> {
         if self.kind == ReasonKind::Exited || self.is_deliberate_signal() {
             return None;
         }
         let killed_by =
             self.signal.map(|s| format!("killed by {}", signal_name(s)));
-        let mut detail = match (killed_by, self.evidence.as_deref()) {
+        let detail = match (killed_by, self.evidence.as_deref()) {
             (Some(k), Some(e)) => format!("{k}: {e}"),
             (Some(k), None) => k,
             (None, Some(e)) => e.to_string(),
             (None, None) => return None,
         };
-        // Where to look for the OOM killer is host-specific, so it is
-        // added here and kept out of the evidence text.
-        if host.kernel_log_hint && self.is_unattributed_sigkill() {
-            detail.push_str(" (`journalctl -k | grep -i oom`)");
-        }
         let core = if self.core_dumped {
             " (core dumped)"
         } else {
@@ -210,10 +204,6 @@ impl ExitReason {
         ))
     }
 
-    fn is_unattributed_sigkill(&self) -> bool {
-        self.limit.is_none() && self.signal == Some(SIGKILL)
-    }
-
     /// A signal a limit explains is never silenced, whatever it is.
     fn is_deliberate_signal(&self) -> bool {
         self.limit.is_none()
@@ -227,42 +217,17 @@ fn signal_reason(
     signal: Option<i32>,
     limits: &LimitsInForce,
 ) -> (ReasonKind, Option<Limit>, Option<String>) {
-    let Some(sig) = signal else {
-        return (ReasonKind::Exited, None, None);
-    };
-    match sig {
-        SIGXCPU => {
-            // ai-jail sets no CPU-time rlimit, so the limit came from
-            // outside; say so rather than imply it was ai-jail's.
-            let evidence = "a CPU-time rlimit was reached; ai-jail set none, \
-                            so it came from the parent environment or the \
-                            command itself";
-            (
-                ReasonKind::Limit,
-                Some(Limit::CpuTime),
-                Some(evidence.into()),
-            )
-        }
-        SIGXFSZ => {
-            // Never claim a value that is not in force.
-            let evidence = match limits.file_size {
-                Some(b) => format!(
-                    "the file-size rlimit was reached ({})",
-                    human_bytes(b)
-                ),
-                None => "a file-size rlimit was reached; ai-jail set none, \
-                         so it came from the parent environment or the \
-                         command itself"
-                    .into(),
-            };
-            (ReasonKind::Limit, Some(Limit::FileSize), Some(evidence))
-        }
-        SIGKILL => {
-            let evidence = "ai-jail cannot attribute it to one of its \
-                            limits; the usual cause is the host OOM killer";
-            (ReasonKind::Signaled, None, Some(evidence.into()))
-        }
-        _ => (ReasonKind::Signaled, None, None),
+    match (signal, limits.file_size) {
+        (None, _) => (ReasonKind::Exited, None, None),
+        (Some(SIGXFSZ), Some(bytes)) => (
+            ReasonKind::Limit,
+            Some(Limit::FileSize),
+            Some(format!(
+                "the file-size rlimit was reached ({})",
+                human_bytes(bytes)
+            )),
+        ),
+        (Some(_), _) => (ReasonKind::Signaled, None, None),
     }
 }
 
@@ -297,14 +262,16 @@ mod tests {
 
     use super::*;
 
+    const SIGKILL_N: i32 = Signal::SIGKILL as i32;
+    const SIGXCPU_N: i32 = Signal::SIGXCPU as i32;
+
     const GIB: u64 = 1 << 30;
 
     /// The host every case outside the host-traits section describes: bwrap
-    /// folds signals and the kernel log exists. Spelled out, not taken from
-    /// `CURRENT`, so the cases hold on a macOS test run too.
+    /// folds signals. Spelled out, not taken from `CURRENT`, so the cases
+    /// hold on a macOS test run too.
     const LINUX: HostTraits = HostTraits {
         folds_signals: true,
-        kernel_log_hint: true,
     };
 
     fn no_limits() -> LimitsInForce {
@@ -372,7 +339,6 @@ mod tests {
         }
         const NO_FOLDING: HostTraits = HostTraits {
             folds_signals: false,
-            kernel_log_hint: false,
         };
         // Where the mark would fire wrongly: a code a folding host decodes
         // is a 128+N inference, never a code taken as it is.
@@ -422,9 +388,9 @@ mod tests {
             let r =
                 classify(&signaled(sig, StatusSource::Direct), &no_limits());
             assert!(
-                r.explanation(LINUX).is_none(),
+                r.explanation().is_none(),
                 "deliberate signal {sig} must print nothing: {:?}",
-                r.explanation(LINUX)
+                r.explanation()
             );
             assert!(r.limit.is_none(), "signal {sig} names no limit");
             assert!(matches!(r.kind, ReasonKind::Signaled));
@@ -432,10 +398,7 @@ mod tests {
         }
         for code in [0, 1, 3] {
             let r = classify(&exited(code), &no_limits());
-            assert!(
-                r.explanation(LINUX).is_none(),
-                "exit {code} prints nothing"
-            );
+            assert!(r.explanation().is_none(), "exit {code} prints nothing");
             assert!(matches!(r.kind, ReasonKind::Exited));
             assert_eq!(r.code, code);
         }
@@ -445,7 +408,7 @@ mod tests {
     fn an_unexplained_signal_is_named() {
         // any other signal end prints one line naming the signal.
         let r = classify(&signaled(11, StatusSource::Direct), &no_limits());
-        let line = r.explanation(LINUX).expect("SIGSEGV must be explained");
+        let line = r.explanation().expect("SIGSEGV must be explained");
         assert!(line.contains("SIGSEGV"), "{line}");
         assert!(!line.contains('\n'), "one line: {line:?}");
         assert!(r.limit.is_none());
@@ -456,40 +419,109 @@ mod tests {
     fn an_unknown_signal_number_does_not_panic() {
         let r = classify(&signaled(99, StatusSource::Direct), &no_limits());
         let line = r
-            .explanation(LINUX)
+            .explanation()
             .expect("an unknown signal is still a signal");
         assert!(line.contains("99"), "{line}");
     }
 
-    // ── unattributed SIGKILL ────────────────────────────────
+    // ── causes that cannot be proven ─────────────────────────
+    //
+    // A status says which signal ended the run, not why it was sent. Each
+    // case below would name a cause WRONGLY if the rule were loose.
 
     #[test]
-    fn unattributed_sigkill_points_at_the_host_oom_killer() {
-        let bare = classify(&signaled(9, StatusSource::Inferred), &no_limits());
-        assert!(bare.limit.is_none());
-        assert!(matches!(bare.kind, ReasonKind::Signaled));
-        let line = bare.explanation(LINUX).expect("explained");
-        assert!(line.contains("SIGKILL"), "{line}");
-        assert!(line.to_lowercase().contains("oom"), "host OOM hint: {line}");
-        assert!(!line.contains('\n'), "one line: {line:?}");
+    fn sigkill_is_reported_as_the_signal_alone() {
+        // A 137 may be the OOM killer, a `kill -9` or a harness: ai-jail
+        // sets no limit that ends a run with SIGKILL, so it names none.
+        for source in [StatusSource::Inferred, StatusSource::Direct] {
+            let r = classify(&signaled(SIGKILL_N, source), &no_limits());
+            assert!(r.limit.is_none(), "{r:?}");
+            assert!(r.evidence.is_none(), "no cause: {r:?}");
+            assert!(matches!(r.kind, ReasonKind::Signaled));
+        }
+        let r = classify(
+            &signaled(SIGKILL_N, StatusSource::Direct),
+            &LimitsInForce {
+                file_size: Some(GIB),
+            },
+        );
+        assert_eq!(
+            r.explanation().as_deref(),
+            Some("sandbox exited with 137: killed by SIGKILL"),
+            "a limit in force does not explain a SIGKILL"
+        );
+        let line = classify(&from_exit_code(137, LINUX), &no_limits())
+            .explanation()
+            .expect("explained");
+        assert_eq!(
+            line,
+            "sandbox exited with 137: killed by SIGKILL \
+             (inferred from exit code 137)"
+        );
+        assert!(!line.to_lowercase().contains("oom"), "{line}");
+        assert!(!line.contains("journalctl"), "{line}");
+    }
+
+    #[test]
+    fn sigxcpu_names_no_limit() {
+        // ai-jail sets no CPU-time limit, so a SIGXCPU is never one of its
+        // limits, with or without the FSIZE ceiling in force.
+        for limits in [
+            no_limits(),
+            LimitsInForce {
+                file_size: Some(GIB),
+            },
+        ] {
+            let r =
+                classify(&signaled(SIGXCPU_N, StatusSource::Direct), &limits);
+            assert!(r.limit.is_none(), "{r:?}");
+            assert!(matches!(r.kind, ReasonKind::Signaled), "{r:?}");
+            assert_eq!(
+                r.explanation().as_deref(),
+                Some("sandbox exited with 152: killed by SIGXCPU")
+            );
+        }
+    }
+
+    #[test]
+    fn sigxfsz_names_no_limit_when_none_is_in_force() {
+        // Without the lockdown ceiling read back, a SIGXFSZ may come from the
+        // parent environment or from `kill -XFSZ`: the signal alone.
+        let r =
+            classify(&signaled(SIGXFSZ, StatusSource::Direct), &no_limits());
+        assert!(r.limit.is_none(), "{r:?}");
+        assert!(matches!(r.kind, ReasonKind::Signaled), "{r:?}");
+        let line = r.explanation().expect("SIGXFSZ is named");
+        assert_eq!(line, "sandbox exited with 153: killed by SIGXFSZ");
+        assert!(!line.contains("file-size"), "{line}");
+        assert!(!mentions_a_byte_value(&line), "no value: {line}");
+        // The converse: with the ceiling in force, the limit and its value.
+        let r = classify(
+            &signaled(SIGXFSZ, StatusSource::Direct),
+            &LimitsInForce {
+                file_size: Some(GIB),
+            },
+        );
+        assert_eq!(r.limit, Some(Limit::FileSize), "{r:?}");
+        assert!(matches!(r.kind, ReasonKind::Limit));
+        let line = r.explanation().expect("explained");
+        assert!(line.contains("file-size rlimit was reached"), "{line}");
+        assert!(mentions_one_gib(&line), "{line}");
     }
 
     // ── what the host folds and logs ────────────────────────
     //
     // The platform enters as a value, so both kinds of host are tested
     // here on Linux. Only bwrap folds a child's signal death into an exit
-    // code `128 + N`, and only Linux has the kernel log `journalctl -k`
-    // reads. Each trait is varied alone, the other taken from CURRENT.
+    // code `128 + N`.
 
     #[test]
     fn exit_code_in_the_signal_window_stays_an_exit_code_without_folded_signals()
      {
         // Where nothing folds signals, 137 is a command that exited 137:
-        // decoding it would invent a SIGKILL, and an OOM hint, for a plain
-        // exit.
+        // decoding it would invent a SIGKILL for a plain exit.
         const NO_FOLDING: HostTraits = HostTraits {
             folds_signals: false,
-            ..HostTraits::CURRENT
         };
         for code in [129, 137, 143, 153, 161, 192] {
             let status = from_exit_code(code, NO_FOLDING);
@@ -508,7 +540,7 @@ mod tests {
             assert!(matches!(r.kind, ReasonKind::Exited), "code {code}: {r:?}");
             assert_eq!(r.signal, None, "code {code} names no signal");
             assert_eq!(
-                r.explanation(NO_FOLDING),
+                r.explanation(),
                 None,
                 "an exit code prints nothing (code {code})"
             );
@@ -521,9 +553,8 @@ mod tests {
         // bwrap folds the signal into the code.
         const FOLDING: HostTraits = HostTraits {
             folds_signals: true,
-            ..HostTraits::CURRENT
         };
-        for (code, signal) in [(137, SIGKILL), (161, 33)] {
+        for (code, signal) in [(137, SIGKILL_N), (161, 33)] {
             let status = from_exit_code(code, FOLDING);
             assert_eq!(
                 status.termination,
@@ -542,10 +573,8 @@ mod tests {
         }
         let r = classify(&from_exit_code(137, FOLDING), &no_limits());
         assert!(matches!(r.kind, ReasonKind::Signaled), "{r:?}");
-        assert_eq!(r.signal, Some(SIGKILL));
-        let line = r
-            .explanation(FOLDING)
-            .expect("a decoded SIGKILL is explained");
+        assert_eq!(r.signal, Some(SIGKILL_N));
+        let line = r.explanation().expect("a decoded SIGKILL is explained");
         assert!(line.contains("SIGKILL"), "{line}");
         assert!(line.contains("(inferred from exit code 137)"), "{line}");
         // And the host these tests run on is one that folds.
@@ -553,40 +582,6 @@ mod tests {
             HostTraits::CURRENT.folds_signals,
             cfg!(target_os = "linux"),
             "signals fold on Linux, and only there"
-        );
-    }
-
-    #[test]
-    fn sigkill_explanation_omits_the_kernel_log_hint_when_the_host_has_none() {
-        // Without a kernel log the hint names a command that is not there.
-        // The pointer at the host OOM killer stays: it holds on every host.
-        const NO_KERNEL_LOG: HostTraits = HostTraits {
-            kernel_log_hint: false,
-            ..HostTraits::CURRENT
-        };
-        const KERNEL_LOG: HostTraits = HostTraits {
-            kernel_log_hint: true,
-            ..HostTraits::CURRENT
-        };
-        let r =
-            classify(&signaled(SIGKILL, StatusSource::Direct), &no_limits());
-        let line = r
-            .explanation(NO_KERNEL_LOG)
-            .expect("an unattributed SIGKILL is still explained");
-        assert!(!line.contains("journalctl"), "no kernel-log hint: {line}");
-        assert!(line.contains("SIGKILL"), "{line}");
-        assert!(
-            line.to_lowercase().contains("oom"),
-            "host OOM pointer kept: {line}"
-        );
-        assert!(!line.contains('\n'), "one line: {line:?}");
-        // Where the host has the log, the hint stays.
-        let line = r.explanation(KERNEL_LOG).expect("explained");
-        assert!(line.contains("journalctl"), "kernel-log hint: {line}");
-        assert_eq!(
-            HostTraits::CURRENT.kernel_log_hint,
-            cfg!(target_os = "linux"),
-            "the kernel-log hint is Linux's, and only Linux's"
         );
     }
 
@@ -758,7 +753,7 @@ mod tests {
             }
         );
         let line = reason_of(&status, &LimitsInForce::default())
-            .explanation(LINUX)
+            .explanation()
             .expect("a SIGSEGV death is explained");
         assert!(line.contains("SIGSEGV"), "{line}");
         assert_eq!(
@@ -775,7 +770,7 @@ mod tests {
         // inferred.
         let direct = signaled(11, StatusSource::Direct);
         let r = reason_of(&direct, &LimitsInForce::default());
-        let line = r.explanation(LINUX).expect("SIGSEGV is explained");
+        let line = r.explanation().expect("SIGSEGV is explained");
         assert!(!line.contains("inferred"), "{line}");
         // A deliberate signal stays silent when decoded too: the qualifier
         // never makes a silent end speak.
@@ -784,7 +779,7 @@ mod tests {
                 &from_exit_code(code, LINUX),
                 &LimitsInForce::default(),
             );
-            assert_eq!(r.explanation(LINUX), None, "exit code {code}");
+            assert_eq!(r.explanation(), None, "exit code {code}");
         }
         // Every decoded line says so, with the code it was decoded from (not
         // the signal number), whether or not it carries evidence.
@@ -795,8 +790,7 @@ mod tests {
                 &from_exit_code(code, LINUX),
                 &LimitsInForce::default(),
             );
-            let line =
-                r.explanation(LINUX).expect("a decoded signal is explained");
+            let line = r.explanation().expect("a decoded signal is explained");
             assert!(line.contains(signal), "{line}");
             let qualifier = format!("(inferred from exit code {code})");
             assert_eq!(
@@ -809,17 +803,17 @@ mod tests {
     }
 
     #[test]
-    fn file_size_named_without_value_when_the_set_failed() {
+    fn a_failed_set_leaves_no_limit_to_name() {
         // Whatever FSIZE this process holds, a set that failed leaves no value
-        // ai-jail may claim.
+        // ai-jail may claim, so the SIGXFSZ names no limit either.
         let limits = LimitsInForce::read_back(false);
         assert_eq!(limits.file_size, None, "a failed set has no value");
 
         let r = reason_of(&signaled(25, StatusSource::Direct), &limits);
-        assert!(matches!(r.limit, Some(Limit::FileSize)), "{r:?}");
-        let line = r.explanation(LINUX).expect("SIGXFSZ is explained");
+        assert!(r.limit.is_none(), "{r:?}");
+        let line = r.explanation().expect("SIGXFSZ is named");
         assert!(line.contains("SIGXFSZ"), "{line}");
-        assert!(line.contains("file-size"), "the limit is named: {line}");
+        assert!(!line.contains("file-size"), "no limit named: {line}");
         assert!(!mentions_a_byte_value(&line), "no value: {line}");
     }
 
@@ -857,7 +851,7 @@ mod tests {
         );
 
         let line = reason_of(&signaled(25, StatusSource::Direct), &limits)
-            .explanation(LINUX)
+            .explanation()
             .expect("SIGXFSZ is explained");
         assert!(!mentions_one_gib(&line), "clamped below 1 GiB: {line}");
         if clamp == MIB_512 {
@@ -891,7 +885,7 @@ mod tests {
         assert_eq!(limits.file_size, Some(GIB.min(hard_before)));
 
         let line = reason_of(&signaled(25, StatusSource::Direct), &limits)
-            .explanation(LINUX)
+            .explanation()
             .expect("SIGXFSZ is explained");
         if hard_before >= GIB {
             assert!(mentions_one_gib(&line), "the lockdown value: {line}");
