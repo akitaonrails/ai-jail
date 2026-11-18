@@ -887,10 +887,14 @@ $ ai-jail --profile agent-test --dry-run claude
 Order: global base, then the command table, then the profile, then CLI flags,
 then the project's saved policy. Trust rules:
 
-- Every access a profile grants beyond the global base and command table is
-  printed before the sandbox starts, without `--verbose` and under
-  `--dry-run`, as `profile=NAME widens=FIELD granted="…"`, and recorded in
-  the audit log. Tightening (`mask`, `no_gpu = true`, …) prints nothing.
+- Every access the profile adds that this launch applies is printed before
+  the sandbox starts, without `--verbose` and under `--dry-run`, as
+  `profile=NAME widens=FIELD granted="…"`, and recorded in the audit log.
+  It is measured after every layer: a grant another layer already gives
+  (the CLI, the project's saved grants), one a first non-interactive
+  launch replaces with restricted defaults, and one `--lockdown` drops
+  print nothing. Tightening (`mask`, `no_gpu = true`, …) prints nothing,
+  and a profile that widens nothing prints no line at all.
   Printed with security warnings, so `--exec` does not silence them.
 - Secret values stay out of what profiles print and save: the widening
   lines, the audit record, `status`, the effective-access review, refusals

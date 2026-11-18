@@ -1423,15 +1423,13 @@ fn run(
             table
         ));
     }
-    // Printed on every launch, `--dry-run` and `--exec` included and
-    // without `--verbose`: a profile may widen the jail only where it is
-    // seen, so quiet mode does not silence it.
-    if let Some(profile) = &global_selection.profile {
-        for line in profile.lines() {
-            output::security_warn(&line);
-        }
-    }
     let profile_report = global_selection.profile;
+    let global_without_profile = global_selection.without_profile;
+    // Kept only when a profile is selected: what it widens is measured
+    // against the same layers without it, once the launch config is final.
+    let grants_without_profile = profile_report
+        .is_some()
+        .then(|| stored_project.grants.clone());
     let global = global_selection.config;
     let onboarding_complete = stored_project.onboarding_complete;
     let global_for_onboarding = global.clone();
@@ -1469,6 +1467,29 @@ fn run(
             &invocation_cwd,
         )
     };
+    let mut profile_layers = grants_without_profile.map(|grants| {
+        let baseline = config::merge(
+            &cli,
+            config::merge_trusted_project(
+                global_without_profile.clone(),
+                grants,
+            ),
+        );
+        let without_profile = if legacy_project_trusted {
+            config::merge_trusted_project(baseline, project_config.clone())
+        } else {
+            config::merge_with_global_report(
+                baseline,
+                project_config.clone(),
+                &invocation_cwd,
+            )
+            .0
+        };
+        config::ProfileLayers {
+            without_profile,
+            with_profile: config.clone(),
+        }
+    });
 
     let resolved_harnesses =
         command::resolve_harnesses(&config.command, &cli.harnesses)?;
@@ -1524,6 +1545,24 @@ fn run(
                 &invocation_cwd,
             )?;
             onboarding::secure_noninteractive(&mut config, &cli);
+            // The same transform without the profile, so a grant these
+            // restricted defaults give on their own (the harness API host)
+            // is not read as the profile's.
+            if let Some(layers) = profile_layers.as_mut() {
+                let mut without_profile =
+                    build_noninteractive_onboarding_effective(
+                        &global_without_profile,
+                        harness,
+                        &cli,
+                        project_config.clone(),
+                        &invocation_cwd,
+                    )?;
+                onboarding::apply_secure_defaults(&mut without_profile, &cli);
+                *layers = config::ProfileLayers {
+                    without_profile,
+                    with_profile: config.clone(),
+                };
+            }
             let selection = onboarding::Selection::from_config(&config);
             onboarding::render_summary(
                 &selection,
@@ -1624,6 +1663,27 @@ fn run(
         && !cli.init
         && !cli.bootstrap
     {
+        // The same transform without the profile, measured against below.
+        if let Some(layers) = profile_layers.as_mut() {
+            *layers = config::ProfileLayers {
+                without_profile: build_onboarding_effective(
+                    global_without_profile.clone(),
+                    stored_grants_for_onboarding.clone(),
+                    &cli,
+                    project_config.clone(),
+                    &invocation_cwd,
+                    legacy_project_trusted,
+                )?,
+                with_profile: build_onboarding_effective(
+                    global_for_onboarding.clone(),
+                    stored_grants_for_onboarding.clone(),
+                    &cli,
+                    project_config.clone(),
+                    &invocation_cwd,
+                    legacy_project_trusted,
+                )?,
+            };
+        }
         config = build_onboarding_effective(
             global_for_onboarding,
             stored_grants_for_onboarding,
@@ -1696,6 +1756,23 @@ fn run(
     config::absolutize_user_paths(&mut config, &invocation_cwd);
     apply_browser_profile(&mut config, !command_from_untrusted_project);
     validate_network_flags(&config)?;
+
+    // Printed on every launch, `--dry-run`, `--exec` and `status` included
+    // and without `--verbose`: a profile may widen the jail only where it
+    // is seen. Measured only now, after onboarding's restricted defaults,
+    // the CLI, the project policy and `--lockdown`, so a line names only
+    // what this launch applies, and a profile that widens nothing prints
+    // nothing (#230 review). The audit record carries the same report.
+    let profile_report = match (profile_report, profile_layers) {
+        (Some(report), Some(layers)) => {
+            let applied = report.applied(layers, &config, &invocation_cwd)?;
+            for line in applied.lines() {
+                output::security_warn(&line);
+            }
+            Some(applied)
+        }
+        _ => None,
+    };
 
     // Handle status command
     if cli.status {

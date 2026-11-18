@@ -2944,7 +2944,7 @@ mod interface_profile_tests {
     /// Sandbox long flags already missing from the guide at 236b365.
     const UNDOCUMENTED_FLAGS_AT_236B365: &str = r"
     --harness --request-file --request --private-home
-    --no-private-home --lockdown --no-lockdown --no-display --display
+    --no-private-home --no-lockdown --no-display --display
     --audio --no-audio --no-github --aws --no-aws --kube --no-kube
     --gcloud --no-gcloud --docker-config --no-docker-config --kvm
     --no-kvm --prompt-hosts --no-prompt-hosts --network --no-network

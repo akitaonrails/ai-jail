@@ -581,9 +581,11 @@ github = true
   empty (`[]`, `{}`, `""`) carries no restriction and is accepted. A
   secret-bearing field of the wrong type is refused without showing its
   value.
-- Every field the profile widens beyond the global base and the command table
-  is printed before the launch, even when other warnings are quiet, as
-  `profile=NAME widens=FIELD granted="…"`.
+- Every access the profile adds that this launch applies is printed before
+  the launch, even when other warnings are quiet, as
+  `profile=NAME widens=FIELD granted="…"`. A grant the CLI or the project
+  already gives, one the restricted first-run defaults replace, and one
+  `--lockdown` drops are not the profile's widening and print nothing.
 
 The final `Complete effective access` review names the selected profile as
 `Named profile: profile=NAME (a trusted global layer)`; text `status`

@@ -235,6 +235,124 @@ fn dry_run_prints_the_same_widening_lines_as_a_real_launch() {
     assert_eq!(dry_lines, widening_lines(&real, "wide"));
 }
 
+// ── Only what the launch applies (#230 review) ──
+
+/// Grants a first non-interactive launch replaces with restricted
+/// defaults: none reaches the sandbox through the profile, so none is a
+/// widening. The API host is one those defaults grant on their own.
+const DEV: &str = "\
+[profiles.dev]
+profile_version = 1
+github = true
+pictures = true
+allow_hosts = [\"api.anthropic.com\"]
+";
+
+#[test]
+fn a_restricted_first_launch_prints_no_widening_it_does_not_apply() {
+    require_bwrap_net!();
+    let tree = Tree::new("restricted-first", DEV);
+    let out = {
+        let _lock = common::SANDBOX_RUN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tree.run(&[
+            "--no-status-bar",
+            "--profile",
+            "dev",
+            "--harness",
+            "claude",
+            "--",
+            "true",
+        ])
+    };
+    let err = stderr(&out);
+    assert!(err.contains("Interactive setup skipped"), "{err}");
+    assert_ok(&out);
+    assert_eq!(
+        widening_lines(&out, "dev"),
+        BTreeSet::new(),
+        "no grant reaches the sandbox through the profile: {err}"
+    );
+}
+
+#[test]
+fn a_widening_another_layer_already_grants_is_not_the_profile_s() {
+    let tree = Tree::new("other-layer", WIDE);
+    let out = tree.dry_run(&[
+        "--profile",
+        "wide",
+        "--pictures",
+        "--allow-host",
+        "registry.npmjs.org",
+    ]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "wide");
+    assert!(line_for(&lines, "pictures").is_none(), "{lines:?}");
+    let hosts = line_for(&lines, "allow_hosts").expect("one host is left");
+    assert!(hosts.contains("api.example.com"), "{hosts}");
+    assert!(!hosts.contains("registry.npmjs.org"), "{hosts}");
+}
+
+#[test]
+fn a_cli_env_entry_is_never_read_as_the_profile_s() {
+    // `env_pass` is reported for every entry of a layer, whatever its
+    // baseline holds: the CLI's own `--env` must not become a widening.
+    let tight = Tree::new(
+        "cli-env-tight",
+        "[profiles.tight]\nprofile_version = 1\nno_gpu = true\n",
+    );
+    let out = tight.dry_run(&["--profile", "tight", "--env", "FOO=bar"]);
+    assert_ok(&out);
+    assert!(!stderr(&out).contains("widens="), "{}", stderr(&out));
+
+    let wide = Tree::new("cli-env-wide", WIDE);
+    let out = wide.dry_run(&["--profile", "wide", "--env", "FOO=bar"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "wide");
+    let env = line_for(&lines, "env_pass").expect("the profile's own key");
+    assert!(env.contains("AJ_PROFILE_SECRET"), "{env}");
+    assert!(!env.contains("FOO"), "the CLI's key: {env}");
+}
+
+#[test]
+fn a_profile_that_widens_nothing_prints_nothing() {
+    let tree = Tree::new(
+        "widens-nothing",
+        "[profiles.tight]\nprofile_version = 1\nno_gpu = true\n",
+    );
+    let out = tree.dry_run(&["--profile", "tight"]);
+    assert_ok(&out);
+    assert!(
+        !stderr(&out).contains("widens="),
+        "a tightening prints no line: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn lockdown_leaves_out_what_it_drops_and_keeps_what_it_narrows() {
+    let tree = Tree::new(
+        "lockdown",
+        "[profiles.dev]\nprofile_version = 1\ngithub = true\n\
+         pictures = true\nallow_hosts = [\"api.example.com\"]\n",
+    );
+    let out = tree.dry_run(&["--profile", "dev", "--lockdown"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "dev");
+    // Dropped by lockdown: no line.
+    assert!(line_for(&lines, "github").is_none(), "{lines:?}");
+    assert!(line_for(&lines, "pictures").is_none(), "{lines:?}");
+    // The proxy still dials a listed host under lockdown: still a widening.
+    let hosts = line_for(&lines, "allow_hosts").expect("{lines:?}");
+    assert!(hosts.contains("api.example.com"), "{hosts}");
+    // The same profile without lockdown names all three.
+    let open = widening_lines(&tree.dry_run(&["--profile", "dev"]), "dev");
+    for field in ["github", "pictures", "allow_hosts"] {
+        assert!(line_for(&open, field).is_some(), "{field}: {open:?}");
+    }
+}
+
 // ── Selection and refusals at launch ──
 
 #[test]

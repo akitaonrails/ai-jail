@@ -566,15 +566,42 @@ fn secret_type_error(name: &str, field: &str, expected: &str) -> String {
     )
 }
 
-/// A deserialization error that names a secret field loses the parser's
-/// message, which may quote the value.
-fn secret_safe_error(name: &str, error: String) -> String {
-    match SECRET_FIELD_TYPES
+/// A deserialization error loses the parser's message, which quotes the
+/// value (`invalid type: string "…"`): only the field and the type it
+/// expects are kept (#230 review: the field name, never the value).
+fn value_free_error(name: &str, error: &str) -> String {
+    if let Some((field, expected)) = SECRET_FIELD_TYPES
         .iter()
         .find(|(field, _)| error.contains(&format!("`{field}`")))
     {
-        Some((field, expected)) => secret_type_error(name, field, expected),
-        None => format!("profile '{name}': {error}"),
+        return secret_type_error(name, field, expected);
+    }
+    // toml 0.8 ends the message with "in `FIELD`"; serde's "expected …"
+    // names a type or the accepted variants, never the value.
+    let field = error.rfind("in `").and_then(|at| {
+        let rest = &error[at + 4..];
+        rest.find('`').map(|end| &rest[..end])
+    });
+    // serde quotes the value before its own "expected …", so a value may
+    // itself contain the word: the last occurrence is serde's.
+    let expected = error
+        .rfind("expected ")
+        .map(|at| error[at + 9..].lines().next().unwrap_or("").trim());
+    match (field, expected) {
+        (Some(field), Some(expected)) => format!(
+            "profile '{name}': {} has the wrong type, expected {}; the \
+             value is not shown",
+            output::escape_control_bytes(field),
+            output::escape_control_bytes(expected)
+        ),
+        (Some(field), None) => format!(
+            "profile '{name}': {} is invalid; the value is not shown",
+            output::escape_control_bytes(field)
+        ),
+        _ => format!(
+            "profile '{name}': a value has the wrong type; the value is not \
+             shown"
+        ),
     }
 }
 
@@ -633,11 +660,11 @@ pub(crate) fn select_profile(
     check_secret_field_types(name, &table)?;
     match table.remove("profile_version") {
         Some(toml::Value::Integer(PROFILE_VERSION)) => {}
-        Some(other) => {
+        Some(_) => {
             return Err(format!(
-                "profile '{name}': profile_version = {other} is not \
-                 supported; this ai-jail reads profile_version = \
-                 {PROFILE_VERSION}"
+                "profile '{name}': this profile_version is not supported; \
+                 this ai-jail reads profile_version = {PROFILE_VERSION} (the \
+                 value is not shown)"
             ));
         }
         None => {
@@ -669,17 +696,17 @@ pub(crate) fn select_profile(
     }
     let config: Config = toml::Value::Table(table.clone())
         .try_into()
-        .map_err(|e| secret_safe_error(name, e.to_string()))?;
+        .map_err(|e| value_free_error(name, &e.to_string()))?;
     let known = toml::Table::try_from(&config)
         .map_err(|e| format!("profile '{name}': {e}"))?;
-    let unknown: Vec<&str> = table
+    let unknown: Vec<String> = table
         .iter()
         .filter(|(key, value)| {
             !known.contains_key(key.as_str())
                 && !NEVER_SERIALIZED.contains(&key.as_str())
                 && !is_empty_toml_value(value)
         })
-        .map(|(key, _)| key.as_str())
+        .map(|(key, _)| output::escape_control_bytes(key))
         .collect();
     if !unknown.is_empty() {
         return Err(format!(
@@ -1290,7 +1317,50 @@ pub fn parse_toml(contents: &str) -> Result<Config, String> {
 pub(crate) fn parse_global_toml(
     contents: &str,
 ) -> Result<GlobalConfig, String> {
-    toml::from_str(contents).map_err(|e| e.to_string())
+    toml::from_str(contents).map_err(|e| {
+        // TOML refuses a duplicate profile or key for the whole file, before
+        // any profile is selected, and its message quotes the source line:
+        // inside `[profiles.*]` that line may hold a secret. Keep where and
+        // what, never the excerpt. Elsewhere the excerpt stays as before.
+        let start = e.span().map(|span| span.start.min(contents.len()));
+        let in_profiles = e.message().contains("table `profiles")
+            || start.is_some_and(|at| in_profiles_section(contents, at));
+        if !in_profiles {
+            return e.to_string();
+        }
+        let line =
+            start.map_or(0, |at| contents[..at].matches('\n').count() + 1);
+        format!(
+            "TOML parse error at line {line} in [profiles]: {}",
+            output::escape_control_bytes(e.message().trim_end())
+        )
+    })
+}
+
+/// Whether byte `at` of a TOML document belongs to a profile: under a
+/// `[profiles…]` / `[[profiles…]]` header (quoted or not), or on a line
+/// that is itself a `profiles…` dotted key or inline table.
+fn in_profiles_section(contents: &str, at: usize) -> bool {
+    // Quotes and spaces never change which table a key names.
+    let names_profiles = |text: &str| {
+        let bare: String = text
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | ' ' | '\t'))
+            .collect();
+        bare.strip_prefix("profiles")
+            .is_some_and(|rest| rest.starts_with(['.', ']', '=']))
+    };
+    let line_start = contents[..at].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = contents[at..].find('\n').map_or(contents.len(), |i| at + i);
+    if names_profiles(contents[line_start..line_end].trim_start()) {
+        return true;
+    }
+    contents[..at]
+        .lines()
+        .rev()
+        .map(str::trim_start)
+        .find(|line| line.starts_with('['))
+        .is_some_and(|header| names_profiles(header.trim_start_matches('[')))
 }
 
 #[test]
@@ -1569,13 +1639,20 @@ pub fn load() -> Result<Config, String> {
 #[derive(Debug)]
 pub(crate) struct GlobalCommandSelection {
     pub config: Config,
+    /// The same selection without the profile: the global base and the
+    /// command table only. It is what the launch would be without
+    /// `--profile`, so the widenings can be measured after every layer.
+    pub without_profile: Config,
     pub ignored_command_tables: Vec<String>,
-    /// The profile `--profile` selected, with what it widened.
+    /// The profile `--profile` selected, with what it asked for beyond the
+    /// global base and the command table. What it widens in the launch is
+    /// [`ProfileReport::applied`].
     pub profile: Option<ProfileReport>,
 }
 
-/// A selected profile and every access it granted beyond the layers
-/// beneath it (global base and command table).
+/// A selected profile and the access it grants beyond the layers beneath
+/// it: first measured against the global base and the command table, then
+/// narrowed by [`ProfileReport::applied`] to what the launch applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProfileReport {
     pub name: String,
@@ -1608,6 +1685,157 @@ impl ProfileReport {
             .collect()
     }
 }
+
+/// The pure layers of one launch, with and without its profile: global
+/// base and command table (plus the profile), project grants, the CLI and
+/// project constraints. Onboarding and lockdown are not in them; they act
+/// on the launch config [`ProfileReport::applied`] is given.
+pub(crate) struct ProfileLayers {
+    pub without_profile: Config,
+    pub with_profile: Config,
+}
+
+impl ProfileReport {
+    /// What the profile still widens once every layer has spoken (#230
+    /// review: name only what this launch applies). A value is kept when
+    /// the profile adds it over the other layers AND the launch config
+    /// still grants it over those layers: onboarding's restricted
+    /// defaults, the CLI or a project grant that already gives it, and a
+    /// grant `--lockdown` drops all leave it out. Nothing left, no line.
+    pub(crate) fn applied(
+        &self,
+        layers: ProfileLayers,
+        launch: &Config,
+        cwd: &Path,
+    ) -> Result<ProfileReport, String> {
+        let label = format!("profile '{}'", self.name);
+        let ProfileLayers {
+            mut without_profile,
+            mut with_profile,
+        } = layers;
+        // The launch config's paths are absolute by now; compare like with
+        // like.
+        absolutize_user_paths(&mut without_profile, cwd);
+        absolutize_user_paths(&mut with_profile, cwd);
+        // A few fields (`env_pass`, `claude_dir`, the exceptions, …) are
+        // reported for every entry whatever the baseline holds, so measured
+        // against itself the baseline names its own entries: those are the
+        // CLI's, the project's or the global base's, never the profile's.
+        let own =
+            profile_widenings(&without_profile, &without_profile, cwd, &label)?;
+        let not_own = |found: Vec<Refusal>| -> Vec<Refusal> {
+            found
+                .into_iter()
+                .map(|mut r| {
+                    if let Some(base) = own.iter().find(|o| o.field == r.field)
+                    {
+                        r.granted.retain(|v| !base.granted.contains(v));
+                    }
+                    r
+                })
+                .filter(|r| !r.granted.is_empty())
+                .collect()
+        };
+        let by_profile = not_own(profile_widenings(
+            &without_profile,
+            &with_profile,
+            cwd,
+            &label,
+        )?);
+        let by_launch =
+            not_own(profile_widenings(&without_profile, launch, cwd, &label)?);
+        let lockdown = launch.lockdown_enabled();
+        let widenings = by_profile
+            .into_iter()
+            .filter(|asked| {
+                !(lockdown && LOCKDOWN_DROPS.contains(&asked.field.as_str()))
+            })
+            .filter_map(|asked| {
+                let granted =
+                    by_launch.iter().find(|r| r.field == asked.field)?;
+                let kept: Vec<String> = asked
+                    .granted
+                    .into_iter()
+                    .filter(|value| granted.granted.contains(value))
+                    .collect();
+                (!kept.is_empty()).then_some(Widening {
+                    field: asked.field,
+                    granted: kept,
+                })
+            })
+            .collect();
+        Ok(ProfileReport {
+            name: self.name.clone(),
+            widenings,
+        })
+    }
+}
+
+/// Fields whose grant has no effect at all under `--lockdown`, so a
+/// profile that sets them widens nothing in a lockdown launch. Read from
+/// the code that drops each one, which differs by backend; a grant lockdown
+/// only narrows (a read-only worktree, the proxy hosts, forwarded ports,
+/// the `CLAUDE_CONFIG_DIR` variable) is still a widening and stays listed.
+#[cfg(target_os = "linux")]
+const LOCKDOWN_DROPS: &[&str] = &[
+    // bwrap.rs `discover_mounts_full`: no maps, devices or sockets, and a
+    // private home whatever `private_home` says.
+    "rw_maps",
+    "ro_maps",
+    "overlay_maps",
+    "no_gpu",
+    "kvm",
+    "no_docker",
+    "tailscale",
+    "no_display",
+    "x11",
+    "audio",
+    "host_shm",
+    "pictures",
+    "ssh",
+    "systemd_user",
+    "private_home",
+    // bwrap.rs: `--unshare-net` and `--clearenv` without the passed env.
+    "network",
+    "inherit_env",
+    // main.rs `finalize_launch_config_with_ssh` and the accessors.
+    "github",
+    "aws",
+    "kube",
+    "gcloud",
+    "docker_config",
+    "prompt_hosts",
+    "no_mise",
+    "no_toolchains",
+    "agent_state",
+    "allow_loopback_connect",
+];
+#[cfg(not(target_os = "linux"))]
+const LOCKDOWN_DROPS: &[&str] = &[
+    // seatbelt.rs: each opt-in rule is skipped under lockdown. Unlike
+    // Linux, macOS lockdown keeps `macos_host_ipc`, the environment
+    // (`inherit_env`, `env_pass`) and read access to the maps.
+    "no_docker",
+    "network",
+    "macos_chromium",
+    "macos_trustd",
+    "macos_pasteboard",
+    "allow_pty",
+    "allow_loopback_listen",
+    "allow_tcp_ports",
+    "pictures",
+    "ssh",
+    // main.rs `finalize_launch_config_with_ssh` and the accessors.
+    "github",
+    "aws",
+    "kube",
+    "gcloud",
+    "docker_config",
+    "no_mise",
+    "no_toolchains",
+    "agent_state",
+    "allow_loopback_connect",
+];
 
 /// The `granted="…"` payload: values joined by `,`, with `\\`, `"` and
 /// `,` inside a value backslash-escaped and control bytes neutralised,
@@ -1708,6 +1936,7 @@ pub(crate) fn global_config_for_command_report(
     {
         apply(harness.name, &mut base);
     }
+    let without_profile = base.clone();
     // The profile is the last trusted layer before the CLI. Only the CLI
     // selects one, so a malformed profile no launch names stays inert.
     let profile = match cli.profile.as_deref() {
@@ -1740,6 +1969,7 @@ pub(crate) fn global_config_for_command_report(
     };
     Ok(GlobalCommandSelection {
         config: base,
+        without_profile,
         ignored_command_tables,
         profile,
     })
@@ -9378,6 +9608,113 @@ mod profile_select_tests {
         }
     }
 
+    // #230 review: a selected profile that is refused names the field and
+    // never its value, whatever the field. "SECRET-VALUE" stands for a value
+    // that must not reach stderr.
+    const LEAK: &str = "SECRET-VALUE";
+
+    #[test]
+    fn a_refused_profile_version_is_named_without_its_value() {
+        for body in [
+            "profile_version = \"SECRET-VALUE\"\n",
+            "profile_version = [\"SECRET-VALUE\"]\n",
+        ] {
+            let map = profiles(&format!("[agent-test]\n{body}"));
+            let err = refused(&map, "agent-test");
+            assert!(err.contains("profile_version"), "{body}: {err}");
+            assert!(!err.contains(LEAK), "{body}: the value leaked: {err}");
+        }
+    }
+
+    #[test]
+    fn a_wrongly_typed_field_is_named_without_its_value() {
+        for (body, field) in [
+            ("network = \"SECRET-VALUE\"\n", "network"),
+            ("allow_hosts = \"SECRET-VALUE\"\n", "allow_hosts"),
+            ("rw_maps = [1, \"SECRET-VALUE\"]\n", "rw_maps"),
+            ("github = { a = \"SECRET-VALUE\" }\n", "github"),
+            // A value holding the word itself: serde's "expected" is last.
+            ("network = \"expected SECRET-VALUE\"\n", "network"),
+        ] {
+            let map = one("agent-test", body);
+            let err = refused(&map, "agent-test");
+            assert!(err.contains(field), "{body}: names {field}: {err}");
+            assert!(!err.contains(LEAK), "{body}: the value leaked: {err}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_is_named_with_its_control_bytes_escaped() {
+        let map = one("agent-test", "\"ne\\u001btwork\" = \"SECRET-VALUE\"\n");
+        let err = refused(&map, "agent-test");
+        assert!(!err.contains('\u{1b}'), "a raw ESC reached stderr: {err:?}");
+        assert!(err.contains("unknown key"), "{err}");
+        assert!(!err.contains(LEAK), "the value leaked: {err}");
+    }
+
+    #[test]
+    fn a_duplicate_inside_profiles_is_refused_without_the_source_line() {
+        // TOML itself refuses both, for the whole file, before any profile
+        // is selected; its message quotes the offending source line.
+        for (text, needle) in [
+            (
+                "[profiles.web]\nprofile_version = 1\n\
+                 env_pass = [\"K=x\"]\nenv_pass = [\"TOKEN=SECRET-VALUE\"]\n",
+                "env_pass",
+            ),
+            (
+                "[profiles.web]\nprofile_version = 1\nnetwork = true\n\
+                 network = \"SECRET-VALUE\"\n",
+                "network",
+            ),
+            (
+                "[profiles.web]\nprofile_version = 1\n\
+                 [profiles.\"web\"]\nallow_hosts = [\"SECRET-VALUE\"]\n",
+                "web",
+            ),
+        ] {
+            let err = parse_global_toml(text).unwrap_err();
+            assert!(err.contains(needle), "names {needle}: {err}");
+            assert!(err.contains("duplicate"), "{err}");
+            assert!(err.contains("line"), "says where: {err}");
+            assert!(!err.contains(LEAK), "the value leaked: {err}");
+        }
+    }
+
+    #[test]
+    fn a_profile_written_another_way_loses_the_excerpt_too() {
+        for text in [
+            "[\"profiles\".web]\nprofile_version = 1\nnetwork = \"SECRET-VALUE\n",
+            "profiles.web.secret_hosts = { h = \"SECRET-VALUE }\n",
+            "profiles = { web = { env_pass = [\"SECRET-VALUE ] } }\n",
+        ] {
+            let err = parse_global_toml(text).unwrap_err();
+            assert!(err.contains("[profiles]"), "{text}: {err}");
+            assert!(!err.contains(LEAK), "{text}: the value leaked: {err}");
+        }
+    }
+
+    #[test]
+    fn a_global_parse_error_outside_profiles_keeps_its_source_line() {
+        // Only `[profiles.*]` loses the excerpt: elsewhere the operator still
+        // sees the line, as before (with `NAME=VALUE` redacted by the caller).
+        let err =
+            parse_global_toml("network = true\nnetwork = false\n").unwrap_err();
+        assert!(err.contains("network = false"), "{err}");
+    }
+
+    #[test]
+    fn every_lockdown_drop_is_a_config_field() {
+        // A renamed field would silently stop being filtered.
+        const SOURCE: &str = include_str!("config.rs");
+        for field in LOCKDOWN_DROPS {
+            assert!(
+                SOURCE.contains(&format!("    pub {field}: ")),
+                "{field} is not a Config field"
+            );
+        }
+    }
+
     #[test]
     fn profile_version_is_not_reported_as_an_unknown_key() {
         let map = one("agent-test", "allow_hosts = [\"a.example\"]\n");
@@ -10270,15 +10607,17 @@ allow_hosts = [\"api.example.com\"]
     }
 
     #[test]
-    fn non_secret_type_error_keeps_the_parser_message() {
-        // The converse: the secret-safe rewrite is for the three secret
-        // fields only; any other field keeps the parser's message.
+    fn non_secret_type_error_names_the_field_and_the_expected_type() {
+        // Since the #230 review every field is value-free, not only the
+        // three secret ones: the field and the type it expects stay, the
+        // parser's quote of the value does not.
         let body = "[profiles.p]\nprofile_version = 1\nallow_hosts = 3\n";
         let err = load(body, &["--profile", "p", "claude"])
             .expect_err("wrong type refuses");
         assert!(err.contains("profile 'p'"), "{err}");
         assert!(err.contains("allow_hosts"), "{err}");
-        assert!(err.contains("invalid type"), "parser message lost: {err}");
+        assert!(err.contains("expected a sequence"), "{err}");
+        assert!(!err.contains("invalid type"), "parser message kept: {err}");
     }
 
     // ── Widenings against the merged result ───────────────────

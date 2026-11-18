@@ -57,9 +57,9 @@ or integration rather than saved sandbox authority.
 
 - Named global profiles: `--profile` selects one `[profiles.NAME]` table of
   the trusted global `config.toml`. Profiles are written by hand there, not
-  in onboarding; every access a profile widens is printed before launch and
-  under `--dry-run` as `profile=NAME widens=FIELD granted="…"`, and recorded
-  in the audit log.
+  in onboarding; every access a profile widens in this launch, after every
+  other layer, is printed before launch and under `--dry-run` as
+  `profile=NAME widens=FIELD granted="…"`, and recorded in the audit log.
 
 - Filesystem overlays and exclusions: `--overlay-map`, `--hide-dotdir`,
   `--mask`, `--mask-except`, `--deny-path`, `--deny-path-except`
