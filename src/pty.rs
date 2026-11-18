@@ -1909,6 +1909,11 @@ pub fn run_with_config(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the spawn bracket is the eighth; the flags beside it are \
+              read once here, so a struct would only rename them"
+)]
 fn run_with_passthrough(
     pty: Pty,
     cmd: &mut std::process::Command,

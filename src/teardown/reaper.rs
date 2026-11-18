@@ -13,7 +13,7 @@
 use super::{
     ChildStatusWire, GRACE, ProcStat, REPORT_VERSION, Survivor, TeardownReport,
     WireUsage, is_dead_state, list_survivors, parse_proc_stat,
-    stop_survivors_in_rounds,
+    stop_survivors_then_relist,
 };
 use nix::errno::Errno;
 use nix::sys::signal::{
@@ -277,7 +277,7 @@ fn stop_the_survivors(
             // Every survivor is stopped; only the report is cut.
             let mut relist = || list_settled(bridges);
             let (survivors, note) =
-                stop_survivors_in_rounds(list, GRACE, &mut relist);
+                stop_survivors_then_relist(list, GRACE, &mut relist);
             cap_survivor_list(survivors, note, reasons)
         }
         Err(e) => {
@@ -288,7 +288,7 @@ fn stop_the_survivors(
 }
 
 /// Cuts the report's list at [`SURVIVOR_CAP`]. The truncation token goes
-/// in before the rounds' per-pid notes, so cutting the joined reason at
+/// in before the per-pid notes, so cutting the joined reason at
 /// `REASON_CAP` cannot drop it.
 fn cap_survivor_list(
     mut survivors: Vec<Survivor>,
@@ -469,8 +469,8 @@ mod tests {
         }
     }
 
-    /// One distinct `kill` errno note per survivor, joined as the rounds
-    /// join them: far past `REASON_CAP` for a list near `SURVIVOR_CAP`.
+    /// One distinct `kill` errno note per survivor, joined as the stop
+    /// joins them: far past `REASON_CAP` for a list near `SURVIVOR_CAP`.
     fn kill_notes(n: usize) -> String {
         (0..n)
             .map(|pid| {

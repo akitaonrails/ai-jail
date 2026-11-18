@@ -349,28 +349,17 @@ pub fn stop_survivors_noting_errors(
     (survivors, note)
 }
 
-/// How many later rounds stop what a re-listing found: a supervisor that
-/// respawns its worker on SIGTERM is followed this far, and no further,
-/// so a teardown always ends. One more listing then only checks.
-const RESPAWN_ROUNDS: usize = 3;
-
-/// The grace a later round gets at least, once the first round has used
-/// most of `grace`: all rounds share one deadline. With the listing
-/// settle (50 ms) and the SIGKILL reap wait ([`KILL_REAP_WAIT`]) the
-/// worst case is about 50 + 2000 + 500 + 3 × (50 + 250 + 500) + 50 ms,
-/// near 5 s.
-const RESPAWN_GRACE_FLOOR: Duration = Duration::from_millis(250);
-
 /// How long a SIGKILLed survivor is waited for before its usage is
 /// given up on (`usage-partial`).
 const KILL_REAP_WAIT: Duration = Duration::from_millis(500);
 const KILL_REAP_POLL: Duration = Duration::from_millis(10);
 
-/// Stops `list`, then lists again with `relist` and stops what appeared
-/// meanwhile, up to [`RESPAWN_ROUNDS`] times. Processes still appearing
-/// after the last round are not stopped here (the pid namespace ends
-/// them with the sandbox) and mark the report `survivors-respawned`.
-pub fn stop_survivors_in_rounds<F>(
+/// Stops `list` (SIGTERM, the grace, SIGKILL), then lists once more with
+/// `relist`. A process that listing finds was started meanwhile (a
+/// supervisor respawning its worker): it is not signalled again, since
+/// the pid namespace ends it with the sandbox, and it marks the report
+/// `survivors-respawned`.
+pub fn stop_survivors_then_relist<F>(
     list: Vec<ProcStat>,
     grace: Duration,
     relist: &mut F,
@@ -378,7 +367,7 @@ pub fn stop_survivors_in_rounds<F>(
 where
     F: FnMut() -> Result<Vec<ProcStat>, String>,
 {
-    stop_survivors_in_rounds_with(
+    stop_survivors_then_relist_with(
         list,
         grace,
         relist,
@@ -386,9 +375,9 @@ where
     )
 }
 
-/// The rounds of [`stop_survivors_in_rounds`], with the per-round stop
-/// passed in, so the rounds can be tested without signalling anything.
-fn stop_survivors_in_rounds_with<F, S>(
+/// [`stop_survivors_then_relist`], with the stop passed in, so the
+/// listing can be tested without signalling anything.
+fn stop_survivors_then_relist_with<F, S>(
     list: Vec<ProcStat>,
     grace: Duration,
     relist: &mut F,
@@ -398,43 +387,29 @@ where
     F: FnMut() -> Result<Vec<ProcStat>, String>,
     S: FnMut(Vec<ProcStat>, Duration) -> (Vec<Survivor>, Option<String>),
 {
-    let mut survivors = Vec::new();
-    let mut notes: Vec<String> = Vec::new();
+    if list.is_empty() {
+        return (Vec::new(), None);
+    }
     // A process already handled may still be listed (a SIGKILLed one not
     // yet reaped by its parent): pid and start time identify it.
-    let mut seen: Vec<(i32, u64)> = Vec::new();
-    let mut next = list;
-    let mut round = 0;
-    let deadline = Instant::now() + grace;
-    while !next.is_empty() {
-        if round > RESPAWN_ROUNDS {
-            // First, so cutting the joined reason cannot drop it.
-            notes.insert(0, "survivors-respawned".into());
-            break;
-        }
-        seen.extend(next.iter().map(|s| (s.pid, s.start_ticks)));
-        let left = deadline.saturating_duration_since(Instant::now());
-        let round_grace = if round == 0 {
-            grace
-        } else {
-            left.max(RESPAWN_GRACE_FLOOR.min(grace))
-        };
-        let (stopped, note) = stop(next, round_grace);
-        survivors.extend(stopped);
-        if let Some(note) = note {
-            note_once(&mut notes, &note);
-        }
-        round += 1;
-        next = match relist() {
-            Ok(found) => found
-                .into_iter()
-                .filter(|s| !seen.contains(&(s.pid, s.start_ticks)))
-                .collect(),
-            Err(e) => {
-                note_once(&mut notes, &e);
-                Vec::new()
+    let seen: Vec<(i32, u64)> =
+        list.iter().map(|s| (s.pid, s.start_ticks)).collect();
+    let (survivors, note) = stop(list, grace);
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(note) = note {
+        note_once(&mut notes, &note);
+    }
+    match relist() {
+        Ok(found) => {
+            if found
+                .iter()
+                .any(|s| !seen.contains(&(s.pid, s.start_ticks)))
+            {
+                // First, so cutting the joined reason cannot drop it.
+                notes.insert(0, "survivors-respawned".into());
             }
-        };
+        }
+        Err(e) => note_once(&mut notes, &e),
     }
     let note = (!notes.is_empty()).then(|| notes.join("; "));
     (survivors, note)
@@ -1151,112 +1126,54 @@ mod tests {
     }
 
     #[test]
-    fn respawned_survivor_is_stopped_in_a_later_round() {
-        run_child_test("respawned_survivor_child");
+    fn a_process_the_relisting_finds_is_reported_not_signalled() {
+        run_child_test("relisted_respawn_child");
     }
 
     #[test]
     #[ignore]
-    fn respawned_survivor_child() {
+    fn relisted_respawn_child() {
         if !in_child_test() {
             return;
         }
-        // The opposite of the persistent case below: a process that appears
-        // once after the SIGKILL sweep (a supervisor restarting its worker) is
-        // found by the next listing, stopped the same way and recorded, and the
-        // report stays complete.
+        // A process that appears after the SIGKILL sweep (a supervisor
+        // restarting its worker) is found by the one re-listing. It is not
+        // signalled again: the pid namespace ends it with the sandbox, so the
+        // report only says it could not claim a clean teardown.
         let (first, first_stat) = spawn_sleep();
         let mut later: Vec<Fixture> = Vec::new();
         let mut calls = 0_usize;
         let mut relist = || -> Result<Vec<ProcStat>, String> {
             calls += 1;
-            assert!(calls <= 10, "the re-list is not bounded");
-            if calls == 1 {
-                let (child, stat) = spawn_sleep();
-                later.push(child);
-                Ok(vec![stat])
-            } else {
-                Ok(Vec::new())
-            }
+            let (child, stat) = spawn_sleep();
+            later.push(child);
+            Ok(vec![stat])
         };
-        let (out, note) = stop_survivors_in_rounds(
+        let started = Instant::now();
+        let (out, note) = stop_survivors_then_relist(
             vec![first_stat],
             Duration::from_millis(400),
             &mut relist,
         );
+        assert!(started.elapsed() < Duration::from_secs(3), "bounded");
+        assert_eq!(calls, 1, "the sandbox is listed again exactly once");
         assert!(ended_by_term(&out, first.id()), "the first survivor");
         let respawned = later[0].id();
-        let found = out
-            .iter()
-            .find(|s| s.pid == respawned as i32)
-            .expect("the process the re-list found is recorded");
-        assert!(matches!(found.ended_by, EndedBy::Sigterm));
-        assert_eq!(found.comm, "sleep");
         assert!(
-            note.is_none(),
-            "one respawn that the next round stops is not incomplete: {note:?}"
+            out.iter().all(|s| s.pid != respawned as i32),
+            "the re-listed process is not recorded as stopped: {out:?}"
         );
-        assert!(
-            (2..=4).contains(&calls),
-            "listed again until a round found nothing, at most 3 rounds: {calls}"
-        );
+        let note = note.expect("a respawn leaves the teardown incomplete");
+        assert_eq!(note.split("; ").next(), Some("survivors-respawned"));
         assert_eq!(
             nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(respawned as i32),
                 None
             ),
-            Err(nix::errno::Errno::ESRCH),
-            "the respawned process really ended"
+            Ok(()),
+            "the re-listed process was left running for the pid namespace"
         );
-    }
-
-    #[test]
-    fn persistent_respawn_marks_survivors_respawned() {
-        run_child_test("persistent_respawn_child");
-    }
-
-    #[test]
-    #[ignore]
-    fn persistent_respawn_child() {
-        if !in_child_test() {
-            return;
-        }
-        // Every listing finds a new process: the rounds stop at 3 and the
-        // report says why it cannot claim a clean teardown.
-        let (first, first_stat) = spawn_sleep();
-        let mut spawned: Vec<Fixture> = Vec::new();
-        let mut calls = 0_usize;
-        let mut relist = || -> Result<Vec<ProcStat>, String> {
-            calls += 1;
-            assert!(calls <= 10, "the re-list is not bounded");
-            let (child, stat) = spawn_sleep();
-            spawned.push(child);
-            Ok(vec![stat])
-        };
-        let started = Instant::now();
-        let (out, note) = stop_survivors_in_rounds(
-            vec![first_stat],
-            Duration::from_millis(400),
-            &mut relist,
-        );
-        let took = started.elapsed();
-        assert!(
-            (3..=4).contains(&calls),
-            "at most 3 rounds: {calls} listings"
-        );
-        let note = note.expect("leftovers after the last round are incomplete");
-        assert!(note.contains("survivors-respawned"), "{note}");
-        assert!(ended_by_term(&out, first.id()), "the first survivor");
-        for child in spawned.iter().take(3) {
-            assert!(
-                ended_by_term(&out, child.id()),
-                "each process a round found is stopped the same way: {}",
-                child.id()
-            );
-        }
-        assert!(took < Duration::from_secs(5), "bounded: {took:?}");
-        // A leftover from a last listing is the pid namespace's to end; here
-        // the fixtures end it when they drop.
+        // The fixtures end it when they drop.
     }
 
     // ── the wrapper's usage in the report ───────
@@ -1377,8 +1294,8 @@ mod tests {
         }
     }
 
-    /// Stops nothing: records each process as SIGKILLed and returns, one
-    /// round at a time, the note `notes` scripts for that round.
+    /// Stops nothing: records each process as SIGKILLed and returns the
+    /// note `notes` scripts for the stop.
     fn scripted_stop(
         notes: Vec<Option<&'static str>>,
     ) -> impl FnMut(Vec<ProcStat>, Duration) -> (Vec<Survivor>, Option<String>)
@@ -1399,28 +1316,28 @@ mod tests {
         }
     }
 
-    /// Three rounds: the first list, then two re-listings that each find
-    /// one new process, then one that finds nothing.
-    fn three_rounds(
-        notes: Vec<Option<&'static str>>,
-    ) -> (Vec<Survivor>, Option<String>) {
+    /// One stop of the first list, whose note `stop_note` scripts, then a
+    /// re-listing that finds `relisted`.
+    fn one_stop(
+        stop_note: Option<&'static str>,
+        relisted: Result<Vec<ProcStat>, String>,
+    ) -> (Vec<Survivor>, Option<String>, usize) {
         let mut calls = 0;
+        let mut relisted = Some(relisted);
         let mut relist = || -> Result<Vec<ProcStat>, String> {
             calls += 1;
-            assert!(calls <= 10, "the re-list is not bounded");
-            Ok(if calls <= 2 {
-                vec![unreachable_stat(calls)]
-            } else {
-                Vec::new()
-            })
+            relisted
+                .take()
+                .expect("the sandbox is listed again only once")
         };
-        let mut stop = scripted_stop(notes);
-        stop_survivors_in_rounds_with(
+        let mut stop = scripted_stop(vec![stop_note]);
+        let (out, note) = stop_survivors_then_relist_with(
             vec![unreachable_stat(0)],
             Duration::from_millis(400),
             &mut relist,
             &mut stop,
-        )
+        );
+        (out, note, calls)
     }
 
     #[test]
@@ -1432,30 +1349,28 @@ mod tests {
         const OTHER_PID_NOTE: &str =
             "kill(4195306, SIGKILL): EPERM: Operation not permitted";
 
-        // Every round gives up on the usage of a SIGKILLed process, once
-        // alone and twice inside a round's joined note: one token.
-        let (out, note) = three_rounds(vec![
-            Some("usage-partial"),
-            Some(
-                "kill(4195305, SIGTERM): EPERM: Operation not permitted; \
-                 usage-partial",
-            ),
+        // The stop gives up on the usage of two SIGKILLed processes: one
+        // token, while notes that differ only in the signal or in one pid
+        // digit name different failures, and each one stays.
+        let (out, note, calls) = one_stop(
             Some(
                 "usage-partial; \
+                 kill(4195305, SIGTERM): EPERM: Operation not permitted; \
+                 usage-partial; \
                  kill(4195305, SIGKILL): EPERM: Operation not permitted; \
                  kill(4195306, SIGKILL): EPERM: Operation not permitted",
             ),
-        ]);
-        assert_eq!(out.len(), 3, "each round's processes are recorded");
-        let note = note.expect("a round that gave up is incomplete");
+            Ok(Vec::new()),
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(out.len(), 1, "the stopped process is recorded");
+        let note = note.expect("a stop that gave up is incomplete");
         let tokens: Vec<&str> = note.split("; ").collect();
         assert_eq!(
             tokens.iter().filter(|t| **t == "usage-partial").count(),
             1,
             "usage-partial is listed once: {note}"
         );
-        // Notes that differ only in the signal or in one pid digit name
-        // different failures, and each one stays.
         for kept in [SIGTERM_NOTE, SIGKILL_NOTE, OTHER_PID_NOTE] {
             assert_eq!(
                 tokens.iter().filter(|t| **t == kept).count(),
@@ -1465,13 +1380,59 @@ mod tests {
         }
         assert_eq!(tokens.len(), 4, "no other token: {note}");
 
-        // One round's single token is the whole reason.
-        let (_, note) = three_rounds(vec![Some("usage-partial"), None, None]);
+        // A single token is the whole reason.
+        let (_, note, _) = one_stop(Some("usage-partial"), Ok(Vec::new()));
         assert_eq!(note.as_deref(), Some("usage-partial"));
 
-        // Rounds without a note leave the teardown complete.
-        let (_, note) = three_rounds(vec![None, None, None]);
+        // A stop without a note and an empty re-listing leave it complete.
+        let (_, note, _) = one_stop(None, Ok(Vec::new()));
         assert_eq!(note, None);
+    }
+
+    #[test]
+    fn the_relisting_decides_respawned_only_on_a_new_process() {
+        // Where the mark would fire WRONGLY: the re-listing still shows the
+        // process just SIGKILLed (its parent has not reaped it yet). Same pid
+        // and start time: handled, not respawned.
+        let (_, note, _) = one_stop(None, Ok(vec![unreachable_stat(0)]));
+        assert_eq!(note, None, "an unreaped survivor is not a respawn");
+
+        // A reused pid with a later start time is a new process.
+        let reused = ProcStat {
+            start_ticks: 2,
+            ..unreachable_stat(0)
+        };
+        let (out, note, _) = one_stop(None, Ok(vec![reused]));
+        assert_eq!(out.len(), 1, "only the first list is stopped: {out:?}");
+        assert_eq!(note.as_deref(), Some("survivors-respawned"));
+
+        // The mark goes first, before the stop's own notes.
+        let (_, note, _) =
+            one_stop(Some("usage-partial"), Ok(vec![unreachable_stat(1)]));
+        assert_eq!(note.as_deref(), Some("survivors-respawned; usage-partial"));
+
+        // A re-listing that fails says why, and claims no respawn.
+        let (_, note, _) =
+            one_stop(None, Err("proc-unreadable: EACCES".to_string()));
+        assert_eq!(note.as_deref(), Some("proc-unreadable: EACCES"));
+    }
+
+    #[test]
+    fn nothing_to_stop_lists_nothing_again() {
+        let mut calls = 0;
+        let mut relist = || -> Result<Vec<ProcStat>, String> {
+            calls += 1;
+            Ok(vec![unreachable_stat(1)])
+        };
+        let (out, note) = stop_survivors_then_relist_with(
+            Vec::new(),
+            Duration::from_millis(400),
+            &mut relist,
+            &mut scripted_stop(Vec::new()),
+        );
+        assert!(out.is_empty());
+        assert_eq!(note, None, "no survivors, no delay, no report line");
+        assert_eq!(calls, 0, "an empty first list is not listed again");
     }
 
     #[test]
