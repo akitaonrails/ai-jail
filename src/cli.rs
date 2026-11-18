@@ -83,6 +83,8 @@ OPTIONS:
                                     Enable/disable only the macOS trustd service
                                     so TLS clients like gh can verify
                                     certificates (default: off)
+    --macos-pasteboard / --no-macos-pasteboard
+                                    Allow native macOS clipboard access only (default: off)
     --allow-pty / --no-allow-pty   Allow opening PTY slave nodes allocated at
                                     runtime on macOS, for tools that spawn their
                                     own pseudo-terminals; grants every /dev/ttys*
@@ -227,6 +229,7 @@ pub struct CliArgs {
     pub macos_host_ipc: Option<bool>,
     pub macos_chromium: Option<bool>,
     pub macos_trustd: Option<bool>,
+    pub macos_pasteboard: Option<bool>,
     pub allow_pty: Option<bool>,
     pub allow_loopback_listen: Option<bool>,
     pub allow_loopback_connect: Option<bool>,
@@ -541,6 +544,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("macos-trustd" | "no-macos-trustd")) => {
                 args.macos_trustd = Some(s == "macos-trustd");
+            }
+            Long(s @ ("macos-pasteboard" | "no-macos-pasteboard")) => {
+                args.macos_pasteboard = Some(s == "macos-pasteboard");
             }
             Long(s @ ("allow-pty" | "no-allow-pty")) => {
                 args.allow_pty = Some(s == "allow-pty");
@@ -1070,7 +1076,9 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--macos-chromium",
     "--no-macos-chromium",
     "--macos-trustd",
+    "--macos-pasteboard",
     "--no-macos-trustd",
+    "--no-macos-pasteboard",
     "--allow-pty",
     "--no-allow-pty",
     "--allow-loopback-listen",
@@ -1242,6 +1250,7 @@ mod tests {
             "macos-host-ipc",
             "macos-chromium",
             "macos-trustd",
+            "macos-pasteboard",
             "allow-pty",
             "allow-loopback-listen",
             "allow-loopback-connect",
@@ -1625,6 +1634,24 @@ mod tests {
         let args = parse_test(&["--macos-trustd", "--no-macos-trustd", "bash"])
             .unwrap();
         assert_eq!(args.macos_trustd, Some(false));
+    }
+
+    #[test]
+    fn parse_macos_pasteboard_last_wins() {
+        let args = parse_test(&[
+            "--no-macos-pasteboard",
+            "--macos-pasteboard",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.macos_pasteboard, Some(true));
+        let args = parse_test(&[
+            "--macos-pasteboard",
+            "--no-macos-pasteboard",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.macos_pasteboard, Some(false));
     }
 
     #[test]

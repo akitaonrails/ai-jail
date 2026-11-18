@@ -1395,6 +1395,7 @@ enum DirectionalAuthority {
     MacosHostIpc,
     MacosChromium,
     MacosTrustd,
+    MacosPasteboard,
     AllowPty,
     LoopbackListen,
     LoopbackConnect,
@@ -1518,6 +1519,11 @@ const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     directional_policy!("macos_host_ipc", MacosHostIpc, "macos-host-ipc"),
     directional_policy!("macos_chromium", MacosChromium, "macos-chromium-ipc"),
     directional_policy!("macos_trustd", MacosTrustd, "macos-trustd"),
+    directional_policy!(
+        "macos_pasteboard",
+        MacosPasteboard,
+        "macos-pasteboard"
+    ),
     directional_policy!("allow_pty", AllowPty, "host-pty"),
     directional_policy!(
         "allow_loopback_listen",
@@ -1607,6 +1613,10 @@ impl DirectionalAuthority {
             }
             Self::MacosTrustd => {
                 c.macos_trustd == Some(true) && b.macos_trustd != Some(true)
+            }
+            Self::MacosPasteboard => {
+                c.macos_pasteboard == Some(true)
+                    && b.macos_pasteboard != Some(true)
             }
             Self::AllowPty => {
                 c.allow_pty == Some(true) && b.allow_pty != Some(true)
@@ -2517,6 +2527,7 @@ mod tests {
             macos_host_ipc: Some(false),
             macos_chromium: Some(false),
             macos_trustd: Some(false),
+            macos_pasteboard: Some(false),
             allow_pty: Some(false),
             allow_loopback_listen: Some(false),
             allow_loopback_connect: Some(false),
@@ -2560,6 +2571,7 @@ mod tests {
             macos_host_ipc: Some(true),
             macos_chromium: Some(true),
             macos_trustd: Some(true),
+            macos_pasteboard: Some(true),
             allow_pty: Some(true),
             allow_loopback_listen: Some(true),
             allow_loopback_connect: Some(true),

@@ -72,6 +72,7 @@ pub(crate) struct AdditionalSelection {
     pub macos_host_ipc: bool,
     pub macos_chromium: bool,
     pub macos_trustd: bool,
+    pub macos_pasteboard: bool,
     pub allow_pty: bool,
     pub allow_loopback_listen: bool,
     pub inherit_env: bool,
@@ -101,6 +102,7 @@ impl AdditionalSelection {
             || self.macos_host_ipc
             || self.macos_chromium
             || self.macos_trustd
+            || self.macos_pasteboard
             || self.allow_pty
             || self.allow_loopback_listen
             || self.inherit_env
@@ -131,6 +133,7 @@ impl AdditionalSelection {
             macos_host_ipc: config.macos_host_ipc_enabled(),
             macos_chromium: config.macos_chromium_enabled(),
             macos_trustd: config.macos_trustd_enabled(),
+            macos_pasteboard: config.macos_pasteboard_enabled(),
             allow_pty: config.allow_pty_enabled(),
             allow_loopback_listen: config.allow_loopback_listen_enabled(),
             inherit_env: config.inherit_env_enabled(),
@@ -163,6 +166,7 @@ impl AdditionalSelection {
             config.macos_host_ipc = Some(self.macos_host_ipc);
             config.macos_chromium = Some(self.macos_chromium);
             config.macos_trustd = Some(self.macos_trustd);
+            config.macos_pasteboard = Some(self.macos_pasteboard);
             config.allow_pty = Some(self.allow_pty);
             config.allow_loopback_listen = Some(self.allow_loopback_listen);
             config.inherit_env = Some(self.inherit_env);
@@ -192,6 +196,7 @@ impl AdditionalSelection {
         config.macos_host_ipc = self.macos_host_ipc.then_some(true);
         config.macos_chromium = self.macos_chromium.then_some(true);
         config.macos_trustd = self.macos_trustd.then_some(true);
+        config.macos_pasteboard = self.macos_pasteboard.then_some(true);
         config.allow_pty = self.allow_pty.then_some(true);
         config.allow_loopback_listen =
             self.allow_loopback_listen.then_some(true);
@@ -2644,6 +2649,10 @@ pub(crate) fn render_effective_access(
         "ALLOWED: macOS trustd agent; request TLS trust evaluation; system trust service only; jailed clients can validate TLS through host trustd",
     );
     authority(
+        config.macos_pasteboard_enabled(),
+        "ALLOWED: macOS pasteboard; read and write native clipboard contents, including text and images; only com.apple.pasteboard.1; copied private data can be read and clipboard contents replaced",
+    );
+    authority(
         config.allow_pty_enabled(),
         "macOS /dev/ttys* nodes; open PTY slaves; every matching terminal node; other user terminals may be reachable",
     );
@@ -3316,6 +3325,7 @@ mod tests {
             macos_host_ipc: true,
             macos_chromium: true,
             macos_trustd: true,
+            macos_pasteboard: true,
             allow_pty: true,
             allow_loopback_listen: true,
             inherit_env: true,

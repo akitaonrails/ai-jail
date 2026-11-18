@@ -688,6 +688,7 @@ impl<'a> App<'a> {
         enabled_flag(additional.macos_host_ipc, "--macos-host-ipc");
         enabled_flag(additional.macos_chromium, "--macos-chromium");
         enabled_flag(additional.macos_trustd, "--macos-trustd");
+        enabled_flag(additional.macos_pasteboard, "--macos-pasteboard");
         enabled_flag(additional.allow_pty, "--allow-pty");
         enabled_flag(
             additional.allow_loopback_listen,

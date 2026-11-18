@@ -242,6 +242,9 @@ pub struct Config {
     /// `com.apple.trustd.agent` lookup is granted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub macos_trustd: Option<bool>,
+    /// Native clipboard access through only com.apple.pasteboard.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_pasteboard: Option<bool>,
     /// Allow the sandboxed process to open PTY slave nodes it allocates at
     /// runtime (`/dev/ttysNNN`) on macOS. Needed by tools that spawn their
     /// own pseudo-terminals -- `expect`, `script`, terminal multiplexers,
@@ -520,6 +523,9 @@ impl Config {
     }
     pub fn macos_trustd_enabled(&self) -> bool {
         self.macos_trustd == Some(true)
+    }
+    pub fn macos_pasteboard_enabled(&self) -> bool {
+        self.macos_pasteboard == Some(true)
     }
     pub fn allow_pty_enabled(&self) -> bool {
         self.allow_pty == Some(true)
@@ -1318,6 +1324,7 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(macos_host_ipc);
     take!(macos_chromium);
     take!(macos_trustd);
+    take!(macos_pasteboard);
     take!(allow_pty);
     take!(allow_loopback_listen);
     take!(allow_loopback_connect);
@@ -1685,6 +1692,8 @@ pub fn merge_with_global_report(
         .macos_chromium_enabled());
     monotonic!(macos_trustd, |config: &Config| config
         .macos_trustd_enabled());
+    monotonic!(macos_pasteboard, |config: &Config| config
+        .macos_pasteboard_enabled());
     monotonic!(allow_pty, |config: &Config| config.allow_pty_enabled());
     monotonic!(allow_loopback_listen, |config: &Config| config
         .allow_loopback_listen_enabled());
@@ -2299,6 +2308,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     direct!(macos_host_ipc);
     direct!(macos_chromium);
     direct!(macos_trustd);
+    direct!(macos_pasteboard);
     direct!(allow_pty);
     direct!(allow_loopback_listen);
     direct!(allow_loopback_connect);
@@ -2489,6 +2499,7 @@ pub fn display_status(config: &Config, stored_path: Option<&Path>) {
     print_opt_in_enabled("  macOS host IPC", config.macos_host_ipc);
     print_opt_in_enabled("  macOS Chromium", config.macos_chromium);
     print_opt_in_enabled("  macOS trustd", config.macos_trustd);
+    print_opt_in_enabled("  macOS pasteboard", config.macos_pasteboard);
     print_opt_in_enabled("  Allow PTY", config.allow_pty);
     print_opt_in_enabled("  Loopback listen", config.allow_loopback_listen);
     print_opt_in_enabled(
@@ -2840,6 +2851,15 @@ mod tests {
     }
 
     #[test]
+    fn regression_v3_4_2_config_without_pasteboard() {
+        let cfg = parse_toml("macos_host_ipc = false\nmacos_trustd = true\n")
+            .unwrap();
+        assert!(!cfg.macos_host_ipc_enabled());
+        assert!(cfg.macos_trustd_enabled());
+        assert!(!serialize_config(&cfg).unwrap().contains("macos_pasteboard"));
+    }
+
+    #[test]
     fn parse_minimal_config() {
         let cfg = parse_toml("").unwrap();
         assert!(cfg.command.is_empty());
@@ -2901,6 +2921,50 @@ mod tests {
             serialize_config(&enabled)
                 .unwrap()
                 .contains("macos_trustd = true")
+        );
+    }
+
+    #[test]
+    fn macos_pasteboard_is_opt_in_and_project_cannot_enable_it() {
+        let project = Config {
+            macos_pasteboard: Some(true),
+            ..Config::default()
+        };
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(!merged.macos_pasteboard_enabled());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("macos_pasteboard"))
+        );
+
+        // A trusted layer may enable it, and the project may still
+        // tighten it back off.
+        let global = Config {
+            macos_pasteboard: Some(true),
+            ..Config::default()
+        };
+        let project = Config {
+            macos_pasteboard: Some(false),
+            ..Config::default()
+        };
+        let (merged, warnings) =
+            merge_with_global_report(global, project, Path::new("/project"));
+        assert!(!merged.macos_pasteboard_enabled());
+        assert!(warnings.is_empty());
+
+        let enabled = Config {
+            macos_pasteboard: Some(true),
+            ..Config::default()
+        };
+        assert!(
+            serialize_config(&enabled)
+                .unwrap()
+                .contains("macos_pasteboard = true")
         );
     }
 
@@ -4512,6 +4576,7 @@ no_gpu = true
             macos_host_ipc: None,
             macos_chromium: None,
             macos_trustd: None,
+            macos_pasteboard: None,
             allow_pty: None,
             allow_loopback_listen: None,
             allow_loopback_connect: Some(true),
@@ -4872,6 +4937,7 @@ tailscale = true
             macos_host_ipc: None,
             macos_chromium: None,
             macos_trustd: None,
+            macos_pasteboard: None,
             allow_pty: None,
             allow_loopback_listen: None,
             allow_loopback_connect: None,
@@ -7899,6 +7965,7 @@ hide_dotdirs = [".my_secrets"]
             macos_host_ipc: None,
             macos_chromium: None,
             macos_trustd: None,
+            macos_pasteboard: None,
             allow_pty: None,
             allow_loopback_listen: None,
             allow_loopback_connect: None,
