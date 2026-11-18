@@ -681,19 +681,20 @@ flag is CLI-only; no configuration key enables it.
 | `reason` | why: `in-allowlist`, `secret-termination`, `prompt-allow`; `not-in-allowlist`, `forbidden-address-range`, `prompt-deny`, `prompt-no-answer`; `connection-cap`, `request-too-large`, `malformed-request`, `method-not-allowed`, `client-read-failed`, `upstream-unreachable`, `client-write-failed` |
 | `bytes_up`, `bytes_down` | bytes relayed to and from the upstream, counted even when the transfer ends early |
 | `duration_ms` | from accept to close |
+| `upstream_host`, `upstream_port` | only on a `secret-termination` line: the host and port the proxy itself dialed over TLS |
 
 Adding a field keeps `v`; removing, renaming, retyping or re-meaning one
-increments it. No request content is ever logged: no path, query, headers,
-body, credentials, or `--secret` placeholder or real value. Host names with
+increments it. No request content is ever logged: no path, query, method,
+headers, body, credentials, or `--secret` key name, placeholder or real value. Host names with
 control or non-ASCII characters are JSON-escaped, so each record stays on one
 line. Lines from concurrent connections are never interleaved.
 
 The file is created with mode 0600 (an existing one is narrowed to 0600),
-opened for append (runs accumulate), and a
-symlink at the path is refused rather than followed. Like the audit log it is
-best-effort: when the file cannot be opened, ai-jail warns with the path and
-the cause and launches without it; a later write failure warns once and the
-traffic keeps flowing. When the command exits, ai-jail shuts the connections
+opened for append (runs accumulate) and close-on-exec, so the sandbox never
+inherits it. Unlike the audit log, opening it is not best-effort: a symlink, a
+non-regular file, another user's file or a missing directory refuses the
+launch, naming the path and the cause. A later write failure warns once and
+the traffic keeps flowing. Linux only: macOS refuses the flag. When the command exits, ai-jail shuts the connections
 it left open and waits up to 2 seconds for their lines, warning with the count
 of any still open after that.
 The existing `--audit-log` `connect` records are unchanged by this flag.

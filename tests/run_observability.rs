@@ -187,29 +187,40 @@ fn egress_log_file_is_private_and_appended_across_runs() {
 }
 
 #[test]
-fn egress_log_unopenable_path_warns_and_launches() {
+fn egress_log_unopenable_path_refuses_the_launch() {
     require_bwrap_net!();
     let dir = tree("egress-unopenable").0;
-    // A missing directory, then a symlink: both warn with the path and
-    // the launch goes on.
-    let missing = dir.join("no-such-dir").join("egress.jsonl");
-    let out = egress_run("egress-unopenable-1", &missing, "exit 7");
-    let stderr = text(&out.stderr);
-    assert_eq!(out.status.code(), Some(7), "launch continued: {stderr}");
-    assert!(
-        stderr.contains("no-such-dir"),
-        "warns with the path: {stderr}"
-    );
+    let marker = dir.join("ran");
+    let touch = format!("touch {}; exit 7", marker.display());
+    let refused = |name: &str, path: &Path, shown: &str| {
+        let out = egress_run(name, path, &touch);
+        let stderr = text(&out.stderr);
+        assert_ne!(out.status.code(), Some(7), "command ran: {stderr}");
+        assert!(!out.status.success(), "{stderr}");
+        assert!(!marker.exists(), "command ran: {stderr}");
+        assert!(stderr.contains(shown), "names the path: {stderr}");
+    };
 
+    // A missing directory.
+    let missing = dir.join("no-such-dir").join("egress.jsonl");
+    refused("egress-unopenable-1", &missing, "no-such-dir");
+
+    // A symlink: refused, never followed.
     let victim = dir.join("victim");
     std::fs::write(&victim, b"untouched").unwrap();
     let link = dir.join("link.jsonl");
     std::os::unix::fs::symlink(&victim, &link).unwrap();
-    let out = egress_run("egress-unopenable-2", &link, "exit 5");
-    let stderr = text(&out.stderr);
-    assert_eq!(out.status.code(), Some(5), "{stderr}");
-    assert!(stderr.contains("link.jsonl"), "{stderr}");
+    refused("egress-unopenable-2", &link, "link.jsonl");
     assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+
+    // Non-regular files: a directory and a FIFO.
+    let directory = dir.join("dir.jsonl");
+    std::fs::create_dir(&directory).unwrap();
+    refused("egress-unopenable-3", &directory, "dir.jsonl");
+    let fifo = dir.join("fifo.jsonl");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    assert!(made.is_ok_and(|s| s.success()), "mkfifo failed");
+    refused("egress-unopenable-4", &fifo, "fifo.jsonl");
 }
 
 #[test]

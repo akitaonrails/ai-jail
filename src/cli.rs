@@ -143,7 +143,7 @@ OPTIONS:
     --audit-verify                 Verify the audit log's hash chain and exit
     --egress-log <PATH>            Append one JSON line per egress-proxy
                                    connection to PATH (mode 0600; needs
-                                   filtered networking)
+                                   filtered networking; Linux only)
     --worktree / --no-worktree     Enable/disable linked Git worktree metadata passthrough
     --no-mise / --mise             Disable/enable mise integration
     --no-toolchains / --toolchains Disable/enable dev-toolchain cache

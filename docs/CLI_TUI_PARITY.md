@@ -78,7 +78,8 @@ or integration rather than saved sandbox authority.
   `--audit-show`, `--audit-verify`
 - Standard process information: `--help`, `--version`, `--verbose`
 - Run observability: `--egress-log` (a per-run output file, not saved
-  authority: no configuration key, refused outside filtered networking)
+  authority: no configuration key, refused outside filtered networking and
+  on macOS)
 - Backward-compatible rejected option: `--allow-tcp-port`
 
 ## Release rule

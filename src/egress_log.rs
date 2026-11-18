@@ -247,6 +247,10 @@ impl Verdict {
 pub struct ConnRecord {
     host: Option<String>,
     port: Option<u16>,
+    /// What the proxy itself dialed when it terminated a `--secret`
+    /// request: the maintainer's review of #228 asked for both ends of a
+    /// substituted connection, and nothing else from it.
+    upstream: Option<(String, u16)>,
     verdict: Verdict,
     reason: &'static str,
     up: Arc<AtomicU64>,
@@ -263,6 +267,7 @@ impl ConnRecord {
         ConnRecord {
             host: None,
             port: None,
+            upstream: None,
             verdict: Verdict::Error,
             reason: "client-read-failed",
             up: Arc::new(AtomicU64::new(0)),
@@ -276,6 +281,12 @@ impl ConnRecord {
     pub fn target(&mut self, host: &str, port: u16) {
         self.host = Some(host.to_string());
         self.port = Some(port);
+    }
+
+    /// The host and port the proxy dials on the sandbox's behalf when they
+    /// are not simply the requested target (`--secret` termination).
+    pub fn upstream(&mut self, host: &str, port: u16) {
+        self.upstream = Some((host.to_string(), port));
     }
 
     pub fn verdict(&mut self, verdict: Verdict, reason: &'static str) {
@@ -309,7 +320,7 @@ impl Drop for ConnRecord {
             .unwrap_or(u64::MAX);
         // Exactly the documented fields; the host goes through serde_json only,
         // so a hostile name stays escaped on one line.
-        let line = serde_json::json!({
+        let mut line = serde_json::json!({
             "v": EGRESS_LINE_VERSION,
             "ts": audit::rfc3339(SystemTime::now()),
             "run_id": log.run_id,
@@ -321,6 +332,14 @@ impl Drop for ConnRecord {
             "bytes_down": down,
             "duration_ms": duration_ms,
         });
+        // Only on a terminated `--secret` request; an ordinary line keeps
+        // exactly the ten fields above.
+        if let (Some((host, port)), Some(fields)) =
+            (&self.upstream, line.as_object_mut())
+        {
+            fields.insert("upstream_host".into(), host.as_str().into());
+            fields.insert("upstream_port".into(), (*port).into());
+        }
         log.write_line(&line);
     }
 }

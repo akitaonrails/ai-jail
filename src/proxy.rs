@@ -1528,6 +1528,7 @@ fn handle_http_termination<S: ClientStream>(
         ));
     }
 
+    conn.record.upstream(&binding.host, port);
     let mut upstream = match tls_connect(&binding.host, port, &shared.config) {
         Ok(stream) => stream,
         Err(why) => {
@@ -3397,6 +3398,45 @@ mod tests {
         assert_eq!(record["key"], "KEY_A");
         assert_eq!(record["substitutions"], 1);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn egress_line_names_both_ends_of_a_secret_termination_and_no_secret() {
+        let fixture = tls_fixture();
+        let binding = crate::secret::SecretBinding::new(
+            "X_KEY",
+            "real-secret",
+            "127.0.0.1",
+        );
+        let placeholder = binding.placeholder.clone();
+        let mut config = test_config(&["127.0.0.1"]);
+        config.secrets = vec![binding];
+        config.danger_extra_roots = vec![fixture_root()];
+        let h = harness("secret-ends", config);
+
+        let request = format!(
+            "GET http://127.0.0.1:{fixture}/v1/test HTTP/1.1\r\n\
+             Host: 127.0.0.1:{fixture}\r\n\
+             x-test-key: {placeholder}\r\n\
+             \r\n"
+        );
+        let stream = connect_and_send(h.proxy.port(), request.as_bytes());
+        let mut response = Vec::new();
+        (&mut &stream).read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+
+        let got = wait_lines(&h.path, 1);
+        let line = &got[0];
+        assert_eq!(line["reason"], "secret-termination", "{line}");
+        assert_eq!(line["host"], "127.0.0.1", "{line}");
+        assert_eq!(line["port"], fixture, "{line}");
+        assert_eq!(line["upstream_host"], "127.0.0.1", "{line}");
+        assert_eq!(line["upstream_port"], fixture, "{line}");
+        let raw = std::fs::read_to_string(&h.path).unwrap();
+        for leaked in ["real-secret", placeholder.as_str(), "X_KEY", "/v1/test"]
+        {
+            assert!(!raw.contains(leaked), "{leaked} in {raw}");
+        }
     }
 
     #[test]

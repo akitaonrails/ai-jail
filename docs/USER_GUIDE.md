@@ -548,9 +548,10 @@ filtered default a known agent gets); with the network off or full, ai-jail
 refuses to start rather than log nothing. Each connection through the egress
 proxy becomes one JSON line in `PATH` (mode 0600, an existing file narrowed to
 it, appended across runs) with its host, port, verdict, reason, byte counts and
-duration, and never any request content. A file that cannot be opened is a
-warning, not a launch failure. The README's `Run observability` section
-describes every field.
+duration, and never any request content. A file that cannot be opened (a
+symlink, a non-regular file, a missing directory) refuses the launch, and the
+flag is refused on macOS. The README's `Run observability` section and
+`docs/SECURITY.md` describe every field and what a line can never contain.
 
 ## Migration and reapproval
 
