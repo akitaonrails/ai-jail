@@ -2858,7 +2858,9 @@ mod tests {
         // Issue #113: the sandbox inherits a PATH describing the host's
         // layout, so entries that were never mounted dangle and tools look
         // installed while resolving to nothing.
-        let real = std::env::temp_dir();
+        // A fixed existing directory, not `temp_dir()`: a test that holds
+        // `TMPDIR` at a missing path must not be able to fail this one.
+        let real = std::path::PathBuf::from("/");
         let missing =
             real.join(format!("ai-jail-no-such-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
