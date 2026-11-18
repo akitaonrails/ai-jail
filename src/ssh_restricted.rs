@@ -12,7 +12,7 @@ use std::os::unix::fs::{
     FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
 };
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -621,15 +621,15 @@ fn collect_known_hosts_with(
     let mut result = String::new();
     for destination in destinations {
         let host = destination_host(destination);
-        let output = Command::new(ssh_keygen)
+        let mut command = Command::new(ssh_keygen);
+        command
             .args(["-F", host, "-f"])
             .arg(source)
             .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|e| {
-                format!("Cannot verify SSH destination {host}: {e}")
-            })?;
+            .stderr(Stdio::null());
+        let output = run_tool(&mut command).map_err(|e| {
+            format!("Cannot verify SSH destination {host}: {e}")
+        })?;
         if !output.status.success() {
             return Err(format!(
                 "No verified known_hosts entry for SSH destination {host}"
@@ -835,20 +835,16 @@ fn render_config(identity_agent: &str, config_root: &str) -> String {
     )
 }
 
-fn ssh_add_supports_destination_constraints(
-    executable: &Path,
-) -> Result<bool, String> {
-    // A concurrent fork can keep a freshly written executable open for
-    // writing, which makes the first exec fail with ETXTBSY even though this
-    // process has closed it. Retry briefly instead of failing setup.
+/// Run a trusted SSH tool, retrying a transient `ETXTBSY`.
+///
+/// A concurrent fork can keep a freshly written executable open for writing,
+/// which makes the first exec fail with `Text file busy` even though this
+/// process has closed it. Retrying briefly keeps a launch from failing on
+/// that race, both for a real tool and for a test fixture.
+fn run_tool(command: &mut Command) -> std::io::Result<Output> {
     let mut attempt = 0;
-    let output = loop {
-        match Command::new(executable)
-            .arg("-?")
-            .stdin(Stdio::null())
-            .output()
-        {
-            Ok(output) => break output,
+    loop {
+        match command.output() {
             Err(error)
                 if error.raw_os_error() == Some(nix::libc::ETXTBSY)
                     && attempt < 5 =>
@@ -856,13 +852,19 @@ fn ssh_add_supports_destination_constraints(
                 attempt += 1;
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(error) => {
-                return Err(format!(
-                    "Cannot inspect ssh-add capabilities: {error}"
-                ));
-            }
+            result => return result,
         }
-    };
+    }
+}
+
+fn ssh_add_supports_destination_constraints(
+    executable: &Path,
+) -> Result<bool, String> {
+    let mut command = Command::new(executable);
+    command.arg("-?").stdin(Stdio::null());
+    let output = run_tool(&mut command).map_err(|error| {
+        format!("Cannot inspect ssh-add capabilities: {error}")
+    })?;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -1142,6 +1144,42 @@ mod tests {
         assert!(args.contains("-F example.test -f"));
         assert!(args.contains(source.to_str().unwrap()));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn known_hosts_lookup_retries_an_executable_busy_with_writers() {
+        let root = test_tmp().join(format!(
+            "ai-jail-ssh-keygen-busy-{}-{}",
+            std::process::id(),
+            PLAN_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("ssh-keygen");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '# Host example.test found: line 1\\nexample.test ssh-ed25519 AAAATEST\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let source = root.join("known_hosts");
+        fs::write(&source, "host fixture").unwrap();
+        // A writer in this process makes exec fail with ETXTBSY; the retry
+        // loop must outlast it instead of failing destination verification.
+        let writer = fs::OpenOptions::new().write(true).open(&script).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(writer);
+        });
+        let copied = collect_known_hosts_with(
+            &["git@example.test".into()],
+            &script,
+            &source,
+        )
+        .unwrap();
+        assert_eq!(copied, "example.test ssh-ed25519 AAAATEST\n");
+        release.join().unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
