@@ -2909,7 +2909,7 @@ mod tests {
 // shape. And a drift test: every `Config` field and every
 // `SANDBOX_LONG_FLAGS` entry appears in `docs/USER_GUIDE.md` as a whole
 // token, or is allowlisted. The allowlist has two parts: fields that are
-// internal, and the names already undocumented in v3.3.0 (fe4dfe0), so the
+// internal, and the names already undocumented in v3.5.0 (236b365), so the
 // test is a ratchet — nothing new may land undocumented, and a name
 // leaves the baseline once the guide documents it.
 #[cfg(test)]
@@ -2924,12 +2924,13 @@ mod interface_profile_tests {
     /// `Config` fields that no user sets: runtime state, never parsed.
     const INTERNAL_FIELDS: &[&str] = &["runtime_harnesses"];
 
-    /// `Config` fields already missing from the guide in v3.3.0 (fe4dfe0).
-    const UNDOCUMENTED_FIELDS_AT_FE4DFE0: &str = r"
+    /// `Config` fields already missing from the guide in v3.5.0 (236b365).
+    const UNDOCUMENTED_FIELDS_AT_236B365: &str = r"
     rw_maps overlay_maps hide_dotdirs mask deny_paths mask_exceptions
     deny_path_exceptions no_gpu no_docker tailscale no_display audio
     aws kube gcloud docker_config kvm prompt_hosts macos_host_ipc
-    macos_chromium macos_trustd allow_pty allow_loopback_listen
+    macos_chromium macos_trustd macos_pasteboard allow_pty
+    allow_loopback_listen terminal_appearance
     allow_loopback_connect x11 host_shm terminal_passthrough
     no_worktree no_mise no_toolchains no_save_config no_hide_config
     pictures browser_profile private_home no_landlock no_status_bar
@@ -2940,15 +2941,16 @@ mod interface_profile_tests {
     audit_log
 ";
 
-    /// Sandbox long flags already missing from the guide at fe4dfe0.
-    const UNDOCUMENTED_FLAGS_AT_FE4DFE0: &str = r"
+    /// Sandbox long flags already missing from the guide at 236b365.
+    const UNDOCUMENTED_FLAGS_AT_236B365: &str = r"
     --harness --request-file --request --private-home
     --no-private-home --lockdown --no-lockdown --no-display --display
     --audio --no-audio --no-github --aws --no-aws --kube --no-kube
     --gcloud --no-gcloud --docker-config --no-docker-config --kvm
     --no-kvm --prompt-hosts --no-prompt-hosts --network --no-network
     --macos-host-ipc --no-macos-host-ipc --macos-chromium
-    --no-macos-chromium --macos-trustd --no-macos-trustd --allow-pty
+    --no-macos-chromium --macos-trustd --no-macos-trustd
+    --macos-pasteboard --no-macos-pasteboard --allow-pty
     --no-allow-pty --allow-loopback-listen --no-allow-loopback-listen
     --allow-loopback-connect --no-allow-loopback-connect --no-gpu
     --gpu --no-docker --docker --tailscale --no-tailscale --landlock
@@ -2956,7 +2958,7 @@ mod interface_profile_tests {
     --no-ssh --pictures --no-pictures --clean --exec --dry-run
     --rw-map --ro-map --overlay-map --map --mask --deny-path
     --mask-except --deny-path-except --hide-dotdir --allow-tcp-port
-    --allow-host --allow-private-host --systemd-user --no-systemd-user
+    --allow-private-host --systemd-user --no-systemd-user
     --worktree --no-worktree --browser --no-browser --claude-dir --x11
     --no-x11 --host-shm --no-host-shm --terminal-passthrough
     --no-terminal-passthrough --agent-state --no-agent-state
@@ -3043,12 +3045,12 @@ mod interface_profile_tests {
         let fields = config_fields();
         assert!(fields.contains(&"allow_hosts"), "field parse: {fields:?}");
         let baseline_fields: Vec<&str> =
-            UNDOCUMENTED_FIELDS_AT_FE4DFE0.split_whitespace().collect();
+            UNDOCUMENTED_FIELDS_AT_236B365.split_whitespace().collect();
         let mut allowed_fields = INTERNAL_FIELDS.to_vec();
         allowed_fields.extend(&baseline_fields);
         let missing_fields = undocumented(&fields, GUIDE, &allowed_fields);
         let baseline_flags: Vec<&str> =
-            UNDOCUMENTED_FLAGS_AT_FE4DFE0.split_whitespace().collect();
+            UNDOCUMENTED_FLAGS_AT_236B365.split_whitespace().collect();
         let missing_flags =
             undocumented(SANDBOX_LONG_FLAGS, GUIDE, &baseline_flags);
         assert!(
@@ -3063,11 +3065,11 @@ mod interface_profile_tests {
         // The ratchet only tightens: a name documented since, or removed,
         // must leave the baseline.
         let fields = config_fields();
-        for name in UNDOCUMENTED_FIELDS_AT_FE4DFE0.split_whitespace() {
+        for name in UNDOCUMENTED_FIELDS_AT_236B365.split_whitespace() {
             assert!(fields.contains(&name), "{name} is no longer a field");
             assert!(!documented(name, GUIDE), "{name} is documented now");
         }
-        for name in UNDOCUMENTED_FLAGS_AT_FE4DFE0.split_whitespace() {
+        for name in UNDOCUMENTED_FLAGS_AT_236B365.split_whitespace() {
             assert!(
                 SANDBOX_LONG_FLAGS.contains(&name),
                 "{name} is no longer a sandbox flag"

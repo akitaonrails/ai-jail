@@ -3611,7 +3611,7 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("macos_pasteboard"))
+                .any(|warning| warning.text.contains("macos_pasteboard"))
         );
 
         // A trusted layer may enable it, and the project may still
@@ -4810,7 +4810,8 @@ terminal_appearance = true
             ..CliArgs::default()
         };
         let selected =
-            global_config_for_command(global, &cli, &Config::default());
+            global_config_for_command(global, &cli, &Config::default())
+                .unwrap();
         assert!(selected.terminal_appearance_enabled());
         assert_eq!(
             merge(
@@ -4850,7 +4851,11 @@ terminal_appearance = true
             Path::new("/project"),
         );
         assert!(!ignored.terminal_appearance_enabled());
-        assert!(warnings.iter().any(|w| w.contains("terminal_appearance")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.text.contains("terminal_appearance"))
+        );
     }
 
     #[test]
