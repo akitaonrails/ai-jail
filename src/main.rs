@@ -10,6 +10,7 @@ mod codex_ps;
 mod command;
 mod config;
 mod config_store;
+mod egress_log;
 mod forge_auth;
 mod fsutil;
 mod github_auth;
@@ -326,6 +327,64 @@ fn validate_network_flags(config: &config::Config) -> Result<(), String> {
     }
     validate_forward_ports(config)?;
     validate_publish_ports(config)
+}
+
+/// `--egress-log` only sees what the filtered-egress proxy relays, so with
+/// the network off or full it would log nothing while looking enabled.
+/// Checked on the finalized config: a config file or a harness
+/// default can change the network mode after the CLI is parsed.
+fn validate_egress_log(
+    egress_log: Option<&std::path::Path>,
+    mode: config::NetworkMode,
+) -> Result<(), String> {
+    validate_egress_log_on(egress_log, mode, cfg!(target_os = "linux"))
+}
+
+/// `validate_egress_log` with the platform as a parameter, so the macOS
+/// refusal is tested on Linux too. Refused rather than accepted silently
+/// on macOS (maintainer's review of #228): no proxy line is written there.
+fn validate_egress_log_on(
+    egress_log: Option<&std::path::Path>,
+    mode: config::NetworkMode,
+    linux: bool,
+) -> Result<(), String> {
+    if egress_log.is_some() && !linux {
+        return Err("--egress-log is supported on Linux only".into());
+    }
+    let network = match (egress_log, mode) {
+        (None, _) | (Some(_), config::NetworkMode::Filtered) => return Ok(()),
+        (Some(_), config::NetworkMode::Off) => "off",
+        (Some(_), config::NetworkMode::Full) => "full",
+    };
+    Err(format!(
+        "--egress-log needs filtered networking (--allow-host HOST, without \
+         --network); the network is {network} for this launch"
+    ))
+}
+
+/// Open the `--egress-log` file for this run. A file that cannot be opened
+/// (a symlink, a non-regular file, another owner's file, a missing
+/// directory) refuses the launch: the operator asked for the record, and
+/// running without it would fail open. Only a later write failure is
+/// best-effort (`EgressLog::write_line`). An unreadable `/dev/urandom`
+/// falls back to a pid-and-time run id, through `output::security_warn`
+/// so `--exec` does not hide it.
+fn open_egress_log(
+    path: &std::path::Path,
+) -> Result<std::sync::Arc<egress_log::EgressLog>, String> {
+    let run_id = egress_log::run_id().unwrap_or_else(|error| {
+        output::security_warn(&format!(
+            "{error}; using a run id from the pid and start time"
+        ));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        egress_log::fallback_run_id(std::process::id(), nanos)
+    });
+    // The error already names the path (EgressLog::open).
+    egress_log::EgressLog::open(path, &run_id)
+        .map(std::sync::Arc::new)
+        .map_err(|error| format!("{error}; refusing to launch"))
 }
 
 /// `--publish-port` contradiction checks, fail-closed at launch. The
@@ -1760,6 +1819,10 @@ fn run(
     {
         output::warn(hint);
     }
+    validate_egress_log(
+        cli.egress_log.as_deref(),
+        launch_runner.config().network_mode(),
+    )?;
     if !cli.dry_run {
         signals::install_handlers();
         launch_runner.start_restricted_ssh()?;
@@ -1792,6 +1855,16 @@ fn run(
     };
     let launch_start = std::time::Instant::now();
 
+    // Opt-in egress log: supervisor-side like the audit
+    // log, so the sandbox never sees the file. `validate_egress_log`
+    // already refused it outside filtered mode. The stats count every
+    // connection whether or not a file was asked for.
+    let egress_log = match cli.egress_log.as_deref() {
+        Some(path) if !cli.dry_run => Some(open_egress_log(path)?),
+        _ => None,
+    };
+    let egress_stats = std::sync::Arc::new(egress_log::EgressStats::default());
+
     // Prepare sandbox resources (temp hosts file on Linux, no-op on macOS)
     let guard = sandbox::prepare()?;
 
@@ -1820,6 +1893,9 @@ fn run(
         // The audit handle is supervisor-side; the sandbox never sees
         // the file it appends to.
         proxy_config.audit = audit_log.clone();
+        proxy_config.egress = egress_log.clone();
+        proxy_config.stats = std::sync::Arc::clone(&egress_stats);
+        proxy_config.drain_on_exit = egress_log.is_some();
         proxy_config.prompt = host_prompt(config);
         let proxy_config = launch_runner.finish_proxy_config(proxy_config);
         let socket = proxy::default_socket_path();
@@ -1843,6 +1919,9 @@ fn run(
         proxy_config.allow_private_hosts =
             config.allow_private_hosts().to_vec();
         proxy_config.audit = audit_log.clone();
+        proxy_config.egress = egress_log.clone();
+        proxy_config.stats = std::sync::Arc::clone(&egress_stats);
+        proxy_config.drain_on_exit = egress_log.is_some();
         let proxy_config = launch_runner.finish_proxy_config(proxy_config);
         let proxy = proxy::Proxy::start(proxy_config, None)
             .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
@@ -2134,6 +2213,14 @@ fn run(
         code
     };
 
+    // A tunnel the command left open would otherwise end only when this
+    // process exits, after the run is over, and its egress line and bytes
+    // would be missing. A run that records its egress shuts them now,
+    // within a bounded grace; any other run keeps the old ending.
+    if let Some(proxy) = egress_proxy.as_ref().filter(|p| p.drain_on_exit()) {
+        proxy.drain(std::time::Duration::from_millis(2000));
+    }
+
     // Append the launch record only now: exit code and duration are
     // what make it an audit trail rather than a log of intentions.
     if let Some(log) = &audit_log {
@@ -2240,14 +2327,26 @@ mod tests {
         resolve_browser_profile, running_inside_multiplexer,
         should_auto_save_project_config, should_check_update,
         should_save_global_preferences,
-        untrusted_project_command_carries_credentials, validate_network_flags,
-        validate_write_flags,
+        untrusted_project_command_carries_credentials, validate_egress_log_on,
+        validate_network_flags, validate_write_flags,
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
     use crate::onboarding::Selection;
     use crate::test_utils::{ENV_LOCK, EnvVarGuard};
     use std::path::Path;
+
+    #[test]
+    fn egress_log_is_refused_off_linux_even_with_filtered_egress() {
+        let path = std::path::Path::new("/tmp/egress.jsonl");
+        let filtered = crate::config::NetworkMode::Filtered;
+        let err = validate_egress_log_on(Some(path), filtered, false)
+            .expect_err("macOS must refuse --egress-log");
+        assert!(err.contains("Linux only"), "{err}");
+        assert!(validate_egress_log_on(Some(path), filtered, true).is_ok());
+        // No flag, nothing to refuse, on any platform.
+        assert!(validate_egress_log_on(None, filtered, false).is_ok());
+    }
 
     #[test]
     fn policy_provenance_matrix_is_consistent() {

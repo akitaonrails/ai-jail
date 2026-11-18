@@ -658,6 +658,48 @@ summaries may display the command and its arguments, so avoid putting secrets
 in argv. The audit file is local sensitive data; safe opening and restrictive
 permissions do not remove that privacy limit.
 
+### Run observability
+
+`--egress-log <PATH>` appends one JSON line to `PATH` for every connection the
+filtered-egress proxy accepts, whether it was allowed, refused, or failed. It
+needs filtered networking (`--allow-host`, or the filtered default a known
+agent gets): with the network off or full (`--no-network` alone, `--network`)
+there is no proxy to observe, so ai-jail refuses to start. The
+flag is CLI-only; no configuration key enables it.
+
+<!-- prettier-ignore -->
+```json
+{"v":1,"ts":"2026-10-10T21:04:05Z","run_id":"9f2c…","host":"api.anthropic.com","port":443,"verdict":"allow","reason":"in-allowlist","bytes_up":5120,"bytes_down":88213,"duration_ms":4031}
+```
+
+| Field                            | Meaning                                                                                                                                                                                                                                                                                            |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `v`                              | line format version, `1`                                                                                                                                                                                                                                                                           |
+| `ts`                             | RFC 3339 UTC time the connection ended                                                                                                                                                                                                                                                             |
+| `run_id`                         | 32 hex characters, the same for every line of one launch                                                                                                                                                                                                                                           |
+| `host`, `port`                   | the requested target; `null` when no request was parsed                                                                                                                                                                                                                                            |
+| `verdict`                        | `allow`, `deny` (refused by policy) or `error` (the connection failed: a malformed or oversized request, or an upstream or client that could not be reached or written to)                                                                                                                         |
+| `reason`                         | why: `in-allowlist`, `secret-termination`, `prompt-allow`; `not-in-allowlist`, `forbidden-address-range`, `prompt-deny`, `prompt-no-answer`; `connection-cap`, `request-too-large`, `malformed-request`, `method-not-allowed`, `client-read-failed`, `upstream-unreachable`, `client-write-failed` |
+| `bytes_up`, `bytes_down`         | bytes relayed to and from the upstream, counted even when the transfer ends early                                                                                                                                                                                                                  |
+| `duration_ms`                    | from accept to close                                                                                                                                                                                                                                                                               |
+| `upstream_host`, `upstream_port` | only on a `secret-termination` line: the host and port the proxy itself dialed over TLS                                                                                                                                                                                                            |
+
+Adding a field keeps `v`; removing, renaming, retyping or re-meaning one
+increments it. No request content is ever logged: no path, query, method,
+headers, body, credentials, or `--secret` key name, placeholder or real value. Host names with
+control or non-ASCII characters are JSON-escaped, so each record stays on one
+line. Lines from concurrent connections are never interleaved.
+
+The file is created with mode 0600 (an existing one is narrowed to 0600),
+opened for append (runs accumulate) and close-on-exec, so the sandbox never
+inherits it. Unlike the audit log, opening it is not best-effort: a symlink, a
+non-regular file, another user's file or a missing directory refuses the
+launch, naming the path and the cause. A later write failure warns once and
+the traffic keeps flowing. Linux only: macOS refuses the flag. When the command exits, ai-jail shuts the connections
+it left open and waits up to 2 seconds for their lines, warning with the count
+of any still open after that.
+The existing `--audit-log` `connect` records are unchanged by this flag.
+
 ## Project secrets
 
 The project directory is writable by default, so secrets inside it are

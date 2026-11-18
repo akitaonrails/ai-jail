@@ -141,6 +141,9 @@ OPTIONS:
                                     (default: off; repository policy cannot enable)
     --audit-show                   Show the local audit log and exit
     --audit-verify                 Verify the audit log's hash chain and exit
+    --egress-log <PATH>            Append one JSON line per egress-proxy
+                                   connection to PATH (mode 0600; needs
+                                   filtered networking; Linux only)
     --worktree / --no-worktree     Enable/disable linked Git worktree metadata passthrough
     --no-mise / --mise             Disable/enable mise integration
     --no-toolchains / --toolchains Disable/enable dev-toolchain cache
@@ -255,6 +258,10 @@ pub struct CliArgs {
     pub inherit_env: Option<bool>,
     pub update_check: Option<bool>,
     pub audit_log: Option<bool>,
+    /// `--egress-log <path>`: one JSON line per
+    /// connection the filtered-egress proxy accepts. CLI-only, never a
+    /// config key.
+    pub egress_log: Option<PathBuf>,
     pub audit_verify: bool,
     pub audit_show: bool,
     pub env_from_file: Vec<PathBuf>,
@@ -602,6 +609,15 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 args.audit_log = Some(s == "audit-log");
             }
             Long("audit-verify") => args.audit_verify = true,
+            Long("egress-log") => {
+                // Kept as an OsString path: a non-UTF-8 name must reach
+                // open(2) unchanged, not lossily rewritten.
+                let val = parser.value().map_err(|e| e.to_string())?;
+                if val.is_empty() {
+                    return Err("--egress-log requires a non-empty path".into());
+                }
+                args.egress_log = Some(PathBuf::from(val));
+            }
             Long("audit-show") => args.audit_show = true,
             Long("env") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -1118,6 +1134,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--audit-log",
     "--no-audit-log",
     "--audit-verify",
+    "--egress-log",
     "--env",
     "--env-from-file",
     "--secret",

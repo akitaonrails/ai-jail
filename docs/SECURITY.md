@@ -284,6 +284,22 @@ for secret-bound hosts the supervisor (and the proxy's TLS endpoint) sees the
 request plaintext, by construction. CONNECT tunnels to any host stay opaque
 and carry no substitution.
 
+The egress log (`--egress-log PATH`, Linux only, CLI-only) is written by the
+supervisor, never by the sandbox. What a line **can** contain: the line
+version, a UTC timestamp, the run id, the requested host and port, the verdict
+and its reason, the byte counts and the duration. For a terminated `--secret`
+request it adds the host and port the proxy itself dialed (`upstream_host`,
+`upstream_port`). What it **cannot** contain: any request content — no path,
+query, method, header, body, credential, `--secret` placeholder, key name, or
+real value — and nothing from inside a CONNECT tunnel, which stays opaque. The
+file is opened `O_NOFOLLOW | O_APPEND | O_CREAT`, mode `0600`, close-on-exec,
+so the sandboxed process never inherits it; a symlink, a non-regular file, a
+file owned by someone else or a missing directory refuses the launch. A write
+failure after that warns once and the traffic keeps flowing. The host names it
+records are still a history of where the agent connected: treat the file as
+local sensitive data, as the audit log is. macOS refuses the flag rather than
+accepting it and writing nothing.
+
 The macOS profile also grants `file-read-metadata` on each directory above an
 allowed path, and on the symlink nodes leading to the command. Seatbelt
 resolves a path one component at a time, so without this an allowed leaf stays
