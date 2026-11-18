@@ -667,21 +667,22 @@ agent gets): with the network off or full (`--no-network` alone, `--network`)
 there is no proxy to observe, so ai-jail refuses to start. The
 flag is CLI-only; no configuration key enables it.
 
+<!-- prettier-ignore -->
 ```json
 {"v":1,"ts":"2026-10-10T21:04:05Z","run_id":"9f2c…","host":"api.anthropic.com","port":443,"verdict":"allow","reason":"in-allowlist","bytes_up":5120,"bytes_down":88213,"duration_ms":4031}
 ```
 
-| Field | Meaning |
-|---|---|
-| `v` | line format version, `1` |
-| `ts` | RFC 3339 UTC time the connection ended |
-| `run_id` | 32 hex characters, the same for every line of one launch |
-| `host`, `port` | the requested target; `null` when no request was parsed |
-| `verdict` | `allow`, `deny` (refused by policy) or `error` (the connection failed: a malformed or oversized request, or an upstream or client that could not be reached or written to) |
-| `reason` | why: `in-allowlist`, `secret-termination`, `prompt-allow`; `not-in-allowlist`, `forbidden-address-range`, `prompt-deny`, `prompt-no-answer`; `connection-cap`, `request-too-large`, `malformed-request`, `method-not-allowed`, `client-read-failed`, `upstream-unreachable`, `client-write-failed` |
-| `bytes_up`, `bytes_down` | bytes relayed to and from the upstream, counted even when the transfer ends early |
-| `duration_ms` | from accept to close |
-| `upstream_host`, `upstream_port` | only on a `secret-termination` line: the host and port the proxy itself dialed over TLS |
+| Field                            | Meaning                                                                                                                                                                                                                                                                                            |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `v`                              | line format version, `1`                                                                                                                                                                                                                                                                           |
+| `ts`                             | RFC 3339 UTC time the connection ended                                                                                                                                                                                                                                                             |
+| `run_id`                         | 32 hex characters, the same for every line of one launch                                                                                                                                                                                                                                           |
+| `host`, `port`                   | the requested target; `null` when no request was parsed                                                                                                                                                                                                                                            |
+| `verdict`                        | `allow`, `deny` (refused by policy) or `error` (the connection failed: a malformed or oversized request, or an upstream or client that could not be reached or written to)                                                                                                                         |
+| `reason`                         | why: `in-allowlist`, `secret-termination`, `prompt-allow`; `not-in-allowlist`, `forbidden-address-range`, `prompt-deny`, `prompt-no-answer`; `connection-cap`, `request-too-large`, `malformed-request`, `method-not-allowed`, `client-read-failed`, `upstream-unreachable`, `client-write-failed` |
+| `bytes_up`, `bytes_down`         | bytes relayed to and from the upstream, counted even when the transfer ends early                                                                                                                                                                                                                  |
+| `duration_ms`                    | from accept to close                                                                                                                                                                                                                                                                               |
+| `upstream_host`, `upstream_port` | only on a `secret-termination` line: the host and port the proxy itself dialed over TLS                                                                                                                                                                                                            |
 
 Adding a field keeps `v`; removing, renaming, retyping or re-meaning one
 increments it. No request content is ever logged: no path, query, method,
