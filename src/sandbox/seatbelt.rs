@@ -487,6 +487,7 @@ fn generate_sbpl_profile_for_tty(
     push_codex_mach_section(&mut profile, config);
     push_chromium_rendezvous_section(&mut profile, config);
     push_trustd_section(&mut profile, config);
+    push_pasteboard_section(&mut profile, config);
     push_allow_pty_section(&mut profile, config);
     push_network_section(&mut profile, config, proxy_port);
     push_codex_control_socket_section(&mut profile, config);
@@ -897,6 +898,17 @@ fn push_chromium_rendezvous_section(profile: &mut String, config: &Config) {
     profile.push_str("; Chromium Mach rendezvous (--macos-chromium)\n");
     profile.push_str(&format!("(allow mach-register {name})\n"));
     profile.push_str(&format!("(allow mach-lookup {name})\n\n"));
+}
+
+/// Native clipboard access without the broad host IPC compatibility rules.
+fn push_pasteboard_section(profile: &mut String, config: &Config) {
+    if config.lockdown_enabled() || !config.macos_pasteboard_enabled() {
+        return;
+    }
+    profile.push_str("; Native macOS clipboard (--macos-pasteboard)\n");
+    profile.push_str(
+        "(allow mach-lookup (global-name \"com.apple.pasteboard.1\"))\n\n",
+    );
 }
 
 /// `--macos-trustd`: Go's crypto/x509 and Security.framework TLS clients
@@ -2167,6 +2179,61 @@ mod tests {
     #[test]
     fn chromium_rendezvous_is_dropped_under_lockdown() {
         assert!(!chromium_profile(true).contains("MachPortRendezvousServer"));
+    }
+
+    #[test]
+    fn pasteboard_is_narrow_opt_in_and_respects_lockdown() {
+        let base = Config::default();
+        let project = Path::new("/tmp/test-project");
+        let disabled = generate_sbpl_profile(&base, project);
+        assert!(!disabled.contains("com.apple.pasteboard.1"));
+        for (grant, lockdown, expected) in [
+            (false, false, false),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let config = Config {
+                macos_pasteboard: Some(grant),
+                lockdown: Some(lockdown),
+                ..base.clone()
+            };
+            let profile = generate_sbpl_profile(&config, project);
+            assert_eq!(profile.contains("com.apple.pasteboard.1"), expected);
+            assert!(!profile.contains("(allow mach-lookup)"));
+            assert!(!profile.contains("(allow iokit-open)"));
+            assert!(!profile.contains("(allow signal)"));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires a logged-in macOS pasteboard service"]
+    fn pasteboard_runtime_access_follows_grant_and_lockdown() {
+        use std::process::{Command, Stdio};
+        for (grant, lockdown, allowed) in [
+            (false, false, false),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let config = Config {
+                macos_pasteboard: Some(grant),
+                lockdown: Some(lockdown),
+                ..Config::default()
+            };
+            let profile = generate_sbpl_profile(&config, Path::new("/tmp"));
+            // Discard the user's clipboard, never print or replace it.
+            let status = Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "/usr/bin/pbpaste"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("sandbox-exec must run");
+            assert_eq!(
+                status.success(),
+                allowed,
+                "grant={grant}, lockdown={lockdown}"
+            );
+        }
     }
 
     fn trustd_profile(lockdown: bool) -> String {

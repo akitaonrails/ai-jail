@@ -38,7 +38,7 @@ or integration rather than saved sandbox authority.
     `--gcloud`, `--no-gcloud`, `--docker-config`, `--no-docker-config`
   - macOS compatibility: `--macos-host-ipc`, `--no-macos-host-ipc`,
     `--macos-chromium`, `--no-macos-chromium`, `--macos-trustd`,
-    `--no-macos-trustd`, `--allow-pty`, `--no-allow-pty`,
+    `--no-macos-trustd`, `--macos-pasteboard`, `--no-macos-pasteboard`, `--allow-pty`, `--no-allow-pty`,
     `--allow-loopback-listen`, `--no-allow-loopback-listen`
   - Workspace and audit: `--inherit-env`, `--no-inherit-env`, `--worktree`,
     `--no-worktree`, `--pictures`, `--no-pictures`, `--audit-log`,

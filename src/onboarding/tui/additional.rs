@@ -21,6 +21,7 @@ pub(super) enum Capability {
     MacosHostIpc,
     MacosChromium,
     MacosTrustd,
+    MacosPasteboard,
     MacosPty,
     MacosLoopbackListen,
     FullEnvironment,
@@ -30,7 +31,7 @@ pub(super) enum Capability {
 }
 
 impl Capability {
-    const ALL: [Self; 25] = [
+    const ALL: [Self; 26] = [
         Self::ShareHostHome,
         Self::Lockdown,
         Self::SystemdUser,
@@ -50,6 +51,7 @@ impl Capability {
         Self::MacosHostIpc,
         Self::MacosChromium,
         Self::MacosTrustd,
+        Self::MacosPasteboard,
         Self::MacosPty,
         Self::MacosLoopbackListen,
         Self::FullEnvironment,
@@ -65,6 +67,7 @@ impl Capability {
                 Self::MacosHostIpc
                 | Self::MacosChromium
                 | Self::MacosTrustd
+                | Self::MacosPasteboard
                 | Self::MacosPty
                 | Self::MacosLoopbackListen => cfg!(target_os = "macos"),
                 Self::SystemdUser
@@ -103,6 +106,7 @@ impl Capability {
             Self::MacosHostIpc => "Broad macOS host IPC",
             Self::MacosChromium => "macOS Chromium rendezvous",
             Self::MacosTrustd => "macOS TLS trust service",
+            Self::MacosPasteboard => "macOS clipboard",
             Self::MacosPty => "macOS runtime PTYs",
             Self::MacosLoopbackListen => "macOS loopback server",
             Self::FullEnvironment => "Every host environment variable",
@@ -118,6 +122,7 @@ impl Capability {
             | Self::TerminalAppearance
             | Self::MacosChromium
             | Self::MacosTrustd
+            | Self::MacosPasteboard
             | Self::MacosLoopbackListen
             | Self::Worktree
             | Self::AuditLog => Risk::Allowed,
@@ -146,6 +151,7 @@ impl Capability {
             Self::MacosHostIpc => s.macos_host_ipc,
             Self::MacosChromium => s.macos_chromium,
             Self::MacosTrustd => s.macos_trustd,
+            Self::MacosPasteboard => s.macos_pasteboard,
             Self::MacosPty => s.allow_pty,
             Self::MacosLoopbackListen => s.allow_loopback_listen,
             Self::FullEnvironment => s.inherit_env,
@@ -176,6 +182,7 @@ impl Capability {
             Self::MacosHostIpc => s.macos_host_ipc = value,
             Self::MacosChromium => s.macos_chromium = value,
             Self::MacosTrustd => s.macos_trustd = value,
+            Self::MacosPasteboard => s.macos_pasteboard = value,
             Self::MacosPty => s.allow_pty = value,
             Self::MacosLoopbackListen => s.allow_loopback_listen = value,
             Self::FullEnvironment => s.inherit_env = value,
@@ -243,6 +250,9 @@ impl Capability {
             }
             Self::MacosTrustd => {
                 "Allows\nOnly macOS trustd lookup so TLS clients can verify certificates.\n\nStill blocked\nOther broad host IPC remains unavailable."
+            }
+            Self::MacosPasteboard => {
+                "Allows\nRead and write native macOS clipboard contents, including text and images.\n\nRisk\nCopied private data can be read and clipboard contents replaced. Other broad host IPC remains blocked."
             }
             Self::MacosPty => {
                 "Allows\nOpening runtime PTY devices on macOS.\n\nRisk\nThe path rule can cover other terminals owned by your user."
@@ -324,6 +334,9 @@ impl Capability {
             Self::MacosTrustd => {
                 "A macOS TLS client needs the host trust service to verify certificates."
             }
+            Self::MacosPasteboard => {
+                "The task needs native copy/paste or pasting screenshots into the agent."
+            }
             Self::MacosPty => {
                 "A macOS task must create runtime pseudo-terminals for interactive subprocesses."
             }
@@ -380,7 +393,7 @@ mod tests {
 
     #[test]
     fn catalog_is_unique_and_every_detail_is_short_and_explicit() {
-        assert_eq!(Capability::ALL.len(), 25);
+        assert_eq!(Capability::ALL.len(), 26);
         let mut labels = Capability::ALL
             .into_iter()
             .map(Capability::label)
