@@ -1,3 +1,6 @@
+use crate::exit_reason::{
+    ChildStatus, HostTraits, StatusSource, Termination, from_exit_code,
+};
 use nix::sys::signal::{
     self, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal,
 };
@@ -274,15 +277,29 @@ pub fn install_handlers() {
     }
 }
 
-pub fn wait_child(pid: i32) -> i32 {
+/// Reap `pid` and keep how it ended. A direct signal death is `Direct`;
+/// an exit code goes through `from_exit_code`, which decodes `128 + sig`
+/// where the host folds signals (on Linux bwrap does: `kill -9` exits
+/// 137). A failed `waitpid` keeps the old fallback code 1.
+pub fn wait_child_status(pid: i32) -> ChildStatus {
     let pid = nix::unistd::Pid::from_raw(pid);
     loop {
         match waitpid(pid, Some(WaitPidFlag::empty())) {
-            Ok(WaitStatus::Exited(_, code)) => return code,
-            Ok(WaitStatus::Signaled(_, sig, _)) => return 128 + sig as i32,
+            Ok(WaitStatus::Exited(_, code)) => {
+                return from_exit_code(code, HostTraits::CURRENT);
+            }
+            Ok(WaitStatus::Signaled(_, sig, core)) => {
+                return ChildStatus {
+                    termination: Termination::Signaled {
+                        signal: sig as i32,
+                        core,
+                    },
+                    source: StatusSource::Direct,
+                };
+            }
             Ok(_) => continue,
             Err(nix::errno::Errno::EINTR) => continue,
-            Err(_) => return 1,
+            Err(_) => return from_exit_code(1, HostTraits::CURRENT),
         }
     }
 }

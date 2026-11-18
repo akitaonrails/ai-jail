@@ -701,6 +701,22 @@ it left open and waits up to 2 seconds for their lines, warning with the count
 of any still open after that.
 The existing `--audit-log` `connect` records are unchanged by this flag.
 
+When the sandboxed command dies of a signal, ai-jail prints one line on stderr
+saying which, and the limit behind it when one is known, also under `--exec`:
+
+```text
+⚠ sandbox exited with 153: killed by SIGXFSZ: the file-size rlimit was reached (1.0 GiB) (inferred from exit code 153)
+```
+
+A limit is named only when ai-jail knows it is in force: today that is the
+lockdown file-size ceiling. Any other signal, `SIGKILL` and `SIGXCPU`
+included, is named alone (`killed by SIGKILL`), because the status cannot say
+who sent it or why. A normal exit, and a deliberate
+`SIGHUP`, `SIGINT`, `SIGPIPE` or `SIGTERM`, print nothing. On Linux bwrap
+reports a signal death as an exit code `128 + N`; a signal decoded from one
+rather than seen directly says so (`inferred from exit code N`). On macOS an
+exit code is always taken as it is. The exit code is never changed.
+
 ## Project secrets
 
 The project directory is writable by default, so secrets inside it are

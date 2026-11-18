@@ -553,6 +553,12 @@ symlink, a non-regular file, a missing directory) refuses the launch, and the
 flag is refused on macOS. The README's `Run observability` section and
 `docs/SECURITY.md` describe every field and what a line can never contain.
 
+When the command dies of a signal, ai-jail prints one stderr line naming the
+signal and the limit behind it when one is known (the file-size rlimit under
+`--lockdown`, with the value actually in force), even under `--exec`. Ordinary
+exits and deliberate signals print nothing, and the exit code is unchanged.
+There is no setting for it.
+
 ## Migration and reapproval
 
 Legacy repository `.ai-jail` files contribute restrictions only. Commands,
