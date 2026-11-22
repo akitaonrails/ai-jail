@@ -196,6 +196,13 @@ Selecting it or passing `--agent-state` mounts the harness state so it starts
 pre-authenticated. `--no-agent-state` forces an isolated, logged-out run. Use
 `--no-private-home` only as an explicit broad host-home exception.
 
+On macOS outside lockdown, Codex can reach named system services needed for
+startup even with `--no-agent-state`. These include managed preferences
+(including the two named CFPreferences shared-memory regions), TLS trust,
+system configuration, notifications, and directory lookup. The Codex-specific
+Keychain lookup and host control socket still require agent state. The
+separate `--macos-host-ipc` flag grants broad host IPC.
+
 ## Platform notes and residual risks
 
 Linux combines bubblewrap namespaces with Landlock, seccomp, and resource
