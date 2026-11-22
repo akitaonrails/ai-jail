@@ -950,21 +950,16 @@ fn push_allow_pty_section(profile: &mut String, config: &Config) {
     profile.push_str("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))\n\n");
 }
 
-/// Codex's managed app-server initializes macOS account and notification
-/// services before it publishes its control socket. Keep these lookups
-/// limited to Codex launches; neither service is granted to arbitrary tools.
+/// Codex initializes managed preferences and system services before it
+/// authenticates. Keychain access remains tied to the agent-state grant.
 fn push_codex_mach_section(profile: &mut String, config: &Config) {
-    if config.lockdown_enabled()
-        || !config.agent_state_enabled()
-        || !config.has_harness("codex")
-    {
+    if config.lockdown_enabled() || !config.has_harness("codex") {
         return;
     }
 
     profile.push_str("; Codex app-server system services\n");
     for service in [
         "com.apple.cfprefsd.agent",
-        "com.apple.SecurityServer",
         "com.apple.trustd.agent",
         "com.apple.SystemConfiguration.configd",
         "com.apple.system.notification_center",
@@ -973,6 +968,11 @@ fn push_codex_mach_section(profile: &mut String, config: &Config) {
         profile.push_str(&format!(
             "(allow mach-lookup (global-name \"{service}\"))\n"
         ));
+    }
+    if config.agent_state_enabled() {
+        profile.push_str(
+            "(allow mach-lookup (global-name \"com.apple.SecurityServer\"))\n",
+        );
     }
     profile.push('\n');
 
@@ -2467,9 +2467,35 @@ mod tests {
         };
         let no_agent_state_profile =
             generate_sbpl_profile(&no_agent_state, &project);
-        assert!(!no_agent_state_profile.contains("com.apple.cfprefsd.agent"));
-        assert!(!no_agent_state_profile.contains("com.apple.trustd.agent"));
-        assert!(!no_agent_state_profile.contains("ipc-posix-shm-read-data"));
+        for service in [
+            "com.apple.cfprefsd.agent",
+            "com.apple.trustd.agent",
+            "com.apple.SystemConfiguration.configd",
+            "com.apple.system.notification_center",
+            "com.apple.system.opendirectoryd.libinfo",
+        ] {
+            assert!(
+                no_agent_state_profile.contains(&format!(
+                    "(allow mach-lookup (global-name \"{service}\"))"
+                )),
+                "missing {service}"
+            );
+        }
+        assert!(!no_agent_state_profile.contains("com.apple.SecurityServer"));
+        assert!(!no_agent_state_profile.contains(&escaped));
+        let preference_rule = format!(
+            "(allow ipc-posix-shm-read-data (ipc-posix-name \"apple.cfprefs.{uid}v1\"))"
+        );
+        assert!(no_agent_state_profile.contains(&preference_rule));
+
+        let lockdown = Config {
+            lockdown: Some(true),
+            ..no_agent_state
+        };
+        let lockdown_profile = generate_sbpl_profile(&lockdown, &project);
+        assert!(!lockdown_profile.contains("com.apple.cfprefsd.agent"));
+        assert!(!lockdown_profile.contains("com.apple.SecurityServer"));
+        assert!(!lockdown_profile.contains(&preference_rule));
 
         let other_tool = Config {
             command: vec!["bash".into()],

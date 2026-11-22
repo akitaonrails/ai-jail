@@ -84,7 +84,19 @@ jobs:
 
   build-linux:
     needs: preflight
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+            artifact: linux-release
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+            artifact: linux-arm64-release
+    runs-on: ${{ matrix.runner }}
+    env:
+      ARCH: ${{ matrix.arch }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -118,12 +130,15 @@ jobs:
           echo "apt failed after 3 attempts" >&2
           exit 1
       - name: Test and build unsigned Linux binary
-        run: cargo test --locked --features test-hooks && cargo build --locked --release --target x86_64-unknown-linux-gnu
+        run: cargo test --locked --features test-hooks && cargo build --locked --release --target "${ARCH}-unknown-linux-gnu"
       - name: Archive and checksum
         run: |
-          tar czf ai-jail-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-gnu/release ai-jail
-          sha256sum ai-jail-linux-x86_64.tar.gz > ai-jail-linux-x86_64.tar.gz.sha256
+          set -eu
+          archive="ai-jail-linux-${ARCH}.tar.gz"
+          tar czf "$archive" -C "target/${ARCH}-unknown-linux-gnu/release" ai-jail
+          sha256sum "$archive" > "$archive.sha256"
       - name: Build Debian package
+        if: matrix.arch == 'x86_64'
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -132,10 +147,10 @@ jobs:
             target/x86_64-unknown-linux-gnu/release/ai-jail .
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: linux-release
+          name: ${{ matrix.artifact }}
           path: |
-            ai-jail-linux-x86_64.tar.gz
-            ai-jail-linux-x86_64.tar.gz.sha256
+            ai-jail-linux-${{ matrix.arch }}.tar.gz
+            ai-jail-linux-${{ matrix.arch }}.tar.gz.sha256
             ai-jail_*_amd64.deb
             ai-jail_*_amd64.deb.sha256
           if-no-files-found: error
@@ -248,13 +263,20 @@ jobs:
           path: artifacts
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          name: linux-arm64-release
+          path: artifacts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
           name: macos-release
           path: artifacts
       - name: Verify final artifacts
-        run: cd artifacts && sha256sum -c ai-jail-linux-x86_64.tar.gz.sha256 && sha256sum -c ai-jail-macos-aarch64.tar.gz.sha256 && sha256sum -c ai-jail_*_amd64.deb.sha256
+        run: cd artifacts && sha256sum -c ai-jail-linux-x86_64.tar.gz.sha256 && sha256sum -c ai-jail-linux-aarch64.tar.gz.sha256 && sha256sum -c ai-jail-macos-aarch64.tar.gz.sha256 && sha256sum -c ai-jail_*_amd64.deb.sha256
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: artifacts/ai-jail-linux-x86_64.tar.gz
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: artifacts/ai-jail-linux-aarch64.tar.gz
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: artifacts/ai-jail-macos-aarch64.tar.gz
@@ -279,6 +301,10 @@ jobs:
           path: artifacts
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          name: linux-arm64-release
+          path: artifacts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
           name: macos-release
           path: artifacts
       - name: Verify checksums and assemble release notes
@@ -288,6 +314,7 @@ jobs:
           set -eu
           cd artifacts
           sha256sum -c ai-jail-linux-x86_64.tar.gz.sha256
+          sha256sum -c ai-jail-linux-aarch64.tar.gz.sha256
           sha256sum -c ai-jail-macos-aarch64.tar.gz.sha256
           sha256sum -c ai-jail_*_amd64.deb.sha256
           cd ..

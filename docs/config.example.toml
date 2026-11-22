@@ -1,0 +1,91 @@
+# Trusted global configuration: $XDG_CONFIG_HOME/ai-jail/config.toml
+# (~/.config/ai-jail/config.toml when XDG_CONFIG_HOME is unset).
+# All settings are commented out. Enable only the lines you need.
+# This file can grant host access. Keep it outside the checkout and set mode 0600.
+
+# Launch and profile defaults
+# command = ["claude"]
+# project_strategy = "basename" # "repo-root" shares policy across linked worktrees
+# no_save_config = true         # disable automatic project policy writes
+
+# Filesystem access. Maps accept PATH or SOURCE:DEST.
+# ro_maps = ["~/reference"]
+# rw_maps = ["~/scratch"]
+# overlay_maps = ["~/reference"] # Linux copy-on-write, macOS read-only
+# private_home = true
+# pictures = false
+# no_worktree = true
+# hide_dotdirs = [".example-cache"]
+# mask = ["./.env"]
+# mask_exceptions = ["./.env.example"]
+# deny_paths = ["./private"]
+# deny_path_exceptions = ["./private/example"]
+# no_hide_config = false
+# claude_dir = "~/.claude"
+
+# Egress. Omit network for built-in filtered defaults. Setting it to false
+# suppresses those defaults but keeps explicitly approved hosts reachable.
+# network = false
+# allow_hosts = ["api.anthropic.com"]
+# allow_private_hosts = []     # separate approval for named private hosts
+# prompt_hosts = false         # Linux desktop approval for new destinations
+# forward_ports = []           # host loopback services, specified by port
+# publish_ports = []           # Linux, publish jailed ports to host loopback
+# allow_tcp_ports = []         # obsolete, nonempty lists are refused
+
+# Credentials and environment. Each enabled grant is available to the jail.
+# agent_state = false
+# ssh = false
+# github = false
+# aws = false
+# kube = false
+# gcloud = false
+# docker_config = false
+# inherit_env = false
+# env_pass = ["LANG"]          # names read from the invoking environment
+# env_from_file = []           # owner-only files outside the checkout
+# secret_hosts = {}            # see README for the filtered HTTPS secret proxy
+
+# Linux host integrations and tools. For inverted no_* keys, true disables.
+# no_gpu = true
+# no_docker = true
+# tailscale = false
+# no_display = true
+# x11 = false
+# audio = false
+# kvm = false
+# host_shm = false
+# systemd_user = false
+# no_toolchains = false
+# no_mise = false
+
+# macOS compatibility grants
+# macos_host_ipc = false
+# macos_chromium = false
+# macos_trustd = false
+# macos_pasteboard = false
+# allow_pty = false
+# allow_loopback_listen = false
+# allow_loopback_connect = false
+
+# Isolation, terminal and diagnostics
+# lockdown = false
+# no_landlock = false
+# no_seccomp = false
+# no_rlimits = false
+# browser_profile = "hard"
+# no_status_bar = false
+# status_bar_style = "pastel"   # also "light" or "dark"
+# resize_redraw_key = "ctrl+l"
+# terminal_passthrough = false
+# terminal_appearance = false
+# update_check = false
+# audit_log = false
+
+# Legacy compatibility only. An empty list grants no repository trust.
+# trust_project_config = []
+
+# Optional per-command overrides. Keep these tables below the global keys.
+# [commands.claude]
+# agent_state = true
+# allow_hosts = ["api.anthropic.com"]

@@ -126,3 +126,41 @@ fn same_path_map_restores_a_previously_remapped_destination() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn explicitly_mapped_home_directories_can_be_listed() {
+    require_bwrap!();
+    let ls = Path::new("/usr/bin/ls");
+    if !ls.is_file() {
+        return;
+    }
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
+    let fixture = MapFixture::new("home-listing");
+    let directory = fixture.home.join("explicit-share");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("visible")).unwrap();
+    for flag in ["--map", "--rw-map"] {
+        let output = Command::new(ai_jail())
+            .args([
+                "--clean",
+                "--no-mise",
+                "--no-toolchains",
+                "--no-agent-state",
+                "--no-network",
+                "--no-save-config",
+                "--no-status-bar",
+                "--exec",
+                flag,
+            ])
+            .arg(&directory)
+            .arg(ls)
+            .arg(&directory)
+            .current_dir(&fixture.project)
+            .env_clear()
+            .env("HOME", &fixture.home)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert_eq!(assert_ok(&output), "visible\n", "{flag}");
+    }
+}

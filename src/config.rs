@@ -1007,6 +1007,54 @@ pub(crate) fn parse_global_toml(
     toml::from_str(contents).map_err(|e| e.to_string())
 }
 
+#[test]
+fn global_config_example_is_inert_and_documents_public_keys() {
+    let example = include_str!("../docs/config.example.toml");
+    assert_eq!(parse_global_toml(example).unwrap(), GlobalConfig::default());
+
+    let uncommented = example
+        .lines()
+        .filter_map(|line| line.strip_prefix("# "))
+        .filter(|line| {
+            line.starts_with('[')
+                || line.split_once(" = ").is_some_and(|(key, _)| {
+                    key.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || byte == b'_'
+                    })
+                })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let parsed = parse_global_toml(&uncommented).unwrap();
+    let expected_keys = include_str!("config.rs")
+        .split_once("pub struct Config {\n")
+        .unwrap()
+        .1
+        .split_once("\n}\n")
+        .unwrap()
+        .0
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pub "))
+        .filter_map(|line| line.split_once(':').map(|(key, _)| key))
+        .filter(|key| *key != "runtime_harnesses")
+        .collect::<std::collections::BTreeSet<_>>();
+    let raw = uncommented.parse::<toml::Table>().unwrap();
+    for key in &expected_keys {
+        assert!(raw.contains_key(*key), "missing example for {key}");
+    }
+    for key in raw.keys() {
+        assert!(
+            expected_keys.contains(key.as_str())
+                || matches!(key.as_str(), "commands" | "project_strategy"),
+            "unknown example key {key}",
+        );
+    }
+    assert_eq!(parsed.base.agent_state, Some(false));
+    assert_eq!(parsed.commands["claude"].agent_state, Some(true));
+}
+
 /// Whether a symlinked config may be followed.
 ///
 /// The project `.ai-jail` is untrusted input, so it is always read as a

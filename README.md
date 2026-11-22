@@ -49,7 +49,8 @@ nix run github:akitaonrails/ai-jail -- claude
 nix profile install github:akitaonrails/ai-jail
 
 # GitHub Releases (signed archives, checksums alongside)
-# ai-jail-linux-x86_64.tar.gz / ai-jail-macos-aarch64.tar.gz
+# Linux: ai-jail-linux-x86_64.tar.gz or ai-jail-linux-aarch64.tar.gz
+# macOS (Apple silicon): ai-jail-macos-aarch64.tar.gz
 # ai-jail_<version>_amd64.deb (Debian/Ubuntu)
 ```
 
@@ -782,6 +783,10 @@ session scratch directory and is removed when the browser exits; only the
 selected native `.app` bundle is made readable, not all of `/Applications`.
 
 ## Configuration
+
+See the [commented global config example](docs/config.example.toml) for
+supported keys, value types, and per-command overrides. Uncomment only the
+settings you want to apply.
 
 Current policy lives outside the repository:
 
