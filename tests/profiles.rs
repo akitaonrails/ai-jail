@@ -316,6 +316,50 @@ fn a_cli_env_entry_is_never_read_as_the_profile_s() {
 }
 
 #[test]
+fn a_cli_override_that_turns_a_grant_off_leaves_no_widening() {
+    // Maintainer's review of #230: github=true in the profile, --no-github
+    // on the command line. The launch does not grant github, so no line may
+    // say the profile widened it; the grant the CLI leaves alone still does.
+    let tree = Tree::new(
+        "cli-off",
+        "[profiles.gh]\nprofile_version = 1\ngithub = true\npictures = true\n",
+    );
+    let out = tree.dry_run(&["--profile", "gh"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "gh");
+    assert!(line_for(&lines, "github").is_some(), "{lines:?}");
+
+    let out = tree.dry_run(&["--profile", "gh", "--no-github"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "gh");
+    assert!(line_for(&lines, "github").is_none(), "{lines:?}");
+    assert!(line_for(&lines, "pictures").is_some(), "{lines:?}");
+}
+
+#[test]
+fn a_saved_project_restriction_leaves_no_widening() {
+    // The same delta when the restriction comes from saved policy rather
+    // than this invocation: --init saves the constraint, the next launch
+    // names only the profile.
+    let tree = Tree::new(
+        "saved-off",
+        "[profiles.gh]\nprofile_version = 1\ngithub = true\npictures = true\n",
+    );
+    let init = tree.run(&["--no-status-bar", "--no-github", "--init", "bash"]);
+    assert_ok(&init);
+    assert!(
+        tree.saved_project_policy().contains("github"),
+        "--init must save the github constraint: {}",
+        tree.saved_project_policy()
+    );
+    let out = tree.dry_run(&["--profile", "gh"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "gh");
+    assert!(line_for(&lines, "github").is_none(), "{lines:?}");
+    assert!(line_for(&lines, "pictures").is_some(), "{lines:?}");
+}
+
+#[test]
 fn a_profile_that_widens_nothing_prints_nothing() {
     let tree = Tree::new(
         "widens-nothing",
@@ -382,6 +426,26 @@ fn profile_unknown_key_fails_the_launch_before_anything_runs() {
         stdout(&out).is_empty(),
         "nothing may be printed as a launch"
     );
+}
+
+#[test]
+fn profile_unknown_key_with_an_empty_value_fails_the_launch() {
+    // An empty array or table is still a key the selected profile does not
+    // know (maintainer's review of #230).
+    for (key, body) in [
+        ("allow_hostz", "allow_hostz = []\n"),
+        ("inline_table", "inline_table = {}\n"),
+        ("header_table", "[profiles.typo.header_table]\n"),
+    ] {
+        let tree = Tree::new(
+            &format!("unknown-empty-{key}"),
+            &format!("[profiles.typo]\nprofile_version = 1\n{body}"),
+        );
+        let out = tree.dry_run(&["--profile", "typo"]);
+        let err = assert_refused(&out);
+        assert!(err.contains(key), "{key}: must name the key: {err}");
+        assert!(stdout(&out).is_empty(), "{key}: nothing may launch");
+    }
 }
 
 #[test]

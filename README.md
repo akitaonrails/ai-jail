@@ -907,8 +907,8 @@ then the project's saved policy. Trust rules:
 - `profile_version = 1` is required. An unknown key (a typo such as
   `allow_host`), a wrong type, `trust_project_config`, `command` or a
   status-bar preference fails the launch and names the profile. An unknown
-  key whose value is empty (`[]`, `{}`, `""`) carries no restriction and is
-  accepted.
+  key is refused whatever its value, an empty `[]`, `{}` or `""` included: a
+  misspelt restriction left empty is still a misspelling.
 - A malformed profile that the launch does not select is ignored.
 - Only the CLI selects a profile. A `profile` key or `[profiles]` table in a
   project policy is ignored with a warning, and a profile is never saved into

@@ -518,13 +518,63 @@ const PROFILE_REFUSED_KEYS: &[&str] = &[
     "resize_redraw_key",
 ];
 
-/// `Config` fields that are deserialized but never serialized. A
-/// serialize round trip drops them, so the unknown-key check must not
-/// read their absence as a typo. The test
-/// `profile_accepts_every_unserialised_field_and_alias_in_config_rs`
-/// keeps this list in step with the struct.
-const NEVER_SERIALIZED: &[&str] =
-    &["env_pass", "env_from_file", "secret_hosts"];
+/// Every key `Config` deserializes, read from serde's derive: a derived
+/// `Deserialize` for a struct hands its field list to `deserialize_struct`
+/// before reading anything. `Config` has no `flatten`, which would bypass
+/// that call; `config_schema_keys_lists_every_field` fails if one appears.
+fn config_schema_keys() -> &'static [&'static str] {
+    use serde::de::{self, Visitor};
+
+    #[derive(Debug)]
+    struct Stop;
+    impl std::fmt::Display for Stop {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("field probe")
+        }
+    }
+    impl std::error::Error for Stop {}
+    impl de::Error for Stop {
+        fn custom<T: std::fmt::Display>(_: T) -> Self {
+            Stop
+        }
+    }
+
+    struct FieldProbe<'a>(&'a mut &'static [&'static str]);
+    impl<'de> de::Deserializer<'de> for FieldProbe<'_> {
+        type Error = Stop;
+        fn deserialize_any<V: Visitor<'de>>(
+            self,
+            _: V,
+        ) -> Result<V::Value, Stop> {
+            Err(Stop)
+        }
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Stop> {
+            *self.0 = fields;
+            Err(Stop)
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str
+            string bytes byte_buf option unit unit_struct newtype_struct seq
+            tuple tuple_struct map enum identifier ignored_any
+        }
+    }
+
+    static KEYS: std::sync::OnceLock<&'static [&'static str]> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        let mut fields: &'static [&'static str] = &[];
+        // The probe always stops with `Stop`; only the captured list matters.
+        let _ = <Config as serde::Deserialize>::deserialize(FieldProbe(
+            &mut fields,
+        ));
+        fields
+    })
+}
 
 /// The fields whose values are secrets, and the TOML shape each takes.
 const SECRET_FIELD_TYPES: &[(&str, &str)] = &[
@@ -697,16 +747,15 @@ pub(crate) fn select_profile(
     let config: Config = toml::Value::Table(table.clone())
         .try_into()
         .map_err(|e| value_free_error(name, &e.to_string()))?;
-    let known = toml::Table::try_from(&config)
-        .map_err(|e| format!("profile '{name}': {e}"))?;
+    // Judged against the struct's own field list, not a serialize round
+    // trip: the round trip drops empty arrays and tables, so a misspelt key
+    // holding `[]` or an empty `[profiles.NAME.key]` table passed unseen
+    // (maintainer's review of #230).
+    let schema = config_schema_keys();
     let unknown: Vec<String> = table
-        .iter()
-        .filter(|(key, value)| {
-            !known.contains_key(key.as_str())
-                && !NEVER_SERIALIZED.contains(&key.as_str())
-                && !is_empty_toml_value(value)
-        })
-        .map(|(key, _)| output::escape_control_bytes(key))
+        .keys()
+        .filter(|key| !schema.contains(&key.as_str()))
+        .map(|key| output::escape_control_bytes(key))
         .collect();
     if !unknown.is_empty() {
         return Err(format!(
@@ -716,15 +765,6 @@ pub(crate) fn select_profile(
         ));
     }
     Ok(config)
-}
-
-/// An empty array or table carries nothing, and a round trip drops it.
-fn is_empty_toml_value(value: &toml::Value) -> bool {
-    match value {
-        toml::Value::Array(items) => items.is_empty(),
-        toml::Value::Table(table) => table.is_empty(),
-        _ => false,
-    }
 }
 
 /// How the global config identifies a project.
@@ -9741,12 +9781,55 @@ mod profile_select_tests {
             ("mask_exept", "mask_exept = [\"/x\"]\n"),
             ("no_gpus", "no_gpus = true\n"),
             ("profile", "profile = \"other\"\n"),
+            // Empty values: a serialize round trip drops them, which is how
+            // they once passed as known (maintainer's review of #230).
+            ("allow_hostz", "allow_hostz = []\n"),
+            ("mask_exeptions", "mask_exeptions = {}\n"),
+            ("bogus_table", "[bogus_table]\n"),
+            ("bogus_text", "bogus_text = \"\"\n"),
         ] {
             let map = one("agent-test", body);
             let err = refused(&map, "agent-test");
             assert!(err.contains("agent-test"), "{key}: {err}");
             assert!(err.contains(key), "{key}: must name the key: {err}");
         }
+    }
+
+    #[test]
+    fn config_schema_keys_lists_every_field() {
+        // The unknown-key check trusts this list, so it must be the struct's
+        // fields exactly: one entry per `pub name:` line in `Config`.
+        let src = include_str!("config.rs");
+        let start = src.find("pub struct Config {").expect("Config");
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(
+            !body.contains("flatten"),
+            "serde(flatten) bypasses deserialize_struct's field list"
+        );
+        // A `#[serde(skip)]` field is never deserialized (runtime-only, such
+        // as `runtime_harnesses`), so it is rightly absent from the schema.
+        let mut declared: Vec<&str> = Vec::new();
+        let mut skipped = false;
+        for line in body.lines().map(str::trim) {
+            if line.starts_with("#[serde(") {
+                skipped |= line
+                    .trim_start_matches("#[serde(")
+                    .trim_end_matches(")]")
+                    .split(',')
+                    .any(|attr| attr.trim() == "skip");
+            } else if let Some(rest) = line.strip_prefix("pub ") {
+                if let Some((name, _)) = rest.split_once(':')
+                    && !skipped
+                {
+                    declared.push(name.trim());
+                }
+                skipped = false;
+            }
+        }
+        declared.sort_unstable();
+        let mut schema = config_schema_keys().to_vec();
+        schema.sort_unstable();
+        assert_eq!(schema, declared);
     }
 
     #[test]

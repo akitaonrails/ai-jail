@@ -577,9 +577,8 @@ github = true
 - Only `--profile NAME` selects a profile. An entry under `[profiles]` that no
   launch selects is ignored, whatever it contains.
 - `profile_version = 1` is required; a typo, an unknown key or a wrong type in
-  the selected profile refuses the launch. An unknown key whose value is
-  empty (`[]`, `{}`, `""`) carries no restriction and is accepted. A
-  secret-bearing field of the wrong type is refused without showing its
+  the selected profile refuses the launch, whatever its value, an empty `[]`,
+  `{}` or `""` included. A secret-bearing field of the wrong type is refused without showing its
   value.
 - Every access the profile adds that this launch applies is printed before
   the launch, even when other warnings are quiet, as
