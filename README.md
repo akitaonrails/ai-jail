@@ -767,6 +767,10 @@ selected native `.app` bundle is made readable, not all of `/Applications`.
 
 ## Configuration
 
+See the [commented global config example](docs/config.example.toml) for
+supported keys, value types, and per-command overrides. Uncomment only the
+settings you want to apply.
+
 Current policy lives outside the repository:
 
 1. `$XDG_CONFIG_HOME/ai-jail/config.toml` (normally
