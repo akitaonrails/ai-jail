@@ -702,6 +702,20 @@ it left open and waits up to 2 seconds for their lines, warning with the count
 of any still open after that.
 The existing `--audit-log` `connect` records are unchanged by this flag.
 
+ai-jail reports unexpected signals on stderr, including under `--exec`.
+On Linux, an exit code can also be consistent with a signal:
+
+```text
+⚠ sandbox exited with 153: consistent with SIGXFSZ: file-size rlimit set by ai-jail: 1.0 GiB (inferred from exit code 153)
+```
+
+For `SIGXFSZ`, ai-jail includes the lockdown file-size limit when it set one.
+The status alone cannot establish why a signal occurred. On Linux, bwrap
+returns `128 + N` for a signal, and a command can return the same code itself.
+The diagnostic labels this as an inference. macOS only reports signals the
+supervisor observed directly. Successful exits and `SIGHUP`, `SIGINT`,
+`SIGPIPE`, and `SIGTERM` produce no diagnostic. The exit code is unchanged.
+
 ## Project secrets
 
 The project directory is writable by default, so secrets inside it are
