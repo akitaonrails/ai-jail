@@ -553,11 +553,10 @@ symlink, a non-regular file, a missing directory) refuses the launch, and the
 flag is refused on macOS. The README's `Run observability` section and
 `docs/SECURITY.md` describe every field and what a line can never contain.
 
-When the command dies of a signal, ai-jail prints one stderr line naming the
-signal and the limit behind it when one is known (the file-size rlimit under
-`--lockdown`, with the value actually in force), even under `--exec`. Ordinary
-exits and deliberate signals print nothing, and the exit code is unchanged.
-There is no setting for it.
+ai-jail reports unexpected signals on stderr, including under `--exec`.
+Linux diagnostics distinguish a signal inferred from an exit code from a
+directly observed signal. For `SIGXFSZ`, the diagnostic includes the
+`--lockdown` file-size limit if ai-jail set one. The exit code is unchanged.
 
 ## Migration and reapproval
 

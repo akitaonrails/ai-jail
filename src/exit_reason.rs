@@ -178,9 +178,15 @@ impl ExitReason {
         if self.kind == ReasonKind::Exited || self.is_deliberate_signal() {
             return None;
         }
-        let killed_by =
-            self.signal.map(|s| format!("killed by {}", signal_name(s)));
-        let detail = match (killed_by, self.evidence.as_deref()) {
+        let signal = self.signal.map(|s| {
+            let description = if self.source == StatusSource::Inferred {
+                "consistent with"
+            } else {
+                "killed by"
+            };
+            format!("{description} {}", signal_name(s))
+        });
+        let detail = match (signal, self.evidence.as_deref()) {
             (Some(k), Some(e)) => format!("{k}: {e}"),
             (Some(k), None) => k,
             (None, Some(e)) => e.to_string(),
@@ -223,7 +229,7 @@ fn signal_reason(
             ReasonKind::Limit,
             Some(Limit::FileSize),
             Some(format!(
-                "the file-size rlimit was reached ({})",
+                "file-size rlimit set by ai-jail: {}",
                 human_bytes(bytes)
             )),
         ),
@@ -455,7 +461,7 @@ mod tests {
             .expect("explained");
         assert_eq!(
             line,
-            "sandbox exited with 137: killed by SIGKILL \
+            "sandbox exited with 137: consistent with SIGKILL \
              (inferred from exit code 137)"
         );
         assert!(!line.to_lowercase().contains("oom"), "{line}");
@@ -505,7 +511,7 @@ mod tests {
         assert_eq!(r.limit, Some(Limit::FileSize), "{r:?}");
         assert!(matches!(r.kind, ReasonKind::Limit));
         let line = r.explanation().expect("explained");
-        assert!(line.contains("file-size rlimit was reached"), "{line}");
+        assert!(line.contains("file-size rlimit set by ai-jail:"), "{line}");
         assert!(mentions_one_gib(&line), "{line}");
     }
 

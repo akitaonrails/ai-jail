@@ -421,7 +421,7 @@ fn exit_cpu_time_signal_names_no_limit() {
     );
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(152), "{stderr}");
-    assert!(stderr.contains("killed by SIGXCPU"), "{stderr}");
+    assert!(stderr.contains("consistent with SIGXCPU"), "{stderr}");
     assert!(!stderr.contains("rlimit"), "no limit claimed: {stderr}");
     assert_eq!(stderr.lines().count(), 1, "one line: {stderr}");
 }
@@ -433,12 +433,29 @@ fn exit_sigkill_names_the_signal_alone() {
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(137), "{stderr}");
     assert!(
-        stderr.contains("sandbox exited with 137: killed by SIGKILL"),
+        stderr.contains("sandbox exited with 137: consistent with SIGKILL"),
         "{stderr}"
     );
     assert!(!stderr.to_lowercase().contains("oom"), "no cause: {stderr}");
     assert!(!stderr.contains("journalctl"), "{stderr}");
     assert_eq!(stderr.lines().count(), 1, "one line: {stderr}");
+}
+
+#[test]
+fn ordinary_exit_153_does_not_claim_the_file_size_limit_was_reached() {
+    require_bwrap_net!();
+    let out = run(
+        "ordinary-153",
+        &["--lockdown", "--exec", "sh", "-c", "exit 153"],
+    );
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(153), "{stderr}");
+    assert!(stderr.contains("consistent with SIGXFSZ"), "{stderr}");
+    assert!(
+        stderr.contains("file-size rlimit set by ai-jail:"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("was reached"), "{stderr}");
 }
 
 #[test]
