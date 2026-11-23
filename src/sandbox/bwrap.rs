@@ -1325,10 +1325,11 @@ fn resolve_landlock_wrapper(
         // bridges.
         && config.forward_ports().is_empty()
         && config.publish_ports().is_empty()
-        // Explicit limits are applied only by the wrapper; skipping it
-        // would drop them while `--dry-run` and the audit record still
-        // report them.
+        // Explicit limits and the CPU set are applied only by the
+        // wrapper; skipping it would drop them while `--dry-run` and the
+        // audit record still report them.
         && config.rlimit.is_empty()
+        && config.cpus.is_none()
         // A teardown report needs the wrapper as the command's sub-reaper.
         && !teardown_report
     {
@@ -1397,6 +1398,12 @@ fn landlock_wrapper_args(
     for (name, value) in &config.rlimit {
         args.push("--rlimit".into());
         args.push(format!("{name}={value}"));
+    }
+    // --cpus: the wrapper pins itself to these CPUs right before its
+    // seccomp filter, which then refuses sched_setaffinity.
+    if let Some(cpus) = &config.cpus {
+        args.push("--cpus".into());
+        args.push(cpus.clone());
     }
 
     args.push(if config.gpu_enabled() {
@@ -9403,10 +9410,10 @@ mod roundtrip_rlimits_tests {
     }
 }
 
-// Explicit limits keep the in-sandbox wrapper.
+// Explicit limits and `cpus` keep the in-sandbox wrapper.
 //
-// Explicit limits are applied only by the wrapper, so it must run while
-// any is set, even with Landlock, seccomp, the default
+// Explicit limits and the CPU set are applied only by the wrapper, so it
+// must run while any is set, even with Landlock, seccomp, the default
 // limits and the network all off; otherwise they are applied nowhere
 // while `--dry-run` and the audit record report them.
 #[cfg(test)]
@@ -9451,5 +9458,15 @@ mod wrapper_explicit_limit_tests {
                 .any(|w| w[0] == "--rlimit" && w[1] == "nofile=64"),
             "the wrapper receives the limit: {args:?}"
         );
+    }
+
+    #[test]
+    fn wrapper_kept_for_cpus_with_every_control_off() {
+        let config = Config {
+            cpus: Some("0".into()),
+            ..all_off()
+        };
+        let wrapper = resolve_landlock_wrapper(&config, false).unwrap();
+        assert!(wrapper.is_some(), "--cpus 0 must keep the wrapper");
     }
 }

@@ -332,12 +332,12 @@ fn validate_network_flags(config: &config::Config) -> Result<(), String> {
     validate_publish_ports(config)
 }
 
-/// Every limit the sandbox would run under, or why it cannot run (an
-/// explicit limit off Linux). Run before any path that writes policy or
-/// reports readiness (`--init`, auto-save, `status`) as well as before the
-/// launch: the maintainer's review of #229 found the platform check after
-/// the `--init` and `status --json` return paths, so a limit no launch
-/// could honour was saved while status still reported readiness.
+/// Every limit the sandbox would run under, or why it cannot run: an
+/// explicit limit off Linux, a CPU set with no CPU left, a CPU set without
+/// seccomp. Run before any path that writes policy or reports readiness
+/// (`--init`, auto-save, `status`) as well as before the launch: the
+/// maintainer's review of #229 found an unavailable CPU set saved by
+/// `--init` while `status --json` still reported readiness.
 fn checked_limits(
     config: &config::Config,
     store: &config_store::StorePaths,
@@ -353,6 +353,12 @@ fn checked_limits(
         &mut limits,
         sandbox::rlimits::host_hard_limit,
     );
+    sandbox::affinity::check_launch(
+        config.cpus.as_deref(),
+        config.cpus_source,
+        project_policy,
+        config.seccomp_enabled(),
+    )?;
     Ok(limits)
 }
 
@@ -1074,6 +1080,17 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
         &cli.landlock_rw_paths,
         cli.verbose,
     )?;
+
+    // --cpus: pin this process (and so the command it becomes) before
+    // seccomp below refuses sched_setaffinity for good. Order: bridges,
+    // Landlock, affinity, seccomp, rlimits, then the agent. Linux only:
+    // `affinity::check_launch` refuses `--cpus` elsewhere before we get here.
+    #[cfg(target_os = "linux")]
+    if let Some(cpus) = config.cpus.as_deref() {
+        sandbox::affinity::apply_cpus(&sandbox::affinity::parse_cpu_list(
+            cpus,
+        )?)?;
+    }
 
     // Apply seccomp filter after Landlock (reduces kernel syscall
     // surface). Must happen before exec so the user command inherits
@@ -2203,6 +2220,9 @@ fn run(
                 sandbox::rlimits::fmt_rlim(ceiling)
             ));
         }
+        if let Some(cpus) = &config.cpus {
+            output::dry_run_line(&format!("cpus={cpus}"));
+        }
         let formatted = sandbox::dry_run(
             &guard,
             config,
@@ -2512,6 +2532,7 @@ fn run(
             exit_code,
             duration: launch_start.elapsed(),
             rlimits: &effective_limits,
+            cpus: config.cpus.as_deref(),
         }));
     }
 

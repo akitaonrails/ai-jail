@@ -236,19 +236,19 @@ guide_sections = ["Linked worktrees"]
 # Advanced CLI/config-only controls: no onboarding message of their own; the
 # final review is where their effect is shown.
 message_ids = []
-policy = "onboarding.advanced_rlimit_in_final_review"
-config_fields = ["rlimit"]
-cli_flags = ["--rlimit"]
+policy = "onboarding.advanced_rlimit_and_cpus_in_final_review"
+config_fields = ["rlimit", "cpus"]
+cli_flags = ["--rlimit", "--cpus"]
 enforced_by = [
   "src/onboarding.rs::render_effective_access",
   "src/sandbox/rlimits.rs::effective",
 ]
 verified_by = [
-  "cli::interface_rlimit_tests::interface_review_lists_each_explicit_limit",
+  "cli::interface_rlimit_tests::interface_review_lists_each_explicit_limit_and_the_cpu_set",
   "cli::interface_rlimit_tests::interface_review_lists_no_explicit_limit_for_defaults",
   "cli::interface_rlimit_tests::interface_user_guide_documents_every_field_and_sandbox_flag",
 ]
-guide_sections = ["Resource limits"]
+guide_sections = ["Resource limits and CPU set"]
 
 [[claim]]
 # Advanced CLI/config-only control: no onboarding message of its own; the

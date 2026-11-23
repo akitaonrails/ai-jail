@@ -461,7 +461,7 @@ resolved endpoint is forwarded as both `DOCKER_HOST` and `CONTAINER_HOST`.
 `--systemd-user` exposes only explicit user-bus sockets, but can still ask the
 host user manager to run services.
 
-### Resource limits without root: `--rlimit`
+### Resource limits without root: `--rlimit` and `--cpus`
 
 ai-jail always applies a few per-process limits (`nofile` 65536, `core` 0,
 `nproc` 4096; `nofile` 4096, `nproc` 1024 and `fsize` 1 GiB under
@@ -472,6 +472,7 @@ launch is refused rather than run without them.
 ```bash
 ai-jail --rlimit nofile=1024 --rlimit cpu=600 --dry-run claude
 ai-jail --rlimit data=8G --rlimit fsize=2G --dry-run claude
+ai-jail --cpus 0-3 --dry-run claude
 ```
 
 - Names: `nproc`, `nofile`, `core`, `cpu`, `fsize`, `data`, `as`. Values are a
@@ -512,16 +513,23 @@ ai-jail --rlimit data=8G --rlimit fsize=2G --dry-run claude
   lose precision past 2^53, so such a reader cannot tell it apart from nearby
   values.
 
+`--cpus LIST` (`8,24`, `0-3`) pins the sandbox to those CPUs with CPU affinity,
+and the seccomp filter then refuses `sched_setaffinity`, so nothing inside can
+widen the set (`taskset` fails). It is refused with `--no-seccomp`, where it
+would only be advisory, and for a CPU the launching process cannot use. A
+project policy may only narrow the set; one sharing no CPU with it refuses the
+launch. `--dry-run` prints `cpus=<list>`.
+
 What an unprivileged process **cannot** enforce, and so is not offered here —
 each needs a cgroup the user does not own:
 
-| Control                                        | Why it is not offered                                                                          |
-| ---------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `memory.max` (total memory)                    | `data`/`as` cap each process; a total across processes is a cgroup limit                       |
-| `cpu.max` (CPU share, throttling)              | rlimits can only end a process after N CPU seconds, not slow it down                           |
-| `cpuset.cpus` (which CPUs the sandbox runs on) | a CPU set is a cgroup control; affinity alone is advisory, since any process may widen its own |
-| `io.max` (disk bandwidth)                      | no rlimit bounds I/O rate                                                                      |
-| `pids.max` below Linux 5.14                    | before 5.14 `RLIMIT_NPROC` counts every process of the user on the host                        |
+| Control                                                      | Why it is not offered                                                                                               |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `memory.max` (total memory)                                  | `data`/`as` cap each process; a total across processes is a cgroup limit                                            |
+| `cpu.max` (CPU share, throttling)                            | rlimits can only end a process after N CPU seconds, not slow it down                                                |
+| `cpuset.cpus` exclusive CPUs (no other process may use them) | `--cpus` keeps the sandbox on a CPU set with affinity plus the seccomp lock, but cannot keep other processes off it |
+| `io.max` (disk bandwidth)                                    | no rlimit bounds I/O rate                                                                                           |
+| `pids.max` below Linux 5.14                                  | before 5.14 `RLIMIT_NPROC` counts every process of the user on the host                                             |
 
 `nproc` on Linux 5.14 and later counts per user _and_ user namespace, so host
 processes of the same user do not count against the sandbox's limit

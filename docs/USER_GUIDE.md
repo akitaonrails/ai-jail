@@ -574,15 +574,17 @@ name (`comm`) only; their command lines and environments are never read.
 The exit code is the command's own. On macOS the flag is accepted and
 changes nothing.
 
-## Resource limits
+## Resource limits and CPU set
 
-Per-process resource limits are an advanced CLI/config-only control: the
-onboarding screens do not offer them, because the right numbers
+Per-process resource limits and the CPU set are advanced CLI/config-only
+controls: the onboarding screens do not offer them, because the right numbers
 depend on the machine, not on the access you grant. Set them per launch or in
 the trusted global config:
 
 ```toml
 # ~/.config/ai-jail/config.toml
+cpus = "0-3"
+
 [rlimit]
 nofile = 4096
 data = "8G"
@@ -591,19 +593,23 @@ data = "8G"
 - `--rlimit NAME=VALUE` sets one limit for this launch; repeat it for more.
   In config, the `[rlimit]` table takes the same names and values. A project
   policy may only tighten a limit, never raise it.
+- `--cpus LIST` pins the sandbox to a CPU list such as `0-3` or `8,24`; in
+  config, `cpus`. It is Linux only and needs seccomp, which stops the sandbox
+  from widening its own CPU set.
 - Explicit limits are Linux only: elsewhere the launch is refused.
 - Under `--lockdown`, a value above the lockdown limit runs at that limit,
   with a warning.
-- A `--rlimit` given on the command line applies to that launch only. It is never saved into the project policy.
-- A limit this host cannot apply is caught before anything is
+- A `--rlimit` or `--cpus` given on the command line applies to that launch
+  only. It is never saved into the project policy.
+- A limit or CPU set this host cannot apply is caught before anything is
   written or reported ready: `--init` and the launch are refused before any
   policy is saved, `status --json` lists it as the `limits_unavailable`
   blocker, and plain `status` warns that a launch would be refused.
 
 The final `Complete effective access` review lists each explicit limit as
-`rlimit NAME=SOFT/HARD (SOURCE)`. `--dry-run` prints every effective limit,
-defaults included. The README section
-[Resource limits without root](../README.md#resource-limits-without-root---rlimit)
+`rlimit NAME=SOFT/HARD (SOURCE)` and the CPU set as `cpus=LIST`. `--dry-run`
+prints every effective limit, defaults included. The README section
+[Resource limits without root](../README.md#resource-limits-without-root---rlimit-and---cpus)
 covers each limit name and what it does to a process.
 
 ## Named profiles

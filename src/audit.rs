@@ -353,6 +353,8 @@ pub(crate) struct LaunchRecord<'a> {
     pub duration: std::time::Duration,
     /// Every limit the sandbox ran under; omitted when empty.
     pub rlimits: &'a [crate::sandbox::rlimits::EffectiveLimit],
+    /// The `--cpus` set, when one was given; omitted otherwise.
+    pub cpus: Option<&'a str>,
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
@@ -653,22 +655,25 @@ pub(crate) fn launch_record(record: &LaunchRecord<'_>) -> serde_json::Value {
     });
     // Optional and additive: a reader of older records sees no new key,
     // and existing keys are untouched.
-    if let Some(object) = value.as_object_mut()
-        && !record.rlimits.is_empty()
-    {
-        let limits: Vec<serde_json::Value> = record
-            .rlimits
-            .iter()
-            .map(|l| {
-                serde_json::json!({
-                    "name": l.name.as_str(),
-                    "soft": l.soft,
-                    "hard": l.hard,
-                    "source": l.source.as_str(),
+    if let Some(object) = value.as_object_mut() {
+        if !record.rlimits.is_empty() {
+            let limits: Vec<serde_json::Value> = record
+                .rlimits
+                .iter()
+                .map(|l| {
+                    serde_json::json!({
+                        "name": l.name.as_str(),
+                        "soft": l.soft,
+                        "hard": l.hard,
+                        "source": l.source.as_str(),
+                    })
                 })
-            })
-            .collect();
-        object.insert("rlimits".into(), limits.into());
+                .collect();
+            object.insert("rlimits".into(), limits.into());
+        }
+        if let Some(cpus) = record.cpus {
+            object.insert("cpus".into(), cpus.into());
+        }
     }
     // Secret fields already carry key names only (`Widening.granted`).
     if let Some(profile) = record.profile
@@ -910,6 +915,7 @@ mod tests {
             exit_code: 0,
             duration: std::time::Duration::from_millis(1500),
             rlimits: &[],
+            cpus: None,
         };
         log.record(launch_record(&launch));
         log.record(connect_record(
@@ -940,11 +946,11 @@ mod tests {
     }
 
     #[test]
-    fn launch_record_adds_rlimits_only_when_present() {
+    fn launch_record_adds_rlimits_and_cpus_only_when_present() {
         use crate::sandbox::rlimits::{
             EffectiveLimit, LimitSource, RlimitName,
         };
-        let base = |rlimits| LaunchRecord {
+        let base = |rlimits, cpus| LaunchRecord {
             command: &[],
             network_mode: "off",
             allow_hosts: &[],
@@ -965,10 +971,12 @@ mod tests {
             duration: std::time::Duration::ZERO,
             rlimits,
             profile: None,
+            cpus,
         };
         // An old-shaped record: no new key appears.
-        let old = launch_record(&base(&[]));
+        let old = launch_record(&base(&[], None));
         assert!(old.get("rlimits").is_none());
+        assert!(old.get("cpus").is_none());
         let limits = [EffectiveLimit {
             name: RlimitName::Cpu,
             soft: 60,
@@ -976,10 +984,11 @@ mod tests {
             source: LimitSource::Cli,
             ceiling: None,
         }];
-        let new = launch_record(&base(&limits));
+        let new = launch_record(&base(&limits, Some("0-3")));
         assert_eq!(new["rlimits"][0]["name"], "cpu");
         assert_eq!(new["rlimits"][0]["hard"], 65);
         assert_eq!(new["rlimits"][0]["source"], "cli");
+        assert_eq!(new["cpus"], "0-3");
         // Every pre-existing key is still there with the same value.
         let old_keys: Vec<&String> = old.as_object().unwrap().keys().collect();
         for key in old_keys {
@@ -1011,6 +1020,7 @@ mod tests {
             global_config: true,
             profile: None,
             rlimits: &[],
+            cpus: None,
             exit_code: 0,
             duration: std::time::Duration::ZERO,
         };

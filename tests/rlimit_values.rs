@@ -1,4 +1,4 @@
-// Adjustable per-process limits, observed through the
+// Adjustable per-process limits and CPU affinity, observed through the
 // built binary.
 //
 // Launch-refusal and --dry-run tests need no sandbox. Tests that look
@@ -188,6 +188,35 @@ fn field(line: &str, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The CPUs this test process may use, from the kernel.
+fn allowed_cpus() -> Vec<usize> {
+    let list = std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+        .map(|v| v.trim().to_string())
+        .unwrap();
+    let mut cpus = Vec::new();
+    for part in list.split(',') {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                cpus.extend(a.parse::<usize>().unwrap()..=b.parse().unwrap())
+            }
+            None => cpus.push(part.parse().unwrap()),
+        }
+    }
+    cpus
+}
+
+fn allowed_list_text() -> String {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+        .map(|v| v.trim().to_string())
+        .unwrap()
+}
+
 // ── --dry-run lines and --help ──────────────
 
 #[test]
@@ -238,6 +267,7 @@ fn help_says_limits_are_per_process_and_cpu_is_not_a_throttle() {
     let out = tree.run(&["--help"]);
     let text = format!("{}{}", stdout(&out), stderr(&out));
     assert!(text.contains("--rlimit"), "--help lacks --rlimit");
+    assert!(text.contains("--cpus"), "--help lacks --cpus");
     let lower = text.to_lowercase();
     assert!(
         lower.contains("each process") || lower.contains("per process"),
@@ -355,7 +385,58 @@ fn unknown_rlimit_name_in_a_config_file_is_fatal() {
     assert!(err.contains("rss"), "{err}");
 }
 
-// ── limits observed inside the jail ──────────
+// ── --cpus refusals at launch ──────────
+
+#[test]
+fn cpus_outside_the_allowed_set_refuse_the_launch_naming_entry_and_set() {
+    let tree = Tree::new("cpus-outside");
+    let allowed = allowed_cpus();
+    let outside = (0..1024).rev().find(|c| !allowed.contains(c)).unwrap();
+    let err = assert_refused(&tree.dry_run(&["--cpus", &outside.to_string()]));
+    assert!(err.contains(&outside.to_string()), "{err}");
+    assert!(err.contains(&allowed_list_text()), "names the set: {err}");
+    let err = assert_refused(&tree.dry_run(&["--cpus", "0-x"]));
+    assert!(err.contains("0-x"), "{err}");
+}
+
+#[test]
+fn cpus_without_seccomp_is_refused_as_advisory() {
+    let tree = Tree::new("cpus-no-seccomp");
+    let cpu = allowed_cpus()[0].to_string();
+    let err = assert_refused(&tree.dry_run(&["--no-seccomp", "--cpus", &cpu]));
+    assert!(err.to_lowercase().contains("seccomp"), "{err}");
+}
+
+#[test]
+fn project_cpus_disjoint_from_the_trusted_set_refuse_the_launch() {
+    let tree = Tree::new("cpus-disjoint");
+    let cpus = allowed_cpus();
+    let trusted = cpus[0];
+    let other = cpus.get(1).copied().unwrap_or(trusted + 1);
+    // A project set that overlaps the trusted one narrows it: accepted.
+    tree.project_file(&format!("cpus = \"{trusted}\"\n"));
+    assert_ok(&tree.dry_run(&["--cpus", &format!("{trusted},{other}")]));
+    // One that shares no CPU with it leaves nothing to run on: refused.
+    tree.project_file(&format!("cpus = \"{other}\"\n"));
+    assert_refused(&tree.dry_run(&["--cpus", &trusted.to_string()]));
+}
+
+#[test]
+fn dry_run_prints_the_effective_cpu_set() {
+    let tree = Tree::new("cpus-dry-run");
+    let cpu = allowed_cpus()[0].to_string();
+    let out = tree.dry_run(&["--cpus", &cpu]);
+    assert_ok(&out);
+    let text = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        text.lines()
+            .map(str::trim)
+            .any(|l| l.starts_with("cpus") && l.contains(&cpu)),
+        "no `cpus ...` line naming {cpu}: {text}"
+    );
+}
+
+// ── limits and affinity observed inside the jail ──────────
 
 #[test]
 fn rlimit_nofile_is_the_soft_and_hard_limit_inside() {
@@ -447,14 +528,71 @@ fn rlimit_nproc_is_applied_inside_and_its_count_is_measured() {
     assert!(spawned < 64, "nproc=64 was not enforced: {spawned} forks");
 }
 
+#[test]
+fn cpus_restricts_every_sandboxed_process_to_the_list() {
+    require_bwrap_net!();
+    let tree = Tree::new("cpus-inside");
+    let cpu = allowed_cpus()[0].to_string();
+    let out = tree.jail(
+        &["--cpus", &cpu],
+        "grep Cpus_allowed_list /proc/self/status; \
+         bash -c 'grep Cpus_allowed_list /proc/self/status'",
+    );
+    let text = assert_ok(&out);
+    let lists: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(lists, [cpu.as_str(), cpu.as_str()], "{text}");
+}
+
+#[test]
+fn affinity_lock_fires_only_when_cpus_is_set() {
+    require_bwrap_net!();
+    require_tool!("python3");
+    let tree = Tree::new("cpus-lock");
+    let probe = "python3 -c 'import os\n\
+        try:\n\
+        \x20   os.sched_setaffinity(0, os.sched_getaffinity(0))\n\
+        \x20   print(\"SET_OK\")\n\
+        except PermissionError as e:\n\
+        \x20   print(\"EPERM\" if e.errno == 1 else \"OTHER\")\n\
+        print(\"GET\", sorted(os.sched_getaffinity(0)))\n'";
+    // Hostile half first: without --cpus nothing may be locked.
+    let plain = assert_ok(&tree.jail(&[], probe));
+    assert!(plain.contains("SET_OK"), "locked without --cpus: {plain}");
+    let cpu = allowed_cpus()[0];
+    let pinned = assert_ok(&tree.jail(&["--cpus", &cpu.to_string()], probe));
+    assert!(pinned.contains("EPERM"), "not locked with --cpus: {pinned}");
+    assert!(pinned.contains(&format!("GET [{cpu}]")), "{pinned}");
+}
+
+#[test]
+fn taskset_cannot_widen_the_cpu_set_inside() {
+    require_bwrap_net!();
+    require_tool!("taskset");
+    let tree = Tree::new("taskset");
+    let cpu = allowed_cpus()[0].to_string();
+    let script = format!(
+        "taskset -p -c {} $$ >/dev/null 2>&1 && echo WIDENED || echo REFUSED",
+        allowed_list_text()
+    );
+    let out = tree.jail(&["--cpus", &cpu], &script);
+    assert_eq!(assert_ok(&out).trim(), "REFUSED");
+}
+
 // ── the audit launch record ────────────────────────
 
 #[test]
-fn audit_record_carries_effective_rlimits() {
+fn audit_record_carries_effective_rlimits_and_cpus() {
     require_bwrap_net!();
     let tree = Tree::new("audit");
-    let out = tree
-        .jail_with_home(&["--audit-log", "--rlimit", "nofile=1024"], "exit 3");
+    let cpu = allowed_cpus()[0].to_string();
+    let out = tree.jail_with_home(
+        &["--audit-log", "--rlimit", "nofile=1024", "--cpus", &cpu],
+        "exit 3",
+    );
     assert_eq!(out.status.code(), Some(3), "stderr={}", stderr(&out));
     let log = tree.home.join(".local/share/ai-jail/history.jsonl");
     let content = std::fs::read_to_string(&log).unwrap();
@@ -474,6 +612,7 @@ fn audit_record_carries_effective_rlimits() {
     assert_eq!(nofile["source"], "cli");
     let core = rlimits.iter().find(|r| r["name"] == "core").expect("core");
     assert_eq!(core["source"], "default");
+    assert_eq!(record["cpus"], cpu.as_str());
 }
 
 // ── supervisor and wrapper agree (round trip) ─────────────

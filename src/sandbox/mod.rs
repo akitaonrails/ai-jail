@@ -68,6 +68,7 @@ mod seatbelt;
 #[cfg(target_os = "linux")]
 mod seccomp;
 
+pub(crate) mod affinity;
 pub(crate) mod rlimits;
 
 #[cfg(test)]

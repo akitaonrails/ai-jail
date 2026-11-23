@@ -65,6 +65,8 @@ or integration rather than saved sandbox authority.
   `--mask`, `--mask-except`, `--deny-path`, `--deny-path-except`
 - Kernel enforcement overrides: `--landlock`, `--no-landlock`, `--seccomp`,
   `--no-seccomp`, `--rlimits`, `--no-rlimits`
+- CPU affinity locked by seccomp: `--cpus` (Linux; shown by `--dry-run` as
+  `cpus=…`)
 - Per-process resource limits: `--rlimit` (a precise numeric primitive per
   limit name; every effective limit, its source and the CPU grace are shown
   by `--dry-run` as `rlimit name=… soft=… hard=… source=…`)
