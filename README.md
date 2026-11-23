@@ -898,6 +898,57 @@ ignores a directory's own saved policy says so with a warning. See
 project_strategy = "repo-root"
 ```
 
+### Named profiles: `--profile NAME`
+
+A profile is a named `[profiles.NAME]` table in the trusted global
+`config.toml`. It holds the same keys as a `[commands.<name>]` table and is
+applied only when a launch says `--profile NAME`, once:
+
+```toml
+# ~/.config/ai-jail/config.toml
+[profiles.agent-test]
+profile_version = 1
+allow_hosts = ["registry.npmjs.org"]
+pictures = true
+mask = ["/usr/bin/ssh"]
+```
+
+```text
+$ ai-jail --profile agent-test --dry-run claude
+⚠ profile=agent-test widens=pictures granted="true"
+⚠ profile=agent-test widens=allow_hosts granted="registry.npmjs.org"
+```
+
+Order: global base, then the command table, then the profile, then CLI flags,
+then the project's saved policy. Trust rules:
+
+- Every access the profile adds that this launch applies is printed before
+  the sandbox starts, without `--verbose` and under `--dry-run`, as
+  `profile=NAME widens=FIELD granted="…"`, and recorded in the audit log.
+  It is measured after every layer: a grant another layer already gives
+  (the CLI, the project's saved grants), one a first non-interactive
+  launch replaces with restricted defaults, and one `--lockdown` drops
+  print nothing. Tightening (`mask`, `no_gpu = true`, …) prints nothing,
+  and a profile that widens nothing prints no line at all.
+  Printed with security warnings, so `--exec` does not silence them.
+- Secret values stay out of what profiles print and save: the widening
+  lines, the audit record, `status`, the effective-access review, refusals
+  and saved files. There `env_pass` and `secret_hosts` show key names only,
+  `env_from_file` shows file paths, never their contents, and a wrong-typed
+  secret field is refused naming the field and the expected type, never the
+  value. The bwrap command line that `--dry-run` prints predates profiles
+  and is not covered: it still shows `--setenv NAME VALUE` literally.
+- Names match `[a-z0-9][a-z0-9_-]{0,63}`; nothing is normalised.
+- `profile_version = 1` is required. An unknown key (a typo such as
+  `allow_host`), a wrong type, `trust_project_config`, `command` or a
+  status-bar preference fails the launch and names the profile. An unknown
+  key is refused whatever its value, an empty `[]`, `{}` or `""` included: a
+  misspelt restriction left empty is still a misspelling.
+- A malformed profile that the launch does not select is ignored.
+- Only the CLI selects a profile. A `profile` key or `[profiles]` table in a
+  project policy is ignored with a warning, and a profile is never saved into
+  a project's policy.
+
 Legacy polarity warning: older boolean fields keep their inverted `no_*`
 names (`no_gpu`, `no_docker`, `no_display`, `no_worktree`, `no_mise`,
 `no_landlock`, `no_seccomp`, `no_rlimits`, `no_save_config`, `no_hide_config`,
