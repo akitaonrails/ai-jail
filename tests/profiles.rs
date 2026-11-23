@@ -189,7 +189,7 @@ fn line_for<'a>(
 #[test]
 fn widening_lines_name_profile_field_and_values_without_verbose() {
     let tree = Tree::new("lines", WIDE);
-    let out = tree.dry_run(&["--profile", "wide"]);
+    let out = tree.dry_run(&["--no-toolchains", "--profile", "wide"]);
     assert_ok(&out);
     let lines = widening_lines(&out, "wide");
     let hosts = line_for(&lines, "allow_hosts").expect("allow_hosts line");
@@ -204,6 +204,72 @@ fn widening_lines_name_profile_field_and_values_without_verbose() {
     );
     // A tightening is not a widening.
     assert!(line_for(&lines, "no_gpu").is_none(), "{lines:?}");
+}
+
+#[test]
+fn default_registry_egress_is_not_reported_as_a_profile_grant() {
+    require_bwrap_net!();
+    let tree = Tree::new("registry-default", WIDE);
+    let out = tree.dry_run(&["--profile", "wide"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "wide");
+    let hosts = line_for(&lines, "allow_hosts").expect("allow_hosts line");
+    assert!(hosts.contains("api.example.com"), "{hosts}");
+    assert!(!hosts.contains("registry.npmjs.org"), "{hosts}");
+}
+
+#[test]
+fn a_profile_reports_changed_secret_bindings_by_name_only() {
+    let tree = Tree::new(
+        "secret-destination",
+        r#"
+env_pass = ["AJ_PROFILE_SECRET=synthetic-value"]
+allow_hosts = ["original.example", "different.example"]
+secret_hosts = { AJ_PROFILE_SECRET = "original.example" }
+
+[profiles.changed]
+profile_version = 1
+secret_hosts = { AJ_PROFILE_SECRET = "different.example" }
+
+[profiles.unchanged]
+profile_version = 1
+secret_hosts = { AJ_PROFILE_SECRET = "original.example" }
+"#,
+    );
+    let changed = tree.dry_run(&["--profile", "changed"]);
+    assert_ok(&changed);
+    assert_eq!(
+        widening_lines(&changed, "changed"),
+        BTreeSet::from([
+            r#"profile=changed widens=secret_hosts granted="AJ_PROFILE_SECRET""#.into(),
+        ])
+    );
+    assert!(!stderr(&changed).contains("synthetic-value"));
+
+    let unchanged = tree.dry_run(&["--profile", "unchanged"]);
+    assert_ok(&unchanged);
+    assert!(widening_lines(&unchanged, "unchanged").is_empty());
+}
+
+#[test]
+fn a_profile_distinguishes_map_destinations_sharing_one_source() {
+    let tree = Tree::new(
+        "map-destinations",
+        r#"
+ro_maps = ["~/Pictures:/tmp/first-map"]
+
+[profiles.extra]
+profile_version = 1
+ro_maps = ["~/Pictures:/tmp/second-map", "~/Pictures:/tmp/third-map"]
+"#,
+    );
+    let out = tree.dry_run(&["--profile", "extra"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "extra");
+    let map = line_for(&lines, "ro_maps").expect("read-only map widening");
+    assert!(map.contains(":/tmp/second-map"), "{map}");
+    assert!(map.contains(":/tmp/third-map"), "{map}");
+    assert!(!map.contains("/tmp/first-map"), "{map}");
 }
 
 #[test]
@@ -577,7 +643,7 @@ fn audit_record_carries_the_profile_and_its_widenings() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert!(granted.contains(&"registry.npmjs.org"), "{granted:?}");
+    assert!(!granted.contains(&"registry.npmjs.org"), "{granted:?}");
     assert!(granted.contains(&"api.example.com"), "{granted:?}");
     let env = widenings
         .iter()

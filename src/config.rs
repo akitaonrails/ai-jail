@@ -1785,8 +1785,9 @@ impl ProfileReport {
         let by_launch =
             not_own(profile_widenings(&without_profile, launch, cwd, &label)?);
         let lockdown = launch.lockdown_enabled();
-        let widenings = by_profile
+        let mut widenings: Vec<Widening> = by_profile
             .into_iter()
+            .filter(|asked| asked.field != "secret_hosts")
             .filter(|asked| {
                 !(lockdown && LOCKDOWN_DROPS.contains(&asked.field.as_str()))
             })
@@ -1804,6 +1805,23 @@ impl ProfileReport {
                 })
             })
             .collect();
+        // Compare the destination before redacting. A baseline binding
+        // for the same variable does not authorize a different host.
+        let changed_bindings: Vec<String> = with_profile
+            .secret_hosts
+            .iter()
+            .filter(|(name, host)| {
+                without_profile.secret_hosts.get(*name) != Some(*host)
+                    && launch.secret_hosts.get(*name) == Some(*host)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if !changed_bindings.is_empty() {
+            widenings.push(Widening {
+                field: "secret_hosts".into(),
+                granted: changed_bindings,
+            });
+        }
         Ok(ProfileReport {
             name: self.name.clone(),
             widenings,
@@ -2047,10 +2065,23 @@ fn profile_widenings(
             project_dir,
             label,
         );
-        let new: Vec<Refusal> = refusals
-            .into_iter()
-            .filter(|r| !found.iter().any(|f| f.field == r.field))
-            .collect();
+        let mut new: Vec<Refusal> = Vec::new();
+        for refusal in refusals {
+            if found.iter().any(|prior| prior.field == refusal.field) {
+                continue;
+            }
+            if let Some(entry) =
+                new.iter_mut().find(|entry| entry.field == refusal.field)
+            {
+                for value in refusal.granted {
+                    if !entry.granted.contains(&value) {
+                        entry.granted.push(value);
+                    }
+                }
+            } else {
+                new.push(refusal);
+            }
+        }
         if new.is_empty() {
             return Ok(found);
         }
@@ -2389,7 +2420,7 @@ fn append_project_maps(
         {
             refusals.push(Refusal::new(
                 field,
-                vec![source.display().to_string()],
+                vec![map.display().to_string()],
                 format!(
                     "{layer} map {} outside project ignored \
                      (use --rw-map/--ro-map or global config)",

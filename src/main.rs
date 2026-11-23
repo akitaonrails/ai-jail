@@ -578,6 +578,30 @@ fn default_agent_api_egress_applies(config: &config::Config) -> bool {
         && config.browser_profile.is_none()
 }
 
+fn apply_default_egress_hosts(config: &mut config::Config) {
+    if default_agent_api_egress_applies(config)
+        && sandbox::unprivileged_netns_available()
+    {
+        for host in command::default_egress_hosts_for(
+            &config.runtime_harnesses,
+            &config.command,
+        ) {
+            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
+                config.allow_hosts.push((*host).into());
+            }
+        }
+    }
+    if default_registry_egress_applies(config)
+        && sandbox::unprivileged_netns_available()
+    {
+        for host in sandbox::TOOLCHAIN_REGISTRY_HOSTS {
+            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
+                config.allow_hosts.push((*host).into());
+            }
+        }
+    }
+}
+
 fn toolchain_dest_already_mapped(config: &config::Config, spec: &str) -> bool {
     let dest = |p: &std::path::Path| {
         config::MapSpec::parse(p)
@@ -762,27 +786,7 @@ pub(crate) fn finalize_launch_config_with_ssh(
             }
         }
     }
-    if default_agent_api_egress_applies(&config)
-        && sandbox::unprivileged_netns_available()
-    {
-        for host in command::default_egress_hosts_for(
-            &config.runtime_harnesses,
-            &config.command,
-        ) {
-            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
-                config.allow_hosts.push((*host).into());
-            }
-        }
-    }
-    if default_registry_egress_applies(&config)
-        && sandbox::unprivileged_netns_available()
-    {
-        for host in sandbox::TOOLCHAIN_REGISTRY_HOSTS {
-            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
-                config.allow_hosts.push((*host).into());
-            }
-        }
-    }
+    apply_default_egress_hosts(&mut config);
     if !config.lockdown_enabled() {
         for path in sandbox::credential_ro_paths(&config) {
             let spec = path.to_string_lossy().into_owned();
@@ -1764,7 +1768,10 @@ fn run(
     // what this launch applies, and a profile that widens nothing prints
     // nothing (#230 review). The audit record carries the same report.
     let profile_report = match (profile_report, profile_layers) {
-        (Some(report), Some(layers)) => {
+        (Some(report), Some(mut layers)) => {
+            layers.without_profile.runtime_harnesses =
+                config.runtime_harnesses.clone();
+            apply_default_egress_hosts(&mut layers.without_profile);
             let applied = report.applied(layers, &config, &invocation_cwd)?;
             for line in applied.lines() {
                 output::security_warn(&line);
