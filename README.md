@@ -506,6 +506,11 @@ ai-jail --rlimit data=8G --rlimit fsize=2G --dry-run claude
   started with shows that limit and `ceiling=host`. Under `--lockdown`, a
   value lowered to lockdown's default adds
   `rlimit name=<n> requested=<r> lockdown_ceiling=<c>`.
+- In the audit record each limit is a JSON number, and `unlimited` is
+  `18446744073709551615` (`RLIM_INFINITY`, `u64::MAX`). Parse it as a 64-bit
+  integer: JavaScript, and `jq` when it compares or computes, use doubles and
+  lose precision past 2^53, so such a reader cannot tell it apart from nearby
+  values.
 
 What an unprivileged process **cannot** enforce, and so is not offered here —
 each needs a cgroup the user does not own:
