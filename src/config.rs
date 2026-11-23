@@ -10890,6 +10890,7 @@ mod profile_field_coverage_tests {
     /// cannot come from a file at all.
     const NEVER_WIDENS: &[&str] = &[
         "runtime_harnesses",
+        "rlimit_source",
         "command",
         "hide_dotdirs",
         "mask",
@@ -10929,6 +10930,7 @@ mod profile_field_coverage_tests {
             "[\"x.example\"]",
             "[4242]",
             "{ AJ_PROFILE_KEY = \"x.example\" }",
+            "{ nofile = \"unlimited\" }",
         ];
         let fields = config_fields();
         assert!(fields.len() > 40, "scanner found {fields:?}");
@@ -10953,7 +10955,12 @@ mod profile_field_coverage_tests {
                         Path::new("/project"),
                         "profile 'coverage'",
                     );
-                    refusals.iter().any(|r| r.field == *field)
+                    refusals.iter().any(|r| {
+                        r.field == *field
+                            || r.field
+                                .strip_prefix(field)
+                                .is_some_and(|suffix| suffix.starts_with('.'))
+                    })
                 })
             });
             if !refused {

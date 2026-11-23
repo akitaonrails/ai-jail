@@ -3569,7 +3569,7 @@ mod interface_profile_tests {
     --allow-loopback-connect --no-allow-loopback-connect --no-gpu
     --gpu --no-docker --docker --tailscale --no-tailscale --landlock
     --no-landlock --seccomp --no-seccomp --rlimits --no-rlimits --ssh
-    --no-ssh --pictures --no-pictures --clean   --dry-run
+    --no-ssh --pictures --no-pictures --clean
     --rw-map --ro-map --overlay-map --map --mask --deny-path
     --mask-except --deny-path-except --hide-dotdir --allow-tcp-port
     --allow-private-host --systemd-user --no-systemd-user
