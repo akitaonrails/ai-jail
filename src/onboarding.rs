@@ -470,6 +470,7 @@ pub(crate) fn prepare_profile(
             proposed.restricted_ssh.clone()
         },
     )?;
+    crate::checked_limits(&finalized.config, effective.store)?;
     let forge_preview =
         if effective.cli.clean || finalized.config.lockdown_enabled() {
             None
@@ -1575,6 +1576,7 @@ fn run_sequential(
             proposed.restricted_ssh.clone()
         },
     )?;
+    crate::checked_limits(&finalized.config, effective.store)?;
     eprintln!(
         "{}",
         render_effective_access(

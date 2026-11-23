@@ -1869,6 +1869,7 @@ fn run(
         )?,
     };
     let mut launch_runner = LaunchRunner::new(finalized);
+    let effective_limits = checked_limits(launch_runner.config(), &store)?;
     if let Some(warning) = launch_runner.github_warning() {
         output::warn(warning);
     }
@@ -2049,11 +2050,6 @@ fn run(
         forge_auth::strip_runtime(&mut to_save);
         config_store::save_project_constraints(&store, to_save)?;
     }
-
-    // Every limit the sandbox will run under, on the final launch config,
-    // so an impossible combination stops the launch before anything
-    // starts, dry run included.
-    let effective_limits = checked_limits(config, &store)?;
 
     // Handle dry run
     if cli.dry_run {
@@ -2308,9 +2304,13 @@ fn run(
     // One explanation line per run, after the terminal is restored so
     // it is not drawn into the child's screen. Normal exits and
     // deliberate signals print nothing.
+    // An explicit FSIZE limit is set in the sandbox wrapper. Reading the
+    // supervisor's limit would report the wrong value in that case.
+    let supervisor_fsize_applies =
+        file_size_set && !config.rlimit.contains_key("fsize");
     let reason = exit_reason::classify(
         &child_status,
-        &exit_reason::LimitsInForce::read_back(file_size_set),
+        &exit_reason::LimitsInForce::read_back(supervisor_fsize_applies),
     );
     if let Some(line) = reason.explanation() {
         output::security_warn(&line);

@@ -556,7 +556,8 @@ flag is refused on macOS. The README's `Run observability` section and
 ai-jail reports unexpected signals on stderr, including under `--exec`.
 Linux diagnostics distinguish a signal inferred from an exit code from a
 directly observed signal. For `SIGXFSZ`, the diagnostic includes the
-`--lockdown` file-size limit if ai-jail set one. The exit code is unchanged.
+`--lockdown` file-size limit when it set one and the sandbox uses that
+default. The exit code is unchanged.
 
 ## Resource limits
 

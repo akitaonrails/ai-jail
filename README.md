@@ -775,7 +775,8 @@ On Linux, an exit code can also be consistent with a signal:
 ⚠ sandbox exited with 153: consistent with SIGXFSZ: file-size rlimit set by ai-jail: 1.0 GiB (inferred from exit code 153)
 ```
 
-For `SIGXFSZ`, ai-jail includes the lockdown file-size limit when it set one.
+For `SIGXFSZ`, ai-jail includes the lockdown file-size limit when it set one
+and the sandbox uses that default.
 The status alone cannot establish why a signal occurred. On Linux, bwrap
 returns `128 + N` for a signal, and a command can return the same code itself.
 The diagnostic labels this as an inference. macOS only reports signals the

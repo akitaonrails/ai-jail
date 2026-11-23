@@ -459,6 +459,30 @@ fn ordinary_exit_153_does_not_claim_the_file_size_limit_was_reached() {
 }
 
 #[test]
+fn explicit_file_size_limit_does_not_report_the_supervisor_limit() {
+    require_bwrap_net!();
+    let out = run(
+        "explicit-fsize-153",
+        &[
+            "--lockdown",
+            "--rlimit",
+            "fsize=64M",
+            "--exec",
+            "sh",
+            "-c",
+            "exit 153",
+        ],
+    );
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(153), "{stderr}");
+    assert!(stderr.contains("consistent with SIGXFSZ"), "{stderr}");
+    assert!(
+        !stderr.contains("file-size rlimit set by ai-jail"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn exit_only_unexplained_signals_speak() {
     require_bwrap_net!();
     // Clean exits and deliberate signals must stay silent, with their codes
