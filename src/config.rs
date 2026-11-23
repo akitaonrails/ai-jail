@@ -9843,8 +9843,8 @@ mod rlimit_config_tests {
             Config::default(),
             with_rlimit(&[("core", "100"), ("nofile", "unlimited")]),
         );
-        assert!(!merged.rlimit.contains_key("core"), "{:?}", merged.rlimit);
-        assert!(!merged.rlimit.contains_key("nofile"), "{:?}", merged.rlimit);
+        assert!(!merged.rlimit.contains_key("core"));
+        assert!(!merged.rlimit.contains_key("nofile"));
         assert!(
             warnings.iter().any(|w| w.contains("rlimit.core")),
             "{warnings:?}"
@@ -10042,17 +10042,16 @@ mod config_project_rlimit_save_tests {
     }
 
     fn assert_project_nproc(merged: &Config, value: &str, step: &str) {
-        assert_eq!(
-            merged.rlimit.get("nproc").map(String::as_str),
-            Some(value),
-            "{step}: {:?}",
-            merged.rlimit
+        assert!(
+            merged
+                .rlimit
+                .get("nproc")
+                .is_some_and(|limit| limit == value),
+            "{step}: unexpected process limit"
         );
-        assert_eq!(
-            merged.rlimit_source.get("nproc"),
-            Some(&LimitSource::Project),
-            "{step}: {:?}",
-            merged.rlimit_source
+        assert!(
+            merged.rlimit_source.get("nproc") == Some(&LimitSource::Project),
+            "{step}: expected the project to supply the process limit"
         );
     }
 
@@ -10111,17 +10110,14 @@ mod config_project_rlimit_save_tests {
     fn raising_project_nproc_is_still_ignored_at_launch() {
         // Guard: keeping a raising value on disk must never let it apply.
         let (merged, warnings) = launch(nproc("9000"));
-        assert_eq!(
-            merged.rlimit.get("nproc").map(String::as_str),
-            Some("8192"),
-            "{:?}",
-            merged.rlimit
+        assert!(
+            merged
+                .rlimit
+                .get("nproc")
+                .is_some_and(|limit| limit == "8192")
         );
-        assert_ne!(
-            merged.rlimit_source.get("nproc"),
-            Some(&LimitSource::Project),
-            "{:?}",
-            merged.rlimit_source
+        assert!(
+            merged.rlimit_source.get("nproc") != Some(&LimitSource::Project)
         );
         let named: Vec<&String> = warnings
             .iter()
@@ -10135,11 +10131,11 @@ mod config_project_rlimit_save_tests {
             Path::new("/project"),
         );
         let (merged, _) = launch(projected);
-        assert_eq!(
-            merged.rlimit.get("nproc").map(String::as_str),
-            Some("8192"),
-            "{:?}",
-            merged.rlimit
+        assert!(
+            merged
+                .rlimit
+                .get("nproc")
+                .is_some_and(|limit| limit == "8192")
         );
     }
 }
