@@ -718,12 +718,12 @@ supervisor observed directly. Successful exits and `SIGHUP`, `SIGINT`,
 
 `--teardown-report` (Linux) deals with processes that outlive the command,
 such as a dev server or watcher left running in the background. When the
-command exits, ai-jail lists every process still alive in the sandbox,
-sends each SIGTERM (and SIGCONT, so a stopped one can act on it), waits up to
-a fixed 2000 ms grace, then sends SIGKILL to the rest and lists the sandbox
-once more. A process that listing finds was started meanwhile, such as a
-worker a supervisor respawns on SIGTERM: it is not signalled again (the
-pid-namespace teardown ends it) and the report says `survivors-respawned`. When
+command exits, its orphaned children reparent to the jail supervisor. ai-jail
+sends its verified children SIGTERM (and SIGCONT for stopped processes), waits
+up to 2000 ms, then sends SIGKILL to any that are still alive. It needs Linux
+pidfd support to verify and signal those children. Children found only on the
+final scan are left to PID namespace cleanup and marked
+`survivors-respawned`. When
 there were survivors it prints one line on stderr with the count and names
 of those it stopped, at most ten and then `+N more`; with none it prints
 nothing and adds no delay. The line is printed even under `--exec`.

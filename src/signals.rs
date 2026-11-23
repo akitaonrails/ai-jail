@@ -150,22 +150,18 @@ pub fn wrap_supervised_command(
 }
 
 /// Supervisor work that must sit exactly around the sandbox spawn. The
-/// teardown report descriptor is made inheritable right
-/// before the fork and closed right after it, so no other child of the
-/// supervisor holds it. A `pre_exec` hook cannot do this:
-/// `wrap_supervised_command` replaces the `Command` and drops them.
+/// teardown attaches its child-only descriptor hook to the final wrapped
+/// command and closes the corresponding parent descriptors after spawning.
 pub trait SpawnBracket {
     /// Runs right before the fork; an error aborts the spawn.
-    fn before_spawn(&mut self) -> Result<(), String>;
+    fn before_spawn(&mut self, command: &mut Command);
     /// Runs right after the spawn returns, whether it succeeded or not.
     fn after_spawn(&mut self, spawned: bool);
 }
 
 /// No work around the spawn.
 impl SpawnBracket for () {
-    fn before_spawn(&mut self) -> Result<(), String> {
-        Ok(())
-    }
+    fn before_spawn(&mut self, _: &mut Command) {}
     fn after_spawn(&mut self, _spawned: bool) {}
 }
 
@@ -176,7 +172,7 @@ pub fn spawn_supervised(
 ) -> Result<Child, String> {
     let mut mask = HandledSignalMask::block()?;
     abort_if_cancelled()?;
-    bracket.before_spawn()?;
+    bracket.before_spawn(command);
     let spawned = command.spawn();
     bracket.after_spawn(spawned.is_ok());
     let mut child =

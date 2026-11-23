@@ -2,10 +2,9 @@
 //! whose write end the wrapper inherits at a fixed descriptor number, the
 //! reader that runs while the supervisor waits, and the stderr lines.
 //!
-//! The descriptor is made inheritable in the supervisor right before the
-//! spawn and closed right after it (`signals::SpawnBracket`), because the
-//! supervised-exec wrapper replaces the `Command` and drops `pre_exec`
-//! hooks. It survives the supervised exec and bwrap's exec
+//! The descriptor is made inheritable only inside the spawned child.
+//! The hook is installed after the supervised-exec command is assembled.
+//! The descriptor survives the supervised exec and bwrap's exec
 //! because it is not close-on-exec, and the in-sandbox wrapper marks it
 //! close-on-exec before it spawns anything.
 
@@ -130,22 +129,22 @@ impl TeardownRun {
 }
 
 impl crate::signals::SpawnBracket for TeardownRun {
-    fn before_spawn(&mut self) -> Result<(), String> {
+    fn before_spawn(&mut self, command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
         if let RunState::Ready(pipe) = &self.state {
             let n = pipe.slot.as_raw_fd();
-            // SAFETY: both are open descriptors owned by `pipe`. dup2 onto
-            // the slot's own number replaces it, atomically, with a
-            // duplicate that is NOT close-on-exec, so the sandbox
-            // inherits N; `slot` still owns (and later closes) N.
-            if unsafe { nix::libc::dup2(pipe.write.as_raw_fd(), n) } < 0 {
-                return Err(format!(
-                    "Cannot pass the teardown report descriptor {n} to the \
-                     sandbox: {}",
-                    std::io::Error::last_os_error()
-                ));
+            let write = pipe.write.as_raw_fd();
+            // SAFETY: both fds remain owned until spawn returns. The hook
+            // runs in the forked child and does only an fd duplication.
+            unsafe {
+                command.pre_exec(move || {
+                    if nix::libc::dup2(write, n) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
             }
         }
-        Ok(())
     }
 
     fn after_spawn(&mut self, spawned: bool) {
@@ -394,13 +393,16 @@ mod tests {
     }
 
     #[test]
-    fn the_slot_is_close_on_exec_until_armed_right_before_the_spawn() {
+    fn the_report_slot_is_inherited_only_by_the_intended_child() {
         let mut run = TeardownRun::start(true);
         let n = run.report_fd().expect("a pipe opens");
         assert!(n > 2, "never a stdio number: {n}");
         assert!(close_on_exec(n), "a child spawned earlier does not get N");
-        run.before_spawn().unwrap();
-        assert!(!close_on_exec(n), "the sandbox inherits N");
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", &format!("test -p /proc/self/fd/{n}")]);
+        run.before_spawn(&mut command);
+        assert!(command.status().unwrap().success());
+        assert!(close_on_exec(n), "the parent's slot stays close-on-exec");
         run.after_spawn(false);
         assert_eq!(run.report_fd(), None);
         // A spawn that failed leaves no report to wait for.
@@ -411,7 +413,6 @@ mod tests {
     fn a_report_written_on_the_slot_is_read_back() {
         let mut run = TeardownRun::start(true);
         let n = run.report_fd().unwrap();
-        run.before_spawn().unwrap();
         // Stand-in for the wrapper: its copy of N outlives the supervisor's.
         // SAFETY: `n` is open (owned by `run`) and LINE is a valid buffer.
         let wrote =
@@ -432,7 +433,6 @@ mod tests {
         // Nothing writes: EOF arrives only if both the pipe's write end and
         // the slot were closed by after_spawn, so finish cannot hang.
         let mut run = TeardownRun::start(true);
-        run.before_spawn().unwrap();
         run.after_spawn(true);
         match run.finish() {
             TeardownSection::Missing { reason } => {
@@ -477,7 +477,6 @@ mod tests {
         // wait for that child.
         let mut run = TeardownRun::start(true);
         let n = run.report_fd().expect("a pipe opens");
-        run.before_spawn().unwrap();
         // SAFETY: dup of a descriptor the run owns; closed at the end.
         let stray = unsafe { nix::libc::dup(n) };
         assert!(stray >= 0);

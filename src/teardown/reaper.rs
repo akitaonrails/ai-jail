@@ -12,7 +12,7 @@
 
 use super::{
     ChildStatusWire, GRACE, ProcStat, REPORT_VERSION, Survivor, TeardownReport,
-    WireUsage, is_dead_state, list_survivors, parse_proc_stat,
+    WireUsage, child_pidfd, list_survivors, signal_pidfd,
     stop_survivors_then_relist,
 };
 use nix::errno::Errno;
@@ -23,7 +23,7 @@ use nix::sys::signal::{
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 use std::io::Write;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -35,24 +35,27 @@ const SURVIVOR_CAP: usize = 256;
 /// otherwise push a 256-entry report past the 64 KiB read bound.
 const REASON_CAP: usize = 4096;
 
-/// The command's pid, read by the TERM/HUP forwarder. 0 until the spawn
-/// returns; the two signals stay blocked until it is set.
-static REAPER_CHILD_PID: AtomicI32 = AtomicI32::new(0);
+/// The command's pidfd, retained until the forwarder is disarmed.
+static REAPER_CHILD_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// SIGTERM/SIGHUP handler: forward to the command. Async-signal-
-/// safe only: an atomic load, `kill(2)`, and errno saved and restored so
+/// safe only: an atomic load, a raw syscall, and errno saved and restored so
 /// the interrupted `waitpid` reads its own errno, not this one's.
 extern "C" fn forward_to_reaper_child(sig: nix::libc::c_int) {
     let saved = Errno::last_raw();
-    let pid = REAPER_CHILD_PID.load(Ordering::SeqCst);
-    if pid > 0 {
-        // SAFETY: kill(2) is async-signal-safe and takes plain integers;
-        // `pid` is the command's, stored before TERM/HUP are unblocked and
-        // cleared right after it is reaped. A signal landing between that
-        // reap and the clear would need the pid reused in that instant;
-        // pids are allocated in sequence, so that is practically
-        // unreachable.
-        unsafe { nix::libc::kill(pid, sig) };
+    let fd = REAPER_CHILD_FD.load(Ordering::SeqCst);
+    if fd >= 0 {
+        // SAFETY: this single-threaded wrapper retains the kernel handle
+        // until the handler is disarmed. Ignore errors if the child exited.
+        unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_pidfd_send_signal,
+                fd,
+                sig,
+                std::ptr::null::<nix::libc::siginfo_t>(),
+                0,
+            )
+        };
     }
     Errno::set_raw(saved);
 }
@@ -64,6 +67,12 @@ pub fn claim_report_fd(fd: RawFd) -> Result<OwnedFd, String> {
     // 0-2 are the command's stdio: marking one CLOEXEC would take it away.
     if fd <= 2 {
         return Err(format!("--teardown-report-fd {fd}: not a report fd"));
+    }
+    use nix::sys::stat::fstat;
+    if !fstat(fd).is_ok_and(|stat| {
+        stat.st_mode & nix::libc::S_IFMT == nix::libc::S_IFIFO
+    }) {
+        return Err("Teardown report descriptor must be a pipe".into());
     }
     // SAFETY: F_GETFD/F_SETFD only read and set the descriptor's flags;
     // an invalid `fd` makes them fail with EBADF, which is returned.
@@ -214,21 +223,32 @@ pub fn run_command_as_reaper(
         return Err("--landlock-exec requires a command".into());
     }
     let mut reasons: Vec<String> = Vec::new();
-    if nix::sys::prctl::set_child_subreaper(true).is_err() {
-        reasons.push("subreaper-unavailable".into());
-    }
     // Not dumpable: /proc/<this pid>/fd is then closed to the command (same
     // uid, same Landlock domain), so it cannot reopen the report pipe there
     // and write a forged first line. It also keeps
     // the host's core handler away from the re-raise below: a piped
     // core_pattern ignores RLIMIT_CORE. exec resets the flag, so the
     // command itself is unaffected.
-    if nix::sys::prctl::set_dumpable(false).is_err() {
-        reasons.push("dumpable-unavailable".into());
+    // A pidfd for this wrapper is valid, but waitid must reject it as a
+    // non-child. Older kernels that cannot verify PIDFd return another error.
+    if !matches!(
+        child_pidfd(nix::unistd::getpid().as_raw()),
+        Err(Errno::ECHILD)
+    ) || nix::sys::prctl::set_child_subreaper(true).is_err()
+        || nix::sys::prctl::set_dumpable(false).is_err()
+    {
+        drop(report);
+        let error = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();
+        return Err(format!("Failed to exec {}: {error}", cmd[0]));
     }
     let inherited = install_signals()?;
     let child = spawn_command(cmd, inherited)?;
-    REAPER_CHILD_PID.store(child.as_raw(), Ordering::SeqCst);
+    let child_handle = child_pidfd(child.as_raw()).ok();
+    if let Some(handle) = &child_handle {
+        REAPER_CHILD_FD.store(handle.as_raw_fd(), Ordering::SeqCst);
+    } else {
+        reasons.push("child-pidfd-unavailable".into());
+    }
     // A TERM/HUP that arrived during the spawn is delivered here, now
     // that the forwarder knows where to send it.
     pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&inherited.mask), None)
@@ -238,7 +258,7 @@ pub fn run_command_as_reaper(
     let status = wait_for_command(child, &mut live_bridges)?;
     // The command is reaped: nothing is left to forward to, and its pid
     // may be reused.
-    REAPER_CHILD_PID.store(0, Ordering::SeqCst);
+    REAPER_CHILD_FD.store(-1, Ordering::SeqCst);
 
     let survivors = stop_the_survivors(&live_bridges, &mut reasons);
     // After the last reap, so the figures cover the command and every
@@ -260,12 +280,20 @@ const SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
 /// delay.
 fn list_settled(exclude: &[i32]) -> Result<Vec<ProcStat>, String> {
     let proc_root = std::path::Path::new("/proc");
-    let first = list_survivors(proc_root, exclude)?;
+    let me = nix::unistd::getpid().as_raw();
+    let owned = || {
+        list_survivors(proc_root, exclude).map(|list| {
+            list.into_iter()
+                .filter(|stat| stat.ppid == me)
+                .collect::<Vec<_>>()
+        })
+    };
+    let first = owned()?;
     if first.is_empty() {
         return Ok(first);
     }
     std::thread::sleep(SETTLE);
-    list_survivors(proc_root, exclude)
+    owned()
 }
 
 fn stop_the_survivors(
@@ -274,7 +302,7 @@ fn stop_the_survivors(
 ) -> Vec<Survivor> {
     match list_settled(bridges) {
         Ok(list) => {
-            // Every survivor is stopped; only the report is cut.
+            // The signal layer independently verifies child ownership.
             let mut relist = || list_settled(bridges);
             let (survivors, note) =
                 stop_survivors_then_relist(list, GRACE, &mut relist);
@@ -367,14 +395,9 @@ fn bounded_reason(reasons: &[String]) -> Option<String> {
 /// its pid reused: the parent check keeps a stranger out, and ESRCH is
 /// fine.
 fn kill_bridges(bridge_pids: &[i32]) {
-    let me = std::process::id() as i32;
     for &pid in bridge_pids {
-        let ours = std::fs::read(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|b| parse_proc_stat(&String::from_utf8_lossy(&b)))
-            .is_some_and(|s| s.ppid == me && !is_dead_state(s.state));
-        if ours {
-            let _ = nix::sys::signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+        if let Ok(handle) = child_pidfd(pid) {
+            let _ = signal_pidfd(&handle, Signal::SIGKILL);
         }
     }
 }
@@ -440,6 +463,12 @@ mod tests {
         }
         // A number far above any open descriptor of the test binary.
         assert!(claim_report_fd(1_000_000).is_err());
+    }
+
+    #[test]
+    fn claim_report_fd_refuses_a_non_pipe() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert!(claim_report_fd(file.as_raw_fd()).is_err());
     }
 
     #[test]

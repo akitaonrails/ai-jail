@@ -204,7 +204,7 @@ pub fn list_survivors(
         else {
             continue;
         };
-        if pid == 1 || pid == me || exclude.contains(&pid) {
+        if pid <= 1 || pid == me || exclude.contains(&pid) {
             continue;
         }
         let path = entry.path().join("stat");
@@ -218,7 +218,9 @@ pub fn list_survivors(
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
         match parse_proc_stat(&text) {
-            Some(stat) if !is_dead_state(stat.state) => out.push(stat),
+            Some(stat) if stat.pid == pid && !is_dead_state(stat.state) => {
+                out.push(stat);
+            }
             _ => {}
         }
     }
@@ -261,18 +263,36 @@ pub fn stop_survivors_noting_errors(
     let mut tracked: Vec<Tracked> = list
         .into_iter()
         .map(|stat| {
-            let ended_by = match send(stat.pid, Signal::SIGTERM) {
-                Ok(()) => {
+            let handle = match child_pidfd(stat.pid) {
+                Ok(handle) => Some(handle),
+                Err(nix::errno::Errno::ESRCH) => None,
+                Err(e) => {
+                    errors.push(format!(
+                        "verify teardown child {}: {e}",
+                        stat.pid
+                    ));
+                    None
+                }
+            };
+            let ended_by = match handle
+                .as_ref()
+                .map(|fd| signal_pidfd(fd, Signal::SIGTERM))
+            {
+                Some(Ok(())) => {
                     // A stopped process keeps the SIGTERM pending until it
                     // is continued, and would otherwise cost the whole
                     // grace and a SIGKILL. For a running one SIGCONT changes
                     // nothing unless it handles the signal, as after any
                     // job-control resume.
-                    let _ = send(stat.pid, Signal::SIGCONT);
+                    if let Some(fd) = &handle {
+                        let _ = signal_pidfd(fd, Signal::SIGCONT);
+                    }
                     None
                 }
-                Err(nix::errno::Errno::ESRCH) => Some(EndedBy::AlreadyGone),
-                Err(e) => {
+                None | Some(Err(nix::errno::Errno::ESRCH)) => {
+                    Some(EndedBy::AlreadyGone)
+                }
+                Some(Err(e)) => {
                     errors.push(format!("kill({}, SIGTERM): {e}", stat.pid));
                     Some(EndedBy::AlreadyGone)
                 }
@@ -281,6 +301,7 @@ pub fn stop_survivors_noting_errors(
                 age_s: now.age_of(stat.start_ticks),
                 stat,
                 ended_by,
+                handle,
             }
         })
         .collect();
@@ -289,7 +310,7 @@ pub fn stop_survivors_noting_errors(
     loop {
         reap_all();
         for t in tracked.iter_mut().filter(|t| t.ended_by.is_none()) {
-            if !is_alive(&t.stat) {
+            if !t.handle.as_ref().is_some_and(pidfd_alive) {
                 t.ended_by = Some(EndedBy::Sigterm);
             }
         }
@@ -304,7 +325,8 @@ pub fn stop_survivors_noting_errors(
     }
 
     for t in tracked.iter_mut().filter(|t| t.ended_by.is_none()) {
-        t.ended_by = Some(match send(t.stat.pid, Signal::SIGKILL) {
+        let Some(handle) = &t.handle else { continue };
+        t.ended_by = Some(match signal_pidfd(handle, Signal::SIGKILL) {
             Ok(()) => EndedBy::Sigkill,
             // It died between the last poll and the SIGKILL: the TERM
             // ended it.
@@ -317,15 +339,15 @@ pub fn stop_survivors_noting_errors(
     }
     // A SIGKILLed process is not a zombie yet when kill() returns: wait
     // for it, briefly, so the wrapper's getrusage counts it.
-    let killed: Vec<&ProcStat> = tracked
+    let killed: Vec<_> = tracked
         .iter()
         .filter(|t| t.ended_by == Some(EndedBy::Sigkill))
-        .map(|t| &t.stat)
+        .filter_map(|t| t.handle.as_ref())
         .collect();
     let reaped_by = Instant::now() + KILL_REAP_WAIT;
     loop {
         reap_all();
-        if !killed.iter().any(|s| is_alive(s)) {
+        if !killed.iter().any(|handle| pidfd_alive(handle)) {
             break;
         }
         if Instant::now() >= reaped_by {
@@ -430,10 +452,47 @@ struct Tracked {
     stat: ProcStat,
     age_s: u64,
     ended_by: Option<EndedBy>,
+    handle: Option<std::os::fd::OwnedFd>,
 }
 
-fn send(pid: i32, sig: nix::sys::signal::Signal) -> nix::Result<()> {
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), sig)
+/// Only processes the kernel recognizes as our children may receive a
+/// teardown signal. The retained pidfd prevents PID reuse changing the target.
+fn child_pidfd(pid: i32) -> nix::Result<std::os::fd::OwnedFd> {
+    use nix::sys::wait::{Id, WaitPidFlag, waitid};
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+    if pid <= 1 {
+        return Err(nix::errno::Errno::ECHILD);
+    }
+    // SAFETY: pidfd_open takes a positive PID and returns a fresh fd.
+    let fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(nix::errno::Errno::last());
+    }
+    // SAFETY: the syscall succeeded and transferred a newly allocated fd.
+    let handle = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    waitid(
+        Id::PIDFd(handle.as_fd()),
+        WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+    )?;
+    Ok(handle)
+}
+
+fn signal_pidfd(
+    fd: &std::os::fd::OwnedFd,
+    signal: nix::sys::signal::Signal,
+) -> nix::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the owned handle remains live; null requests default siginfo.
+    let result = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            signal as i32,
+            std::ptr::null::<nix::libc::siginfo_t>(),
+            0,
+        )
+    };
+    nix::errno::Errno::result(result).map(drop)
 }
 
 /// Reaps every child that has ended, without blocking. As sub-reaper the
@@ -449,24 +508,11 @@ fn reap_all() {
     }
 }
 
-/// Alive means: the pid still exists, is not a zombie, and is the same
-/// process (same start time) rather than a reused pid. A zombie whose own
-/// parent has not reaped it yet is dead for teardown purposes.
-fn is_alive(stat: &ProcStat) -> bool {
-    if let Err(nix::errno::Errno::ESRCH) =
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(stat.pid), None)
-    {
-        return false;
-    }
-    match std::fs::read(format!("/proc/{}/stat", stat.pid)) {
-        Ok(bytes) => match parse_proc_stat(&String::from_utf8_lossy(&bytes)) {
-            Some(now) => {
-                !is_dead_state(now.state) && now.start_ticks == stat.start_ticks
-            }
-            None => true,
-        },
-        Err(e) => !vanished(&e),
-    }
+fn pidfd_alive(handle: &std::os::fd::OwnedFd) -> bool {
+    use nix::poll::{PollFd, PollFlags, poll};
+    use std::os::fd::AsFd;
+    let mut pollfd = [PollFd::new(handle.as_fd(), PollFlags::POLLIN)];
+    !matches!(poll(&mut pollfd, 0u8), Ok(1))
 }
 
 /// The two inputs of `age_seconds`, read once per teardown. Either read
@@ -519,6 +565,13 @@ mod tests {
 
     use super::supervisor::parse_report_line;
     use super::*;
+
+    #[test]
+    fn kernel_ownership_check_refuses_non_children() {
+        for pid in [-1, 0, 1, std::process::id() as i32] {
+            assert!(child_pidfd(pid).is_err(), "unowned PID {pid}");
+        }
+    }
     use std::io::Write;
     use std::os::fd::OwnedFd;
     use std::path::{Path, PathBuf};

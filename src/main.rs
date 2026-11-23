@@ -2181,8 +2181,8 @@ fn run(
     // internal clone() calls for namespace creation.
     let file_size_set = sandbox::rlimits::apply(config, cli.verbose);
 
-    // Both spawn paths arm the report descriptor right before the fork
-    // and close it right after.
+    // Both spawn paths make the report descriptor inheritable in the
+    // intended child and close the parent copies after spawning.
     #[cfg(target_os = "linux")]
     let spawn_bracket: &mut dyn signals::SpawnBracket = &mut teardown_run;
     #[cfg(not(target_os = "linux"))]
