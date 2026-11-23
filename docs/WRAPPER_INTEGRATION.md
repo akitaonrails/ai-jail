@@ -164,6 +164,11 @@ and `blockers`. Stable blocker codes include `onboarding_required`,
 `changed_ssh_key`, and `backend_unavailable`. Status is read-only and never
 prompts.
 
+`named_profile` is present only when `--profile NAME` selected a named
+profile (`[profiles.NAME]` in the global config), and carries `NAME`.
+`project.profile_present` is unrelated: it says whether the project has a saved
+onboarding profile.
+
 `project` carries `canonical_path`, the launch directory, and `policy_path`,
 the directory whose saved policy applies. They differ only when the trusted
 global setting `project_strategy = "repo-root"` resolves a linked worktree to

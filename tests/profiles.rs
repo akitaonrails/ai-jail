@@ -1,0 +1,653 @@
+// `--profile NAME` through the built binary: the widening lines, refusals at launch, the project file's
+// inability to select a profile, saving, and the audit record.
+//
+// Each test gets a temporary HOME, XDG_CONFIG_HOME and project directory
+// under CARGO_TARGET_TMPDIR. The `[profiles.*]` tables live in the trusted
+// global config `$XDG_CONFIG_HOME/ai-jail/config.toml` (since v3.3.0;
+// `~/.ai-jail` is only the legacy file it migrates), and the project
+// policy that `--init` and auto-save write is the per-project document
+// under `$XDG_CONFIG_HOME/ai-jail/projects/`. --dry-run tests need no
+// sandbox; real launches need bwrap with network namespaces and skip with
+// a message when it is unavailable (`require_bwrap_net!` from
+// `tests/common/mod.rs`). Fixtures use only keys a v3.3.0 config can hold
+// (no cpus or rlimit keys), so this suite depends on no other change.
+#![cfg(target_os = "linux")]
+
+mod common;
+
+use common::ai_jail;
+use std::collections::BTreeSet;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// A profile that widens (filtered-egress hosts, a capability, a secret
+/// env entry) and also tightens (no_gpu).
+const WIDE: &str = "\
+[profiles.wide]
+profile_version = 1
+allow_hosts = [\"registry.npmjs.org\", \"api.example.com\"]
+pictures = true
+no_gpu = true
+env_pass = [\"AJ_PROFILE_SECRET=topsecret-value\"]
+";
+
+struct Tree {
+    root: PathBuf,
+    project: PathBuf,
+    home: PathBuf,
+    xdg: PathBuf,
+}
+
+impl Tree {
+    fn new(name: &str, global: &str) -> Self {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("ai-jail-prof-{name}-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = root.join("project");
+        let home = root.join("home");
+        let xdg = root.join("xdg");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(home.join("Pictures")).unwrap();
+        let store = xdg.join("ai-jail");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::set_permissions(
+            &store,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let config = store.join("config.toml");
+        std::fs::write(&config, global).unwrap();
+        std::fs::set_permissions(
+            &config,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        Self {
+            root,
+            project,
+            home,
+            xdg,
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(ai_jail())
+            .args(args)
+            .current_dir(&self.project)
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", &self.xdg)
+            .env_remove("AI_JAIL_QUIET")
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run ai-jail")
+    }
+
+    fn dry_run(&self, flags: &[&str]) -> Output {
+        let mut args = vec!["--no-status-bar", "--no-save-config"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["--dry-run", "bash"]);
+        self.run(&args)
+    }
+
+    fn launch(&self, flags: &[&str], script: &str) -> Output {
+        let _lock = common::SANDBOX_RUN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut args = vec!["--no-status-bar", "--no-save-config"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["bash", "-c", script]);
+        self.run(&args)
+    }
+
+    /// Every project policy this launch could have written: the per-project
+    /// documents of the store and the legacy project `.ai-jail`, joined.
+    /// A store document's `[project]` table is identity metadata (the
+    /// canonical path and key), not policy, and is dropped: the checkout
+    /// path may itself contain a word such as `profiles`.
+    fn saved_project_policy(&self) -> String {
+        let mut body = String::new();
+        if let Ok(entries) =
+            std::fs::read_dir(self.xdg.join("ai-jail/projects"))
+        {
+            for entry in entries.filter_map(Result::ok) {
+                let text =
+                    std::fs::read_to_string(entry.path()).unwrap_or_default();
+                let mut doc: toml::Table =
+                    text.parse().expect("project document is TOML");
+                doc.remove("project");
+                body.push_str(&toml::to_string(&doc).unwrap());
+            }
+        }
+        body.push_str(
+            &std::fs::read_to_string(self.project.join(".ai-jail"))
+                .unwrap_or_default(),
+        );
+        body
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+fn stdout(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+fn assert_ok(o: &Output) {
+    assert!(
+        o.status.success(),
+        "ai-jail failed: {:?}\nstdout={}\nstderr={}",
+        o.status,
+        stdout(o),
+        stderr(o)
+    );
+}
+
+fn assert_refused(o: &Output) -> String {
+    assert!(
+        !o.status.success(),
+        "launch must be refused\nstdout={}\nstderr={}",
+        stdout(o),
+        stderr(o)
+    );
+    stderr(o)
+}
+
+/// The `profile=<name> widens=...` lines of stderr, with any warning glyph
+/// in front stripped.
+fn widening_lines(o: &Output, name: &str) -> BTreeSet<String> {
+    let needle = format!("profile={name} ");
+    stderr(o)
+        .lines()
+        .filter_map(|l| l.find(&needle).map(|at| l[at..].trim().to_string()))
+        .filter(|l| l.contains("widens="))
+        .collect()
+}
+
+fn line_for<'a>(
+    lines: &'a BTreeSet<String>,
+    field: &str,
+) -> Option<&'a String> {
+    let needle = format!("widens={field} ");
+    lines.iter().find(|l| l.contains(&needle))
+}
+
+// ── The widening lines ─────────────────
+
+#[test]
+fn widening_lines_name_profile_field_and_values_without_verbose() {
+    let tree = Tree::new("lines", WIDE);
+    let out = tree.dry_run(&["--no-toolchains", "--profile", "wide"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "wide");
+    let hosts = line_for(&lines, "allow_hosts").expect("allow_hosts line");
+    assert!(
+        hosts.contains("registry.npmjs.org")
+            && hosts.contains("api.example.com"),
+        "{hosts}"
+    );
+    assert!(
+        line_for(&lines, "pictures").is_some(),
+        "capability line: {lines:?}"
+    );
+    // A tightening is not a widening.
+    assert!(line_for(&lines, "no_gpu").is_none(), "{lines:?}");
+}
+
+#[test]
+fn default_registry_egress_is_not_reported_as_a_profile_grant() {
+    require_bwrap_net!();
+    let tree = Tree::new("registry-default", WIDE);
+    let out = tree.dry_run(&["--profile", "wide"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "wide");
+    let hosts = line_for(&lines, "allow_hosts").expect("allow_hosts line");
+    assert!(hosts.contains("api.example.com"), "{hosts}");
+    assert!(!hosts.contains("registry.npmjs.org"), "{hosts}");
+}
+
+#[test]
+fn a_profile_reports_changed_secret_bindings_by_name_only() {
+    let tree = Tree::new(
+        "secret-destination",
+        r#"
+env_pass = ["AJ_PROFILE_SECRET=synthetic-value"]
+allow_hosts = ["original.example", "different.example"]
+secret_hosts = { AJ_PROFILE_SECRET = "original.example" }
+
+[profiles.changed]
+profile_version = 1
+secret_hosts = { AJ_PROFILE_SECRET = "different.example" }
+
+[profiles.unchanged]
+profile_version = 1
+secret_hosts = { AJ_PROFILE_SECRET = "original.example" }
+"#,
+    );
+    let changed = tree.dry_run(&["--profile", "changed"]);
+    assert_ok(&changed);
+    assert_eq!(
+        widening_lines(&changed, "changed"),
+        BTreeSet::from([
+            r#"profile=changed widens=secret_hosts granted="AJ_PROFILE_SECRET""#.into(),
+        ])
+    );
+    assert!(!stderr(&changed).contains("synthetic-value"));
+
+    let unchanged = tree.dry_run(&["--profile", "unchanged"]);
+    assert_ok(&unchanged);
+    assert!(widening_lines(&unchanged, "unchanged").is_empty());
+}
+
+#[test]
+fn a_profile_distinguishes_map_destinations_sharing_one_source() {
+    let tree = Tree::new(
+        "map-destinations",
+        r#"
+ro_maps = ["~/Pictures:/tmp/first-map"]
+
+[profiles.extra]
+profile_version = 1
+ro_maps = ["~/Pictures:/tmp/second-map", "~/Pictures:/tmp/third-map"]
+"#,
+    );
+    let out = tree.dry_run(&["--profile", "extra"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "extra");
+    let map = line_for(&lines, "ro_maps").expect("read-only map widening");
+    assert!(map.contains(":/tmp/second-map"), "{map}");
+    assert!(map.contains(":/tmp/third-map"), "{map}");
+    assert!(!map.contains("/tmp/first-map"), "{map}");
+}
+
+#[test]
+fn widening_lines_never_carry_a_secret_value() {
+    let tree = Tree::new("secret", WIDE);
+    let out = tree.dry_run(&["--profile", "wide"]);
+    assert_ok(&out);
+    let err = stderr(&out);
+    assert!(
+        !err.contains("topsecret-value"),
+        "secret value on stderr: {err}"
+    );
+    let lines = widening_lines(&out, "wide");
+    let env =
+        line_for(&lines, "env_pass").expect("env_pass line names the key");
+    assert!(env.contains("AJ_PROFILE_SECRET"), "{env}");
+}
+
+#[test]
+fn dry_run_prints_the_same_widening_lines_as_a_real_launch() {
+    require_bwrap_net!();
+    let tree = Tree::new("same-lines", WIDE);
+    let dry = tree.dry_run(&["--profile", "wide"]);
+    assert_ok(&dry);
+    let real = tree.launch(&["--profile", "wide"], "true");
+    assert_ok(&real);
+    let dry_lines = widening_lines(&dry, "wide");
+    assert!(!dry_lines.is_empty());
+    assert_eq!(dry_lines, widening_lines(&real, "wide"));
+}
+
+// ── Only what the launch applies (#230 review) ──
+
+/// Grants a first non-interactive launch replaces with restricted
+/// defaults: none reaches the sandbox through the profile, so none is a
+/// widening. The API host is one those defaults grant on their own.
+const DEV: &str = "\
+[profiles.dev]
+profile_version = 1
+github = true
+pictures = true
+allow_hosts = [\"api.anthropic.com\"]
+";
+
+#[test]
+fn a_restricted_first_launch_prints_no_widening_it_does_not_apply() {
+    require_bwrap_net!();
+    let tree = Tree::new("restricted-first", DEV);
+    let out = {
+        let _lock = common::SANDBOX_RUN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tree.run(&[
+            "--no-status-bar",
+            "--profile",
+            "dev",
+            "--harness",
+            "claude",
+            "--",
+            "true",
+        ])
+    };
+    let err = stderr(&out);
+    assert!(err.contains("Interactive setup skipped"), "{err}");
+    assert_ok(&out);
+    assert_eq!(
+        widening_lines(&out, "dev"),
+        BTreeSet::new(),
+        "no grant reaches the sandbox through the profile: {err}"
+    );
+}
+
+#[test]
+fn a_widening_another_layer_already_grants_is_not_the_profile_s() {
+    let tree = Tree::new("other-layer", WIDE);
+    let out = tree.dry_run(&[
+        "--profile",
+        "wide",
+        "--pictures",
+        "--allow-host",
+        "registry.npmjs.org",
+    ]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "wide");
+    assert!(line_for(&lines, "pictures").is_none(), "{lines:?}");
+    let hosts = line_for(&lines, "allow_hosts").expect("one host is left");
+    assert!(hosts.contains("api.example.com"), "{hosts}");
+    assert!(!hosts.contains("registry.npmjs.org"), "{hosts}");
+}
+
+#[test]
+fn a_cli_env_entry_is_never_read_as_the_profile_s() {
+    // `env_pass` is reported for every entry of a layer, whatever its
+    // baseline holds: the CLI's own `--env` must not become a widening.
+    let tight = Tree::new(
+        "cli-env-tight",
+        "[profiles.tight]\nprofile_version = 1\nno_gpu = true\n",
+    );
+    let out = tight.dry_run(&["--profile", "tight", "--env", "FOO=bar"]);
+    assert_ok(&out);
+    assert!(!stderr(&out).contains("widens="), "{}", stderr(&out));
+
+    let wide = Tree::new("cli-env-wide", WIDE);
+    let out = wide.dry_run(&["--profile", "wide", "--env", "FOO=bar"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "wide");
+    let env = line_for(&lines, "env_pass").expect("the profile's own key");
+    assert!(env.contains("AJ_PROFILE_SECRET"), "{env}");
+    assert!(!env.contains("FOO"), "the CLI's key: {env}");
+}
+
+#[test]
+fn a_cli_override_that_turns_a_grant_off_leaves_no_widening() {
+    // Maintainer's review of #230: github=true in the profile, --no-github
+    // on the command line. The launch does not grant github, so no line may
+    // say the profile widened it; the grant the CLI leaves alone still does.
+    let tree = Tree::new(
+        "cli-off",
+        "[profiles.gh]\nprofile_version = 1\ngithub = true\npictures = true\n",
+    );
+    let out = tree.dry_run(&["--profile", "gh"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "gh");
+    assert!(line_for(&lines, "github").is_some(), "{lines:?}");
+
+    let out = tree.dry_run(&["--profile", "gh", "--no-github"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "gh");
+    assert!(line_for(&lines, "github").is_none(), "{lines:?}");
+    assert!(line_for(&lines, "pictures").is_some(), "{lines:?}");
+}
+
+#[test]
+fn a_saved_project_restriction_leaves_no_widening() {
+    // The same delta when the restriction comes from saved policy rather
+    // than this invocation: --init saves the constraint, the next launch
+    // names only the profile.
+    let tree = Tree::new(
+        "saved-off",
+        "[profiles.gh]\nprofile_version = 1\ngithub = true\npictures = true\n",
+    );
+    let init = tree.run(&["--no-status-bar", "--no-github", "--init", "bash"]);
+    assert_ok(&init);
+    assert!(
+        tree.saved_project_policy().contains("github"),
+        "--init must save the github constraint: {}",
+        tree.saved_project_policy()
+    );
+    let out = tree.dry_run(&["--profile", "gh"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "gh");
+    assert!(line_for(&lines, "github").is_none(), "{lines:?}");
+    assert!(line_for(&lines, "pictures").is_some(), "{lines:?}");
+}
+
+#[test]
+fn a_profile_that_widens_nothing_prints_nothing() {
+    let tree = Tree::new(
+        "widens-nothing",
+        "[profiles.tight]\nprofile_version = 1\nno_gpu = true\n",
+    );
+    let out = tree.dry_run(&["--profile", "tight"]);
+    assert_ok(&out);
+    assert!(
+        !stderr(&out).contains("widens="),
+        "a tightening prints no line: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn lockdown_leaves_out_what_it_drops_and_keeps_what_it_narrows() {
+    let tree = Tree::new(
+        "lockdown",
+        "[profiles.dev]\nprofile_version = 1\ngithub = true\n\
+         pictures = true\nallow_hosts = [\"api.example.com\"]\n",
+    );
+    let out = tree.dry_run(&["--profile", "dev", "--lockdown"]);
+    assert_ok(&out);
+    let lines = widening_lines(&out, "dev");
+    // Dropped by lockdown: no line.
+    assert!(line_for(&lines, "github").is_none(), "{lines:?}");
+    assert!(line_for(&lines, "pictures").is_none(), "{lines:?}");
+    // The proxy still dials a listed host under lockdown: still a widening.
+    let hosts = line_for(&lines, "allow_hosts").expect("{lines:?}");
+    assert!(hosts.contains("api.example.com"), "{hosts}");
+    // The same profile without lockdown names all three.
+    let open = widening_lines(&tree.dry_run(&["--profile", "dev"]), "dev");
+    for field in ["github", "pictures", "allow_hosts"] {
+        assert!(line_for(&open, field).is_some(), "{field}: {open:?}");
+    }
+}
+
+// ── Selection and refusals at launch ──
+
+#[test]
+fn profile_given_twice_is_refused() {
+    let tree = Tree::new("twice", WIDE);
+    // One --profile is a valid launch; the refusal is about the repetition.
+    assert_ok(&tree.dry_run(&["--profile", "wide"]));
+    let err = assert_refused(&tree.dry_run(&[
+        "--profile",
+        "wide",
+        "--profile",
+        "wide",
+    ]));
+    assert!(err.contains("--profile"), "{err}");
+}
+
+#[test]
+fn profile_unknown_key_fails_the_launch_before_anything_runs() {
+    let tree = Tree::new(
+        "unknown-key",
+        "[profiles.typo]\nprofile_version = 1\nallow_host = [\"x.example\"]\n",
+    );
+    let out = tree.dry_run(&["--profile", "typo"]);
+    let err = assert_refused(&out);
+    assert!(err.contains("typo") && err.contains("allow_host"), "{err}");
+    assert!(
+        stdout(&out).is_empty(),
+        "nothing may be printed as a launch"
+    );
+}
+
+#[test]
+fn profile_unknown_key_with_an_empty_value_fails_the_launch() {
+    // An empty array or table is still a key the selected profile does not
+    // know (maintainer's review of #230).
+    for (key, body) in [
+        ("allow_hostz", "allow_hostz = []\n"),
+        ("inline_table", "inline_table = {}\n"),
+        ("header_table", "[profiles.typo.header_table]\n"),
+    ] {
+        let tree = Tree::new(
+            &format!("unknown-empty-{key}"),
+            &format!("[profiles.typo]\nprofile_version = 1\n{body}"),
+        );
+        let out = tree.dry_run(&["--profile", "typo"]);
+        let err = assert_refused(&out);
+        assert!(err.contains(key), "{key}: must name the key: {err}");
+        assert!(stdout(&out).is_empty(), "{key}: nothing may launch");
+    }
+}
+
+#[test]
+fn missing_profile_lists_the_defined_names() {
+    let tree = Tree::new("missing", WIDE);
+    let err = assert_refused(&tree.dry_run(&["--profile", "nope"]));
+    assert!(err.contains("nope") && err.contains("wide"), "{err}");
+}
+
+#[test]
+fn malformed_unselected_profile_is_harmless_and_a_sibling_still_selects() {
+    let global = format!(
+        "{WIDE}\n[profiles.bad]\nprofile_version = \"x\"\nallow_hosts = 3\n"
+    );
+    let tree = Tree::new("malformed-sibling", &global);
+    assert_ok(&tree.dry_run(&[]));
+    let out = tree.dry_run(&["--profile", "wide"]);
+    assert_ok(&out);
+    assert!(!widening_lines(&out, "wide").is_empty());
+    let err = assert_refused(&tree.dry_run(&["--profile", "bad"]));
+    assert!(err.contains("bad"), "{err}");
+}
+
+// ── The project file and saving ──────────────
+
+#[test]
+fn project_file_cannot_select_a_profile_and_is_warned() {
+    let tree = Tree::new("project-select", WIDE);
+    std::fs::write(
+        tree.project.join(".ai-jail"),
+        "profile = \"wide\"\n[profiles.evil]\nprofile_version = 1\nnetwork = true\n",
+    )
+    .unwrap();
+    let out = tree.dry_run(&[]);
+    assert_ok(&out);
+    let err = stderr(&out);
+    assert!(
+        err.lines().any(|l| {
+            let l = l.to_lowercase();
+            l.contains("profile") && l.contains("cli")
+        }),
+        "missing the 'only the CLI selects a profile' warning: {err}"
+    );
+    assert!(widening_lines(&out, "wide").is_empty(), "{err}");
+    assert!(widening_lines(&out, "evil").is_empty(), "{err}");
+}
+
+#[test]
+fn init_never_writes_a_profile_key_into_the_project_file() {
+    let tree = Tree::new("init", WIDE);
+    let out = tree.run(&["--profile", "wide", "--init", "bash"]);
+    assert_ok(&out);
+    let body = tree.saved_project_policy();
+    assert!(!body.is_empty(), "--init writes the project policy");
+    for leaked in [
+        "registry.npmjs.org",
+        "pictures",
+        "profile",
+        "AJ_PROFILE_SECRET",
+    ] {
+        assert!(
+            !body.contains(leaked),
+            "{leaked} leaked into the project policy:\n{body}"
+        );
+    }
+}
+
+#[test]
+fn auto_save_never_writes_a_profile_key_into_the_project_file() {
+    require_bwrap_net!();
+    let tree = Tree::new("auto-save", WIDE);
+    let _lock = common::SANDBOX_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Without --no-save-config: a normal launch auto-saves the project
+    // policy.
+    let out = tree.run(&[
+        "--no-status-bar",
+        "--profile",
+        "wide",
+        "bash",
+        "-c",
+        "true",
+    ]);
+    assert_ok(&out);
+    let body = tree.saved_project_policy();
+    for leaked in [
+        "registry.npmjs.org",
+        "pictures",
+        "profile",
+        "AJ_PROFILE_SECRET",
+    ] {
+        assert!(
+            !body.contains(leaked),
+            "{leaked} leaked into the project policy:\n{body}"
+        );
+    }
+}
+
+// ── The audit launch record ──────────────────
+
+#[test]
+fn audit_record_carries_the_profile_and_its_widenings() {
+    require_bwrap_net!();
+    let tree = Tree::new("audit", WIDE);
+    let out = tree.launch(&["--audit-log", "--profile", "wide"], "exit 4");
+    assert_eq!(out.status.code(), Some(4), "stderr={}", stderr(&out));
+    let log = tree.home.join(".local/share/ai-jail/history.jsonl");
+    let content = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        !content.contains("topsecret-value"),
+        "secret value recorded"
+    );
+    let record: serde_json::Value =
+        serde_json::from_str(content.lines().last().unwrap()).unwrap();
+    assert_eq!(record["type"], "launch");
+    assert_eq!(record["exit_code"], 4);
+    assert_eq!(record["profile"]["name"], "wide");
+    let widenings = record["profile"]["widenings"]
+        .as_array()
+        .expect("widenings");
+    let hosts = widenings
+        .iter()
+        .find(|w| w["field"] == "allow_hosts")
+        .expect("allow_hosts widening");
+    let granted: Vec<&str> = hosts["granted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(!granted.contains(&"registry.npmjs.org"), "{granted:?}");
+    assert!(granted.contains(&"api.example.com"), "{granted:?}");
+    let env = widenings
+        .iter()
+        .find(|w| w["field"] == "env_pass")
+        .expect("env_pass widening");
+    assert_eq!(env["granted"], serde_json::json!(["AJ_PROFILE_SECRET"]));
+}
