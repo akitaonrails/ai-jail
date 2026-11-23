@@ -102,9 +102,8 @@ impl LimitsInForce {
     }
 }
 
-/// A limit ai-jail itself put in force. Only the lockdown FSIZE ceiling
-/// can be one today: ai-jail sets no CPU-time limit, so a SIGXCPU is
-/// reported as the signal alone.
+/// A limit the supervisor can verify through kernel readback. Explicit
+/// CPU-time and file-size limits are installed in the jailed command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Limit {
     FileSize,
@@ -470,8 +469,8 @@ mod tests {
 
     #[test]
     fn sigxcpu_names_no_limit() {
-        // ai-jail sets no CPU-time limit, so a SIGXCPU is never one of its
-        // limits, with or without the FSIZE ceiling in force.
+        // The supervisor cannot read the command's CPU limit back, so
+        // SIGXCPU alone does not establish that a limit was reached.
         for limits in [
             no_limits(),
             LimitsInForce {
@@ -848,7 +847,8 @@ mod tests {
             lockdown: Some(true),
             ..crate::config::Config::default()
         };
-        crate::sandbox::rlimits::apply(&lockdown, false);
+        crate::sandbox::rlimits::apply(&lockdown, false)
+            .expect("lockdown limits apply");
         let limits = LimitsInForce::read_back(true);
         assert_eq!(
             limits.file_size,
@@ -879,7 +879,8 @@ mod tests {
             lockdown: Some(true),
             ..crate::config::Config::default()
         };
-        crate::sandbox::rlimits::apply(&lockdown, false);
+        crate::sandbox::rlimits::apply(&lockdown, false)
+            .expect("lockdown limits apply");
         let limits = LimitsInForce::read_back(true);
         let (soft_after, _) =
             getrlimit(Resource::RLIMIT_FSIZE).expect("getrlimit");

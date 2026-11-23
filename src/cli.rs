@@ -44,6 +44,12 @@ OPTIONS:
     --landlock / --no-landlock     Enable/disable Landlock LSM (Linux 5.13+, default: on)
     --seccomp / --no-seccomp       Enable/disable seccomp syscall filter (Linux, default: on)
     --rlimits / --no-rlimits       Enable/disable resource limits (default: on)
+    --rlimit <NAME=VALUE>          Set one resource limit per process, not a total for
+                                   the sandbox (repeatable).
+                                   NAME: nproc, nofile, core, cpu, fsize, data, as.
+                                   VALUE: integer, K/M/G/T for fsize/data/as, or unlimited.
+                                   cpu is CPU seconds and ends the process; it does not throttle.
+                                   Linux only: refused on other platforms.
     --profile <NAME>               Apply [profiles.NAME] from the global
                                    config (once; every access it widens is
                                    printed before launch)
@@ -220,6 +226,8 @@ pub struct CliArgs {
     pub landlock: Option<bool>,
     pub seccomp: Option<bool>,
     pub rlimits: Option<bool>,
+    /// `--rlimit NAME=VALUE`, validated at parse time, in order given.
+    pub rlimit: Vec<(String, String)>,
     /// `--profile NAME`: a `[profiles.NAME]` table of the global config.
     /// Validated against the global config at load, not here.
     pub profile: Option<String>,
@@ -461,6 +469,10 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("rlimits" | "no-rlimits")) => {
                 args.rlimits = Some(s == "rlimits");
+            }
+            Long("rlimit") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                args.rlimit.push(parse_rlimit_spec(&val.to_string_lossy())?);
             }
             Long(s @ ("systemd-user" | "no-systemd-user")) => {
                 args.systemd_user = Some(s == "systemd-user");
@@ -1086,6 +1098,24 @@ fn parse_configure_tail(
     Ok(())
 }
 
+/// Parse one `--rlimit NAME=VALUE`. The value is checked here, so a typo
+/// stops the launch instead of running without the limit.
+fn parse_rlimit_spec(spec: &str) -> Result<(String, String), String> {
+    use crate::sandbox::rlimits::{RlimitName, RlimitValue};
+    let (name, value) = spec.split_once('=').ok_or_else(|| {
+        format!(
+            "invalid --rlimit {spec:?}: expected NAME=VALUE, NAME one of \
+             nproc, nofile, core, cpu, fsize, data, as"
+        )
+    })?;
+    let parsed: RlimitName = name
+        .parse()
+        .map_err(|e| format!("invalid --rlimit {spec:?}: {e}"))?;
+    RlimitValue::parse(parsed, value)
+        .map_err(|e| format!("invalid --rlimit {spec:?}: {e}"))?;
+    Ok((name.to_string(), value.to_string()))
+}
+
 /// Long flags that configure the sandbox itself (as opposed to the wrapped
 /// command). Used to reject a sandbox flag that appears after the command
 /// with no `--` separator. Every entry MUST have a matching parse arm in
@@ -1148,6 +1178,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-seccomp",
     "--rlimits",
     "--no-rlimits",
+    "--rlimit",
     "--profile",
     "--ssh",
     "--no-ssh",
@@ -1214,6 +1245,215 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--bootstrap",
     "--verbose",
 ];
+
+/// Config fields that are runtime state, never written by a user.
+#[cfg(test)]
+const INTERFACE_INTERNAL_FIELDS: &[&str] =
+    &["rlimit_source", "runtime_harnesses"];
+
+/// Names already missing from docs/USER_GUIDE.md at upstream v3.3.0
+/// (fe4dfe0). The drift test is a ratchet: it holds every name added
+/// since to the guide, and documenting one of these lets it be removed.
+#[cfg(test)]
+const INTERFACE_UNDOCUMENTED_BASELINE: &[&str] = &[
+    "rw_maps",
+    "overlay_maps",
+    "hide_dotdirs",
+    "mask",
+    "deny_paths",
+    "mask_exceptions",
+    "deny_path_exceptions",
+    "no_gpu",
+    "no_docker",
+    "tailscale",
+    "no_display",
+    "audio",
+    "aws",
+    "kube",
+    "gcloud",
+    "docker_config",
+    "kvm",
+    "prompt_hosts",
+    "macos_host_ipc",
+    "macos_chromium",
+    "macos_trustd",
+    "allow_pty",
+    "allow_loopback_listen",
+    "allow_loopback_connect",
+    "terminal_passthrough",
+    "x11",
+    "host_shm",
+    "no_worktree",
+    "no_mise",
+    "no_toolchains",
+    "no_save_config",
+    "no_hide_config",
+    "pictures",
+    "browser_profile",
+    "private_home",
+    "no_landlock",
+    "no_status_bar",
+    "status_bar_style",
+    "resize_redraw_key",
+    "no_seccomp",
+    "no_rlimits",
+    "systemd_user",
+    "allow_tcp_ports",
+    "allow_hosts",
+    "allow_private_hosts",
+    "forward_ports",
+    "publish_ports",
+    "claude_dir",
+    "inherit_env",
+    "env_pass",
+    "env_from_file",
+    "secret_hosts",
+    "trust_project_config",
+    "update_check",
+    "audit_log",
+    "--harness",
+    "--request-file",
+    "--request",
+    "--private-home",
+    "--no-private-home",
+    "--lockdown",
+    "--no-lockdown",
+    "--no-display",
+    "--display",
+    "--audio",
+    "--no-audio",
+    "--no-github",
+    "--aws",
+    "--no-aws",
+    "--kube",
+    "--no-kube",
+    "--gcloud",
+    "--no-gcloud",
+    "--docker-config",
+    "--no-docker-config",
+    "--kvm",
+    "--no-kvm",
+    "--prompt-hosts",
+    "--no-prompt-hosts",
+    "--network",
+    "--no-network",
+    "--macos-host-ipc",
+    "--no-macos-host-ipc",
+    "--macos-chromium",
+    "--no-macos-chromium",
+    "--macos-trustd",
+    "--no-macos-trustd",
+    "--allow-pty",
+    "--no-allow-pty",
+    "--allow-loopback-listen",
+    "--no-allow-loopback-listen",
+    "--allow-loopback-connect",
+    "--no-allow-loopback-connect",
+    "--no-gpu",
+    "--gpu",
+    "--no-docker",
+    "--docker",
+    "--tailscale",
+    "--no-tailscale",
+    "--landlock",
+    "--no-landlock",
+    "--seccomp",
+    "--no-seccomp",
+    "--rlimits",
+    "--no-rlimits",
+    "--ssh",
+    "--no-ssh",
+    "--pictures",
+    "--no-pictures",
+    "--clean",
+    "--exec",
+    "--dry-run",
+    "--rw-map",
+    "--ro-map",
+    "--overlay-map",
+    "--map",
+    "--mask",
+    "--deny-path",
+    "--mask-except",
+    "--deny-path-except",
+    "--hide-dotdir",
+    "--allow-tcp-port",
+    "--allow-host",
+    "--allow-private-host",
+    "--systemd-user",
+    "--no-systemd-user",
+    "--worktree",
+    "--no-worktree",
+    "--browser",
+    "--no-browser",
+    "--claude-dir",
+    "--x11",
+    "--no-x11",
+    "--host-shm",
+    "--no-host-shm",
+    "--terminal-passthrough",
+    "--no-terminal-passthrough",
+    "--terminal-appearance",
+    "--no-terminal-appearance",
+    "--agent-state",
+    "--no-agent-state",
+    "--publish-port",
+    "--inherit-env",
+    "--no-inherit-env",
+    "--update-check",
+    "--no-update-check",
+    "--audit-log",
+    "--no-audit-log",
+    "--audit-verify",
+    "--egress-log",
+    "--env-from-file",
+    "--secret",
+    "--mise",
+    "--no-mise",
+    "--toolchains",
+    "--no-toolchains",
+    "--save-config",
+    "--no-save-config",
+    "--hide-config",
+    "--no-hide-config",
+    "--status-bar",
+    "--no-status-bar",
+    "--bootstrap",
+    "--verbose",
+    // Undocumented upstream at f0dc67e, before this branch.
+    "macos_pasteboard",
+    "terminal_appearance",
+    "--macos-pasteboard",
+    "--no-macos-pasteboard",
+];
+
+/// Whether `text` names `name` as a whole word: `--rlimits` does not
+/// name `--rlimit`, and `no_rlimits` does not name `rlimit`.
+#[cfg(test)]
+fn names_whole(text: &str, name: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    text.match_indices(name).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + name.len()..].chars().next();
+        !before.is_some_and(word) && !after.is_some_and(word)
+    })
+}
+
+/// Every `Config` field and sandbox long flag `guide` does not mention,
+/// apart from runtime-only fields and the ratchet baseline.
+#[cfg(test)]
+pub(crate) fn interface_drift(guide: &str) -> Vec<String> {
+    crate::config_store::config_field_names()
+        .into_iter()
+        .chain(SANDBOX_LONG_FLAGS.iter().copied())
+        .filter(|name| {
+            !INTERFACE_INTERNAL_FIELDS.contains(name)
+                && !INTERFACE_UNDOCUMENTED_BASELINE.contains(name)
+                && !names_whole(guide, name)
+        })
+        .map(str::to_string)
+        .collect()
+}
 
 fn is_sandbox_long_flag(arg: &str) -> bool {
     let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
@@ -2974,6 +3214,320 @@ mod tests {
     }
 }
 
+// `--rlimit` stays in sync across the interface surfaces.
+//
+// - `crate::onboarding::render_effective_access` lists every explicit
+//   limit as `rlimit <name>=<soft>/<hard> (<source>)`, with the values
+//   `rlimits::effective()` applies. Defaults are not explicit limits and
+//   are not listed that way.
+// - `crate::cli::interface_drift(guide: &str) -> Vec<String>` returns every
+//   `Config` field (by its config name, e.g. `rlimit`) and every long flag
+//   in `SANDBOX_LONG_FLAGS` (e.g. `--rlimit`) that `guide` does not
+//   mention as a whole name and that is not on the drift test's own
+//   allowlist of internal fields. A longer name (`--rlimits`,
+//   `no_rlimits`) does not document a shorter one.
+// - `docs/TUI_DESIGN.md` names `--rlimit` as CLI/config-only, and
+//   `docs/onboarding-provenance.toml` has a claim for it whose guide
+//   sections exist in `docs/USER_GUIDE.md`.
+#[cfg(test)]
+mod interface_rlimit_tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use crate::cli::interface_drift;
+    use crate::config::Config;
+    use crate::sandbox::rlimits::LimitSource;
+
+    const GUIDE: &str = include_str!("../docs/USER_GUIDE.md");
+    const DESIGN: &str = include_str!("../docs/TUI_DESIGN.md");
+    const PROVENANCE: &str = include_str!("../docs/onboarding-provenance.toml");
+
+    fn review(config: &Config) -> String {
+        crate::onboarding::render_effective_access(
+            config,
+            Path::new("/project"),
+            "claude",
+            None,
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn with_limits(pairs: &[(&str, &str, LimitSource)]) -> Config {
+        Config {
+            rlimit: pairs
+                .iter()
+                .map(|(k, v, _)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            rlimit_source: pairs
+                .iter()
+                .map(|(k, _, s)| (k.to_string(), *s))
+                .collect::<BTreeMap<_, _>>(),
+            ..Config::default()
+        }
+    }
+
+    fn has_line(text: &str, want: &str) -> bool {
+        text.lines()
+            .any(|l| l.trim().trim_start_matches("- ") == want)
+    }
+
+    #[test]
+    fn interface_review_lists_no_explicit_limit_for_defaults() {
+        // Hostile half first: the defaults the launch applies anyway are
+        // not explicit limits.
+        let text = review(&Config::default());
+        assert!(
+            !text.lines().any(|l| l.contains("rlimit ")
+                && l.contains('=')
+                && l.contains('/')),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn interface_review_lists_each_explicit_limit() {
+        let config = with_limits(&[
+            ("nofile", "64", LimitSource::Cli),
+            ("cpu", "10", LimitSource::Cli),
+            ("data", "8G", LimitSource::Global),
+        ]);
+        let text = review(&config);
+        assert!(has_line(&text, "rlimit nofile=64/64 (cli)"), "{text}");
+        // cpu carries the 5-second grace the launch applies.
+        assert!(has_line(&text, "rlimit cpu=10/15 (cli)"), "{text}");
+        let gib8 = 8_u64 << 30;
+        assert!(
+            has_line(&text, &format!("rlimit data={gib8}/{gib8} (global)")),
+            "{text}"
+        );
+        // An untouched default is still not listed as explicit.
+        assert!(!text.contains("rlimit core="), "{text}");
+    }
+
+    #[test]
+    fn interface_drift_names_undocumented_limit_controls() {
+        let drift = interface_drift("");
+        for item in ["rlimit", "--rlimit"] {
+            assert!(
+                drift.iter().any(|d| d == item),
+                "{item} must not be allowlisted as internal: {drift:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interface_drift_is_not_satisfied_by_a_longer_name() {
+        let guide = "Use `--rlimits` or `--no-rlimits`; the config key is \
+                     `no_rlimits`.\n";
+        let drift = interface_drift(guide);
+        assert!(drift.iter().any(|d| d == "--rlimit"), "{drift:?}");
+        assert!(drift.iter().any(|d| d == "rlimit"), "{drift:?}");
+    }
+
+    #[test]
+    fn interface_drift_accepts_the_documented_forms() {
+        let guide = "## Resource limits\n\n`--rlimit NAME=VALUE` sets one \
+                     limit; in config, `[rlimit]` takes `nofile = 4096`.\n";
+        let drift = interface_drift(guide);
+        for item in ["rlimit", "--rlimit"] {
+            assert!(!drift.iter().any(|d| d == item), "{item}: {drift:?}");
+        }
+    }
+
+    #[test]
+    fn interface_user_guide_documents_every_field_and_sandbox_flag() {
+        // The control this branch adds, checked directly as well, so the
+        // guard does not rest on `interface_drift` alone.
+        {
+            let flag = "--rlimit";
+            assert!(
+                GUIDE.replace(&format!("{flag}s"), "").contains(flag),
+                "docs/USER_GUIDE.md lacks {flag}"
+            );
+        }
+        let drift = interface_drift(GUIDE);
+        assert!(
+            drift.is_empty(),
+            "undocumented in docs/USER_GUIDE.md: {drift:?}"
+        );
+    }
+
+    #[test]
+    fn interface_tui_design_and_provenance_name_the_limit_controls() {
+        {
+            let flag = "--rlimit";
+            // `--rlimits` is an older, different flag: it does not count.
+            assert!(
+                DESIGN
+                    .lines()
+                    .any(|l| l.replace(&format!("{flag}s"), "").contains(flag)),
+                "docs/TUI_DESIGN.md lacks {flag}"
+            );
+        }
+        assert!(DESIGN.contains("CLI/config-only"), "docs/TUI_DESIGN.md");
+
+        let doc: toml::Value = toml::from_str(PROVENANCE).unwrap();
+        let claims = doc["claim"].as_array().unwrap();
+        {
+            let field = "rlimit";
+            let claim = claims
+                .iter()
+                .find(|c| {
+                    toml::to_string(c)
+                        .unwrap()
+                        .split(|ch: char| {
+                            !(ch.is_ascii_alphanumeric() || ch == '_')
+                        })
+                        .any(|word| word == field)
+                })
+                .unwrap_or_else(|| panic!("no provenance claim for {field}"));
+            let sections = claim["guide_sections"].as_array().unwrap();
+            assert!(!sections.is_empty(), "{field}: no guide section");
+            for section in sections {
+                let heading = format!("## {}", section.as_str().unwrap());
+                assert!(
+                    GUIDE.lines().any(|l| l.trim_end() == heading),
+                    "{field}: docs/USER_GUIDE.md has no {heading}"
+                );
+            }
+        }
+    }
+}
+
+// Explicit `--rlimit` values are refused off Linux, so both places a user
+// learns the flag from must say so before the launch does:
+// - the `--help` entry for `--rlimit` (its option line and the continuation
+//   lines under it) names Linux, as other Linux-only entries do;
+// - the README section "Resource limits without root" says "Linux only".
+// The neighbouring text already says Linux (`--no-gpu` in the help, "Linux
+// 5.14" and the next section's "**Linux only**" in the README), so each
+// check reads only its own entry or section, and the extractors are pinned
+// on fixtures where only a neighbour carries the word.
+#[cfg(test)]
+mod rlimit_platform_doc_tests {
+    use super::HELP;
+
+    const README: &str = include_str!("../README.md");
+    const SECTION: &str = "### Resource limits without root";
+
+    // The help entry of one option: its own line plus the continuation
+    // lines under it, up to the next line that starts another option.
+    fn help_entry<'a>(help: &'a str, option: &str) -> Vec<&'a str> {
+        let head = format!("{option} ");
+        let mut lines = help.lines();
+        let Some(first) =
+            lines.by_ref().find(|l| l.trim_start().starts_with(&head))
+        else {
+            return Vec::new();
+        };
+        let mut entry = vec![first];
+        entry.extend(lines.take_while(|l| {
+            !l.trim().is_empty() && !l.trim_start().starts_with('-')
+        }));
+        entry
+    }
+
+    // The README section under a heading, up to the next heading of level
+    // two or three. A `#` line inside a code fence is a shell comment, not
+    // a heading.
+    fn readme_section<'a>(readme: &'a str, heading: &str) -> Vec<&'a str> {
+        let mut lines = readme.lines();
+        if lines.by_ref().find(|l| l.starts_with(heading)).is_none() {
+            return Vec::new();
+        }
+        let mut in_fence = false;
+        let mut section = Vec::new();
+        for line in lines {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+            }
+            if !in_fence
+                && (line.starts_with("## ") || line.starts_with("### "))
+            {
+                break;
+            }
+            section.push(line);
+        }
+        section
+    }
+
+    fn says_linux_only(lines: &[&str]) -> bool {
+        lines
+            .iter()
+            .any(|l| l.to_lowercase().contains("linux only"))
+    }
+
+    #[test]
+    fn linux_only_help_entry_ignores_a_neighbour_that_says_linux() {
+        // The `--rlimits` toggle shares the prefix and `--no-gpu` follows
+        // with "(Linux)"; neither belongs to the `--rlimit` entry.
+        let help = "\
+    --rlimits / --no-rlimits       Enable/disable (Linux)
+    --rlimit NAME=VALUE            Set one resource limit
+                                   (per process; repeatable).
+    --no-gpu / --gpu               Disable/enable GPU passthrough (Linux)
+";
+        let entry = help_entry(help, "--rlimit");
+        assert_eq!(entry.len(), 2, "{entry:?}");
+        assert!(entry[0].contains("NAME=VALUE"), "{entry:?}");
+        assert!(!entry.iter().any(|l| l.contains("Linux")), "{entry:?}");
+    }
+
+    #[test]
+    fn linux_only_readme_section_ignores_the_next_section() {
+        // "Linux only" in the next section must not count, and a shell
+        // comment inside a fence must not end the section early.
+        let readme = "\
+### Resource limits without root: `--rlimit`
+
+```bash
+# a comment, not a heading
+ai-jail --rlimit nofile=1024 claude
+```
+
+Applies on Linux 5.14 and later.
+
+### Dev toolchains
+
+On by default, **Linux only**.
+";
+        let section = readme_section(readme, SECTION);
+        assert!(
+            section.iter().any(|l| l.contains("Linux 5.14")),
+            "{section:?}"
+        );
+        assert!(!says_linux_only(&section), "{section:?}");
+    }
+
+    #[test]
+    fn linux_only_rlimit_help_entry_names_linux() {
+        let entry = help_entry(HELP, "--rlimit");
+        assert!(
+            entry.first().is_some_and(|l| l.contains("NAME=VALUE")),
+            "no --rlimit entry in --help: {entry:?}"
+        );
+        assert!(
+            entry.iter().any(|l| l.contains("Linux")),
+            "--help entry for --rlimit does not say Linux:\n{}",
+            entry.join("\n")
+        );
+    }
+
+    #[test]
+    fn linux_only_readme_rlimit_section_says_linux_only() {
+        let section = readme_section(README, SECTION);
+        assert!(
+            section.iter().any(|l| l.contains("--rlimit NAME=VALUE")),
+            "README has no section {SECTION:?}"
+        );
+        assert!(
+            says_linux_only(&section),
+            "README section {SECTION:?} does not say Linux only"
+        );
+    }
+}
+
 // The interface-synchronization contract for `--profile`. The documents
 // name it an advanced CLI/config-only control: the user guide as a
 // "named profile (`[profiles.NAME]`)", kept apart from the onboarding
@@ -2995,7 +3549,7 @@ mod interface_profile_tests {
     const CONFIG_RS: &str = include_str!("config.rs");
 
     /// `Config` fields that no user sets: runtime state, never parsed.
-    const INTERNAL_FIELDS: &[&str] = &["runtime_harnesses"];
+    const INTERNAL_FIELDS: &[&str] = &["runtime_harnesses", "rlimit_source"];
 
     /// `Config` fields already missing from the guide at f0dc67e.
     const UNDOCUMENTED_FIELDS_AT_F0DC67E: &str = r"
@@ -3028,7 +3582,7 @@ mod interface_profile_tests {
     --allow-loopback-connect --no-allow-loopback-connect --no-gpu
     --gpu --no-docker --docker --tailscale --no-tailscale --landlock
     --no-landlock --seccomp --no-seccomp --rlimits --no-rlimits --ssh
-    --no-ssh --pictures --no-pictures --clean   --dry-run
+    --no-ssh --pictures --no-pictures --clean
     --rw-map --ro-map --overlay-map --map --mask --deny-path
     --mask-except --deny-path-except --hide-dotdir --allow-tcp-port
     --allow-private-host --systemd-user --no-systemd-user

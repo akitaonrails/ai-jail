@@ -333,6 +333,30 @@ fn validate_network_flags(config: &config::Config) -> Result<(), String> {
     validate_publish_ports(config)
 }
 
+/// Every limit the sandbox would run under, or why it cannot run (an
+/// explicit limit off Linux). Run before any path that writes policy or
+/// reports readiness (`--init`, auto-save, `status`) as well as before the
+/// launch: the maintainer's review of #229 found the platform check after
+/// the `--init` and `status --json` return paths, so a limit no launch
+/// could honour was saved while status still reported readiness.
+fn checked_limits(
+    config: &config::Config,
+    store: &config_store::StorePaths,
+) -> Result<Vec<sandbox::rlimits::EffectiveLimit>, String> {
+    let project_policy = store.available.then_some(store.project.as_path());
+    sandbox::rlimits::check_platform(
+        config,
+        cfg!(target_os = "linux"),
+        project_policy,
+    )?;
+    let mut limits = sandbox::rlimits::effective(config)?;
+    sandbox::rlimits::clamp_to_host(
+        &mut limits,
+        sandbox::rlimits::host_hard_limit,
+    );
+    Ok(limits)
+}
+
 /// `--egress-log` only sees what the filtered-egress proxy relays, so with
 /// the network off or full it would log nothing while looking enabled.
 /// Checked on the finalized config: a config file or a harness
@@ -896,6 +920,30 @@ fn build_noninteractive_onboarding_effective(
     restrictions.secret_hosts.clear();
     restrictions.trust_project_config.clear();
     restrictions.browser_profile = None;
+    // `monotonic_project_constraints` keeps a stored project's limits as
+    // written; this layer is the trusted global one, so only the limits
+    // that tighten the built-in defaults restrict the first run. A raised
+    // or `unlimited` global value is not a restriction.
+    // Compared against the defaults this launch runs under, lockdown's
+    // included, so a value between the two defaults stays `default`.
+    let defaults = config::Config {
+        lockdown: restrictions.lockdown,
+        ..config::Config::default()
+    };
+    restrictions.rlimit.retain(|key, value| {
+        let single = config::Config {
+            rlimit: std::collections::BTreeMap::from([(
+                key.clone(),
+                value.clone(),
+            )]),
+            ..defaults.clone()
+        };
+        !sandbox::rlimits::widens(&single, &defaults)
+    });
+    let kept: Vec<String> = restrictions.rlimit.keys().cloned().collect();
+    restrictions
+        .rlimit_source
+        .retain(|key, _| kept.contains(key));
     let automatic_api =
         restrictions.network != Some(false) && !restrictions.lockdown_enabled();
     let mut safe_grants = onboarding::Selection {
@@ -1021,14 +1069,6 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     // the filter.
     sandbox::apply_seccomp(&config, cli.verbose)?;
 
-    // Apply NPROC here, inside the sandbox, after bwrap has finished
-    // setting up namespaces. RLIMIT_NPROC counts all processes owned
-    // by the real UID system-wide, so setting it on the outer ai-jail
-    // before bwrap's clone() calls would cause EAGAIN when Chrome or
-    // other heavy applications are running.
-    #[cfg(target_os = "linux")]
-    sandbox::rlimits::apply_nproc(&config, cli.verbose);
-
     // Drop PATH entries that do not exist in here.
     //
     // The sandbox inherits the host's PATH, which describes the host's
@@ -1049,6 +1089,12 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
         unsafe { std::env::set_var("PATH", &pruned) };
     }
 
+    // Prepare limits after the launcher and bridges have been created.
+    // The teardown reaper applies them in its forked command, so per-process
+    // limits cannot prevent the reaper itself from spawning or reporting.
+    #[cfg(target_os = "linux")]
+    let limits = sandbox::rlimits::prepare_sandbox_limits(&config)?;
+
     // With a teardown report, stay resident as the command's sub-reaper
     // instead of becoming it; the exec path below is unchanged without it.
     #[cfg(target_os = "linux")]
@@ -1057,8 +1103,12 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
             &cli.command,
             report,
             &bridge_pids,
+            limits,
+            cli.verbose,
         );
     }
+    #[cfg(target_os = "linux")]
+    sandbox::rlimits::apply_sandbox_limits(&limits, cli.verbose)?;
 
     // Replace this process with the real command
     let err = std::process::Command::new(&cli.command[0])
@@ -1778,6 +1828,8 @@ fn run(
     config::absolutize_user_paths(&mut config, &invocation_cwd);
     apply_browser_profile(&mut config, !command_from_untrusted_project);
     validate_network_flags(&config)?;
+    // Before status, --init and auto-save: see `checked_limits`.
+    let limits_check = checked_limits(&config, &store).map(|_| ());
 
     // Printed on every launch, `--dry-run`, `--exec` and `status` included
     // and without `--verbose`: a profile may widen the jail only where it
@@ -1802,6 +1854,10 @@ fn run(
     // Handle status command
     if cli.status {
         if cli.json {
+            if let Err(error) = &limits_check {
+                status_blockers
+                    .push(("limits_unavailable".into(), error.clone()));
+            }
             if !onboarding_complete && !resolved_harnesses.is_empty() {
                 status_blockers.push((
                     "onboarding_required".into(),
@@ -1872,8 +1928,13 @@ fn run(
             _ => None,
         };
         config::display_status(&config, contributing_path);
+        if let Err(error) = &limits_check {
+            output::warn(&format!("{error}; a launch would be refused"));
+        }
         return Ok(0);
     }
+    // A limit no launch can honour is refused before anything is written.
+    limits_check?;
 
     // Persist user-level preferences in the external XDG config store.
     if should_save_global_preferences(&cli) && store.available {
@@ -1925,6 +1986,7 @@ fn run(
         )?,
     };
     let mut launch_runner = LaunchRunner::new(finalized);
+    let effective_limits = checked_limits(launch_runner.config(), &store)?;
     if let Some(warning) = launch_runner.github_warning() {
         output::warn(warning);
     }
@@ -2125,6 +2187,29 @@ fn run(
 
     // Handle dry run
     if cli.dry_run {
+        for limit in &effective_limits {
+            let ceiling = limit
+                .ceiling
+                .map(|c| format!(" ceiling={}", c.as_str()))
+                .unwrap_or_default();
+            output::dry_run_line(&format!(
+                "rlimit name={} soft={} hard={} source={}{ceiling}",
+                limit.name.as_str(),
+                sandbox::rlimits::fmt_rlim(limit.soft),
+                sandbox::rlimits::fmt_rlim(limit.hard),
+                limit.source.as_str()
+            ));
+        }
+        for (name, requested, ceiling) in
+            sandbox::rlimits::lockdown_clamps(config)
+        {
+            output::dry_run_line(&format!(
+                "rlimit name={} requested={requested} \
+                 lockdown_ceiling={}",
+                name.as_str(),
+                sandbox::rlimits::fmt_rlim(ceiling)
+            ));
+        }
         let formatted = sandbox::dry_run(
             &guard,
             config,
@@ -2284,7 +2369,7 @@ fn run(
     // across fork+exec). NPROC is applied inside the sandbox instead
     // — see run_landlock_exec() — to avoid EAGAIN during bwrap's
     // internal clone() calls for namespace creation.
-    let file_size_set = sandbox::rlimits::apply(config, cli.verbose);
+    let file_size_set = sandbox::rlimits::apply(config, cli.verbose)?;
 
     // Both spawn paths make the report descriptor inheritable in the
     // intended child and close the parent copies after spawning.
@@ -2385,9 +2470,13 @@ fn run(
     // One explanation line per run, after the terminal is restored so
     // it is not drawn into the child's screen. Normal exits and
     // deliberate signals print nothing.
+    // An explicit FSIZE limit is set in the sandbox wrapper. Reading the
+    // supervisor's limit would report the wrong value in that case.
+    let supervisor_fsize_applies =
+        file_size_set && !config.rlimit.contains_key("fsize");
     let reason = exit_reason::classify(
         &child_status,
-        &exit_reason::LimitsInForce::read_back(file_size_set),
+        &exit_reason::LimitsInForce::read_back(supervisor_fsize_applies),
     );
     if let Some(line) = reason.explanation() {
         output::security_warn(&line);
@@ -2462,6 +2551,7 @@ fn run(
             profile: profile_report.as_ref(),
             exit_code,
             duration: launch_start.elapsed(),
+            rlimits: &effective_limits,
         }));
     }
 
@@ -3371,6 +3461,42 @@ mod tests {
         ] {
             assert!(validate_write_flags(&cli).is_err());
         }
+    }
+
+    #[test]
+    fn noninteractive_onboarding_drops_global_limits_that_raise_the_defaults() {
+        // The global layer is trusted, not a restriction,
+        // so a raised or `unlimited` global limit must not become a
+        // first-run project restriction; one that tightens still does.
+        let global = Config {
+            rlimit: std::collections::BTreeMap::from([
+                ("nproc".to_string(), "unlimited".to_string()),
+                ("nofile".to_string(), "1048576".to_string()),
+                ("cpu".to_string(), "600".to_string()),
+            ]),
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            command: vec!["claude".into()],
+            ..CliArgs::default()
+        };
+        let effective = build_noninteractive_onboarding_effective(
+            &global,
+            "claude",
+            &cli,
+            Config::default(),
+            Path::new("/project"),
+        )
+        .unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(!effective.rlimit.contains_key("nproc"));
+        assert!(!effective.rlimit.contains_key("nofile"));
+        assert!(
+            effective
+                .rlimit
+                .get("cpu")
+                .is_some_and(|limit| limit == "600")
+        );
     }
 
     #[test]

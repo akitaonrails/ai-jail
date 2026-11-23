@@ -1124,12 +1124,19 @@ fn migrate_project(
             migration: None,
         }
     };
+    let rlimit = config::tighter_project_rlimits(
+        &doc.constraints.rlimit,
+        &projected.rlimit,
+    );
     doc.constraints = config::merge_with_global_report(
         doc.constraints,
         projected,
         &paths.canonical_project,
     )
     .0;
+    // The merge above compares against the built-in defaults; the stored
+    // limits are combined by value instead.
+    doc.constraints.rlimit = rlimit;
     doc.migration = Some(MigrationProvenance {
         migration_version: MIGRATION_VERSION,
         source_kind: "project_legacy_file".into(),
@@ -1413,6 +1420,7 @@ enum DirectionalAuthority {
     Landlock,
     Seccomp,
     Rlimits,
+    RlimitValues,
     Systemd,
     InheritEnv,
     Worktree,
@@ -1494,6 +1502,19 @@ macro_rules! directional_policy {
     };
 }
 
+/// Every `Config` field by its config name, from the exhaustive policy
+/// table, for the interface drift test.
+#[cfg(test)]
+pub(crate) fn config_field_names() -> Vec<&'static str> {
+    CONFIG_FIELD_POLICY
+        .iter()
+        .map(|item| match item {
+            ConfigFieldPolicy::Static { field, .. }
+            | ConfigFieldPolicy::Directional { field, .. } => *field,
+        })
+        .collect()
+}
+
 const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     excluded_policy!("runtime_harnesses", Authority),
     static_policy!("command", Authority, Command),
@@ -1565,6 +1586,10 @@ const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     excluded_policy!("resize_redraw_key", Preference),
     directional_policy!("no_seccomp", Seccomp, "disable-seccomp"),
     directional_policy!("no_rlimits", Rlimits, "disable-resource-limits"),
+    directional_policy!("rlimit", RlimitValues, "raise-resource-limits"),
+    // Runtime label of where each `rlimit` came from; never read from a
+    // file (`#[serde(skip)]`).
+    excluded_policy!("rlimit_source", Preference),
     directional_policy!("systemd_user", Systemd, "systemd-user"),
     static_policy!("allow_tcp_ports", Authority, TcpPorts),
     static_policy!("allow_hosts", Authority, Hosts),
@@ -1665,6 +1690,7 @@ impl DirectionalAuthority {
             Self::Rlimits => {
                 c.no_rlimits == Some(true) && b.no_rlimits != Some(true)
             }
+            Self::RlimitValues => crate::sandbox::rlimits::widens(c, b),
             Self::Systemd => {
                 c.systemd_user == Some(true) && b.systemd_user != Some(true)
             }
@@ -1964,7 +1990,13 @@ fn write_project_document(
     durable_write(path, body.as_bytes())?;
     let identity = &doc.project;
     let checked = read_project_document(path, identity)?;
-    if checked != *doc {
+    // `rlimit_source` is runtime-only (`#[serde(skip)]`): it is never
+    // written, so the read-back cannot carry it and must not be compared on
+    // it, or every policy holding an `rlimit` fails to verify.
+    let mut written = doc.clone();
+    written.grants.rlimit_source.clear();
+    written.constraints.rlimit_source.clear();
+    if checked != written {
         return Err(format!("Failed to verify {}", path.display()));
     }
     Ok(())
@@ -2005,12 +2037,19 @@ pub(crate) fn save_project_constraints(
         // launch's checkout. Replacing would erase restrictions saved from
         // another checkout, so merge monotonically as migration does.
         ProjectStrategy::RepoRoot => {
-            config::merge_with_global_report(
+            let rlimit = config::tighter_project_rlimits(
+                &doc.constraints.rlimit,
+                &projected.rlimit,
+            );
+            let mut merged = config::merge_with_global_report(
                 doc.constraints,
                 projected,
                 &paths.canonical_project,
             )
-            .0
+            .0;
+            // As in the migration: stored limits combine by value.
+            merged.rlimit = rlimit;
+            merged
         }
     };
     write_project_document(&paths.project, &doc)
@@ -2311,6 +2350,7 @@ mod tests {
         expected_excluded!("no_status_bar", Preference),
         expected_excluded!("status_bar_style", Preference),
         expected_excluded!("resize_redraw_key", Preference),
+        expected_excluded!("rlimit_source", Preference),
         expected_authority!(
             "allow_tcp_ports",
             Authority,
@@ -2407,6 +2447,12 @@ mod tests {
             "status_bar_style" => config.status_bar_style = Some("dark".into()),
             "resize_redraw_key" => {
                 config.resize_redraw_key = Some("top-secret".into());
+            }
+            "rlimit_source" => {
+                config.rlimit_source.insert(
+                    "nofile".into(),
+                    crate::sandbox::rlimits::LimitSource::Cli,
+                );
             }
             "allow_tcp_ports" => config.allow_tcp_ports = vec![443],
             "allow_hosts" => {
@@ -2545,6 +2591,7 @@ mod tests {
             no_landlock: Some(false),
             no_seccomp: Some(false),
             no_rlimits: Some(false),
+            rlimit: [("nofile".to_string(), "1024".to_string())].into(),
             systemd_user: Some(false),
             inherit_env: Some(false),
             no_worktree: Some(true),
@@ -2589,6 +2636,7 @@ mod tests {
             no_landlock: Some(true),
             no_seccomp: Some(true),
             no_rlimits: Some(true),
+            rlimit: [("nofile".to_string(), "unlimited".to_string())].into(),
             systemd_user: Some(true),
             inherit_env: Some(true),
             no_worktree: Some(false),

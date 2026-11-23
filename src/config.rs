@@ -143,6 +143,40 @@ fn transform_map_specs(
     }
 }
 
+/// Accept `nofile = 4096` as well as `data = "8G"` in an `[rlimit]`
+/// table: both are natural to write by hand, and the CLI grammar is the
+/// one stored representation.
+fn deserialize_rlimit_map<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RawLimit {
+        Int(u64),
+        Text(String),
+    }
+    use crate::sandbox::rlimits::{RlimitName, RlimitValue};
+    let raw = BTreeMap::<String, RawLimit>::deserialize(deserializer)?;
+    let mut out = BTreeMap::new();
+    for (key, value) in raw {
+        let text = match value {
+            RawLimit::Int(n) => n.to_string(),
+            RawLimit::Text(t) => t,
+        };
+        // Checked at load in every layer: a typo in a limit must stop
+        // the launch, never silently drop the restriction it meant.
+        let name: RlimitName = key
+            .parse()
+            .map_err(|e| serde::de::Error::custom(format!("rlimit: {e}")))?;
+        RlimitValue::parse(name, &text).map_err(serde::de::Error::custom)?;
+        out.insert(key, text);
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
     /// Explicit harness identities supplied by a trusted wrapper. Runtime
@@ -313,6 +347,19 @@ pub struct Config {
     pub no_seccomp: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_rlimits: Option<bool>,
+    /// Explicit per-process limits, `NAME = VALUE` in the `--rlimit`
+    /// grammar. A TOML integer is accepted and stored as its
+    /// decimal string so every layer compares one representation.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "deserialize_rlimit_map"
+    )]
+    pub rlimit: BTreeMap<String, String>,
+    /// Which layer supplied each `rlimit` entry, for `--dry-run` and the
+    /// audit record. Runtime only: never read from or written to a file.
+    #[serde(skip)]
+    pub rlimit_source: BTreeMap<String, crate::sandbox::rlimits::LimitSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub systemd_user: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1422,7 +1469,8 @@ fn global_config_example_is_inert_and_documents_public_keys() {
         .lines()
         .filter_map(|line| line.trim().strip_prefix("pub "))
         .filter_map(|line| line.split_once(':').map(|(key, _)| key))
-        .filter(|key| *key != "runtime_harnesses")
+        // Runtime-only fields, `#[serde(skip)]`: never read from a file.
+        .filter(|key| !matches!(*key, "runtime_harnesses" | "rlimit_source"))
         .collect::<std::collections::BTreeSet<_>>();
     let raw = uncommented.parse::<toml::Table>().unwrap();
     for key in &expected_keys {
@@ -1956,6 +2004,12 @@ pub(crate) fn global_config_for_command_report(
         profiles,
         ..
     } = global;
+    // The global file's own `[rlimit]` entries are labelled here; command
+    // tables are labelled by `merge_trusted`.
+    for name in base.rlimit.keys() {
+        base.rlimit_source
+            .insert(name.clone(), crate::sandbox::rlimits::LimitSource::Global);
+    }
     let mut ignored_command_tables = Vec::new();
     let mut apply = |name: &str, base: &mut Config| {
         let Some(command_config) = commands.get(name) else {
@@ -2179,6 +2233,11 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(no_landlock);
     take!(no_seccomp);
     take!(no_rlimits);
+    for (name, value) in local.rlimit {
+        c.rlimit_source
+            .insert(name.clone(), crate::sandbox::rlimits::LimitSource::Global);
+        c.rlimit.insert(name, value);
+    }
     take!(systemd_user);
     take!(agent_state);
     take!(inherit_env);
@@ -2656,6 +2715,39 @@ pub(crate) fn merge_layer_report(
     monotonic!(no_landlock, |config: &Config| !config.landlock_enabled());
     monotonic!(no_seccomp, |config: &Config| !config.seccomp_enabled());
     monotonic!(no_rlimits, |config: &Config| !config.rlimits_enabled());
+    // Per limit, the project may only tighten: its value is kept when it
+    // is at or below what the trusted layers (or the default) give.
+    // Compared as numbers, so "4G" tightens a trusted 8589934592.
+    for (key, text) in local.rlimit {
+        let candidate = Config {
+            rlimit: BTreeMap::from([(key.clone(), text.clone())]),
+            ..c.clone()
+        };
+        if crate::sandbox::rlimits::widens(&candidate, &c) {
+            let field = format!("rlimit.{key}");
+            let granted = key
+                .parse()
+                .ok()
+                .and_then(|name| {
+                    crate::sandbox::rlimits::RlimitValue::parse(name, &text)
+                        .ok()
+                })
+                .map(|value| crate::sandbox::rlimits::fmt_rlim(value.as_raw()))
+                .into_iter()
+                .collect();
+            warnings.push(Refusal::new(
+                &field,
+                granted,
+                format!("{layer} {field} ignored because it weakens the baseline sandbox"),
+            ));
+        } else {
+            c.rlimit_source.insert(
+                key.clone(),
+                crate::sandbox::rlimits::LimitSource::Project,
+            );
+            c.rlimit.insert(key, text);
+        }
+    }
     monotonic!(systemd_user, |config: &Config| config
         .systemd_user_enabled());
     monotonic!(no_mise, |config: &Config| config.mise_enabled());
@@ -2833,10 +2925,57 @@ pub fn save_auto(config: &Config, project_trusted: bool, project_dir: &Path) {
     }
 }
 
+/// The well-formed `rlimit` entries of a stored policy, values verbatim.
+/// Storing does not judge a value against the built-in defaults: the
+/// launch merge applies it only where it tightens the trusted value. A
+/// malformed or unknown entry is dropped, as the launch merge would
+/// refuse it anyway.
+pub(crate) fn well_formed_rlimits(
+    rlimit: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    use crate::sandbox::rlimits::{RlimitName, RlimitValue};
+    rlimit
+        .iter()
+        .filter(|(key, text)| {
+            key.parse::<RlimitName>()
+                .is_ok_and(|name| RlimitValue::parse(name, text).is_ok())
+        })
+        .map(|(key, text)| (key.clone(), text.clone()))
+        .collect()
+}
+
+/// Two stored project policies combined: per name, the smaller of the two
+/// well-formed values. Merging one stored policy over another with
+/// [`merge_with_global_report`] would compare against the built-in
+/// defaults and drop a value between the default and the trusted value.
+pub(crate) fn tighter_project_rlimits(
+    stored: &BTreeMap<String, String>,
+    incoming: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    use crate::sandbox::rlimits::{RlimitName, RlimitValue};
+    let raw = |key: &str, text: &str| -> Option<u64> {
+        let name = key.parse::<RlimitName>().ok()?;
+        RlimitValue::parse(name, text).ok().map(RlimitValue::as_raw)
+    };
+    let mut out = well_formed_rlimits(stored);
+    for (key, text) in well_formed_rlimits(incoming) {
+        let tighter = out
+            .get(&key)
+            .and_then(|old| Some((raw(&key, old)?, raw(&key, &text)?)))
+            .is_none_or(|(old, new)| new < old);
+        if tighter {
+            out.insert(key, text);
+        }
+    }
+    out
+}
+
 /// What an untrusted project `.ai-jail` keeps once loaded: the project
 /// layer of [`merge_with_global_report`] over a default baseline. Using the
 /// merge itself keeps auto-save and loading from drifting apart when a
-/// capability is added.
+/// capability is added. `rlimit` is the exception: the default baseline
+/// would drop a value above the built-in default that the launch merge,
+/// against the trusted value, applies.
 pub(crate) fn monotonic_project_constraints(
     config: &Config,
     project_dir: &Path,
@@ -2847,6 +2986,12 @@ pub(crate) fn monotonic_project_constraints(
         project_dir,
     )
     .0;
+    projected.rlimit = well_formed_rlimits(&config.rlimit);
+    projected.rlimit_source = projected
+        .rlimit
+        .keys()
+        .map(|key| (key.clone(), crate::sandbox::rlimits::LimitSource::Project))
+        .collect();
     // Command selection is execution policy rather than a restriction. It is
     // deliberately not imported from repository-controlled legacy files.
     projected.command.clear();
@@ -3295,6 +3440,12 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     invert!(landlock, no_landlock);
     invert!(seccomp, no_seccomp);
     invert!(rlimits, no_rlimits);
+    for (name, value) in &cli.rlimit {
+        config.rlimit.insert(name.clone(), value.clone());
+        config
+            .rlimit_source
+            .insert(name.clone(), crate::sandbox::rlimits::LimitSource::Cli);
+    }
     invert!(status_bar, no_status_bar);
     clone_into!(status_bar_style);
 
@@ -3409,7 +3560,12 @@ pub fn project_config_for_auto_save(
     invocation_cwd: &Path,
 ) -> Config {
     let stored_project_command = project.command.clone();
+    // `--rlimit` is this launch's choice. Only the project policy's own
+    // entries are saved: a CLI value written here would pin every later
+    // launch to it.
+    let project_rlimit = project.rlimit.clone();
     let mut to_save = merge(cli, project);
+    to_save.rlimit = project_rlimit;
 
     // A CLI-passed command is transient when the project already has a stored
     // command. Preserve that project default instead of flipping it between
@@ -3417,6 +3573,13 @@ pub fn project_config_for_auto_save(
     if !stored_project_command.is_empty() && !cli.command.is_empty() {
         to_save.command = stored_project_command;
     }
+
+    // The project's own limits are saved as they are. Filtering them
+    // against the built-in defaults erased a value between the default and
+    // a raised trusted value, which the launch merge had just applied.
+    // That merge stays the only tighten-only decision.
+    to_save.rlimit = well_formed_rlimits(&to_save.rlimit);
+    to_save.rlimit_source.clear();
 
     drop_launch_only_fields(&mut to_save);
     absolutize_user_paths(&mut to_save, invocation_cwd);
@@ -5582,6 +5745,8 @@ no_gpu = true
             resize_redraw_key: Some("ctrl-shift-l".into()),
             no_seccomp: None,
             no_rlimits: None,
+            rlimit: BTreeMap::from([("nofile".into(), "1024".into())]),
+            rlimit_source: BTreeMap::new(),
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000, 8080],
             allow_hosts: vec!["api.anthropic.com".into()],
@@ -9003,6 +9168,8 @@ hide_dotdirs = [".my_secrets"]
             resize_redraw_key: Some("ctrl-shift-l".into()),
             no_seccomp: None,
             no_rlimits: None,
+            rlimit: BTreeMap::new(),
+            rlimit_source: BTreeMap::new(),
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000],
             allow_hosts: vec![],
@@ -9534,6 +9701,533 @@ claude_dir = "/home/user/.claude-example"
         };
         let serialized = toml::to_string_pretty(&config).unwrap();
         assert!(!serialized.contains("claude_dir"));
+    }
+}
+
+// `--rlimit` flag, `rlimit` config field and the project tighten-only
+// rule.
+//
+// - `Config.rlimit: BTreeMap<String, String>`, skipped when empty; a TOML
+//   integer is accepted and stored as its decimal string;
+// - `merge()` puts CLI `--rlimit NAME=VALUE` entries over the trusted map;
+// - `merge_with_global_report` keeps min(project, trusted) per name and
+//   warns `... rlimit.<name> ignored ...` for a project value that raises
+//   or removes a limit; a name the trusted side leaves at its default is
+//   compared with that default.
+// The report of `merge_with_global_report` is read through `Debug`, so
+// these tests hold for `Vec<String>` and for `feat/profiles`' `Vec<Refusal>`.
+#[cfg(test)]
+mod rlimit_config_tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use super::*;
+
+    fn cli(args: &[&str]) -> Result<CliArgs, String> {
+        crate::cli::parse_from(lexopt::Parser::from_args(
+            args.iter().map(std::ffi::OsString::from),
+        ))
+    }
+
+    fn rl(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn with_rlimit(pairs: &[(&str, &str)]) -> Config {
+        Config {
+            rlimit: rl(pairs),
+            ..Config::default()
+        }
+    }
+
+    /// Warnings as text. `format!("{w:?}")` works whether the report is
+    /// today's `Vec<String>` or the `Vec<Refusal>` of `feat/profiles`
+    /// (whose `text` field carries the same warning), so this file
+    /// survives the merge into `integration` unchanged.
+    fn project_merge(
+        trusted: Config,
+        project: Config,
+    ) -> (Config, Vec<String>) {
+        let (merged, report) =
+            merge_with_global_report(trusted, project, Path::new("/tmp"));
+        (merged, report.iter().map(|w| format!("{w:?}")).collect())
+    }
+
+    #[test]
+    fn rlimit_table_accepts_quoted_and_unquoted_values() {
+        let config = parse_toml(
+            "[rlimit]\nnofile = 4096\ndata = \"8G\"\ncpu = \"unlimited\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.rlimit,
+            rl(&[("cpu", "unlimited"), ("data", "8G"), ("nofile", "4096")])
+        );
+    }
+
+    #[test]
+    fn regression_v3_3_0_config_without_rlimit() {
+        let config =
+            parse_toml("no_rlimits = true\ncommand = [\"bash\"]\n").unwrap();
+        assert!(config.rlimit.is_empty());
+        assert_eq!(config.no_rlimits, Some(true));
+        let body = toml::to_string(&Config::default()).unwrap();
+        assert!(
+            !body.contains("rlimit"),
+            "empty map must not be written: {body}"
+        );
+    }
+
+    #[test]
+    fn cli_rlimit_overrides_the_trusted_map_per_name() {
+        let args =
+            cli(&["--rlimit", "nofile=64", "--rlimit", "cpu=30", "bash"])
+                .unwrap();
+        let trusted = with_rlimit(&[("nofile", "2048"), ("core", "0")]);
+        let merged = merge(&args, trusted);
+        assert_eq!(
+            merged.rlimit,
+            rl(&[("core", "0"), ("cpu", "30"), ("nofile", "64")])
+        );
+    }
+
+    #[test]
+    fn cli_rlimit_after_the_command_is_refused() {
+        assert!(cli(&["bash", "--rlimit", "nofile=64"]).is_err());
+        assert!(cli(&["bash", "--", "--rlimit", "nofile=64"]).is_ok());
+    }
+
+    #[test]
+    fn project_rlimit_that_removes_a_limit_is_ignored_with_a_warning() {
+        // Hostile halves first: a project value that would loosen.
+        let (merged, warnings) = project_merge(
+            with_rlimit(&[("nofile", "1024")]),
+            with_rlimit(&[("nofile", "unlimited")]),
+        );
+        assert_eq!(
+            merged.rlimit.get("nofile").map(String::as_str),
+            Some("1024")
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("rlimit.nofile") && w.contains("ignored")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn project_rlimit_that_raises_a_trusted_value_is_ignored() {
+        let (merged, warnings) = project_merge(
+            with_rlimit(&[("nofile", "1024")]),
+            with_rlimit(&[("nofile", "2048")]),
+        );
+        assert_eq!(
+            merged.rlimit.get("nofile").map(String::as_str),
+            Some("1024")
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("rlimit.nofile")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn project_rlimit_above_an_untouched_default_is_ignored() {
+        // The trusted side leaves core at its default (0): raising it, or
+        // removing nofile's default, is a weakening too.
+        let (merged, warnings) = project_merge(
+            Config::default(),
+            with_rlimit(&[("core", "100"), ("nofile", "unlimited")]),
+        );
+        assert!(!merged.rlimit.contains_key("core"));
+        assert!(!merged.rlimit.contains_key("nofile"));
+        assert!(
+            warnings.iter().any(|w| w.contains("rlimit.core")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("rlimit.nofile")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn project_rlimit_that_tightens_is_kept_without_warning() {
+        let (merged, warnings) = project_merge(
+            with_rlimit(&[("nofile", "1024"), ("data", "8G")]),
+            with_rlimit(&[("nofile", "512"), ("data", "4G"), ("nproc", "100")]),
+        );
+        assert_eq!(
+            merged.rlimit.get("nofile").map(String::as_str),
+            Some("512")
+        );
+        assert_eq!(merged.rlimit.get("data").map(String::as_str), Some("4G"));
+        // nproc was at its default (4096) on the trusted side: 100 tightens.
+        assert_eq!(merged.rlimit.get("nproc").map(String::as_str), Some("100"));
+        assert!(
+            !warnings.iter().any(|w| w.contains("rlimit.")),
+            "a tightening must not warn: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn project_rlimit_compares_values_not_spellings() {
+        // "4G" is smaller than a trusted 8589934592 (8 GiB) even though the
+        // strings compare the other way round; "1G" equals 1073741824.
+        let (merged, warnings) = project_merge(
+            with_rlimit(&[("data", "8589934592"), ("fsize", "1073741824")]),
+            with_rlimit(&[("data", "4G"), ("fsize", "1G")]),
+        );
+        assert_eq!(merged.rlimit.get("data").map(String::as_str), Some("4G"));
+        assert!(
+            !warnings.iter().any(|w| w.contains("rlimit.")),
+            "{warnings:?}"
+        );
+        let fsize = merged.rlimit.get("fsize").map(String::as_str);
+        assert!(
+            fsize == Some("1G") || fsize == Some("1073741824"),
+            "an equal value is neither a raise nor dropped: {fsize:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rlimit_auto_save_tests {
+    use super::*;
+
+    #[test]
+    fn auto_save_writes_no_cli_rlimit_tight_or_loose() {
+        let cli = crate::cli::parse_from(lexopt::Parser::from_args(
+            [
+                "--rlimit",
+                "nofile=1024",
+                "--rlimit",
+                "nproc=unlimited",
+                "--rlimit",
+                "core=100",
+                "--rlimit",
+                "data=4G",
+                "bash",
+            ]
+            .iter()
+            .map(std::ffi::OsString::from),
+        ))
+        .unwrap();
+        let saved = project_config_for_auto_save(
+            &cli,
+            Config::default(),
+            Path::new("/tmp"),
+        );
+        // A CLI limit is this launch's choice, whether it tightens
+        // (nofile, data) or not (nproc, core): none is saved.
+        assert!(saved.rlimit.is_empty(), "{:?}", saved.rlimit);
+        assert!(saved.rlimit_source.is_empty());
+    }
+}
+
+// Limits are never sticky: auto-save never writes a CLI `--rlimit` into
+// the project policy; the project policy's own entries are what it keeps.
+#[cfg(test)]
+mod config_explicit_rlimit_tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use super::*;
+
+    fn cli(args: &[&str]) -> CliArgs {
+        crate::cli::parse_from(lexopt::Parser::from_args(
+            args.iter().map(std::ffi::OsString::from),
+        ))
+        .unwrap()
+    }
+
+    fn rl(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn auto_save(cli: &CliArgs, project: Config) -> Config {
+        project_config_for_auto_save(cli, project, Path::new("/project"))
+    }
+
+    #[test]
+    fn auto_save_never_writes_cli_rlimit() {
+        let args = cli(&["--rlimit", "nofile=1024", "bash"]);
+        let saved = auto_save(&args, Config::default());
+        assert!(saved.rlimit.is_empty(), "{:?}", saved.rlimit);
+        assert!(saved.rlimit_source.is_empty(), "{:?}", saved.rlimit_source);
+    }
+
+    #[test]
+    fn auto_save_keeps_only_the_project_policy_own_rlimit() {
+        let project = Config {
+            rlimit: rl(&[("nofile", "512")]),
+            ..Config::default()
+        };
+        // Hostile half first: the project policy's own entries survive an
+        // auto-save; dropping them would loosen it on the next launch.
+        let saved = auto_save(&cli(&["bash"]), project.clone());
+        assert_eq!(saved.rlimit, rl(&[("nofile", "512")]));
+        // A CLI value for the same name is this launch's, not the
+        // project's: the saved policy keeps the project's own.
+        let args = cli(&["--rlimit", "nofile=1024", "bash"]);
+        let saved = auto_save(&args, project);
+        assert_eq!(saved.rlimit, rl(&[("nofile", "512")]));
+    }
+}
+
+// The project's own limit survives save and migration.
+//
+// The case pinned here:
+// a trusted `nproc = 8192` raised above the built-in default (4096) and a
+// project `nproc = 6000` between the two. The launch merge applies 6000;
+// saving or migrating the project policy must keep it, or the next launch
+// silently runs at 8192.
+//
+// - Auto-save keeps every well-formed project `rlimit` entry, including a
+//   value above the built-in default.
+// - The legacy-file migration projection keeps it too.
+// - Keeping a value is not applying it: a project value that raises the
+//   trusted limit is still stored, and still ignored, with a warning, at
+//   launch. The launch merge stays the only tighten-only decision.
+// The merge report is read through `Debug`, so these tests hold for
+// `Vec<String>` and for `feat/profiles`' `Vec<Refusal>`.
+#[cfg(test)]
+mod config_project_rlimit_save_tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use super::*;
+    use crate::sandbox::rlimits::LimitSource;
+
+    fn cli(args: &[&str]) -> CliArgs {
+        crate::cli::parse_from(lexopt::Parser::from_args(
+            args.iter().map(std::ffi::OsString::from),
+        ))
+        .unwrap()
+    }
+
+    fn nproc(value: &str) -> Config {
+        Config {
+            rlimit: BTreeMap::from([("nproc".to_string(), value.to_string())]),
+            ..Config::default()
+        }
+    }
+
+    /// The trusted layer of the failing case: `nproc` raised above the default.
+    fn trusted() -> Config {
+        nproc("8192")
+    }
+
+    /// The launch-time merge of the trusted layer and a project policy.
+    fn launch(project: Config) -> (Config, Vec<String>) {
+        let (merged, report) =
+            merge_with_global_report(trusted(), project, Path::new("/project"));
+        let warnings = report.iter().map(|w| format!("{w:?}")).collect();
+        (merged, warnings)
+    }
+
+    fn auto_save(project: Config) -> Config {
+        project_config_for_auto_save(
+            &cli(&["bash"]),
+            project,
+            Path::new("/project"),
+        )
+    }
+
+    fn assert_project_nproc(merged: &Config, value: &str, step: &str) {
+        assert!(
+            merged
+                .rlimit
+                .get("nproc")
+                .is_some_and(|limit| limit == value),
+            "{step}: unexpected process limit"
+        );
+        assert!(
+            merged.rlimit_source.get("nproc") == Some(&LimitSource::Project),
+            "{step}: expected the project to supply the process limit"
+        );
+    }
+
+    #[test]
+    fn auto_save_keeps_a_project_nproc_between_default_and_trusted() {
+        // The launch applies the project's 6000 under the trusted 8192.
+        let (first, _) = launch(nproc("6000"));
+        assert_project_nproc(&first, "6000", "first launch");
+
+        // Saving that project policy must keep 6000: dropping it because
+        // it is above the built-in 4096 loosens the next launch to 8192.
+        let saved = auto_save(nproc("6000"));
+        assert_eq!(
+            saved.rlimit.get("nproc").map(String::as_str),
+            Some("6000"),
+            "auto-save erased the project's own nproc: {:?}",
+            saved.rlimit
+        );
+
+        let (next, _) = launch(saved);
+        assert_project_nproc(&next, "6000", "launch from the saved policy");
+    }
+
+    #[test]
+    fn migration_keeps_a_project_nproc_between_default_and_trusted() {
+        // What the legacy-file migration writes as the project constraints.
+        let projected = monotonic_project_constraints(
+            &nproc("6000"),
+            Path::new("/project"),
+        );
+        assert_eq!(
+            projected.rlimit.get("nproc").map(String::as_str),
+            Some("6000"),
+            "migration dropped the project's own nproc: {:?}",
+            projected.rlimit
+        );
+
+        let (next, _) = launch(projected);
+        assert_project_nproc(&next, "6000", "launch from the migrated policy");
+    }
+
+    #[test]
+    fn auto_save_still_stores_a_raising_project_nproc() {
+        // Saving keeps every well-formed entry: the save does not judge
+        // the value, the launch does (next test).
+        let saved = auto_save(nproc("9000"));
+        assert_eq!(
+            saved.rlimit.get("nproc").map(String::as_str),
+            Some("9000"),
+            "{:?}",
+            saved.rlimit
+        );
+    }
+
+    #[test]
+    fn raising_project_nproc_is_still_ignored_at_launch() {
+        // Guard: keeping a raising value on disk must never let it apply.
+        let (merged, warnings) = launch(nproc("9000"));
+        assert!(
+            merged
+                .rlimit
+                .get("nproc")
+                .is_some_and(|limit| limit == "8192")
+        );
+        assert!(
+            merged.rlimit_source.get("nproc") != Some(&LimitSource::Project)
+        );
+        let named: Vec<&String> = warnings
+            .iter()
+            .filter(|w| w.contains("rlimit.nproc") && w.contains("ignored"))
+            .collect();
+        assert_eq!(named.len(), 1, "{warnings:?}");
+
+        // The same holds for a raising value that came through migration.
+        let projected = monotonic_project_constraints(
+            &nproc("9000"),
+            Path::new("/project"),
+        );
+        let (merged, _) = launch(projected);
+        assert!(
+            merged
+                .rlimit
+                .get("nproc")
+                .is_some_and(|limit| limit == "8192")
+        );
+    }
+}
+
+// A config layer holding `cpu = 0` fails to load, naming the file.
+//
+// The value is refused where every other malformed limit is: at load, so
+// the operator learns which file to fix before anything runs. TOML gives
+// the value as an integer or as a string; both spellings are the same
+// zero. Other limits keep `0` as a valid value.
+#[cfg(test)]
+mod config_cpu_floor_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    struct CpuFloorDir(PathBuf);
+
+    impl CpuFloorDir {
+        fn new(tag: &str) -> CpuFloorDir {
+            let dir = std::env::temp_dir().join(format!(
+                "ai-jail-config-cpu-floor-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            CpuFloorDir(dir)
+        }
+
+        fn load_global(&self, body: &str) -> (PathBuf, Result<(), String>) {
+            let path = self.0.join("config.toml");
+            std::fs::write(&path, body).unwrap();
+            let loaded = load_global_from_path(&path).map(|_| ());
+            (path, loaded)
+        }
+    }
+
+    impl Drop for CpuFloorDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn config_cpu_floor_loads_one_second_unlimited_and_other_zeros() {
+        // Hostile half first: values next to the floor, and `0` on limits
+        // the floor is not about, still load.
+        let dir = CpuFloorDir::new("ok");
+        for body in [
+            "[rlimit]\ncpu = 1\n",
+            "[rlimit]\ncpu = \"unlimited\"\n",
+            "[rlimit]\ncore = 0\nnofile = 0\nfsize = \"0\"\n",
+        ] {
+            let (path, loaded) = dir.load_global(body);
+            assert!(
+                loaded.is_ok(),
+                "{} with {body:?}: {loaded:?}",
+                path.display()
+            );
+        }
+        assert!(parse_toml("[rlimit]\ncpu = 1\ncore = 0\n").is_ok());
+    }
+
+    #[test]
+    fn config_cpu_floor_refuses_a_global_zero_naming_the_file() {
+        let dir = CpuFloorDir::new("zero");
+        // Hostile half: the quoted zero is the same value as the bare one.
+        for body in ["[rlimit]\ncpu = 0\n", "[rlimit]\ncpu = \"0\"\n"] {
+            let (path, loaded) = dir.load_global(body);
+            let err = match loaded {
+                Ok(()) => panic!("{body:?} must not load"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains(&path.display().to_string()),
+                "must name the layer's file: {err}"
+            );
+            assert!(err.contains("cpu"), "must name the limit: {err}");
+            assert!(
+                err.contains("at least 1 second"),
+                "must say what the floor is: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_cpu_floor_refuses_a_project_zero() {
+        let err = match parse_toml("[rlimit]\ncpu = 0\n") {
+            Ok(_) => panic!("a project cpu = 0 must not parse"),
+            Err(e) => e,
+        };
+        assert!(err.contains("at least 1 second"), "{err}");
     }
 }
 
@@ -10192,6 +10886,7 @@ mod profile_field_coverage_tests {
     /// cannot come from a file at all.
     const NEVER_WIDENS: &[&str] = &[
         "runtime_harnesses",
+        "rlimit_source",
         "command",
         "hide_dotdirs",
         "mask",
@@ -10231,6 +10926,7 @@ mod profile_field_coverage_tests {
             "[\"x.example\"]",
             "[4242]",
             "{ AJ_PROFILE_KEY = \"x.example\" }",
+            "{ nofile = \"unlimited\" }",
         ];
         let fields = config_fields();
         assert!(fields.len() > 40, "scanner found {fields:?}");
@@ -10255,7 +10951,12 @@ mod profile_field_coverage_tests {
                         Path::new("/project"),
                         "profile 'coverage'",
                     );
-                    refusals.iter().any(|r| r.field == *field)
+                    refusals.iter().any(|r| {
+                        r.field == *field
+                            || r.field
+                                .strip_prefix(field)
+                                .is_some_and(|suffix| suffix.starts_with('.'))
+                    })
                 })
             });
             if !refused {
@@ -10737,6 +11438,45 @@ allow_hosts = [\"api.example.com\"]
     }
 
     // ── Widenings against the merged result ───────────────────
+
+    #[test]
+    fn profile_reports_a_raised_resource_limit_unless_the_cli_chooses_it() {
+        let body = "\
+[rlimit]
+nofile = 512
+[profiles.more]
+profile_version = 1
+[profiles.more.rlimit]
+nofile = 1024
+";
+        let (_, report) = load(body, &["--profile", "more", "claude"]).unwrap();
+        assert!(report.unwrap().widenings.iter().any(|widening| {
+            widening.field == "rlimit.nofile" && widening.granted == ["1024"]
+        }));
+        let args =
+            cli(&["--profile", "more", "--rlimit", "nofile=1024", "claude"]);
+        let base = parse_toml("[rlimit]\nnofile = 512\n").unwrap();
+        let (profiled, report) =
+            load(body, &["--profile", "more", "claude"]).unwrap();
+        let launch = merge(&args, profiled);
+        let report = report
+            .unwrap()
+            .applied(
+                ProfileLayers {
+                    without_profile: merge(&args, base),
+                    with_profile: launch.clone(),
+                },
+                &launch,
+                Path::new("."),
+            )
+            .unwrap();
+        assert!(
+            !report
+                .widenings
+                .iter()
+                .any(|widening| { widening.field == "rlimit.nofile" })
+        );
+    }
 
     #[test]
     fn refused_lockdown_does_not_hide_the_agent_state_widening() {

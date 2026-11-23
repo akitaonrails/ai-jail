@@ -1325,6 +1325,10 @@ fn resolve_landlock_wrapper(
         // bridges.
         && config.forward_ports().is_empty()
         && config.publish_ports().is_empty()
+        // Explicit limits are applied only by the wrapper; skipping it
+        // would drop them while `--dry-run` and the audit record still
+        // report them.
+        && config.rlimit.is_empty()
         // A teardown report needs the wrapper as the command's sub-reaper.
         && !teardown_report
     {
@@ -1388,6 +1392,12 @@ fn landlock_wrapper_args(
     } else {
         "--no-rlimits".into()
     });
+    // Explicit limits travel to the wrapper, which recomputes the same
+    // `rlimits::effective()` set and applies it inside the sandbox.
+    for (name, value) in &config.rlimit {
+        args.push("--rlimit".into());
+        args.push(format!("{name}={value}"));
+    }
 
     args.push(if config.gpu_enabled() {
         "--gpu".into()
@@ -9281,5 +9291,165 @@ nameserver 8.8.8.8
         std::fs::remove_file(&lock).unwrap();
         assert_eq!(position(&args_for(&config), "--bind", &own, &lock), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+// The limits the supervisor computes are the limits the in-sandbox
+// wrapper re-computes from its forwarded arguments.
+//
+// The wrapper builds its config as
+// `config::merge(&cli, Config::default())` from the arguments after
+// `--landlock-exec` (as `run_landlock_exec` does today), so feeding those
+// arguments back through `cli::parse_from` must give the same
+// `rlimits::effective()` (name, soft, hard) as the supervisor's config.
+#[cfg(test)]
+mod roundtrip_rlimits_tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::sandbox::rlimits;
+
+    fn base_config(pairs: &[(&str, &str)], no_rlimits: bool) -> Config {
+        Config {
+            command: vec!["bash".into()],
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            no_display: Some(true),
+            no_mise: Some(true),
+            no_rlimits: no_rlimits.then_some(true),
+            rlimit: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            ..Config::default()
+        }
+    }
+
+    /// The arguments the wrapper receives, between `--landlock-exec` and
+    /// the `--` that precedes the command.
+    fn wrapper_args(config: &Config) -> Vec<String> {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            config,
+            &PathBuf::from("/home/user/project"),
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+        let start = args
+            .iter()
+            .position(|a| a == "--landlock-exec")
+            .expect("wrapper present");
+        let end = args[start..]
+            .iter()
+            .position(|a| a == "--")
+            .map(|i| start + i)
+            .expect("separator after wrapper args");
+        args[start..end].to_vec()
+    }
+
+    fn triples(config: &Config) -> Vec<(String, u64, u64)> {
+        let mut v: Vec<(String, u64, u64)> = rlimits::effective(config)
+            .unwrap()
+            .iter()
+            .map(|l| (l.name.as_str().to_string(), l.soft, l.hard))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn reparsed(config: &Config) -> Config {
+        let mut args = wrapper_args(config);
+        args.push("true".into());
+        let cli = crate::cli::parse_from(lexopt::Parser::from_args(args))
+            .expect("wrapper args parse");
+        crate::config::merge(&cli, Config::default())
+    }
+
+    #[test]
+    fn roundtrip_wrapper_rlimit_args_give_the_same_effective_limits() {
+        let outer = base_config(
+            &[
+                ("nproc", "300"),
+                ("nofile", "512"),
+                ("cpu", "120"),
+                ("fsize", "64M"),
+                ("data", "8G"),
+                ("as", "unlimited"),
+                ("core", "0"),
+            ],
+            false,
+        );
+        assert_eq!(triples(&reparsed(&outer)), triples(&outer));
+    }
+
+    #[test]
+    fn roundtrip_no_rlimits_with_explicit_values_survives_forwarding() {
+        let outer = base_config(&[("nofile", "1024")], true);
+        let inner = reparsed(&outer);
+        assert_eq!(triples(&inner), triples(&outer));
+        assert_eq!(triples(&inner).len(), 1, "no default may reappear");
+    }
+
+    #[test]
+    fn roundtrip_lockdown_defaults_survive_forwarding() {
+        let mut outer = base_config(&[("nofile", "1024")], false);
+        outer.lockdown = Some(true);
+        assert_eq!(triples(&reparsed(&outer)), triples(&outer));
+    }
+}
+
+// Explicit limits keep the in-sandbox wrapper.
+//
+// Explicit limits are applied only by the wrapper, so it must run while
+// any is set, even with Landlock, seccomp, the default
+// limits and the network all off; otherwise they are applied nowhere
+// while `--dry-run` and the audit record report them.
+#[cfg(test)]
+mod wrapper_explicit_limit_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    /// Every control that keeps the wrapper on its own, turned off.
+    fn all_off() -> Config {
+        Config {
+            no_landlock: Some(true),
+            no_seccomp: Some(true),
+            no_rlimits: Some(true),
+            network: Some(false),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn wrapper_still_skipped_when_nothing_needs_it() {
+        // Hostile half first: the fix must not keep the wrapper for a
+        // launch that has nothing for it to do.
+        let wrapper = resolve_landlock_wrapper(&all_off(), false).unwrap();
+        assert!(wrapper.is_none(), "{wrapper:?}");
+    }
+
+    #[test]
+    fn wrapper_kept_for_an_explicit_limit_with_every_control_off() {
+        let config = Config {
+            rlimit: BTreeMap::from([("nofile".to_string(), "64".to_string())]),
+            ..all_off()
+        };
+        let wrapper = resolve_landlock_wrapper(&config, false).unwrap();
+        assert!(
+            wrapper.is_some(),
+            "--rlimit nofile=64 with every control off must keep the wrapper"
+        );
+        let args = landlock_wrapper_args(&config, &[], false, None);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--rlimit" && w[1] == "nofile=64"),
+            "the wrapper receives the limit: {args:?}"
+        );
     }
 }

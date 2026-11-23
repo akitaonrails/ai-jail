@@ -470,6 +470,7 @@ pub(crate) fn prepare_profile(
             proposed.restricted_ssh.clone()
         },
     )?;
+    crate::checked_limits(&finalized.config, effective.store)?;
     let forge_preview =
         if effective.cli.clean || finalized.config.lockdown_enabled() {
             None
@@ -1576,6 +1577,7 @@ fn run_sequential(
             proposed.restricted_ssh.clone()
         },
     )?;
+    crate::checked_limits(&finalized.config, effective.store)?;
     eprintln!(
         "{}",
         render_effective_access_with_profile(
@@ -2768,6 +2770,36 @@ pub(crate) fn render_effective_access_with_profile(
     ] {
         if !ports.is_empty() {
             lines.push(format!("- [WARN] ALLOWED: {label} {}; TCP access; exact listed ports; {effect}", ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")));
+        }
+    }
+    // `--rlimit` has no onboarding control (advanced
+    // CLI/config-only, docs/TUI_DESIGN.md), so this review is where its
+    // effect is shown: the values the sandbox applies, not the text typed.
+    // The same host clamp as the dry run, so the review shows what the
+    // sandbox gets under a low host hard limit.
+    let mut effective = crate::sandbox::rlimits::effective(config)?;
+    crate::sandbox::rlimits::clamp_to_host(
+        &mut effective,
+        crate::sandbox::rlimits::host_hard_limit,
+    );
+    let explicit: Vec<_> = effective
+        .into_iter()
+        .filter(|l| l.source != crate::sandbox::rlimits::LimitSource::Default)
+        .collect();
+    if !explicit.is_empty() {
+        lines.push("Explicit resource limits:".into());
+        for limit in explicit {
+            let ceiling = limit
+                .ceiling
+                .map(|c| format!(" ceiling={}", c.as_str()))
+                .unwrap_or_default();
+            lines.push(format!(
+                "- rlimit {}={}/{} ({}){ceiling}",
+                limit.name.as_str(),
+                crate::sandbox::rlimits::fmt_rlim(limit.soft),
+                crate::sandbox::rlimits::fmt_rlim(limit.hard),
+                limit.source.as_str()
+            ));
         }
     }
     if config.env_pass.is_empty() {
@@ -3963,5 +3995,93 @@ mod tests {
         assert!(provenance.contains(
             "scripted_pty_confirms_recommended_github_and_saves_without_final_review"
         ));
+    }
+}
+
+// The effective-access review spells `RLIM_INFINITY` as `unlimited`, as the
+// dry run, the clamp warnings and the audit text do.
+//
+// `--rlimit` accepts `unlimited` back but not the 20-digit number, so a
+// review line showing `18446744073709551615` is one the operator cannot
+// type again. Only `RLIM_INFINITY` itself becomes the word: the largest
+// finite value stays a number.
+#[cfg(test)]
+mod rlimit_unlimited_review_tests {
+    use std::{collections::BTreeMap, path::Path};
+
+    use crate::{config::Config, sandbox::rlimits::LimitSource};
+
+    const UNLIMITED: u64 = nix::libc::RLIM_INFINITY;
+
+    fn rlimit_unlimited_review(pairs: &[(&str, &str)]) -> String {
+        let config = Config {
+            rlimit: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            rlimit_source: pairs
+                .iter()
+                .map(|(k, _)| (k.to_string(), LimitSource::Cli))
+                .collect::<BTreeMap<_, _>>(),
+            ..Config::default()
+        };
+        super::render_effective_access(
+            &config,
+            Path::new("/project"),
+            "claude",
+            None,
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn rlimit_unlimited_line<'a>(text: &'a str, limit: &str) -> &'a str {
+        let prefix = format!("rlimit {limit}=");
+        text.lines()
+            .find(|l| l.contains(&prefix))
+            .unwrap_or_else(|| panic!("no {prefix} line in:\n{text}"))
+    }
+
+    #[test]
+    fn rlimit_unlimited_review_keeps_the_largest_finite_value_a_number() {
+        // Hostile half first: one below RLIM_INFINITY is a real limit and
+        // must not collapse into the word.
+        use crate::sandbox::rlimits::{RlimitName, host_hard_limit};
+        let finite = UNLIMITED - 1;
+        let expected =
+            finite.min(host_hard_limit(RlimitName::As).unwrap_or(UNLIMITED));
+        let text = rlimit_unlimited_review(&[("as", &finite.to_string())]);
+        let line = rlimit_unlimited_line(&text, "as");
+        assert!(
+            line.contains(&format!("as={expected}/{expected}")),
+            "{line}"
+        );
+        assert!(!line.contains("unlimited"), "{line}");
+    }
+
+    #[test]
+    fn rlimit_unlimited_review_spells_the_raw_maximum_as_the_word() {
+        let raw = UNLIMITED.to_string();
+        let raw_review = rlimit_unlimited_review(&[("as", &raw)]);
+        let typed_review = rlimit_unlimited_review(&[("as", "unlimited")]);
+        assert_eq!(
+            rlimit_unlimited_line(&raw_review, "as"),
+            rlimit_unlimited_line(&typed_review, "as")
+        );
+        assert!(!rlimit_unlimited_line(&raw_review, "as").contains(&raw));
+    }
+
+    #[test]
+    fn rlimit_unlimited_review_shows_unlimited_soft_and_hard() {
+        let text = rlimit_unlimited_review(&[
+            ("as", "unlimited"),
+            ("cpu", "unlimited"),
+        ]);
+        let line = rlimit_unlimited_line(&text, "as");
+        assert!(line.contains("as=unlimited/unlimited"), "{line}");
+        // cpu's five-second grace saturates: hard is RLIM_INFINITY as well.
+        let line = rlimit_unlimited_line(&text, "cpu");
+        assert!(line.contains("cpu=unlimited/unlimited"), "{line}");
+        assert!(!text.contains(&UNLIMITED.to_string()), "{text}");
     }
 }

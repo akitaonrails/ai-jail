@@ -213,6 +213,10 @@ checklist row would invite guessing a number, and where the right value
 depends on the machine rather than on the access being granted. Their effect
 must still appear in the final `Complete effective access` review.
 
+- `--rlimit NAME=VALUE` and the `[rlimit]` table: per-process resource limits.
+  The review lists each explicit limit as `rlimit NAME=SOFT/HARD (SOURCE)`,
+  with the values the sandbox applies (after a `--lockdown` clamp, and with
+  the five-second `cpu` grace). Defaults are not listed there.
 - `--profile NAME` selects a named profile, a `[profiles.NAME]` table in the
   trusted global config. It is CLI/config-only because a profile is written
   by hand in the global file and onboarding only edits per-project grants;

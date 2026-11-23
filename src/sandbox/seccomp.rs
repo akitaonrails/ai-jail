@@ -239,7 +239,6 @@ fn compile_filter(
             rules.insert(nr, vec![]);
         }
     }
-
     // SeccompCondition::new compares Dword syscall arguments. MaskedEq(0xF)
     // matches SOCK_RAW despite SOCK_CLOEXEC or SOCK_NONBLOCK type flags.
     let mut socket_rules = [

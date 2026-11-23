@@ -85,6 +85,11 @@
 # Legacy compatibility only. An empty list grants no repository trust.
 # trust_project_config = []
 
+# Linux only: per-process limits inside the sandbox, by name
+# [rlimit]
+# nofile = 4096
+# data = "8G"
+
 # Optional per-command overrides. Keep these tables below the global keys.
 # [commands.claude]
 # agent_state = true

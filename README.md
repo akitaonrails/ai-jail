@@ -461,6 +461,72 @@ resolved endpoint is forwarded as both `DOCKER_HOST` and `CONTAINER_HOST`.
 `--systemd-user` exposes only explicit user-bus sockets, but can still ask the
 host user manager to run services.
 
+### Resource limits without root: `--rlimit`
+
+ai-jail always applies a few per-process limits (`nofile` 65536, `core` 0,
+`nproc` 4096; `nofile` 4096, `nproc` 1024 and `fsize` 1 GiB under
+`--lockdown`). `--rlimit NAME=VALUE` replaces one of them or adds another, and
+needs no privilege. Explicit limits are Linux only: on other platforms the
+launch is refused rather than run without them.
+
+```bash
+ai-jail --rlimit nofile=1024 --rlimit cpu=600 --dry-run claude
+ai-jail --rlimit data=8G --rlimit fsize=2G --dry-run claude
+```
+
+- Names: `nproc`, `nofile`, `core`, `cpu`, `fsize`, `data`, `as`. Values are a
+  decimal integer, `unlimited`, or — for the byte limits `fsize`, `data` and
+  `as` only — an integer with `K`/`M`/`G`/`T` (powers of 1024).
+- **Every limit applies to each process on its own**, not to the sandbox as a
+  whole: `data=8G` lets every process use 8 GiB.
+- `cpu` is CPU _seconds_. At the limit the process gets `SIGXCPU`, five seconds
+  later `SIGKILL`. It ends a runaway loop; it does not throttle. It needs at
+  least 1 second: `cpu=0` is refused.
+- Explicit values are applied inside the sandbox only, never to ai-jail's own
+  supervisor, so the terminal proxy, the egress proxy and the audit writer keep
+  running when the agent hits a limit. The supervisor always keeps its own
+  `core` 0 and `nofile` default, and under `--lockdown` its `fsize` default,
+  so the sandbox cannot be given more than those.
+- A limit can only be lowered from where the process starts: asking for more
+  than the current hard limit applies the hard limit and prints
+  `RLIMIT_<NAME>: requested …, hard limit …, applied …`.
+- `--lockdown` runs a value above its own defaults at that default and prints a
+  warning naming both; `--no-rlimits` drops the defaults but keeps explicit
+  values.
+- In `config.toml`, `[rlimit]` takes the same names (`nofile = 4096`,
+  `data = "8G"`). A project policy may only lower a limit: a higher or
+  `unlimited` value is ignored with a warning. An unknown name or a malformed
+  value stops the launch.
+- `--dry-run` prints every effective limit as
+  `rlimit name=<n> soft=<s> hard=<h> source=<default|cli|global|project>`, and
+  the audit log records the same set. These are the values the sandbox gets:
+  an explicit `core` or `nofile` above ai-jail's own default (`core` 0,
+  `nofile` 65536) cannot be raised past it, so the line shows the default and
+  adds `ceiling=supervisor`. A value above the hard limit ai-jail itself was
+  started with shows that limit and `ceiling=host`. Under `--lockdown`, a
+  value lowered to lockdown's default adds
+  `rlimit name=<n> requested=<r> lockdown_ceiling=<c>`.
+- In the audit record each limit is a JSON number, and `unlimited` is
+  `18446744073709551615` (`RLIM_INFINITY`, `u64::MAX`). Parse it as a 64-bit
+  integer: JavaScript, and `jq` when it compares or computes, use doubles and
+  lose precision past 2^53, so such a reader cannot tell it apart from nearby
+  values.
+
+What an unprivileged process **cannot** enforce, and so is not offered here —
+each needs a cgroup the user does not own:
+
+| Control                                        | Why it is not offered                                                                          |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `memory.max` (total memory)                    | `data`/`as` cap each process; a total across processes is a cgroup limit                       |
+| `cpu.max` (CPU share, throttling)              | rlimits can only end a process after N CPU seconds, not slow it down                           |
+| `cpuset.cpus` (which CPUs the sandbox runs on) | a CPU set is a cgroup control; affinity alone is advisory, since any process may widen its own |
+| `io.max` (disk bandwidth)                      | no rlimit bounds I/O rate                                                                      |
+| `pids.max` below Linux 5.14                    | before 5.14 `RLIMIT_NPROC` counts every process of the user on the host                        |
+
+`nproc` on Linux 5.14 and later counts per user _and_ user namespace, so host
+processes of the same user do not count against the sandbox's limit
+(`tests/rlimit_values.rs` checks it).
+
 ### Dev toolchains
 
 `--toolchains` / `--no-toolchains` (on by default, **Linux only** — macOS
@@ -717,7 +783,8 @@ On Linux, an exit code can also be consistent with a signal:
 ⚠ sandbox exited with 153: consistent with SIGXFSZ: file-size rlimit set by ai-jail: 1.0 GiB (inferred from exit code 153)
 ```
 
-For `SIGXFSZ`, ai-jail includes the lockdown file-size limit when it set one.
+For `SIGXFSZ`, ai-jail includes the lockdown file-size limit when it set one
+and the sandbox uses that default.
 The status alone cannot establish why a signal occurred. On Linux, bwrap
 returns `128 + N` for a signal, and a command can return the same code itself.
 The diagnostic labels this as an inference. macOS only reports signals the
