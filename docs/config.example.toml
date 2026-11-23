@@ -82,6 +82,9 @@
 # update_check = false
 # audit_log = false
 
+# Linux only: pin the sandbox to these CPUs (needs seccomp)
+# cpus = "0-3"
+
 # Legacy compatibility only. An empty list grants no repository trust.
 # trust_project_config = []
 

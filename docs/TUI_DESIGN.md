@@ -225,6 +225,8 @@ must still appear in the final `Complete effective access` review.
   (the per-project grants these screens edit). The review shows
   `Named profile: profile=NAME (a trusted global layer)`, and every field it
   widens is printed as a `profile=NAME widens=FIELD` line before the launch.
+- `--cpus LIST` and `cpus`: the CPU set, locked by seccomp, Linux only. The
+  review shows it as `cpus=LIST`.
 
 ## Plain-terminal fallback
 

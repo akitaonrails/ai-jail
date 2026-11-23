@@ -239,6 +239,14 @@ fn compile_filter(
             rules.insert(nr, vec![]);
         }
     }
+    // --cpus is applied as CPU affinity just before this filter; any
+    // process could otherwise widen its own set again (`taskset -p`).
+    // Reading the set (sched_getaffinity) stays allowed so nproc, make
+    // -j and runtimes size their parallelism to the CPUs they got.
+    if config.cpus.is_some() {
+        rules.insert(libc::SYS_sched_setaffinity, vec![]);
+    }
+
     // SeccompCondition::new compares Dword syscall arguments. MaskedEq(0xF)
     // matches SOCK_RAW despite SOCK_CLOEXEC or SOCK_NONBLOCK type flags.
     let mut socket_rules = [
@@ -460,5 +468,58 @@ mod tests {
         assert!(DENY_ALWAYS.contains(&libc::SYS_pidfd_getfd));
         let (_, clone3_bpf, _) = compile_filter(&Config::default()).unwrap();
         assert!(!clone3_bpf.is_empty());
+    }
+}
+
+// The seccomp lock that makes `--cpus` binding.
+//
+// `Config.cpus: Option<String>`; `compile_filter(&Config)`
+// (existing) denies `sched_setaffinity` only when `cpus` is set, never
+// denies `sched_getaffinity`, and keeps every io_uring syscall denied.
+#[cfg(test)]
+mod seccomp_tests {
+    use super::*;
+
+    fn filter_names(config: &Config, nr: i64) -> bool {
+        let (bpf, _, _) = compile_filter(config).unwrap();
+        bpf.iter().any(|insn| u64::from(insn.k) == nr as u64)
+    }
+
+    fn pinned() -> Config {
+        Config {
+            cpus: Some("0".into()),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn sched_setaffinity_is_not_denied_without_cpus() {
+        // Hostile half first: the lock must not fire when nothing is pinned.
+        assert!(!filter_names(
+            &Config::default(),
+            libc::SYS_sched_setaffinity
+        ));
+    }
+
+    #[test]
+    fn sched_setaffinity_is_denied_when_cpus_is_set() {
+        assert!(filter_names(&pinned(), libc::SYS_sched_setaffinity));
+    }
+
+    #[test]
+    fn sched_getaffinity_stays_allowed_with_cpus() {
+        assert!(!filter_names(&pinned(), libc::SYS_sched_getaffinity));
+    }
+
+    #[test]
+    fn io_uring_stays_denied_while_cpus_is_set() {
+        // IORING_REGISTER_IOWQ_AFF would set worker affinity.
+        for nr in [
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
+        ] {
+            assert!(filter_names(&pinned(), nr), "io_uring syscall {nr}");
+        }
     }
 }

@@ -1590,6 +1590,11 @@ const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     // Runtime label of where each `rlimit` came from; never read from a
     // file (`#[serde(skip)]`).
     excluded_policy!("rlimit_source", Preference),
+    // Runtime label of the layer that decided `cpus`; never read from a
+    // file (`#[serde(skip)]`).
+    excluded_policy!("cpus_source", Preference),
+    // A project may only narrow it (affinity::tighten_cpus).
+    excluded_policy!("cpus", Restriction),
     directional_policy!("systemd_user", Systemd, "systemd-user"),
     static_policy!("allow_tcp_ports", Authority, TcpPorts),
     static_policy!("allow_hosts", Authority, Hosts),
@@ -1990,12 +1995,15 @@ fn write_project_document(
     durable_write(path, body.as_bytes())?;
     let identity = &doc.project;
     let checked = read_project_document(path, identity)?;
-    // `rlimit_source` is runtime-only (`#[serde(skip)]`): it is never
-    // written, so the read-back cannot carry it and must not be compared on
-    // it, or every policy holding an `rlimit` fails to verify.
+    // `rlimit_source` and `cpus_source` are runtime-only
+    // (`#[serde(skip)]`): they are never written, so the read-back cannot
+    // carry them and must not be compared on them, or every policy holding
+    // an `rlimit` or `cpus` fails to verify.
     let mut written = doc.clone();
     written.grants.rlimit_source.clear();
     written.constraints.rlimit_source.clear();
+    written.grants.cpus_source = None;
+    written.constraints.cpus_source = None;
     if checked != written {
         return Err(format!("Failed to verify {}", path.display()));
     }
@@ -2351,6 +2359,8 @@ mod tests {
         expected_excluded!("status_bar_style", Preference),
         expected_excluded!("resize_redraw_key", Preference),
         expected_excluded!("rlimit_source", Preference),
+        expected_excluded!("cpus_source", Preference),
+        expected_excluded!("cpus", Restriction),
         expected_authority!(
             "allow_tcp_ports",
             Authority,
@@ -2447,6 +2457,11 @@ mod tests {
             "status_bar_style" => config.status_bar_style = Some("dark".into()),
             "resize_redraw_key" => {
                 config.resize_redraw_key = Some("top-secret".into());
+            }
+            "cpus" => config.cpus = Some("0-1".into()),
+            "cpus_source" => {
+                config.cpus_source =
+                    Some(crate::sandbox::rlimits::LimitSource::Cli);
             }
             "rlimit_source" => {
                 config.rlimit_source.insert(

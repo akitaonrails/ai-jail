@@ -53,6 +53,8 @@ OPTIONS:
     --profile <NAME>               Apply [profiles.NAME] from the global
                                    config (once; every access it widens is
                                    printed before launch)
+    --cpus <LIST>                  Run only on these CPUs (e.g. 8,24 or 0-3); locked
+                                   by seccomp so the sandbox cannot widen it (Linux)
     --systemd-user / --no-systemd-user
                                    Expose host systemd --user bus (dangerous; default: off)
     --no-gpu / --gpu               Disable/enable GPU device passthrough (Linux only)
@@ -231,6 +233,8 @@ pub struct CliArgs {
     /// `--profile NAME`: a `[profiles.NAME]` table of the global config.
     /// Validated against the global config at load, not here.
     pub profile: Option<String>,
+    /// `--cpus LIST`, normalized (`0-1,3`).
+    pub cpus: Option<String>,
     pub systemd_user: Option<bool>,
     pub gpu: Option<bool>,
     pub docker: Option<bool>,
@@ -469,6 +473,16 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("rlimits" | "no-rlimits")) => {
                 args.rlimits = Some(s == "rlimits");
+            }
+            Long("cpus") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let text = val.to_string_lossy();
+                let set = crate::sandbox::affinity::parse_cpu_list(&text)
+                    .map_err(|e| format!("--cpus: {e}"))?;
+                // Stored normalized so saved configs and the inner
+                // wrapper see one canonical spelling.
+                args.cpus =
+                    Some(crate::sandbox::affinity::format_cpu_list(&set));
             }
             Long("rlimit") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -1180,6 +1194,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-rlimits",
     "--rlimit",
     "--profile",
+    "--cpus",
     "--ssh",
     "--no-ssh",
     "--pictures",
@@ -1249,7 +1264,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
 /// Config fields that are runtime state, never written by a user.
 #[cfg(test)]
 const INTERFACE_INTERNAL_FIELDS: &[&str] =
-    &["rlimit_source", "runtime_harnesses"];
+    &["rlimit_source", "cpus_source", "runtime_harnesses"];
 
 /// Names already missing from docs/USER_GUIDE.md at upstream v3.3.0
 /// (fe4dfe0). The drift test is a ratchet: it holds every name added
@@ -3214,20 +3229,21 @@ mod tests {
     }
 }
 
-// `--rlimit` stays in sync across the interface surfaces.
+// `--rlimit` and `--cpus` stay in sync across the interface surfaces.
 //
 // - `crate::onboarding::render_effective_access` lists every explicit
 //   limit as `rlimit <name>=<soft>/<hard> (<source>)`, with the values
-//   `rlimits::effective()` applies. Defaults are not explicit limits and
-//   are not listed that way.
+//   `rlimits::effective()` applies, and the CPU set as `cpus=<set>`
+//   Defaults are not explicit limits and are not listed
+//   that way.
 // - `crate::cli::interface_drift(guide: &str) -> Vec<String>` returns every
 //   `Config` field (by its config name, e.g. `rlimit`) and every long flag
 //   in `SANDBOX_LONG_FLAGS` (e.g. `--rlimit`) that `guide` does not
 //   mention as a whole name and that is not on the drift test's own
 //   allowlist of internal fields. A longer name (`--rlimits`,
 //   `no_rlimits`) does not document a shorter one.
-// - `docs/TUI_DESIGN.md` names `--rlimit` as CLI/config-only, and
-//   `docs/onboarding-provenance.toml` has a claim for it whose guide
+// - `docs/TUI_DESIGN.md` names `--rlimit` and `--cpus` as CLI/config-only,
+//   and `docs/onboarding-provenance.toml` has a claim for each whose guide
 //   sections exist in `docs/USER_GUIDE.md`.
 #[cfg(test)]
 mod interface_rlimit_tests {
@@ -3275,7 +3291,7 @@ mod interface_rlimit_tests {
     #[test]
     fn interface_review_lists_no_explicit_limit_for_defaults() {
         // Hostile half first: the defaults the launch applies anyway are
-        // not explicit limits.
+        // not explicit limits, and no CPU set means no cpus line.
         let text = review(&Config::default());
         assert!(
             !text.lines().any(|l| l.contains("rlimit ")
@@ -3283,15 +3299,20 @@ mod interface_rlimit_tests {
                 && l.contains('/')),
             "{text}"
         );
+        assert!(
+            !text.lines().any(|l| l.trim().starts_with("cpus=")),
+            "{text}"
+        );
     }
 
     #[test]
-    fn interface_review_lists_each_explicit_limit() {
-        let config = with_limits(&[
+    fn interface_review_lists_each_explicit_limit_and_the_cpu_set() {
+        let mut config = with_limits(&[
             ("nofile", "64", LimitSource::Cli),
             ("cpu", "10", LimitSource::Cli),
             ("data", "8G", LimitSource::Global),
         ]);
+        config.cpus = Some("0-3".into());
         let text = review(&config);
         assert!(has_line(&text, "rlimit nofile=64/64 (cli)"), "{text}");
         // cpu carries the 5-second grace the launch applies.
@@ -3301,6 +3322,7 @@ mod interface_rlimit_tests {
             has_line(&text, &format!("rlimit data={gib8}/{gib8} (global)")),
             "{text}"
         );
+        assert!(has_line(&text, "cpus=0-3"), "{text}");
         // An untouched default is still not listed as explicit.
         assert!(!text.contains("rlimit core="), "{text}");
     }
@@ -3308,7 +3330,7 @@ mod interface_rlimit_tests {
     #[test]
     fn interface_drift_names_undocumented_limit_controls() {
         let drift = interface_drift("");
-        for item in ["rlimit", "--rlimit"] {
+        for item in ["rlimit", "cpus", "--rlimit", "--cpus"] {
             assert!(
                 drift.iter().any(|d| d == item),
                 "{item} must not be allowlisted as internal: {drift:?}"
@@ -3328,19 +3350,20 @@ mod interface_rlimit_tests {
     #[test]
     fn interface_drift_accepts_the_documented_forms() {
         let guide = "## Resource limits\n\n`--rlimit NAME=VALUE` sets one \
-                     limit; in config, `[rlimit]` takes `nofile = 4096`.\n";
+                     limit; in config, `[rlimit]` takes `nofile = 4096`.\n\
+                     `--cpus LIST` pins the sandbox; in config, \
+                     `cpus = \"0-3\"`.\n";
         let drift = interface_drift(guide);
-        for item in ["rlimit", "--rlimit"] {
+        for item in ["rlimit", "cpus", "--rlimit", "--cpus"] {
             assert!(!drift.iter().any(|d| d == item), "{item}: {drift:?}");
         }
     }
 
     #[test]
     fn interface_user_guide_documents_every_field_and_sandbox_flag() {
-        // The control this branch adds, checked directly as well, so the
-        // guard does not rest on `interface_drift` alone.
-        {
-            let flag = "--rlimit";
+        // The two controls this branch adds, checked directly as well, so
+        // the guard does not rest on `interface_drift` alone.
+        for flag in ["--rlimit", "--cpus"] {
             assert!(
                 GUIDE.replace(&format!("{flag}s"), "").contains(flag),
                 "docs/USER_GUIDE.md lacks {flag}"
@@ -3355,8 +3378,7 @@ mod interface_rlimit_tests {
 
     #[test]
     fn interface_tui_design_and_provenance_name_the_limit_controls() {
-        {
-            let flag = "--rlimit";
+        for flag in ["--rlimit", "--cpus"] {
             // `--rlimits` is an older, different flag: it does not count.
             assert!(
                 DESIGN
@@ -3369,8 +3391,7 @@ mod interface_rlimit_tests {
 
         let doc: toml::Value = toml::from_str(PROVENANCE).unwrap();
         let claims = doc["claim"].as_array().unwrap();
-        {
-            let field = "rlimit";
+        for field in ["rlimit", "cpus"] {
             let claim = claims
                 .iter()
                 .find(|c| {
@@ -3398,9 +3419,9 @@ mod interface_rlimit_tests {
 // Explicit `--rlimit` values are refused off Linux, so both places a user
 // learns the flag from must say so before the launch does:
 // - the `--help` entry for `--rlimit` (its option line and the continuation
-//   lines under it) names Linux, as other Linux-only entries do;
+//   lines under it) names Linux, the way `--cpus` already does;
 // - the README section "Resource limits without root" says "Linux only".
-// The neighbouring text already says Linux (`--no-gpu` in the help, "Linux
+// The neighbouring text already says Linux (`--cpus` in the help, "Linux
 // 5.14" and the next section's "**Linux only**" in the README), so each
 // check reads only its own entry or section, and the extractors are pinned
 // on fixtures where only a neighbour carries the word.
@@ -3460,13 +3481,13 @@ mod rlimit_platform_doc_tests {
 
     #[test]
     fn linux_only_help_entry_ignores_a_neighbour_that_says_linux() {
-        // The `--rlimits` toggle shares the prefix and `--no-gpu` follows
+        // The `--rlimits` toggle shares the prefix and `--cpus` follows
         // with "(Linux)"; neither belongs to the `--rlimit` entry.
         let help = "\
     --rlimits / --no-rlimits       Enable/disable (Linux)
     --rlimit NAME=VALUE            Set one resource limit
                                    (per process; repeatable).
-    --no-gpu / --gpu               Disable/enable GPU passthrough (Linux)
+    --cpus <LIST>                  Run only on these CPUs (Linux)
 ";
         let entry = help_entry(help, "--rlimit");
         assert_eq!(entry.len(), 2, "{entry:?}");
@@ -3549,7 +3570,8 @@ mod interface_profile_tests {
     const CONFIG_RS: &str = include_str!("config.rs");
 
     /// `Config` fields that no user sets: runtime state, never parsed.
-    const INTERNAL_FIELDS: &[&str] = &["runtime_harnesses", "rlimit_source"];
+    const INTERNAL_FIELDS: &[&str] =
+        &["runtime_harnesses", "rlimit_source", "cpus_source"];
 
     /// `Config` fields already missing from the guide at f0dc67e.
     const UNDOCUMENTED_FIELDS_AT_F0DC67E: &str = r"

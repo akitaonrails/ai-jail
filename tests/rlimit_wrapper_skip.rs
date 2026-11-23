@@ -1,6 +1,6 @@
 // Explicit limits through the built binary: applied with every other
-// control off, each clamp warned about once, and a one-off `--rlimit`
-// never carried into the next launch.
+// control off, each clamp warned about once, and a one-off `--cpus` or
+// `--rlimit` never carried into the next launch.
 //
 // Each test runs with a temporary HOME, XDG_CONFIG_HOME and project
 // directory, so the developer's own config cannot leak in, and without
@@ -140,6 +140,25 @@ fn warnings_naming(o: &Output, needles: &[&str]) -> Vec<String> {
         .collect()
 }
 
+fn allowed_cpus() -> Vec<usize> {
+    let list = std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+        .map(|v| v.trim().to_string())
+        .unwrap();
+    let mut cpus = Vec::new();
+    for part in list.split(',') {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                cpus.extend(a.parse::<usize>().unwrap()..=b.parse().unwrap())
+            }
+            None => cpus.push(part.parse().unwrap()),
+        }
+    }
+    cpus
+}
+
 #[test]
 fn explicit_limit_applies_with_every_other_control_off() {
     require_bwrap_net!();
@@ -212,6 +231,44 @@ fn lockdown_clamps_an_explicit_value_and_warns_once() {
         "{}",
         hits[0]
     );
+}
+
+#[test]
+fn cli_cpus_once_does_not_pin_the_next_launch() {
+    require_bwrap_net!();
+    let cpus = allowed_cpus();
+    let first = cpus[0].to_string();
+    let tree = Tree::new("cpus-sticky");
+    // A real launch, saving the project policy as an ordinary run does.
+    assert_ok(&tree.run(
+        None,
+        &[
+            "--no-status-bar",
+            "--no-network",
+            "--cpus",
+            &first,
+            "bash",
+            "-c",
+            "true",
+        ],
+    ));
+    let plain = tree.dry_run(&[]);
+    let text = assert_ok(&plain) + &stderr(&plain);
+    assert!(
+        !text.lines().any(|l| l.trim().starts_with("cpus=")),
+        "a plain launch must not inherit --cpus {first}: {text}"
+    );
+    // A different set on the next launch is this launch's choice, not a
+    // conflict with the one before.
+    if let Some(other) = cpus.get(1) {
+        let other = other.to_string();
+        let next = tree.dry_run(&["--cpus", &other]);
+        let text = assert_ok(&next) + &stderr(&next);
+        assert!(
+            text.lines().any(|l| l.trim() == format!("cpus={other}")),
+            "{text}"
+        );
+    }
 }
 
 #[test]
