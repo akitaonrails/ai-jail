@@ -580,6 +580,30 @@ fn default_agent_api_egress_applies(config: &config::Config) -> bool {
         && config.browser_profile.is_none()
 }
 
+fn apply_default_egress_hosts(config: &mut config::Config) {
+    if default_agent_api_egress_applies(config)
+        && sandbox::unprivileged_netns_available()
+    {
+        for host in command::default_egress_hosts_for(
+            &config.runtime_harnesses,
+            &config.command,
+        ) {
+            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
+                config.allow_hosts.push((*host).into());
+            }
+        }
+    }
+    if default_registry_egress_applies(config)
+        && sandbox::unprivileged_netns_available()
+    {
+        for host in sandbox::TOOLCHAIN_REGISTRY_HOSTS {
+            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
+                config.allow_hosts.push((*host).into());
+            }
+        }
+    }
+}
+
 fn toolchain_dest_already_mapped(config: &config::Config, spec: &str) -> bool {
     let dest = |p: &std::path::Path| {
         config::MapSpec::parse(p)
@@ -764,27 +788,7 @@ pub(crate) fn finalize_launch_config_with_ssh(
             }
         }
     }
-    if default_agent_api_egress_applies(&config)
-        && sandbox::unprivileged_netns_available()
-    {
-        for host in command::default_egress_hosts_for(
-            &config.runtime_harnesses,
-            &config.command,
-        ) {
-            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
-                config.allow_hosts.push((*host).into());
-            }
-        }
-    }
-    if default_registry_egress_applies(&config)
-        && sandbox::unprivileged_netns_available()
-    {
-        for host in sandbox::TOOLCHAIN_REGISTRY_HOSTS {
-            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
-                config.allow_hosts.push((*host).into());
-            }
-        }
-    }
+    apply_default_egress_hosts(&mut config);
     if !config.lockdown_enabled() {
         for path in sandbox::credential_ro_paths(&config) {
             let spec = path.to_string_lossy().into_owned();
@@ -1441,7 +1445,7 @@ fn run(
             config_store::load_global(&store)?,
             &cli,
             global_command_selector,
-        )
+        )?
     } else {
         // Read-only compatibility path. Writable modes migrated this above.
         config::load_global_for_command_report(&cli, global_command_selector)?
@@ -1452,6 +1456,13 @@ fn run(
             table
         ));
     }
+    let profile_report = global_selection.profile;
+    let global_without_profile = global_selection.without_profile;
+    // Kept only when a profile is selected: what it widens is measured
+    // against the same layers without it, once the launch config is final.
+    let grants_without_profile = profile_report
+        .is_some()
+        .then(|| stored_project.grants.clone());
     let global = global_selection.config;
     let onboarding_complete = stored_project.onboarding_complete;
     let global_for_onboarding = global.clone();
@@ -1489,6 +1500,29 @@ fn run(
             &invocation_cwd,
         )
     };
+    let mut profile_layers = grants_without_profile.map(|grants| {
+        let baseline = config::merge(
+            &cli,
+            config::merge_trusted_project(
+                global_without_profile.clone(),
+                grants,
+            ),
+        );
+        let without_profile = if legacy_project_trusted {
+            config::merge_trusted_project(baseline, project_config.clone())
+        } else {
+            config::merge_with_global_report(
+                baseline,
+                project_config.clone(),
+                &invocation_cwd,
+            )
+            .0
+        };
+        config::ProfileLayers {
+            without_profile,
+            with_profile: config.clone(),
+        }
+    });
 
     let resolved_harnesses =
         command::resolve_harnesses(&config.command, &cli.harnesses)?;
@@ -1544,6 +1578,24 @@ fn run(
                 &invocation_cwd,
             )?;
             onboarding::secure_noninteractive(&mut config, &cli);
+            // The same transform without the profile, so a grant these
+            // restricted defaults give on their own (the harness API host)
+            // is not read as the profile's.
+            if let Some(layers) = profile_layers.as_mut() {
+                let mut without_profile =
+                    build_noninteractive_onboarding_effective(
+                        &global_without_profile,
+                        harness,
+                        &cli,
+                        project_config.clone(),
+                        &invocation_cwd,
+                    )?;
+                onboarding::apply_secure_defaults(&mut without_profile, &cli);
+                *layers = config::ProfileLayers {
+                    without_profile,
+                    with_profile: config.clone(),
+                };
+            }
             let selection = onboarding::Selection::from_config(&config);
             onboarding::render_summary(
                 &selection,
@@ -1644,6 +1696,27 @@ fn run(
         && !cli.init
         && !cli.bootstrap
     {
+        // The same transform without the profile, measured against below.
+        if let Some(layers) = profile_layers.as_mut() {
+            *layers = config::ProfileLayers {
+                without_profile: build_onboarding_effective(
+                    global_without_profile.clone(),
+                    stored_grants_for_onboarding.clone(),
+                    &cli,
+                    project_config.clone(),
+                    &invocation_cwd,
+                    legacy_project_trusted,
+                )?,
+                with_profile: build_onboarding_effective(
+                    global_for_onboarding.clone(),
+                    stored_grants_for_onboarding.clone(),
+                    &cli,
+                    project_config.clone(),
+                    &invocation_cwd,
+                    legacy_project_trusted,
+                )?,
+            };
+        }
         config = build_onboarding_effective(
             global_for_onboarding,
             stored_grants_for_onboarding,
@@ -1707,7 +1780,7 @@ fn run(
         ));
     }
     for warning in security_warnings {
-        output::security_warn(&warning);
+        output::security_warn(&warning.text);
     }
     // Resolve any relative paths in rw_maps/ro_maps against the user's
     // invocation cwd before they reach bwrap/landlock/seatbelt (issue
@@ -1716,6 +1789,26 @@ fn run(
     config::absolutize_user_paths(&mut config, &invocation_cwd);
     apply_browser_profile(&mut config, !command_from_untrusted_project);
     validate_network_flags(&config)?;
+
+    // Printed on every launch, `--dry-run`, `--exec` and `status` included
+    // and without `--verbose`: a profile may widen the jail only where it
+    // is seen. Measured only now, after onboarding's restricted defaults,
+    // the CLI, the project policy and `--lockdown`, so a line names only
+    // what this launch applies, and a profile that widens nothing prints
+    // nothing (#230 review). The audit record carries the same report.
+    let profile_report = match (profile_report, profile_layers) {
+        (Some(report), Some(mut layers)) => {
+            layers.without_profile.runtime_harnesses =
+                config.runtime_harnesses.clone();
+            apply_default_egress_hosts(&mut layers.without_profile);
+            let applied = report.applied(layers, &config, &invocation_cwd)?;
+            for line in applied.lines() {
+                output::security_warn(&line);
+            }
+            Some(applied)
+        }
+        _ => None,
+    };
 
     // Handle status command
     if cli.status {
@@ -1753,6 +1846,7 @@ fn run(
                     project: &invocation_cwd,
                     policy_path: store.policy_root(),
                     profile_present: stored_project.present,
+                    named_profile: cli.profile.as_deref(),
                     onboarding_complete,
                     harnesses: &resolved_harnesses,
                     config: &config,
@@ -1776,6 +1870,10 @@ fn run(
             "Project constraints",
             if provenance.constraints { "yes" } else { "no" },
         );
+        // Name the --profile in force; nothing when none is.
+        if let Some(name) = cli.profile.as_deref() {
+            output::status_header("Named profile", &format!("profile={name}"));
+        }
         let legacy_status_path = invocation_cwd.join(".ai-jail");
         let contributing_path = match provenance.source {
             "external_store" => Some(store.project.as_path()),
@@ -2046,12 +2144,13 @@ fn run(
     {
         eprintln!(
             "{}",
-            onboarding::render_effective_access(
+            onboarding::render_effective_access_with_profile(
                 config,
                 &invocation_cwd,
                 &harness,
                 saved,
                 &approved_env_names,
+                cli.profile.as_deref(),
             )?
         );
     }
@@ -2321,6 +2420,7 @@ fn run(
                 || audit_home
                     .as_ref()
                     .is_some_and(|home| home.join(".ai-jail").exists()),
+            profile: profile_report.as_ref(),
             exit_code,
             duration: launch_start.elapsed(),
         }));

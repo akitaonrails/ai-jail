@@ -205,6 +205,23 @@ The interface is dense, restrained, and optimized for careful review.
 - Cancellation writes no onboarding grants and starts no harness. Terminal
   state is restored on success, cancellation, validation failure, and panic.
 
+## Advanced CLI/config-only controls
+
+Some controls deliberately have no onboarding control. They are advanced
+CLI/config-only options: precise numeric or per-host primitives where a
+checklist row would invite guessing a number, and where the right value
+depends on the machine rather than on the access being granted. Their effect
+must still appear in the final `Complete effective access` review.
+
+- `--profile NAME` selects a named profile, a `[profiles.NAME]` table in the
+  trusted global config. It is CLI/config-only because a profile is written
+  by hand in the global file and onboarding only edits per-project grants;
+  offering it there would let the onboarding screen select trusted authority
+  it cannot show in full. It is unrelated to the onboarding access profile
+  (the per-project grants these screens edit). The review shows
+  `Named profile: profile=NAME (a trusted global layer)`, and every field it
+  widens is printed as a `profile=NAME widens=FIELD` line before the launch.
+
 ## Plain-terminal fallback
 
 `TERM=dumb` keeps the sequential text interface. Noninteractive execution
