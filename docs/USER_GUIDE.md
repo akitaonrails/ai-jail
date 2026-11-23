@@ -606,6 +606,34 @@ name (`comm`) only; their command lines and environments are never read.
 The exit code is the command's own. On macOS the flag is accepted and
 changes nothing.
 
+### Save a run summary
+
+Choose a new file in a directory you own that the sandbox cannot write to.
+For example, run these commands from the project directory:
+
+```sh
+report_dir=$(mktemp -d)
+ai-jail --run-summary "$report_dir/run.json" -- sh -c 'exit 7'
+cat "$report_dir/run.json"
+```
+
+The summary reports exit code 7. The launch's exit code stays 7 even if
+publishing the summary fails. Use a different file for each run. An existing
+destination stops the launch, and a destination created during the run stays
+untouched. The file appears only after the summary is complete. Dry runs and
+configuration commands produce no summary.
+
+On Linux the summary enables teardown reporting. It includes the resource
+usage the in-jail supervisor reaped, which may include port bridges and can
+exclude processes left to kernel cleanup. On macOS teardown and resources
+are `null`. Filtered networking includes proxy totals and reports whether
+the proxy finished counting within the grace period. Other network modes
+report `egress: null`. If you also specify `--egress-log`, both outputs share
+a run ID.
+
+`--run-summary` is a one-run flag. It grants no access and onboarding does
+not save it. See the [version 1 JSON schema](run-summary.schema.json).
+
 ## Named profiles
 
 A named profile (`[profiles.NAME]`) is a set of grants and restrictions kept
