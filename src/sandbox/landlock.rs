@@ -55,9 +55,10 @@ use crate::config::Config;
 use crate::config::MapSpec;
 use crate::output;
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, NetPort, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus, Scope, path_beneath_rules,
+    ABI, Access, AccessFs, AccessNet, NetPort, PathBeneath, Ruleset,
+    RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, path_beneath_rules,
 };
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 const ABI_VERSION: ABI = ABI::V3;
@@ -68,6 +69,7 @@ pub fn apply(
     project_dir: &Path,
     mounted_ro_paths: &[PathBuf],
     mounted_rw_paths: &[PathBuf],
+    ecryptfs_lower_fds: &[OwnedFd],
     verbose: bool,
 ) -> Result<(), String> {
     if !config.landlock_enabled() {
@@ -88,7 +90,7 @@ pub fn apply(
         verbose,
     );
 
-    let fs_result = match do_apply(&ro_paths, &rw_paths) {
+    let fs_result = match do_apply(&ro_paths, &rw_paths, ecryptfs_lower_fds) {
         Ok(status) => match status {
             RulesetStatus::FullyEnforced => {
                 output::info("Landlock: fully enforced");
@@ -241,16 +243,24 @@ fn collect_landlock_paths(
 fn do_apply(
     ro_paths: &[PathBuf],
     rw_paths: &[PathBuf],
+    ecryptfs_lower_fds: &[OwnedFd],
 ) -> Result<RulesetStatus, landlock::RulesetError> {
     let access_all = AccessFs::from_all(ABI_VERSION);
     let access_read = AccessFs::from_read(ABI_VERSION);
 
-    let status = Ruleset::default()
+    let mut created = Ruleset::default()
         .handle_access(access_all)?
         .create()?
         .add_rules(path_beneath_rules(ro_paths, access_read))?
-        .add_rules(path_beneath_rules(rw_paths, access_all))?
-        .restrict_self()?;
+        .add_rules(path_beneath_rules(rw_paths, access_all))?;
+    // #243: eCryptfs opens the lower directory under the caller's credentials
+    // during readdir. Grant ReadDir only on the host-opened lower directory
+    // descriptors (which stay unmounted in the sandbox and are closed before
+    // exec).
+    for fd in ecryptfs_lower_fds {
+        created = created.add_rule(PathBeneath::new(fd, AccessFs::ReadDir))?;
+    }
+    let status = created.restrict_self()?;
 
     Ok(status.ruleset)
 }
@@ -1109,7 +1119,9 @@ mod tests {
             ..Config::default()
         };
         // Should return without error or panic
-        assert!(apply(&config, Path::new("/tmp"), &[], &[], false).is_ok());
+        assert!(
+            apply(&config, Path::new("/tmp"), &[], &[], &[], false).is_ok()
+        );
     }
 
     #[test]
@@ -1119,7 +1131,9 @@ mod tests {
         // On kernels without landlock this prints a warning;
         // on kernels with landlock it enforces rules.
         // Either way it must not panic.
-        assert!(apply(&config, Path::new("/tmp"), &[], &[], false).is_ok());
+        assert!(
+            apply(&config, Path::new("/tmp"), &[], &[], &[], false).is_ok()
+        );
     }
 
     #[test]
@@ -1128,7 +1142,7 @@ mod tests {
             lockdown: Some(true),
             ..Config::default()
         };
-        let _ = apply(&config, Path::new("/tmp"), &[], &[], false);
+        let _ = apply(&config, Path::new("/tmp"), &[], &[], &[], false);
     }
 
     #[test]
@@ -1138,7 +1152,9 @@ mod tests {
             no_landlock: Some(true),
             ..Config::default()
         };
-        assert!(apply(&config, Path::new("/tmp"), &[], &[], false).is_err());
+        assert!(
+            apply(&config, Path::new("/tmp"), &[], &[], &[], false).is_err()
+        );
     }
 
     #[test]

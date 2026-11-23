@@ -1780,6 +1780,7 @@ pub fn apply_landlock(
     project_dir: &Path,
     mounted_ro_paths: &[PathBuf],
     mounted_rw_paths: &[PathBuf],
+    #[cfg(target_os = "linux")] ecryptfs_lower_fds: &[std::os::fd::OwnedFd],
     verbose: bool,
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
@@ -1789,6 +1790,7 @@ pub fn apply_landlock(
             project_dir,
             mounted_ro_paths,
             mounted_rw_paths,
+            ecryptfs_lower_fds,
             verbose,
         )
     }
@@ -1959,6 +1961,9 @@ pub fn build(
     proxy: Option<&crate::proxy::Proxy>,
     bridge_sockets: &BridgeSockets,
     teardown_report_fd: Option<std::os::fd::RawFd>,
+    #[cfg(target_os = "linux")] ecryptfs_lower_fds: &mut Vec<
+        std::os::fd::OwnedFd,
+    >,
 ) -> Result<Command, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1971,6 +1976,7 @@ pub fn build(
             proxy.and_then(|p| p.unix_path()),
             bridge_sockets,
             teardown_report_fd,
+            ecryptfs_lower_fds,
         )
     }
     #[cfg(target_os = "macos")]

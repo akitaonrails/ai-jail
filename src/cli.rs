@@ -334,6 +334,9 @@ pub struct CliArgs {
     pub landlock_rw_paths: Vec<PathBuf>,
     /// Internal: opaque read-only mount destinations for Landlock.
     pub landlock_ro_paths: Vec<PathBuf>,
+    /// Internal: inherited O_PATH directory descriptors for eCryptfs lower
+    /// directories granted `AccessFs::ReadDir` only (#243).
+    pub landlock_ecryptfs_lower_fds: Vec<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -861,6 +864,23 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 let val: PathBuf =
                     parser.value().map_err(|e| e.to_string())?.into();
                 args.landlock_ro_paths.push(val);
+            }
+            Long("landlock-ecryptfs-lower-fd") => {
+                if !args.landlock_exec {
+                    return Err(
+                        "--landlock-ecryptfs-lower-fd is internal and only valid with --landlock-exec"
+                            .into(),
+                    );
+                }
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let fd_text = val.to_string_lossy();
+                let fd: i32 = fd_text.parse().map_err(|_| {
+                    format!("invalid ecryptfs lower fd: {fd_text}")
+                })?;
+                if fd < 3 {
+                    return Err(format!("invalid ecryptfs lower fd: {fd}"));
+                }
+                args.landlock_ecryptfs_lower_fds.push(fd);
             }
             Long("clean") => args.clean = true,
             Long("dry-run") => args.dry_run = true,
@@ -2898,6 +2918,43 @@ mod tests {
         // Without the flag the wrapper keeps its exec path.
         let args = parse_test(&["--landlock-exec", "--", "bash"]).unwrap();
         assert_eq!(args.teardown_report_fd, None);
+    }
+
+    #[test]
+    fn parse_ecryptfs_lower_fd_requires_landlock_exec() {
+        assert!(parse_test(&["--landlock-ecryptfs-lower-fd", "7"]).is_err());
+        assert!(
+            parse_test(&[
+                "--landlock-exec",
+                "--landlock-ecryptfs-lower-fd",
+                "2",
+                "--",
+                "bash",
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_test(&[
+                "--landlock-exec",
+                "--landlock-ecryptfs-lower-fd",
+                "nope",
+                "--",
+                "bash",
+            ])
+            .is_err()
+        );
+        let args = parse_test(&[
+            "--landlock-exec",
+            "--landlock-ecryptfs-lower-fd",
+            "7",
+            "--landlock-ecryptfs-lower-fd",
+            "8",
+            "--",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.landlock_ecryptfs_lower_fds, vec![7, 8]);
+        assert!(!HELP.contains("--landlock-ecryptfs-lower-fd"));
     }
 
     #[test]
