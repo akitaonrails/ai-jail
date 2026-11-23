@@ -3470,6 +3470,7 @@ mod tests {
             Path::new("/project"),
         )
         .unwrap();
+        #[cfg(target_os = "linux")]
         assert_eq!(
             effective.rlimit.get("nproc"),
             None,

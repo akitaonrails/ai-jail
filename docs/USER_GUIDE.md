@@ -539,41 +539,6 @@ for <launch dir> is ignored`. Restrictions saved only in that per-directory
 
 The setting is global only. A repository file cannot enable it.
 
-## Run observability
-
-Onboarding has no control for `--egress-log PATH`, by design: it records a run,
-it grants nothing, and it is never saved to a profile. Pass it on each launch
-that should be observed. It needs filtered networking (`--allow-host`, or the
-filtered default a known agent gets); with the network off or full, ai-jail
-refuses to start rather than log nothing. Each connection through the egress
-proxy becomes one JSON line in `PATH` (mode 0600, an existing file narrowed to
-it, appended across runs) with its host, port, verdict, reason, byte counts and
-duration, and never any request content. A file that cannot be opened (a
-symlink, a non-regular file, a missing directory) refuses the launch, and the
-flag is refused on macOS. The README's `Run observability` section and
-`docs/SECURITY.md` describe every field and what a line can never contain.
-
-ai-jail reports unexpected signals on stderr, including under `--exec`.
-Linux diagnostics distinguish a signal inferred from an exit code from a
-directly observed signal. For `SIGXFSZ`, the diagnostic includes the
-`--lockdown` file-size limit when it set one and the sandbox uses that
-default. The exit code is unchanged.
-
-`--teardown-report` is a per-launch CLI flag, not a saved setting, so the
-onboarding screens do not offer it. On Linux, when the command exits,
-ai-jail uses Linux pidfds to stop children verified as belonging to its
-in-jail supervisor. It sends SIGTERM (with SIGCONT for stopped children), then
-SIGKILL to verified children still alive after 2000 ms. Children found only
-on the final scan are left to PID namespace cleanup and mark the report
-`survivors-respawned`. If any were stopped, one
-stderr line gives their count and names (at most ten, then `+N more`), even
-under `--exec`. A report that could not be completed prints one
-`Teardown report incomplete: <reason>` line instead of passing for a clean
-teardown. Survivors are named by their kernel command
-name (`comm`) only; their command lines and environments are never read.
-The exit code is the command's own. On macOS the flag is accepted and
-changes nothing.
-
 ## Resource limits and CPU set
 
 Per-process resource limits and the CPU set are advanced CLI/config-only
@@ -611,6 +576,41 @@ The final `Complete effective access` review lists each explicit limit as
 prints every effective limit, defaults included. The README section
 [Resource limits without root](../README.md#resource-limits-without-root---rlimit-and---cpus)
 covers each limit name and what it does to a process.
+
+## Run observability
+
+Onboarding has no control for `--egress-log PATH`, by design: it records a run,
+it grants nothing, and it is never saved to a profile. Pass it on each launch
+that should be observed. It needs filtered networking (`--allow-host`, or the
+filtered default a known agent gets); with the network off or full, ai-jail
+refuses to start rather than log nothing. Each connection through the egress
+proxy becomes one JSON line in `PATH` (mode 0600, an existing file narrowed to
+it, appended across runs) with its host, port, verdict, reason, byte counts and
+duration, and never any request content. A file that cannot be opened (a
+symlink, a non-regular file, a missing directory) refuses the launch, and the
+flag is refused on macOS. The README's `Run observability` section and
+`docs/SECURITY.md` describe every field and what a line can never contain.
+
+ai-jail reports unexpected signals on stderr, including under `--exec`.
+Linux diagnostics distinguish a signal inferred from an exit code from a
+directly observed signal. For `SIGXFSZ`, the diagnostic includes the
+`--lockdown` file-size limit when it set one and the sandbox uses that
+default. The exit code is unchanged.
+
+`--teardown-report` is a per-launch CLI flag, not a saved setting, so the
+onboarding screens do not offer it. On Linux, when the command exits,
+ai-jail uses Linux pidfds to stop children verified as belonging to its
+in-jail supervisor. It sends SIGTERM (with SIGCONT for stopped children), then
+SIGKILL to verified children still alive after 2000 ms. Children found only
+on the final scan are left to PID namespace cleanup and mark the report
+`survivors-respawned`. If any were stopped, one
+stderr line gives their count and names (at most ten, then `+N more`), even
+under `--exec`. A report that could not be completed prints one
+`Teardown report incomplete: <reason>` line instead of passing for a clean
+teardown. Survivors are named by their kernel command
+name (`comm`) only; their command lines and environments are never read.
+The exit code is the command's own. On macOS the flag is accepted and
+changes nothing.
 
 ## Named profiles
 
