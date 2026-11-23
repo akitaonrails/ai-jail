@@ -603,54 +603,42 @@ fn check_secret_field_types(
             _ => false,
         };
         if !ok {
-            return Err(secret_type_error(name, field, expected));
+            return Err(format!(
+                "profile '{name}': {field} must be {expected}; the value is not shown"
+            ));
         }
     }
     Ok(())
 }
 
-fn secret_type_error(name: &str, field: &str, expected: &str) -> String {
-    format!(
-        "profile '{name}': {field} must be {expected}; the value is not \
-         shown because it may hold a secret"
-    )
-}
-
-/// A deserialization error loses the parser's message, which quotes the
-/// value (`invalid type: string "…"`): only the field and the type it
-/// expects are kept (#230 review: the field name, never the value).
+/// Report only the top-level schema key and a known type description.
+/// Parser diagnostics can include excerpts of malformed values.
 fn value_free_error(name: &str, error: &str) -> String {
-    if let Some((field, expected)) = SECRET_FIELD_TYPES
-        .iter()
-        .find(|(field, _)| error.contains(&format!("`{field}`")))
-    {
-        return secret_type_error(name, field, expected);
-    }
-    // toml 0.8 ends the message with "in `FIELD`"; serde's "expected …"
-    // names a type or the accepted variants, never the value.
     let field = error.rfind("in `").and_then(|at| {
-        let rest = &error[at + 4..];
-        rest.find('`').map(|end| &rest[..end])
+        let path = &error[at + 4..];
+        let (field, _) = path.split_once('`')?;
+        config_schema_keys()
+            .iter()
+            .copied()
+            .find(|key| *key == field)
     });
-    // serde quotes the value before its own "expected …", so a value may
-    // itself contain the word: the last occurrence is serde's.
     let expected = error
         .rfind("expected ")
-        .map(|at| error[at + 9..].lines().next().unwrap_or("").trim());
+        .and_then(|at| error[at + 9..].lines().next())
+        .and_then(|kind| {
+            ["a boolean", "an integer", "a sequence", "a string", "a map"]
+                .into_iter()
+                .find(|known| *known == kind.trim())
+        });
     match (field, expected) {
         (Some(field), Some(expected)) => format!(
-            "profile '{name}': {} has the wrong type, expected {}; the \
-             value is not shown",
-            output::escape_control_bytes(field),
-            output::escape_control_bytes(expected)
+            "profile '{name}': {field} has the wrong type, expected {expected}; the value is not shown"
         ),
         (Some(field), None) => format!(
-            "profile '{name}': {} is invalid; the value is not shown",
-            output::escape_control_bytes(field)
+            "profile '{name}': {field} is invalid; the value is not shown"
         ),
         _ => format!(
-            "profile '{name}': a value has the wrong type; the value is not \
-             shown"
+            "profile '{name}': a value has the wrong type; the value is not shown"
         ),
     }
 }
