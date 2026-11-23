@@ -1080,15 +1080,6 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     // the filter.
     sandbox::apply_seccomp(&config, cli.verbose)?;
 
-    // Apply the full limit set here, inside the sandbox, after bwrap
-    // has finished setting up namespaces. RLIMIT_NPROC counts all
-    // processes owned by the real UID system-wide, so setting it on the
-    // outer ai-jail before bwrap's clone() calls would cause EAGAIN when
-    // Chrome or other heavy applications are running; explicit
-    // `--rlimit` values land here too, so they never cap the supervisor.
-    #[cfg(target_os = "linux")]
-    sandbox::rlimits::apply_sandbox(&config, cli.verbose)?;
-
     // Drop PATH entries that do not exist in here.
     //
     // The sandbox inherits the host's PATH, which describes the host's
@@ -1109,6 +1100,12 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
         unsafe { std::env::set_var("PATH", &pruned) };
     }
 
+    // Prepare limits after the launcher and bridges have been created.
+    // The teardown reaper applies them in its forked command, so per-process
+    // limits cannot prevent the reaper itself from spawning or reporting.
+    #[cfg(target_os = "linux")]
+    let limits = sandbox::rlimits::prepare_sandbox_limits(&config)?;
+
     // With a teardown report, stay resident as the command's sub-reaper
     // instead of becoming it; the exec path below is unchanged without it.
     #[cfg(target_os = "linux")]
@@ -1117,8 +1114,12 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
             &cli.command,
             report,
             &bridge_pids,
+            limits,
+            cli.verbose,
         );
     }
+    #[cfg(target_os = "linux")]
+    sandbox::rlimits::apply_sandbox_limits(&limits, cli.verbose)?;
 
     // Replace this process with the real command
     let err = std::process::Command::new(&cli.command[0])
