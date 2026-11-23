@@ -588,7 +588,7 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = Path::new("/tmp").join(format!(
             "ai-jail-teardown-test-{name}-{}",
             std::process::id()
         ));
@@ -1516,7 +1516,7 @@ mod tests {
 
     #[test]
     fn a_comm_cut_inside_a_utf8_character_does_not_hide_other_survivors() {
-        let root = std::env::temp_dir()
+        let root = Path::new("/tmp")
             .join(format!("ai-jail-teardown-utf8-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for (pid, comm) in [
@@ -1586,7 +1586,7 @@ mod tests {
         // A survivor that ignores SIGTERM and burns CPU until the SIGKILL.
         // It touches `ready` once the trap is installed: a SIGTERM sent
         // before that would end it, not exercise the SIGKILL path.
-        let ready = std::env::temp_dir()
+        let ready = Path::new("/tmp")
             .join(format!("ai-jail-sigkilled-usage-{}", std::process::id()));
         let _ = std::fs::remove_file(&ready);
         let script = format!(

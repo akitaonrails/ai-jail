@@ -20,6 +20,7 @@ mod onboarding;
 mod output;
 mod proxy;
 mod pty;
+mod run_summary;
 mod sandbox;
 mod secret;
 mod signals;
@@ -365,17 +366,9 @@ fn validate_egress_log_on(
     ))
 }
 
-/// Open the `--egress-log` file for this run. A file that cannot be opened
-/// (a symlink, a non-regular file, another owner's file, a missing
-/// directory) refuses the launch: the operator asked for the record, and
-/// running without it would fail open. Only a later write failure is
-/// best-effort (`EgressLog::write_line`). An unreadable `/dev/urandom`
-/// falls back to a pid-and-time run id, through `output::security_warn`
-/// so `--exec` does not hide it.
-fn open_egress_log(
-    path: &std::path::Path,
-) -> Result<std::sync::Arc<egress_log::EgressLog>, String> {
-    let run_id = egress_log::run_id().unwrap_or_else(|error| {
+/// The summary and egress log use the same run identifier.
+fn observed_run_id() -> String {
+    egress_log::run_id().unwrap_or_else(|error| {
         output::security_warn(&format!(
             "{error}; using a run id from the pid and start time"
         ));
@@ -383,11 +376,7 @@ fn open_egress_log(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
         egress_log::fallback_run_id(std::process::id(), nanos)
-    });
-    // The error already names the path (EgressLog::open).
-    egress_log::EgressLog::open(path, &run_id)
-        .map(std::sync::Arc::new)
-        .map_err(|error| format!("{error}; refusing to launch"))
+    })
 }
 
 /// `--publish-port` contradiction checks, fail-closed at launch. The
@@ -1987,10 +1976,27 @@ fn run(
     // log, so the sandbox never sees the file. `validate_egress_log`
     // already refused it outside filtered mode. The stats count every
     // connection whether or not a file was asked for.
+    let run_id = if !cli.dry_run
+        && (cli.egress_log.is_some() || cli.run_summary.is_some())
+    {
+        observed_run_id()
+    } else {
+        String::new()
+    };
     let egress_log = match cli.egress_log.as_deref() {
-        Some(path) if !cli.dry_run => Some(open_egress_log(path)?),
+        Some(path) if !cli.dry_run => Some(std::sync::Arc::new(
+            egress_log::EgressLog::open(path, &run_id)
+                .map_err(|error| format!("{error}; refusing to launch"))?,
+        )),
         _ => None,
     };
+    let summary = match cli.run_summary.as_deref() {
+        Some(path) if !cli.dry_run => {
+            Some(run_summary::RunSummary::open(path)?)
+        }
+        _ => None,
+    };
+    let teardown_requested = cli.teardown_report || cli.run_summary.is_some();
     let egress_stats = std::sync::Arc::new(egress_log::EgressStats::default());
 
     // Prepare sandbox resources (temp hosts file on Linux, no-op on macOS)
@@ -2023,7 +2029,7 @@ fn run(
         proxy_config.audit = audit_log.clone();
         proxy_config.egress = egress_log.clone();
         proxy_config.stats = std::sync::Arc::clone(&egress_stats);
-        proxy_config.drain_on_exit = egress_log.is_some();
+        proxy_config.drain_on_exit = egress_log.is_some() || summary.is_some();
         proxy_config.prompt = host_prompt(config);
         let proxy_config = launch_runner.finish_proxy_config(proxy_config);
         let socket = proxy::default_socket_path();
@@ -2049,7 +2055,7 @@ fn run(
         proxy_config.audit = audit_log.clone();
         proxy_config.egress = egress_log.clone();
         proxy_config.stats = std::sync::Arc::clone(&egress_stats);
-        proxy_config.drain_on_exit = egress_log.is_some();
+        proxy_config.drain_on_exit = egress_log.is_some() || summary.is_some();
         let proxy_config = launch_runner.finish_proxy_config(proxy_config);
         let proxy = proxy::Proxy::start(proxy_config, None)
             .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
@@ -2126,7 +2132,7 @@ fn run(
             cli.verbose,
             egress_proxy.as_ref(),
             &bridge_sockets,
-            cli.teardown_report,
+            teardown_requested,
         )?;
         output::dry_run_line(&formatted);
         return Ok(0);
@@ -2256,7 +2262,7 @@ fn run(
     // is built, because the wrapper is told its descriptor number. Every
     // early return below drops it; it is close-on-exec until the spawn.
     #[cfg(target_os = "linux")]
-    let mut teardown_run = teardown::TeardownRun::start(cli.teardown_report);
+    let mut teardown_run = teardown::TeardownRun::start(teardown_requested);
     #[cfg(target_os = "linux")]
     let teardown_report_fd = teardown_run.report_fd();
     #[cfg(not(target_os = "linux"))]
@@ -2327,38 +2333,50 @@ fn run(
         // slave. The overlay remains optional, but output filtering is not.
         // `use_pty` is what put a PTY in `pty` above.
         let pty = pty.expect("PTY allocated when use_pty is set");
-        match pty::run_with_config(
+        let result = pty::run_with_config(
             pty,
             &mut cmd,
             resize_redraw_key.as_deref(),
             config,
             use_status_bar,
             spawn_bracket,
-        ) {
-            Ok(status) => {
-                statusbar::teardown();
-                status
-            }
-            Err(e) => {
-                statusbar::teardown();
-                return Err(e);
-            }
-        }
+        );
+        statusbar::teardown();
+        result
     } else {
-        // Non-interactive and --exec paths preserve inherited/piped stdio.
-        let gate = signals::wrap_supervised_command(&mut cmd)?;
-        let child = signals::spawn_supervised(&mut cmd, gate, spawn_bracket)?;
+        (|| {
+            // Non-interactive and --exec paths preserve inherited/piped stdio.
+            let gate = signals::wrap_supervised_command(&mut cmd)?;
+            let child =
+                signals::spawn_supervised(&mut cmd, gate, spawn_bracket)?;
 
-        let pid = child.id() as i32;
+            let pid = child.id() as i32;
 
-        let status = signals::wait_child_status(pid);
-        std::mem::forget(child);
-        // Defensive terminal reset — see issue #40. The child may
-        // have left mouse tracking, alt-screen, etc. on. The PTY path
-        // does its own reset in pty::run; here we cover the
-        // no-status-bar / multiplexer-detected / crush paths.
-        output::terminal_reset();
-        status
+            let status = signals::wait_child_status(pid);
+            std::mem::forget(child);
+            // Defensive terminal reset — see issue #40. The child may
+            // have left mouse tracking, alt-screen, etc. on. The PTY path
+            // does its own reset in pty::run; here we cover the
+            // no-status-bar / multiplexer-detected / crush paths.
+            output::terminal_reset();
+            Ok(status)
+        })()
+    };
+    let child_status = match child_status {
+        Ok(status) => status,
+        Err(error) => {
+            if let Some(summary) = &summary {
+                summary.finish(
+                    &run_id,
+                    &config.command,
+                    serde_json::json!({"kind": "launch_error"}),
+                    None,
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                );
+            }
+            return Err(error);
+        }
     };
     // The plain wait-status mapping, never a value derived from the
     // classified reason, so scripts see the same code as before.
@@ -2379,14 +2397,35 @@ fn run(
     // process exits, after the run is over, and its egress line and bytes
     // would be missing. A run that records its egress shuts them now,
     // within a bounded grace; any other run keeps the old ending.
-    if let Some(proxy) = egress_proxy.as_ref().filter(|p| p.drain_on_exit()) {
-        proxy.drain(std::time::Duration::from_millis(2000));
-    }
+    let egress_complete = egress_proxy
+        .as_ref()
+        .filter(|proxy| proxy.drain_on_exit())
+        .is_some_and(|proxy| {
+            proxy.drain(std::time::Duration::from_millis(2000))
+        });
     // The reader is joined only after the wait: it returns at the first
     // report line, and EOF follows the wrapper's exit. `finish` prints
     // what the report says; macOS accepts the flag and changes nothing.
     #[cfg(target_os = "linux")]
-    let _teardown_section = teardown_run.finish();
+    let teardown_section = teardown_run.finish();
+    if let Some(summary) = summary {
+        #[cfg(target_os = "linux")]
+        let (teardown, resources) =
+            run_summary::teardown_values(teardown_section);
+        #[cfg(not(target_os = "linux"))]
+        let (teardown, resources) =
+            (serde_json::Value::Null, serde_json::Value::Null);
+        summary.finish(
+            &run_id,
+            &config.command,
+            run_summary::exit_value(&reason),
+            egress_proxy
+                .as_ref()
+                .map(|_| (egress_stats.snapshot(), egress_complete)),
+            teardown,
+            resources,
+        );
+    }
 
     // Append the launch record only now: exit code and duration are
     // what make it an audit trail rather than a log of intentions.
