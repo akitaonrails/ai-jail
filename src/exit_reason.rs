@@ -848,7 +848,8 @@ mod tests {
             lockdown: Some(true),
             ..crate::config::Config::default()
         };
-        crate::sandbox::rlimits::apply(&lockdown, false);
+        crate::sandbox::rlimits::apply(&lockdown, false)
+            .expect("lockdown limits apply");
         let limits = LimitsInForce::read_back(true);
         assert_eq!(
             limits.file_size,
@@ -879,7 +880,8 @@ mod tests {
             lockdown: Some(true),
             ..crate::config::Config::default()
         };
-        crate::sandbox::rlimits::apply(&lockdown, false);
+        crate::sandbox::rlimits::apply(&lockdown, false)
+            .expect("lockdown limits apply");
         let limits = LimitsInForce::read_back(true);
         let (soft_after, _) =
             getrlimit(Resource::RLIMIT_FSIZE).expect("getrlimit");

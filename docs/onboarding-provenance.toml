@@ -231,3 +231,21 @@ verified_by = [
   "onboarding::tests::plain_header_names_shared_policy_root",
 ]
 guide_sections = ["Linked worktrees"]
+
+[[claim]]
+# Advanced CLI/config-only controls: no onboarding message of their own; the
+# final review is where their effect is shown.
+message_ids = []
+policy = "onboarding.advanced_rlimit_in_final_review"
+config_fields = ["rlimit"]
+cli_flags = ["--rlimit"]
+enforced_by = [
+  "src/onboarding.rs::render_effective_access",
+  "src/sandbox/rlimits.rs::effective",
+]
+verified_by = [
+  "cli::interface_rlimit_tests::interface_review_lists_each_explicit_limit",
+  "cli::interface_rlimit_tests::interface_review_lists_no_explicit_limit_for_defaults",
+  "cli::interface_rlimit_tests::interface_user_guide_documents_every_field_and_sandbox_flag",
+]
+guide_sections = ["Resource limits"]

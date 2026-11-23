@@ -59,6 +59,9 @@ or integration rather than saved sandbox authority.
   `--mask`, `--mask-except`, `--deny-path`, `--deny-path-except`
 - Kernel enforcement overrides: `--landlock`, `--no-landlock`, `--seccomp`,
   `--no-seccomp`, `--rlimits`, `--no-rlimits`
+- Per-process resource limits: `--rlimit` (a precise numeric primitive per
+  limit name; every effective limit, its source and the CPU grace are shown
+  by `--dry-run` as `rlimit name=… soft=… hard=… source=…`)
 - Filtered egress policy: `--allow-host`, `--allow-private-host`,
   `--prompt-hosts`, `--no-prompt-hosts`
 - Port bridges: `--forward-port`, `--publish-port`
