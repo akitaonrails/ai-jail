@@ -771,3 +771,95 @@ fn teardown_dry_run_shows_the_wrapper_and_a_placeholder_fd() {
         "the fd is a placeholder, not a number no dry run opened: {fd:?}"
     );
 }
+
+#[test]
+fn run_summary_preserves_exit_status_and_has_private_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    require_bwrap_net!();
+    let (project, home) = tree("summary");
+    let report = home.join("run.json");
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let out = command(&project, &home)
+        .args(["--exec", "--no-network", "--no-toolchains", "--run-summary"])
+        .arg(&report)
+        .args(["sh", "-c", "exit 7", "argument-not-in-report"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(7), "{}", text(&out.stderr));
+    let body = std::fs::read_to_string(&report).unwrap();
+    assert!(!body.contains("argument-not-in-report"));
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(doc["schema_version"], 1);
+    assert_eq!(doc["program"], "sh");
+    assert_eq!(doc["exit"]["code"], 7);
+    assert_eq!(doc["exit"]["source"], "exit_code");
+    assert!(doc["egress"].is_null());
+    assert_eq!(doc["teardown"]["status"], "complete");
+    assert!(doc["resources"]["peak_rss_kib"].as_u64().is_some());
+    assert!(is_rfc3339_utc(&doc["started_at"]));
+    assert!(is_rfc3339_utc(&doc["finished_at"]));
+    assert_eq!(
+        std::fs::metadata(&report).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(std::fs::read_dir(&home).unwrap().count(), 1);
+}
+
+#[test]
+fn run_summary_and_egress_log_share_the_run_id_and_totals() {
+    require_bwrap_net!();
+    require_curl!();
+    let fixture = http_fixture();
+    let (project, home) = tree("summary-egress");
+    let report = home.join("run.json");
+    let log = home.join("egress.jsonl");
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let out = command(&project, &home)
+        .args(["--exec", "--allow-host", "127.0.0.1", "--egress-log"])
+        .arg(&log)
+        .arg("--run-summary")
+        .arg(&report)
+        .args(["bash", "-c", &three_connections(fixture)])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    let lines = read_jsonl(&log);
+    assert_eq!(lines.len(), 3);
+    assert!(is_hex32(&doc["run_id"]));
+    for line in &lines {
+        assert_eq!(line["run_id"], doc["run_id"]);
+    }
+    assert_eq!(doc["egress"]["complete"], true);
+    assert_eq!(doc["egress"]["allowed"], 1);
+    assert_eq!(doc["egress"]["denied"], 1);
+    assert_eq!(doc["egress"]["errored"], 1);
+}
+
+#[test]
+fn run_summary_refuses_existing_output_and_leaves_dry_run_read_only() {
+    require_bwrap_net!();
+    let (project, home) = tree("summary-destination");
+    let report = home.join("run.json");
+    let mut dry_run = command(&project, &home);
+    dry_run
+        .args(["--dry-run", "--run-summary"])
+        .arg(&report)
+        .arg("sh");
+    let out = dry_run.output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!report.exists());
+
+    std::fs::write(&report, "existing").unwrap();
+    let out = command(&project, &home)
+        .args(["--exec", "--run-summary"])
+        .arg(&report)
+        .args(["sh", "-c", "printf should-not-start"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert_eq!(std::fs::read_to_string(report).unwrap(), "existing");
+}

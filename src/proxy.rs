@@ -433,7 +433,7 @@ impl Proxy {
     /// relay pumps return, and wait up to `grace` for the handlers to
     /// finish. A handler writes its egress line before it leaves `active`,
     /// so once this sees 0 every line and every byte is counted.
-    pub(crate) fn drain(&self, grace: Duration) {
+    pub(crate) fn drain(&self, grace: Duration) -> bool {
         let shared = &self.shared;
         shared.draining.store(true, Ordering::SeqCst);
         // Connections waiting on another connection's prompt give up now.
@@ -463,10 +463,11 @@ impl Proxy {
                      egress lines are missing from the log",
                     grace.as_millis()
                 ));
-                return;
+                return false;
             }
             thread::sleep(DRAIN_POLL);
         }
+        true
     }
 }
 

@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ai-jail run summary version 1",
+  "type": "object",
+  "required": ["schema_version", "run_id", "started_at", "finished_at", "duration_ms", "program", "exit", "egress", "teardown", "resources"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "type": "string", "pattern": "^[a-f0-9]{32}$" },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": "string", "format": "date-time" },
+    "duration_ms": { "$ref": "#/$defs/counter" },
+    "program": { "type": ["null", "string"], "description": "Command basename only." },
+    "exit": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": { "kind": { "const": "launch_error" } }
+        },
+        {
+          "type": "object",
+          "required": ["code", "signal", "core_dumped", "kind", "source", "limit"],
+          "properties": {
+            "code": { "type": "integer" },
+            "signal": { "type": ["integer", "null"] },
+            "core_dumped": { "type": "boolean" },
+            "kind": { "enum": ["exited", "signaled", "limit"] },
+            "source": { "enum": ["exit_code", "inferred", "direct"] },
+            "limit": { "enum": ["file_size", null] }
+          }
+        }
+      ]
+    },
+    "egress": {
+      "type": ["object", "null"],
+      "required": ["complete", "allowed", "denied", "errored", "bytes_up", "bytes_down"],
+      "properties": {
+        "complete": { "type": "boolean" },
+        "allowed": { "$ref": "#/$defs/counter" },
+        "denied": { "$ref": "#/$defs/counter" },
+        "errored": { "$ref": "#/$defs/counter" },
+        "bytes_up": { "$ref": "#/$defs/counter" },
+        "bytes_down": { "$ref": "#/$defs/counter" }
+      }
+    },
+    "teardown": {
+      "type": ["object", "null"],
+      "required": ["status", "reason"],
+      "properties": {
+        "status": { "enum": ["complete", "incomplete", "missing"] },
+        "reason": { "type": ["string", "null"] },
+        "grace_ms": { "$ref": "#/$defs/counter" },
+        "survivors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["pid", "ppid", "comm", "age_s", "ended_by"],
+            "properties": {
+              "pid": { "type": "integer", "minimum": 1 },
+              "ppid": { "type": "integer", "minimum": 1 },
+              "comm": { "type": "string" },
+              "age_s": { "$ref": "#/$defs/counter" },
+              "ended_by": { "enum": ["sigterm", "sigkill", "already-gone"] }
+            }
+          }
+        }
+      }
+    },
+    "resources": {
+      "type": ["object", "null"],
+      "required": ["cpu_user_ms", "cpu_system_ms", "peak_rss_kib"],
+      "properties": {
+        "cpu_user_ms": { "$ref": "#/$defs/counter" },
+        "cpu_system_ms": { "$ref": "#/$defs/counter" },
+        "peak_rss_kib": { "$ref": "#/$defs/counter" }
+      }
+    }
+  },
+  "$defs": { "counter": { "type": "integer", "minimum": 0 } }
+}

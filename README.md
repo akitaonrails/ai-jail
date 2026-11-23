@@ -662,6 +662,14 @@ permissions do not remove that privacy limit.
 
 ### Run observability
 
+`--run-summary <PATH>` writes one versioned JSON report after a launch with
+the exit reason, filtered-egress totals, and Linux teardown and measured
+resource use. Use a new path in a directory outside the sandbox's write
+access. The file is published atomically with mode 0600. The flag enables
+Linux teardown reporting and shares the run ID with `--egress-log`. See the
+[walkthrough](docs/USER_GUIDE.md#save-a-run-summary) and
+[JSON schema](docs/run-summary.schema.json).
+
 `--egress-log <PATH>` appends one JSON line to `PATH` for every connection the
 filtered-egress proxy accepts, whether it was allowed, refused, or failed. It
 needs filtered networking (`--allow-host`, or the filtered default a known
