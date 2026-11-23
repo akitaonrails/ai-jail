@@ -591,6 +591,55 @@ defaults included. The README section
 [Resource limits without root](../README.md#resource-limits-without-root---rlimit)
 covers each limit name and what it does to a process.
 
+`--teardown-report` is a per-launch CLI flag, not a saved setting, so the
+onboarding screens do not offer it. On Linux, when the command exits,
+ai-jail uses Linux pidfds to stop children verified as belonging to its
+in-jail supervisor. It sends SIGTERM (with SIGCONT for stopped children), then
+SIGKILL to verified children still alive after 2000 ms. Children found only
+on the final scan are left to PID namespace cleanup and mark the report
+`survivors-respawned`. If any were stopped, one
+stderr line gives their count and names (at most ten, then `+N more`), even
+under `--exec`. A report that could not be completed prints one
+`Teardown report incomplete: <reason>` line instead of passing for a clean
+teardown. Survivors are named by their kernel command
+name (`comm`) only; their command lines and environments are never read.
+The exit code is the command's own. On macOS the flag is accepted and
+changes nothing.
+
+## Named profiles
+
+A named profile (`[profiles.NAME]`) is a set of grants and restrictions kept
+in the trusted global config and selected per launch with `--profile NAME`.
+It is not the onboarding access profile: onboarding edits one project's saved
+grants, while a named profile is written by hand, applies to any project, and
+is never saved into a project policy. It is an advanced CLI/config-only
+control, so the onboarding screens do not offer it.
+
+```toml
+# ~/.config/ai-jail/config.toml
+[profiles.web]
+profile_version = 1
+github = true
+```
+
+- Only `--profile NAME` selects a profile. An entry under `[profiles]` that no
+  launch selects is ignored, whatever it contains.
+- `profile_version = 1` is required; a typo, an unknown key or a wrong type in
+  the selected profile refuses the launch, whatever its value, an empty `[]`,
+  `{}` or `""` included. A secret-bearing field of the wrong type is refused without showing its
+  value.
+- Every access the profile adds that this launch applies is printed before
+  the launch, even when other warnings are quiet, as
+  `profile=NAME widens=FIELD granted="…"`. A grant the CLI or the project
+  already gives, one the restricted first-run defaults replace, and one
+  `--lockdown` drops are not the profile's widening and print nothing.
+
+The final `Complete effective access` review names the selected profile as
+`Named profile: profile=NAME (a trusted global layer)`; text `status`
+prints `Named profile: profile=NAME`. The README section
+[Named profiles](../README.md#named-profiles---profile-name) lists the merge
+order and the trust rules in full.
+
 ## Migration and reapproval
 
 Legacy repository `.ai-jail` files contribute restrictions only. Commands,

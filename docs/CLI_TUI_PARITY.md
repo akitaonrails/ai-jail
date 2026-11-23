@@ -55,6 +55,12 @@ or integration rather than saved sandbox authority.
 
 ## Advanced CLI-only policy
 
+- Named global profiles: `--profile` selects one `[profiles.NAME]` table of
+  the trusted global `config.toml`. Profiles are written by hand there, not
+  in onboarding; every access a profile widens in this launch, after every
+  other layer, is printed before launch and under `--dry-run` as
+  `profile=NAME widens=FIELD granted="…"`, and recorded in the audit log.
+
 - Filesystem overlays and exclusions: `--overlay-map`, `--hide-dotdir`,
   `--mask`, `--mask-except`, `--deny-path`, `--deny-path-except`
 - Kernel enforcement overrides: `--landlock`, `--no-landlock`, `--seccomp`,
@@ -83,6 +89,8 @@ or integration rather than saved sandbox authority.
 - Run observability: `--egress-log` (a per-run output file, not saved
   authority: no configuration key, refused outside filtered networking and
   on macOS)
+- Run observability: `--teardown-report` (reports on one run; no saved
+  authority and no config key)
 - Backward-compatible rejected option: `--allow-tcp-port`
 
 ## Release rule

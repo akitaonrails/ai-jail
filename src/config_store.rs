@@ -711,6 +711,7 @@ fn read_project(
     };
     let text = std::str::from_utf8(&raw)
         .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+    config::warn_if_project_selects_profile(text, &["grants", "constraints"]);
     let doc: ProjectPolicyDocument = toml::from_str(text).map_err(|e| {
         format!(
             "Failed to parse {}: {}",
@@ -918,7 +919,7 @@ fn migrate_global(
         durable_write(&paths.global, &raw)?;
     }
     let installed = load_global(paths)?;
-    if !prior_digest_matches && installed != parsed {
+    if !prior_digest_matches && !installed.same_policy(&parsed) {
         return Err(format!(
             "Global migration verification failed at {}; legacy source retained at {}",
             paths.global.display(),
@@ -1069,6 +1070,7 @@ fn migrate_project(
     let text = std::str::from_utf8(raw).map_err(|e| {
         format!("Failed to parse {}: {e}", paths.legacy_project.display())
     })?;
+    config::warn_if_project_selects_profile(text, &[]);
     let legacy = config::parse_toml(text).map_err(|e| {
         format!("Failed to parse {}: {e}", paths.legacy_project.display())
     })?;
@@ -1080,7 +1082,7 @@ fn migrate_project(
         load_global(paths)?,
         &selector,
         &Config::default(),
-    );
+    )?;
     // The legacy file lives in, and its relative paths refer to, the launch
     // checkout. Only the destination document follows the policy root; the
     // runtime merge filters stored paths against the launch directory again.
@@ -2084,12 +2086,12 @@ pub(crate) fn save_global_preferences(
         .map_err(|e| format!("Cannot serialize global config: {e}"))?;
     let encoded = config::parse_global_toml(&body)
         .map_err(|e| format!("Cannot verify updated global config: {e}"))?;
-    if encoded != expected {
+    if !encoded.same_policy(&expected) {
         return Err(format!("Cannot preserve {}", paths.global.display()));
     }
     durable_write(&paths.global, body.as_bytes())?;
     let checked = load_global(paths)?;
-    if checked != expected {
+    if !checked.same_policy(&expected) {
         return Err(format!("Failed to verify {}", paths.global.display()));
     }
     Ok(())

@@ -346,6 +346,9 @@ pub(crate) struct LaunchRecord<'a> {
     pub project_grants: bool,
     pub project_constraints: bool,
     pub global_config: bool,
+    /// The `--profile` this launch selected and what it widened; the
+    /// record omits the key when no profile was selected.
+    pub profile: Option<&'a crate::config::ProfileReport>,
     pub exit_code: i32,
     pub duration: std::time::Duration,
     /// Every limit the sandbox ran under; omitted when empty.
@@ -667,6 +670,22 @@ pub(crate) fn launch_record(record: &LaunchRecord<'_>) -> serde_json::Value {
             .collect();
         object.insert("rlimits".into(), limits.into());
     }
+    // Secret fields already carry key names only (`Widening.granted`).
+    if let Some(profile) = record.profile
+        && let Some(object) = value.as_object_mut()
+    {
+        let widenings: Vec<serde_json::Value> = profile
+            .widenings
+            .iter()
+            .map(
+                |w| serde_json::json!({"field": w.field, "granted": w.granted}),
+            )
+            .collect();
+        object.insert(
+            "profile".into(),
+            serde_json::json!({"name": profile.name, "widenings": widenings}),
+        );
+    }
     value
 }
 
@@ -887,6 +906,7 @@ mod tests {
             project_grants: false,
             project_constraints: true,
             global_config: true,
+            profile: None,
             exit_code: 0,
             duration: std::time::Duration::from_millis(1500),
             rlimits: &[],
@@ -944,6 +964,7 @@ mod tests {
             exit_code: 0,
             duration: std::time::Duration::ZERO,
             rlimits,
+            profile: None,
         };
         // An old-shaped record: no new key appears.
         let old = launch_record(&base(&[]));
@@ -964,6 +985,60 @@ mod tests {
         for key in old_keys {
             if key != "ts" {
                 assert_eq!(old[key], new[key], "{key} changed");
+            }
+        }
+    }
+
+    #[test]
+    fn launch_record_adds_profile_only_when_selected() {
+        use crate::config::{ProfileReport, Widening};
+        let base = LaunchRecord {
+            command: &[],
+            network_mode: "off",
+            allow_hosts: &[],
+            lockdown: false,
+            agent_state: false,
+            gpu: false,
+            display: false,
+            audio: false,
+            kvm: false,
+            browser_profile: None,
+            project_config: false,
+            project_trusted: false,
+            project_source: "none",
+            project_grants: false,
+            project_constraints: false,
+            global_config: true,
+            profile: None,
+            rlimits: &[],
+            exit_code: 0,
+            duration: std::time::Duration::ZERO,
+        };
+        let old = launch_record(&base);
+        assert!(old.get("profile").is_none(), "{old}");
+        let report = ProfileReport {
+            name: "agent-test".into(),
+            widenings: vec![Widening {
+                field: "env_pass".into(),
+                granted: vec!["AJ_PROFILE_SECRET".into()],
+            }],
+        };
+        let new = launch_record(&LaunchRecord {
+            profile: Some(&report),
+            ..base
+        });
+        assert_eq!(new["profile"]["name"], "agent-test");
+        assert_eq!(
+            new["profile"]["widenings"],
+            serde_json::json!([{
+                "field": "env_pass",
+                "granted": ["AJ_PROFILE_SECRET"],
+            }])
+        );
+        // Every pre-existing key is unchanged.
+        for (key, value) in old.as_object().unwrap() {
+            if key != "ts" && key != "duration_s" {
+                assert_eq!(&new[key], value, "{key}");
             }
         }
     }

@@ -25,6 +25,8 @@ mod secret;
 mod signals;
 mod ssh_restricted;
 mod statusbar;
+#[cfg(target_os = "linux")]
+mod teardown;
 
 #[cfg(test)]
 mod test_utils;
@@ -602,6 +604,30 @@ fn default_agent_api_egress_applies(config: &config::Config) -> bool {
         && config.browser_profile.is_none()
 }
 
+fn apply_default_egress_hosts(config: &mut config::Config) {
+    if default_agent_api_egress_applies(config)
+        && sandbox::unprivileged_netns_available()
+    {
+        for host in command::default_egress_hosts_for(
+            &config.runtime_harnesses,
+            &config.command,
+        ) {
+            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
+                config.allow_hosts.push((*host).into());
+            }
+        }
+    }
+    if default_registry_egress_applies(config)
+        && sandbox::unprivileged_netns_available()
+    {
+        for host in sandbox::TOOLCHAIN_REGISTRY_HOSTS {
+            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
+                config.allow_hosts.push((*host).into());
+            }
+        }
+    }
+}
+
 fn toolchain_dest_already_mapped(config: &config::Config, spec: &str) -> bool {
     let dest = |p: &std::path::Path| {
         config::MapSpec::parse(p)
@@ -786,27 +812,7 @@ pub(crate) fn finalize_launch_config_with_ssh(
             }
         }
     }
-    if default_agent_api_egress_applies(&config)
-        && sandbox::unprivileged_netns_available()
-    {
-        for host in command::default_egress_hosts_for(
-            &config.runtime_harnesses,
-            &config.command,
-        ) {
-            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
-                config.allow_hosts.push((*host).into());
-            }
-        }
-    }
-    if default_registry_egress_applies(&config)
-        && sandbox::unprivileged_netns_available()
-    {
-        for host in sandbox::TOOLCHAIN_REGISTRY_HOSTS {
-            if !config.allow_hosts.iter().any(|allowed| allowed == host) {
-                config.allow_hosts.push((*host).into());
-            }
-        }
-    }
+    apply_default_egress_hosts(&mut config);
     if !config.lockdown_enabled() {
         for path in sandbox::credential_ro_paths(&config) {
             let spec = path.to_string_lossy().into_owned();
@@ -1004,6 +1010,19 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     // but re-running guarantees no relative path reaches landlock.
     config::absolutize_user_paths(&mut config, &project_dir);
 
+    // Teardown report: claimed and marked close-on-exec
+    // before anything is spawned, so neither the bridges nor the command
+    // inherit it.
+    #[cfg(target_os = "linux")]
+    let teardown_report = cli
+        .teardown_report_fd
+        .map(teardown::claim_report_fd)
+        .transpose()?;
+    // Every bridge is the wrapper's own child: the teardown never counts
+    // one as a survivor.
+    #[cfg(target_os = "linux")]
+    let mut bridge_pids: Vec<i32> = Vec::new();
+
     // Filtered egress (Linux): spawn the in-sandbox bridge BEFORE
     // apply_landlock/apply_seccomp below. Both restrict the caller and
     // its future children only, so an already-spawned bridge process
@@ -1015,35 +1034,35 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     // below -- exits.
     #[cfg(target_os = "linux")]
     if let Some(port) = cli.proxy_bridge_port {
-        spawn_bridge(
+        bridge_pids.push(spawn_bridge(
             "--proxy-bridge",
             port,
             std::path::Path::new(proxy::IN_SANDBOX_SOCK_PATH),
             None,
-        )?;
+        )?);
     }
     // Port forwards: the same bridge, one per port, pumping into the
     // host-side forward socket bwrap mounted at the per-port path.
     #[cfg(target_os = "linux")]
     for &port in config.forward_ports() {
-        spawn_bridge(
+        bridge_pids.push(spawn_bridge(
             "--proxy-bridge",
             port,
             &proxy::forward_in_sandbox_path(port),
             Some("--forward-port"),
-        )?;
+        )?);
     }
     // Published ports: the reverse bridge, one per port, connected to the
     // supervisor's socket before the agent runs so it is the only peer
     // the supervisor ever accepts there.
     #[cfg(target_os = "linux")]
     for &port in config.publish_ports() {
-        spawn_bridge(
+        bridge_pids.push(spawn_bridge(
             "--publish-bridge",
             port,
             &proxy::publish_in_sandbox_path(port),
             Some("--publish-port"),
-        )?;
+        )?);
     }
 
     // Apply Landlock inside the sandbox (after bwrap namespace setup).
@@ -1090,6 +1109,17 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
         unsafe { std::env::set_var("PATH", &pruned) };
     }
 
+    // With a teardown report, stay resident as the command's sub-reaper
+    // instead of becoming it; the exec path below is unchanged without it.
+    #[cfg(target_os = "linux")]
+    if let Some(report) = teardown_report {
+        return teardown::run_command_as_reaper(
+            &cli.command,
+            report,
+            &bridge_pids,
+        );
+    }
+
     // Replace this process with the real command
     let err = std::process::Command::new(&cli.command[0])
         .args(&cli.command[1..])
@@ -1103,9 +1133,11 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
 /// for filtered egress and each `--forward-port`; `--publish-bridge`:
 /// Unix `socket` -> 127.0.0.1:<port>, for each `--publish-port`). Fatal
 /// on spawn failure: without the bridge, the port the launch asked for
-/// silently leads nowhere. The child is never reaped or waited on -- it
-/// lives exactly as long as the sandbox's pid namespace (see the call
-/// site).
+/// silently leads nowhere. Returns the bridge's pid, which the teardown
+/// report excludes from the survivors. On the exec path the child is
+/// never reaped or waited on -- it lives exactly as long as the sandbox's
+/// pid namespace (see the call site); the teardown wrapper kills it
+/// after its report.
 ///
 /// With `wait_ready_for` (the launch flag, for the error), also fatal
 /// when the bridge cannot come up, and the agent is not exec'd until it
@@ -1119,7 +1151,7 @@ fn spawn_bridge(
     port: u16,
     socket: &std::path::Path,
     wait_ready_for: Option<&str>,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     use std::io::BufRead;
     let exe = std::env::current_exe().map_err(|e| {
         format!("Cannot resolve ai-jail binary for the bridge on {port}: {e}")
@@ -1154,7 +1186,8 @@ fn spawn_bridge(
             ));
         }
     }
-    Ok(())
+    i32::try_from(child.id())
+        .map_err(|_| format!("The bridge on {port} has an out-of-range pid"))
 }
 
 /// Drop `PATH` entries that are not directories here, returning the rewritten
@@ -1461,7 +1494,7 @@ fn run(
             config_store::load_global(&store)?,
             &cli,
             global_command_selector,
-        )
+        )?
     } else {
         // Read-only compatibility path. Writable modes migrated this above.
         config::load_global_for_command_report(&cli, global_command_selector)?
@@ -1472,6 +1505,13 @@ fn run(
             table
         ));
     }
+    let profile_report = global_selection.profile;
+    let global_without_profile = global_selection.without_profile;
+    // Kept only when a profile is selected: what it widens is measured
+    // against the same layers without it, once the launch config is final.
+    let grants_without_profile = profile_report
+        .is_some()
+        .then(|| stored_project.grants.clone());
     let global = global_selection.config;
     let onboarding_complete = stored_project.onboarding_complete;
     let global_for_onboarding = global.clone();
@@ -1509,6 +1549,29 @@ fn run(
             &invocation_cwd,
         )
     };
+    let mut profile_layers = grants_without_profile.map(|grants| {
+        let baseline = config::merge(
+            &cli,
+            config::merge_trusted_project(
+                global_without_profile.clone(),
+                grants,
+            ),
+        );
+        let without_profile = if legacy_project_trusted {
+            config::merge_trusted_project(baseline, project_config.clone())
+        } else {
+            config::merge_with_global_report(
+                baseline,
+                project_config.clone(),
+                &invocation_cwd,
+            )
+            .0
+        };
+        config::ProfileLayers {
+            without_profile,
+            with_profile: config.clone(),
+        }
+    });
 
     let resolved_harnesses =
         command::resolve_harnesses(&config.command, &cli.harnesses)?;
@@ -1564,6 +1627,24 @@ fn run(
                 &invocation_cwd,
             )?;
             onboarding::secure_noninteractive(&mut config, &cli);
+            // The same transform without the profile, so a grant these
+            // restricted defaults give on their own (the harness API host)
+            // is not read as the profile's.
+            if let Some(layers) = profile_layers.as_mut() {
+                let mut without_profile =
+                    build_noninteractive_onboarding_effective(
+                        &global_without_profile,
+                        harness,
+                        &cli,
+                        project_config.clone(),
+                        &invocation_cwd,
+                    )?;
+                onboarding::apply_secure_defaults(&mut without_profile, &cli);
+                *layers = config::ProfileLayers {
+                    without_profile,
+                    with_profile: config.clone(),
+                };
+            }
             let selection = onboarding::Selection::from_config(&config);
             onboarding::render_summary(
                 &selection,
@@ -1664,6 +1745,27 @@ fn run(
         && !cli.init
         && !cli.bootstrap
     {
+        // The same transform without the profile, measured against below.
+        if let Some(layers) = profile_layers.as_mut() {
+            *layers = config::ProfileLayers {
+                without_profile: build_onboarding_effective(
+                    global_without_profile.clone(),
+                    stored_grants_for_onboarding.clone(),
+                    &cli,
+                    project_config.clone(),
+                    &invocation_cwd,
+                    legacy_project_trusted,
+                )?,
+                with_profile: build_onboarding_effective(
+                    global_for_onboarding.clone(),
+                    stored_grants_for_onboarding.clone(),
+                    &cli,
+                    project_config.clone(),
+                    &invocation_cwd,
+                    legacy_project_trusted,
+                )?,
+            };
+        }
         config = build_onboarding_effective(
             global_for_onboarding,
             stored_grants_for_onboarding,
@@ -1727,7 +1829,7 @@ fn run(
         ));
     }
     for warning in security_warnings {
-        output::security_warn(&warning);
+        output::security_warn(&warning.text);
     }
     // Resolve any relative paths in rw_maps/ro_maps against the user's
     // invocation cwd before they reach bwrap/landlock/seatbelt (issue
@@ -1738,6 +1840,26 @@ fn run(
     validate_network_flags(&config)?;
     // Before status, --init and auto-save: see `checked_limits`.
     let limits_check = checked_limits(&config, &store).map(|_| ());
+
+    // Printed on every launch, `--dry-run`, `--exec` and `status` included
+    // and without `--verbose`: a profile may widen the jail only where it
+    // is seen. Measured only now, after onboarding's restricted defaults,
+    // the CLI, the project policy and `--lockdown`, so a line names only
+    // what this launch applies, and a profile that widens nothing prints
+    // nothing (#230 review). The audit record carries the same report.
+    let profile_report = match (profile_report, profile_layers) {
+        (Some(report), Some(mut layers)) => {
+            layers.without_profile.runtime_harnesses =
+                config.runtime_harnesses.clone();
+            apply_default_egress_hosts(&mut layers.without_profile);
+            let applied = report.applied(layers, &config, &invocation_cwd)?;
+            for line in applied.lines() {
+                output::security_warn(&line);
+            }
+            Some(applied)
+        }
+        _ => None,
+    };
 
     // Handle status command
     if cli.status {
@@ -1779,6 +1901,7 @@ fn run(
                     project: &invocation_cwd,
                     policy_path: store.policy_root(),
                     profile_present: stored_project.present,
+                    named_profile: cli.profile.as_deref(),
                     onboarding_complete,
                     harnesses: &resolved_harnesses,
                     config: &config,
@@ -1802,6 +1925,10 @@ fn run(
             "Project constraints",
             if provenance.constraints { "yes" } else { "no" },
         );
+        // Name the --profile in force; nothing when none is.
+        if let Some(name) = cli.profile.as_deref() {
+            output::status_header("Named profile", &format!("profile={name}"));
+        }
         let legacy_status_path = invocation_cwd.join(".ai-jail");
         let contributing_path = match provenance.source {
             "external_store" => Some(store.project.as_path()),
@@ -2083,6 +2210,7 @@ fn run(
             cli.verbose,
             egress_proxy.as_ref(),
             &bridge_sockets,
+            cli.teardown_report,
         )?;
         output::dry_run_line(&formatted);
         return Ok(0);
@@ -2100,12 +2228,13 @@ fn run(
     {
         eprintln!(
             "{}",
-            onboarding::render_effective_access(
+            onboarding::render_effective_access_with_profile(
                 config,
                 &invocation_cwd,
                 &harness,
                 saved,
                 &approved_env_names,
+                cli.profile.as_deref(),
             )?
         );
     }
@@ -2207,6 +2336,15 @@ fn run(
     // known while the sandbox profile is still being generated.
     let pty = if use_pty { Some(pty::open()?) } else { None };
     let sandbox_tty = pty.as_ref().and_then(pty::Pty::slave_path);
+    // Teardown report: the pipe opens before the command
+    // is built, because the wrapper is told its descriptor number. Every
+    // early return below drops it; it is close-on-exec until the spawn.
+    #[cfg(target_os = "linux")]
+    let mut teardown_run = teardown::TeardownRun::start(cli.teardown_report);
+    #[cfg(target_os = "linux")]
+    let teardown_report_fd = teardown_run.report_fd();
+    #[cfg(not(target_os = "linux"))]
+    let teardown_report_fd = None;
     let mut cmd = launch_runner.build_sandbox(|final_config| {
         sandbox::build(
             &guard,
@@ -2216,6 +2354,7 @@ fn run(
             sandbox_tty.as_deref(),
             egress_proxy.as_ref(),
             &bridge_sockets,
+            teardown_report_fd,
         )
     })?;
 
@@ -2224,6 +2363,13 @@ fn run(
     // — see run_landlock_exec() — to avoid EAGAIN during bwrap's
     // internal clone() calls for namespace creation.
     let file_size_set = sandbox::rlimits::apply(config, cli.verbose)?;
+
+    // Both spawn paths make the report descriptor inheritable in the
+    // intended child and close the parent copies after spawning.
+    #[cfg(target_os = "linux")]
+    let spawn_bracket: &mut dyn signals::SpawnBracket = &mut teardown_run;
+    #[cfg(not(target_os = "linux"))]
+    let spawn_bracket: &mut dyn signals::SpawnBracket = &mut ();
 
     let child_status = if use_pty {
         let resize_redraw_key =
@@ -2271,6 +2417,7 @@ fn run(
             resize_redraw_key.as_deref(),
             config,
             use_status_bar,
+            spawn_bracket,
         ) {
             Ok(status) => {
                 statusbar::teardown();
@@ -2284,7 +2431,7 @@ fn run(
     } else {
         // Non-interactive and --exec paths preserve inherited/piped stdio.
         let gate = signals::wrap_supervised_command(&mut cmd)?;
-        let child = signals::spawn_supervised(&mut cmd, gate)?;
+        let child = signals::spawn_supervised(&mut cmd, gate, spawn_bracket)?;
 
         let pid = child.id() as i32;
 
@@ -2323,6 +2470,11 @@ fn run(
     if let Some(proxy) = egress_proxy.as_ref().filter(|p| p.drain_on_exit()) {
         proxy.drain(std::time::Duration::from_millis(2000));
     }
+    // The reader is joined only after the wait: it returns at the first
+    // report line, and EOF follows the wrapper's exit. `finish` prints
+    // what the report says; macOS accepts the flag and changes nothing.
+    #[cfg(target_os = "linux")]
+    let _teardown_section = teardown_run.finish();
 
     // Append the launch record only now: exit code and duration are
     // what make it an audit trail rather than a log of intentions.
@@ -2356,6 +2508,7 @@ fn run(
                 || audit_home
                     .as_ref()
                     .is_some_and(|home| home.join(".ai-jail").exists()),
+            profile: profile_report.as_ref(),
             exit_code,
             duration: launch_start.elapsed(),
             rlimits: &effective_limits,

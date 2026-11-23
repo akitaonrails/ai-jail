@@ -217,6 +217,14 @@ must still appear in the final `Complete effective access` review.
   The review lists each explicit limit as `rlimit NAME=SOFT/HARD (SOURCE)`,
   with the values the sandbox applies (after a `--lockdown` clamp, and with
   the five-second `cpu` grace). Defaults are not listed there.
+- `--profile NAME` selects a named profile, a `[profiles.NAME]` table in the
+  trusted global config. It is CLI/config-only because a profile is written
+  by hand in the global file and onboarding only edits per-project grants;
+  offering it there would let the onboarding screen select trusted authority
+  it cannot show in full. It is unrelated to the onboarding access profile
+  (the per-project grants these screens edit). The review shows
+  `Named profile: profile=NAME (a trusted global layer)`, and every field it
+  widens is printed as a `profile=NAME widens=FIELD` line before the launch.
 
 ## Plain-terminal fallback
 
