@@ -122,10 +122,10 @@ impl Tree {
             .expect("failed to run ai-jail")
     }
 
-    /// A real launch of `sh -c script` that auto-saves, as an ordinary
+    /// A real launch of `bash -c script` that auto-saves, as an ordinary
     /// run does.
     fn launch(&self, script: &str) -> Output {
-        self.run(&["--no-status-bar", "sh", "-c", script])
+        self.run(&["--no-status-bar", "bash", "-c", script])
     }
 
     /// `--dry-run sh` from the project; never auto-saves.
