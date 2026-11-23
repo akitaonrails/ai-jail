@@ -1940,6 +1940,15 @@ pub struct BridgeSockets {
 /// filtered mode. Linux bind-mounts its Unix socket into the sandbox;
 /// macOS points its seatbelt endpoint rule and the child env at its
 /// loopback TCP port.
+///
+/// `teardown_report_fd` is the descriptor the supervisor makes
+/// inheritable right before the spawn. Linux forces the
+/// in-sandbox wrapper and tells it the number; macOS ignores it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one value per launch input; a bundle struct would be built \
+              at this single call site only"
+)]
 pub fn build(
     guard: &SandboxGuard,
     config: &Config,
@@ -1948,6 +1957,7 @@ pub fn build(
     sandbox_tty: Option<&Path>,
     proxy: Option<&crate::proxy::Proxy>,
     bridge_sockets: &BridgeSockets,
+    teardown_report_fd: Option<std::os::fd::RawFd>,
 ) -> Result<Command, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1959,11 +1969,13 @@ pub fn build(
             verbose,
             proxy.and_then(|p| p.unix_path()),
             bridge_sockets,
+            teardown_report_fd,
         )
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (guard, bridge_sockets);
+        // No teardown report on macOS.
+        let _ = (guard, bridge_sockets, teardown_report_fd);
         let prepared = prepare_seatbelt_config(config)?;
         seatbelt::build(
             &prepared,
@@ -1982,6 +1994,7 @@ pub fn dry_run(
     verbose: bool,
     proxy: Option<&crate::proxy::Proxy>,
     bridge_sockets: &BridgeSockets,
+    teardown_report: bool,
 ) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1992,11 +2005,13 @@ pub fn dry_run(
             verbose,
             proxy.and_then(|p| p.unix_path()),
             bridge_sockets,
+            teardown_report,
         )
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (guard, bridge_sockets);
+        // No wrapper on macOS: the teardown report is not supported there.
+        let _ = (guard, bridge_sockets, teardown_report);
         let prepared = prepare_seatbelt_config(config)?;
         seatbelt::dry_run(
             &prepared,

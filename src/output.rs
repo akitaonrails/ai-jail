@@ -167,10 +167,14 @@ pub fn dry_run_line(line: &str) {
 pub fn escape_control_bytes(s: &str) -> String {
     s.chars()
         .map(|ch| match ch {
-            '\u{2028}'
+            // Bidi controls reorder, and zero-width and byte-order
+            // characters hide, what the terminal shows around them.
+            '\u{200b}'..='\u{200f}'
+            | '\u{2028}'
             | '\u{2029}'
             | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}' => '?',
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}' => '?',
             '\u{20}'..='\u{7e}' | '\u{a0}'.. => ch,
             _ => '?',
         })
@@ -297,5 +301,38 @@ mod tests {
     fn terminal_reset_seq_restores_cursor_visibility_and_sgr() {
         assert!(TERMINAL_RESET_SEQ.contains("\x1b[?25h"));
         assert!(TERMINAL_RESET_SEQ.contains("\x1b[0m"));
+    }
+
+    #[test]
+    fn escape_control_bytes_replaces_zero_width_characters() {
+        // Zero-width and byte-order characters are invisible, so a name
+        // holding one reads as a different name.
+        for c in [
+            '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}',
+            '\u{feff}',
+        ] {
+            assert_eq!(
+                escape_control_bytes(&format!("a{c}b")),
+                "a?b",
+                "{c:?} must become ?"
+            );
+        }
+        // Their neighbours are visible text and stay as they are.
+        for c in ['\u{200a}', '\u{2010}', '\u{2027}', '\u{fefc}'] {
+            let text = format!("a{c}b");
+            assert_eq!(escape_control_bytes(&text), text, "{c:?} must stay");
+        }
+        // The bidi overrides and isolates still become ?.
+        for c in ['\u{202a}', '\u{202e}', '\u{2066}', '\u{2069}'] {
+            assert_eq!(
+                escape_control_bytes(&format!("a{c}b")),
+                "a?b",
+                "{c:?} must become ?"
+            );
+        }
+        // Plain text, ASCII or not, is unchanged.
+        for text in ["node", "python3.12", "worker-1", "café", "日本語"] {
+            assert_eq!(escape_control_bytes(text), text);
+        }
     }
 }

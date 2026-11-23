@@ -558,6 +558,21 @@ Linux diagnostics distinguish a signal inferred from an exit code from a
 directly observed signal. For `SIGXFSZ`, the diagnostic includes the
 `--lockdown` file-size limit if ai-jail set one. The exit code is unchanged.
 
+`--teardown-report` is a per-launch CLI flag, not a saved setting, so the
+onboarding screens do not offer it. On Linux, when the command exits,
+ai-jail uses Linux pidfds to stop children verified as belonging to its
+in-jail supervisor. It sends SIGTERM (with SIGCONT for stopped children), then
+SIGKILL to verified children still alive after 2000 ms. Children found only
+on the final scan are left to PID namespace cleanup and mark the report
+`survivors-respawned`. If any were stopped, one
+stderr line gives their count and names (at most ten, then `+N more`), even
+under `--exec`. A report that could not be completed prints one
+`Teardown report incomplete: <reason>` line instead of passing for a clean
+teardown. Survivors are named by their kernel command
+name (`comm`) only; their command lines and environments are never read.
+The exit code is the command's own. On macOS the flag is accepted and
+changes nothing.
+
 ## Migration and reapproval
 
 Legacy repository `.ai-jail` files contribute restrictions only. Commands,
