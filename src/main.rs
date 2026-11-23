@@ -3510,23 +3510,13 @@ mod tests {
         )
         .unwrap();
         #[cfg(target_os = "linux")]
-        assert_eq!(
-            effective.rlimit.get("nproc"),
-            None,
-            "{:?}",
-            effective.rlimit
-        );
-        assert_eq!(
-            effective.rlimit.get("nofile"),
-            None,
-            "{:?}",
-            effective.rlimit
-        );
-        assert_eq!(
-            effective.rlimit.get("cpu").map(String::as_str),
-            Some("600"),
-            "{:?}",
-            effective.rlimit
+        assert!(!effective.rlimit.contains_key("nproc"));
+        assert!(!effective.rlimit.contains_key("nofile"));
+        assert!(
+            effective
+                .rlimit
+                .get("cpu")
+                .is_some_and(|limit| limit == "600")
         );
     }
 
