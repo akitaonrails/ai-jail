@@ -1351,6 +1351,22 @@ fn landlock_wrapper_args(
     verbose: bool,
     teardown_report_fd: Option<String>,
 ) -> Vec<String> {
+    landlock_wrapper_args_with_ecryptfs(
+        config,
+        map_args,
+        verbose,
+        teardown_report_fd,
+        &[],
+    )
+}
+
+fn landlock_wrapper_args_with_ecryptfs(
+    config: &Config,
+    map_args: &[String],
+    verbose: bool,
+    teardown_report_fd: Option<String>,
+    ecryptfs_lower_fds: &[std::os::fd::RawFd],
+) -> Vec<String> {
     let mut args = vec![
         LANDLOCK_WRAPPER_DEST.into(),
         "--landlock-exec".into(),
@@ -1496,6 +1512,10 @@ fn landlock_wrapper_args(
         args.push("--teardown-report-fd".into());
         args.push(fd);
     }
+    for &fd in ecryptfs_lower_fds {
+        args.push("--landlock-ecryptfs-lower-fd".into());
+        args.push(fd.to_string());
+    }
 
     if config.browser_profile().is_none() {
         args.extend_from_slice(map_args);
@@ -1521,6 +1541,7 @@ fn landlock_wrapper_args(
     args
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     guard: &SandboxGuard,
     config: &Config,
@@ -1529,6 +1550,7 @@ pub fn build(
     proxy_socket: Option<&Path>,
     bridge_sockets: &super::BridgeSockets,
     teardown_report_fd: Option<std::os::fd::RawFd>,
+    ecryptfs_lower_fds: &mut Vec<std::os::fd::OwnedFd>,
 ) -> Result<Command, String> {
     let sources = MountSources::from_guard(guard);
     let mount_set =
@@ -1590,15 +1612,26 @@ pub fn build(
     let args_fd = write_bwrap_args_fd(&opt_args)?;
     cmd.arg("--args").arg(args_fd.to_string());
 
+    ecryptfs_lower_fds.clear();
+    if wrapper.is_some() && config.landlock_enabled() {
+        *ecryptfs_lower_fds =
+            collect_ecryptfs_lower_fds(&mount_set, project_dir);
+    }
+    let ecryptfs_raw_fds: Vec<std::os::fd::RawFd> = ecryptfs_lower_fds
+        .iter()
+        .map(std::os::fd::AsRawFd::as_raw_fd)
+        .collect();
+
     // The separator and command stay on the real argv (bwrap --args does not
     // accept the command from the fd).
     cmd.arg("--");
     if wrapper.is_some() {
-        for arg in landlock_wrapper_args(
+        for arg in landlock_wrapper_args_with_ecryptfs(
             config,
             &map_args,
             verbose,
             teardown_report_fd.map(|fd| fd.to_string()),
+            &ecryptfs_raw_fds,
         ) {
             cmd.arg(arg);
         }
@@ -1638,6 +1671,220 @@ pub fn build(
     }
 
     Ok(cmd)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EcryptfsMount {
+    mount_point: PathBuf,
+    lower_root: PathBuf,
+    fnek_enabled: bool,
+}
+
+fn unescape_mountinfo_field(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let d1 = bytes[i + 1];
+            let d2 = bytes[i + 2];
+            let d3 = bytes[i + 3];
+            if (b'0'..=b'7').contains(&d1)
+                && (b'0'..=b'7').contains(&d2)
+                && (b'0'..=b'7').contains(&d3)
+            {
+                let val = ((d1 - b'0') << 6) | ((d2 - b'0') << 3) | (d3 - b'0');
+                out.push(val);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_ecryptfs_mounts(mountinfo: &str) -> Vec<EcryptfsMount> {
+    let mut mounts = Vec::new();
+    for line in mountinfo.lines() {
+        let Some((pre, post)) = line.split_once(" - ") else {
+            continue;
+        };
+        let pre_fields: Vec<&str> = pre.split(' ').collect();
+        if pre_fields.len() < 5 {
+            continue;
+        }
+        let mut post_fields = post.split(' ');
+        let Some(fs_type) = post_fields.next() else {
+            continue;
+        };
+        if fs_type != "ecryptfs" {
+            continue;
+        }
+        let Some(source) = post_fields.next() else {
+            continue;
+        };
+        let super_opts = post_fields.next().unwrap_or("");
+        let mount_point =
+            PathBuf::from(unescape_mountinfo_field(pre_fields[4]));
+        let lower_root = PathBuf::from(unescape_mountinfo_field(source));
+        if !mount_point.is_absolute() || !lower_root.is_absolute() {
+            continue;
+        }
+        let fnek_enabled = super_opts
+            .split(',')
+            .any(|opt| opt.starts_with("ecryptfs_fnek_sig="));
+        mounts.push(EcryptfsMount {
+            mount_point,
+            lower_root,
+            fnek_enabled,
+        });
+    }
+    // Longest mount point first so nested mounts match most specifically.
+    mounts.sort_by(|a, b| {
+        b.mount_point
+            .as_os_str()
+            .len()
+            .cmp(&a.mount_point.as_os_str().len())
+    });
+    mounts
+}
+
+fn open_ecryptfs_lower_dir(
+    mount: &EcryptfsMount,
+    upper_dir: &Path,
+) -> Option<std::os::fd::OwnedFd> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let rel = upper_dir.strip_prefix(&mount.mount_point).ok()?;
+    let root_c = CString::new(mount.lower_root.as_os_str().as_bytes()).ok()?;
+    let flags = nix::libc::O_PATH
+        | nix::libc::O_DIRECTORY
+        | nix::libc::O_NOFOLLOW
+        | nix::libc::O_CLOEXEC;
+    // SAFETY: `root_c` is NUL-terminated; returns a fresh fd or -1.
+    let raw_root = unsafe { nix::libc::open(root_c.as_ptr(), flags) };
+    if raw_root < 0 {
+        return None;
+    }
+    // SAFETY: `raw_root` is a newly opened owned fd.
+    let mut cur = unsafe { OwnedFd::from_raw_fd(raw_root) };
+
+    if mount.fnek_enabled {
+        // With filename encryption, lower directory names are encrypted
+        // (ECRYPTFS_FNEK_ENCRYPTED.*), so plaintext relative components do not
+        // exist under `lower_root`. Grant ReadDir only on `lower_root`; the
+        // lower tree stays unmounted inside the sandbox and the fd is closed
+        // before exec.
+        return Some(cur);
+    }
+
+    for comp in rel.components() {
+        let Component::Normal(seg) = comp else {
+            return None;
+        };
+        let seg_c = CString::new(seg.as_bytes()).ok()?;
+        // SAFETY: `cur` is a valid directory fd, `seg_c` is NUL-terminated,
+        // and O_NOFOLLOW prevents symlink traversal outside `lower_root`.
+        let next = unsafe {
+            nix::libc::openat(cur.as_raw_fd(), seg_c.as_ptr(), flags)
+        };
+        if next < 0 {
+            return None;
+        }
+        // SAFETY: `next` is a newly opened owned fd.
+        cur = unsafe { OwnedFd::from_raw_fd(next) };
+    }
+    Some(cur)
+}
+
+fn fd_dev_ino(fd: std::os::fd::RawFd) -> Option<(u64, u64)> {
+    let mut st = std::mem::MaybeUninit::<nix::libc::stat>::zeroed();
+    // SAFETY: `fd` is a valid open descriptor and `st` is writable.
+    if unsafe { nix::libc::fstat(fd, st.as_mut_ptr()) } < 0 {
+        return None;
+    }
+    // SAFETY: `fstat` succeeded.
+    let st = unsafe { st.assume_init() };
+    Some((st.st_dev, st.st_ino))
+}
+
+fn collect_ecryptfs_lower_fds(
+    mount_set: &MountSet,
+    project_dir: &Path,
+) -> Vec<std::os::fd::OwnedFd> {
+    use std::collections::HashSet;
+    use std::os::fd::AsRawFd;
+
+    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return Vec::new();
+    };
+    let mounts = parse_ecryptfs_mounts(&mountinfo);
+    if mounts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.push(project_dir.to_path_buf());
+    for group in [
+        &mount_set.home_dotfiles,
+        &mount_set.devin_state,
+        &mount_set.local_overrides,
+        &mount_set.command_binary,
+        &mount_set.git_worktree,
+        &mount_set.ssh_agent,
+        &mount_set.pictures,
+        &mount_set.browser_state,
+        &mount_set.extra,
+        &mount_set.overlay,
+        &mount_set.project,
+        &mount_set.devin_state_inside,
+        &mount_set.extra_inside,
+        &mount_set.overlay_inside,
+    ] {
+        for m in group {
+            match m {
+                Mount::RoBind { src, .. } | Mount::Bind { src, .. } => {
+                    candidates.push(src.clone());
+                }
+                Mount::Overlay {
+                    lower, upper, work, ..
+                } => {
+                    candidates.push(lower.clone());
+                    candidates.push(upper.clone());
+                    candidates.push(work.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
+    let mut fds = Vec::new();
+    for path in candidates {
+        let Ok(canon) = std::fs::canonicalize(&path) else {
+            continue;
+        };
+        if !canon.is_dir() {
+            continue;
+        }
+        let Some(ecryptfs) =
+            mounts.iter().find(|m| canon.starts_with(&m.mount_point))
+        else {
+            continue;
+        };
+        if let Some(fd) = open_ecryptfs_lower_dir(ecryptfs, &canon)
+            && let Some(key) = fd_dev_ino(fd.as_raw_fd())
+            && seen_inodes.insert(key)
+        {
+            fds.push(fd);
+        }
+    }
+    fds
 }
 
 /// Serialize bwrap arguments as a NUL-separated blob for `bwrap --args FD`.
@@ -7311,6 +7558,7 @@ mod tests {
             None,
             &crate::sandbox::BridgeSockets::default(),
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         let argv: Vec<String> = cmd
@@ -7529,6 +7777,7 @@ mod tests {
                 None,
                 &crate::sandbox::BridgeSockets::default(),
                 fd,
+                &mut Vec::new(),
             )
             .unwrap()
             .get_args()
@@ -9468,5 +9717,113 @@ mod wrapper_explicit_limit_tests {
         };
         let wrapper = resolve_landlock_wrapper(&config, false).unwrap();
         assert!(wrapper.is_some(), "--cpus 0 must keep the wrapper");
+    }
+
+    #[test]
+    fn parse_ecryptfs_mounts_handles_plain_fnek_and_escapes() {
+        let mountinfo = "\
+22 1 0:20 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+55 22 0:42 / /home/alice rw,relatime - ecryptfs /home/.ecryptfs/alice/.Private rw,ecryptfs_sig=0123456789abcdef,ecryptfs_cipher=aes
+56 55 0:43 / /home/alice/my\\040vault rw,relatime - ecryptfs /backing/my\\040vault rw,ecryptfs_sig=0123456789abcdef,ecryptfs_fnek_sig=fedcba9876543210
+";
+        let mounts = parse_ecryptfs_mounts(mountinfo);
+        assert_eq!(mounts.len(), 2);
+        // Longest mount point first.
+        assert_eq!(
+            mounts[0].mount_point,
+            PathBuf::from("/home/alice/my vault")
+        );
+        assert_eq!(mounts[0].lower_root, PathBuf::from("/backing/my vault"));
+        assert!(mounts[0].fnek_enabled);
+        assert_eq!(mounts[1].mount_point, PathBuf::from("/home/alice"));
+        assert_eq!(
+            mounts[1].lower_root,
+            PathBuf::from("/home/.ecryptfs/alice/.Private")
+        );
+        assert!(!mounts[1].fnek_enabled);
+    }
+
+    #[test]
+    fn open_ecryptfs_lower_dir_scopes_plain_and_rejects_symlinks() {
+        use std::os::fd::AsRawFd;
+
+        let base = std::env::temp_dir().join(format!(
+            "ai-jail-ecryptfs-lower-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let lower = base.join("lower");
+        let mapped = lower.join("mapped").join("sub");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&mapped).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, lower.join("escape")).unwrap();
+
+        let plain_mount = EcryptfsMount {
+            mount_point: PathBuf::from("/home/fixture"),
+            lower_root: lower.clone(),
+            fnek_enabled: false,
+        };
+        let fd = open_ecryptfs_lower_dir(
+            &plain_mount,
+            Path::new("/home/fixture/mapped/sub"),
+        )
+        .expect("plain lower subdir should open");
+        let expected_meta = std::fs::metadata(&mapped).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fd_dev_ino(fd.as_raw_fd()),
+            Some((expected_meta.dev(), expected_meta.ino()))
+        );
+
+        // Symlink inside lower_root must be rejected (O_NOFOLLOW).
+        assert!(
+            open_ecryptfs_lower_dir(
+                &plain_mount,
+                Path::new("/home/fixture/escape")
+            )
+            .is_none()
+        );
+
+        // FNEK mount opens lower_root directly even when plaintext relative
+        // name does not exist in lower_root.
+        let fnek_mount = EcryptfsMount {
+            mount_point: PathBuf::from("/home/fnek"),
+            lower_root: lower.clone(),
+            fnek_enabled: true,
+        };
+        let fnek_fd = open_ecryptfs_lower_dir(
+            &fnek_mount,
+            Path::new("/home/fnek/encrypted-name-missing-in-lower"),
+        )
+        .expect("fnek mount should open lower_root");
+        let lower_meta = std::fs::metadata(&lower).unwrap();
+        assert_eq!(
+            fd_dev_ino(fnek_fd.as_raw_fd()),
+            Some((lower_meta.dev(), lower_meta.ino()))
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn landlock_wrapper_args_passes_ecryptfs_lower_fds_before_separator() {
+        let args = landlock_wrapper_args_with_ecryptfs(
+            &all_off(),
+            &[],
+            false,
+            None,
+            &[7, 9],
+        );
+        let sep = args.iter().position(|a| a == "--").unwrap();
+        let fd7 = args
+            .windows(2)
+            .position(|w| w[0] == "--landlock-ecryptfs-lower-fd" && w[1] == "7")
+            .unwrap();
+        let fd9 = args
+            .windows(2)
+            .position(|w| w[0] == "--landlock-ecryptfs-lower-fd" && w[1] == "9")
+            .unwrap();
+        assert!(fd7 < sep && fd9 < sep);
     }
 }

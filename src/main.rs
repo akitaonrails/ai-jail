@@ -988,6 +988,69 @@ fn materialize_approved_env_names(
     Ok(materialized)
 }
 
+/// Claim inherited `O_PATH` directory descriptors for eCryptfs lower
+/// directories (#243). Marks each close-on-exec immediately so neither
+/// in-sandbox bridges nor the jailed command inherit them, and verifies
+/// each descriptor refers to a directory.
+#[cfg(target_os = "linux")]
+fn claim_ecryptfs_lower_fds(
+    raw_fds: &[i32],
+) -> Result<Vec<std::os::fd::OwnedFd>, String> {
+    use std::collections::HashSet;
+    use std::os::fd::FromRawFd;
+
+    let mut seen = HashSet::with_capacity(raw_fds.len());
+    let mut owned = Vec::with_capacity(raw_fds.len());
+    for &fd in raw_fds {
+        if fd < 3 {
+            return Err(format!("invalid ecryptfs lower fd: {fd}"));
+        }
+        if !seen.insert(fd) {
+            return Err(format!("duplicate ecryptfs lower fd: {fd}"));
+        }
+        // SAFETY: `fd` was passed as an inherited descriptor; check flags
+        // and set FD_CLOEXEC before wrapping in OwnedFd so it is never
+        // inherited by bridges or the jailed command.
+        let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
+        if flags < 0 {
+            return Err(format!(
+                "invalid ecryptfs lower fd {fd}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if unsafe {
+            nix::libc::fcntl(
+                fd,
+                nix::libc::F_SETFD,
+                flags | nix::libc::FD_CLOEXEC,
+            )
+        } < 0
+        {
+            return Err(format!(
+                "marking ecryptfs lower fd {fd} close-on-exec: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `fd` is open, unique in `seen`, and now exclusively owned.
+        let guard = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        let mut st = std::mem::MaybeUninit::<nix::libc::stat>::zeroed();
+        // SAFETY: `fd` is a valid open descriptor and `st` is writable.
+        if unsafe { nix::libc::fstat(fd, st.as_mut_ptr()) } < 0 {
+            return Err(format!(
+                "stat ecryptfs lower fd {fd}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `fstat` succeeded and initialized `st`.
+        let st = unsafe { st.assume_init() };
+        if (st.st_mode & nix::libc::S_IFMT) != nix::libc::S_IFDIR {
+            return Err(format!("ecryptfs lower fd {fd} is not a directory"));
+        }
+        owned.push(guard);
+    }
+    Ok(owned)
+}
+
 fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     use std::os::unix::process::CommandExt;
 
@@ -1013,6 +1076,12 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
         .teardown_report_fd
         .map(teardown::claim_report_fd)
         .transpose()?;
+    // eCryptfs lower-directory descriptors (#243): claim and mark close-on-exec
+    // before spawning bridges, then drop immediately after Landlock applies so
+    // the jailed command never inherits them.
+    #[cfg(target_os = "linux")]
+    let ecryptfs_lower_fds =
+        claim_ecryptfs_lower_fds(&cli.landlock_ecryptfs_lower_fds)?;
     // Every bridge is the wrapper's own child: the teardown never counts
     // one as a survivor.
     #[cfg(target_os = "linux")]
@@ -1067,8 +1136,12 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
         &project_dir,
         &cli.landlock_ro_paths,
         &cli.landlock_rw_paths,
+        #[cfg(target_os = "linux")]
+        &ecryptfs_lower_fds,
         cli.verbose,
     )?;
+    #[cfg(target_os = "linux")]
+    drop(ecryptfs_lower_fds);
 
     // --cpus: pin this process (and so the command it becomes) before
     // seccomp below refuses sched_setaffinity for good. Order: bridges,
@@ -2367,11 +2440,13 @@ fn run(
     // is built, because the wrapper is told its descriptor number. Every
     // early return below drops it; it is close-on-exec until the spawn.
     #[cfg(target_os = "linux")]
-    let mut teardown_run = teardown::TeardownRun::start(teardown_requested);
+    let teardown_run = teardown::TeardownRun::start(teardown_requested);
     #[cfg(target_os = "linux")]
     let teardown_report_fd = teardown_run.report_fd();
     #[cfg(not(target_os = "linux"))]
     let teardown_report_fd = None;
+    #[cfg(target_os = "linux")]
+    let mut ecryptfs_lower_fds: Vec<std::os::fd::OwnedFd> = Vec::new();
     let mut cmd = launch_runner.build_sandbox(|final_config| {
         sandbox::build(
             &guard,
@@ -2382,6 +2457,8 @@ fn run(
             egress_proxy.as_ref(),
             &bridge_sockets,
             teardown_report_fd,
+            #[cfg(target_os = "linux")]
+            &mut ecryptfs_lower_fds,
         )
     })?;
 
@@ -2391,10 +2468,52 @@ fn run(
     // internal clone() calls for namespace creation.
     let file_size_set = sandbox::rlimits::apply(config, cli.verbose)?;
 
-    // Both spawn paths make the report descriptor inheritable in the
-    // intended child and close the parent copies after spawning.
+    // Both spawn paths make the report descriptor and any eCryptfs lower
+    // directory descriptors inheritable only in the intended child and close
+    // the parent copies right after spawning.
     #[cfg(target_os = "linux")]
-    let spawn_bracket: &mut dyn signals::SpawnBracket = &mut teardown_run;
+    struct LaunchSpawnBracket {
+        teardown: teardown::TeardownRun,
+        ecryptfs_lower_fds: Vec<std::os::fd::OwnedFd>,
+    }
+    #[cfg(target_os = "linux")]
+    impl signals::SpawnBracket for LaunchSpawnBracket {
+        fn before_spawn(&mut self, command: &mut std::process::Command) {
+            self.teardown.before_spawn(command);
+            if !self.ecryptfs_lower_fds.is_empty() {
+                use std::os::fd::AsRawFd;
+                use std::os::unix::process::CommandExt;
+                let raw_fds: Vec<i32> = self
+                    .ecryptfs_lower_fds
+                    .iter()
+                    .map(AsRawFd::as_raw_fd)
+                    .collect();
+                // SAFETY: only calls async-signal-safe fcntl in the forked
+                // child right before exec.
+                unsafe {
+                    command.pre_exec(move || {
+                        for &fd in &raw_fds {
+                            if nix::libc::fcntl(fd, nix::libc::F_SETFD, 0) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                        }
+                        Ok(())
+                    });
+                }
+            }
+        }
+        fn after_spawn(&mut self, spawned: bool) {
+            self.teardown.after_spawn(spawned);
+            self.ecryptfs_lower_fds.clear();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let mut launch_bracket = LaunchSpawnBracket {
+        teardown: teardown_run,
+        ecryptfs_lower_fds,
+    };
+    #[cfg(target_os = "linux")]
+    let spawn_bracket: &mut dyn signals::SpawnBracket = &mut launch_bracket;
     #[cfg(not(target_os = "linux"))]
     let spawn_bracket: &mut dyn signals::SpawnBracket = &mut ();
 
@@ -2516,7 +2635,7 @@ fn run(
     // report line, and EOF follows the wrapper's exit. `finish` prints
     // what the report says; macOS accepts the flag and changes nothing.
     #[cfg(target_os = "linux")]
-    let teardown_section = teardown_run.finish();
+    let teardown_section = launch_bracket.teardown.finish();
     if let Some(summary) = summary {
         #[cfg(target_os = "linux")]
         let (teardown, resources) =
