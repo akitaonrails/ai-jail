@@ -10195,6 +10195,22 @@ mod config_explicit_rlimit_tests {
     }
 
     #[test]
+    fn project_grants_cpus_replaces_the_global_set() {
+        // Grants are trusted policy (review of #229): a `[grants] cpus`
+        // replaces the global set, where a constraint may only narrow it.
+        let global = Config {
+            cpus: Some("0-7".into()),
+            ..Config::default()
+        };
+        let grants = Config {
+            cpus: Some("8-11".into()),
+            ..Config::default()
+        };
+        let merged = merge_trusted_project(global, grants);
+        assert_eq!(merged.cpus.as_deref(), Some("8-11"));
+    }
+
+    #[test]
     fn project_cpus_overlap_is_reported_as_narrowed_to_the_set() {
         let trusted = Config {
             cpus: Some("0-7".into()),

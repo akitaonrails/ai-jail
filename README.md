@@ -520,6 +520,12 @@ would only be advisory, and for a CPU the launching process cannot use. A
 project policy may only narrow the set; one sharing no CPU with it refuses the
 launch. `--dry-run` prints `cpus=<list>`.
 
+The narrowing rule is for the project's constraints. A `cpus` in the
+project's saved grants (`[grants]` in its policy under
+`$XDG_CONFIG_HOME/ai-jail/projects`) is trusted policy, like the global config:
+it replaces the global set rather than narrowing it, and so may name CPUs the
+global set does not.
+
 What an unprivileged process **cannot** enforce, and so is not offered here —
 each needs a cgroup the user does not own:
 
