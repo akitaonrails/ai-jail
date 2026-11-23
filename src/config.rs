@@ -11372,10 +11372,13 @@ allow_hosts = [\"api.example.com\"]
         for fragment in LEAK {
             assert!(
                 !err.contains(fragment),
-                "secret fragment {fragment:?} echoed: {err}"
+                "error contained sensitive fixture data"
             );
         }
-        assert!(err.contains("profile 'p'"), "{err}");
+        assert!(
+            err.contains("profile 'p'"),
+            "error must identify the profile"
+        );
         err
     }
 
@@ -11388,10 +11391,10 @@ allow_hosts = [\"api.example.com\"]
     fn env_pass_of_the_wrong_type_is_refused_without_its_value() {
         // Brackets forgotten: the most likely mistake, and the leaky one.
         let err = secret_refusal("env_pass = \"API_KEY=sk-live-TOPSECRET\"");
-        assert!(err.contains("env_pass"), "{err}");
+        assert!(err.contains("env_pass"), "error must identify env_pass");
         assert!(
             names_one_of(&err, &["array", "sequence", "list"]),
-            "must name the expected type: {err}"
+            "must name the expected type"
         );
     }
 
@@ -11400,10 +11403,13 @@ allow_hosts = [\"api.example.com\"]
         let err = secret_refusal(
             "env_from_file = \"/home/u/API_KEY/sk-live-TOPSECRET/SECRETPATH\"",
         );
-        assert!(err.contains("env_from_file"), "{err}");
+        assert!(
+            err.contains("env_from_file"),
+            "error must identify env_from_file"
+        );
         assert!(
             names_one_of(&err, &["array", "sequence", "list"]),
-            "must name the expected type: {err}"
+            "must name the expected type"
         );
     }
 
@@ -11411,10 +11417,13 @@ allow_hosts = [\"api.example.com\"]
     fn secret_hosts_of_the_wrong_type_is_refused_without_its_value() {
         let err =
             secret_refusal("secret_hosts = \"API_KEY=sk-live-TOPSECRET\"");
-        assert!(err.contains("secret_hosts"), "{err}");
+        assert!(
+            err.contains("secret_hosts"),
+            "error must identify secret_hosts"
+        );
         assert!(
             names_one_of(&err, &["table", "map"]),
-            "must name the expected type: {err}"
+            "must name the expected type"
         );
     }
 
