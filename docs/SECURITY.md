@@ -333,6 +333,14 @@ records are still a history of where the agent connected: treat the file as
 local sensitive data, as the audit log is. macOS refuses the flag rather than
 accepting it and writing nothing.
 
+The supervisor writes `--run-summary PATH` to a new 0600 file. Choose a
+directory outside every writable sandbox mount. The supervisor holds a
+close-on-exec directory descriptor and publishes the complete JSON without
+overwriting any directory entry. The report contains exit, aggregate traffic
+and process metadata. It does not contain command arguments, environment
+values, request content or credentials. A sandboxed process can choose its
+kernel process name, so readers should treat survivor names as data.
+
 The macOS profile also grants `file-read-metadata` on each directory above an
 allowed path, and on the symlink nodes leading to the command. Seatbelt
 resolves a path one component at a time, so without this an allowed leaf stays

@@ -105,9 +105,7 @@ impl RunSummary {
         if let Err(error) = self.publish(run_id, &document) {
             crate::output::security_warn(&format!(
                 "Cannot write run summary {}: {error}",
-                crate::output::escape_control_bytes(
-                    &self.path.to_string_lossy()
-                ),
+                self.path.display(),
             ));
         }
     }

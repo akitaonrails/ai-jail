@@ -457,10 +457,14 @@ impl Proxy {
                 // A handler still resolving, dialing or awaiting a prompt
                 // holds a registered socket too, so the open count is not
                 // split by phase: it would claim a precision it lacks.
+                let effect = if shared.config.egress.is_some() {
+                    "their egress lines are missing from the log"
+                } else {
+                    "the run summary has partial egress totals"
+                };
                 crate::output::security_warn(&format!(
                     "egress proxy: {open} connection(s) still open after a \
-                     {} ms drain ({undrainable} could not be shut); their \
-                     egress lines are missing from the log",
+                     {} ms drain ({undrainable} could not be shut); {effect}",
                     grace.as_millis()
                 ));
                 return false;
