@@ -326,3 +326,16 @@ fn project_policy_rlimit_survives_launch_after_launch() {
         );
     }
 }
+
+#[test]
+fn process_limit_applies_after_the_teardown_reaper_forks() {
+    require_bwrap_net!();
+    let tree = Tree::new("reaper-nproc");
+    let out = tree.jail(
+        None,
+        &["--teardown-report", "--no-mise", "--rlimit", "nproc=1"],
+        "ulimit -u",
+    );
+    assert_eq!(assert_ok(&out).trim(), "1");
+    assert!(!stderr(&out).contains("Teardown report incomplete"));
+}

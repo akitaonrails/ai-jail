@@ -379,7 +379,7 @@ pub fn effective(config: &Config) -> Result<Vec<EffectiveLimit>, String> {
         let name: RlimitName = key.parse()?;
         let value = RlimitValue::parse(name, text)?.as_raw();
         // Lockdown only tightens: a value above its ceiling runs at the
-        // ceiling (warned about by `apply_sandbox`), so a project
+        // ceiling (warned about by `prepare_sandbox_limits`), so a project
         // `lockdown = true` never turns a working trusted config into a
         // refusal.
         let value = match lockdown_clamp(config, name, value) {
@@ -501,11 +501,40 @@ pub fn widens(candidate: &Config, baseline: &Config) -> bool {
 ///
 /// `warn_clamp` is false for a default the supervisor already applied
 /// and warned about, so a host clamp is reported once per launch.
-fn apply_one(
+pub(crate) struct PreparedLimit {
+    name: RlimitName,
+    resource: Resource,
+    soft: u64,
+    hard: u64,
+    explicit: bool,
+}
+
+impl PreparedLimit {
+    fn apply(&self, verbose: bool) -> Result<bool, String> {
+        let label = format!("RLIMIT_{}", self.name.as_str().to_uppercase());
+        if let Err(error) = setrlimit(self.resource, self.soft, self.hard) {
+            let message = format!("Failed to set {label}: {error}");
+            if self.explicit {
+                return Err(message);
+            }
+            output::warn(&format!("{message}, skipping"));
+            return Ok(false);
+        }
+        if verbose {
+            output::verbose(&format!(
+                "{label}: {} (hard: {})",
+                fmt_rlim(self.soft),
+                fmt_rlim(self.hard)
+            ));
+        }
+        Ok(true)
+    }
+}
+
+fn prepare_one(
     limit: &EffectiveLimit,
     warn_clamp: bool,
-    verbose: bool,
-) -> Result<bool, String> {
+) -> Result<Option<PreparedLimit>, String> {
     let explicit = limit.source != LimitSource::Default;
     let label = format!("RLIMIT_{}", limit.name.as_str().to_uppercase());
     let fail = |msg: String| {
@@ -513,7 +542,7 @@ fn apply_one(
             Err(msg)
         } else {
             output::warn(&format!("{msg}, skipping"));
-            Ok(false)
+            Ok(None)
         }
     };
     let Some(resource) = limit.name.resource() else {
@@ -523,12 +552,9 @@ fn apply_one(
         Ok((_, hard)) => hard,
         Err(e) => return fail(format!("Failed to read {label}: {e}")),
     };
-    // An unprivileged process cannot raise its hard limit: clamp, but
-    // say so, since the operator asked for a different number.
     let soft = limit.soft.min(current_hard);
     let hard = limit.hard.min(current_hard);
     if warn_clamp && soft < limit.soft {
-        // A clamped `cpu` also loses its SIGXCPU grace when soft == hard.
         let grace = if limit.name == RlimitName::Cpu && hard - soft < 5 {
             format!(
                 ", leaving {} s of the 5 s grace before SIGKILL",
@@ -548,8 +574,6 @@ fn apply_one(
         && soft == limit.soft
         && hard < limit.hard
     {
-        // The soft limit fits, but the host hard limit eats the grace that
-        // keeps SIGXCPU ahead of SIGKILL.
         output::warn(&format!(
             "{label}: requested soft {}, hard limit {} \
              leaves {} s of the 5 s grace before SIGKILL",
@@ -558,17 +582,22 @@ fn apply_one(
             hard.saturating_sub(soft)
         ));
     }
-    if let Err(e) = setrlimit(resource, soft, hard) {
-        return fail(format!("Failed to set {label}: {e}"));
-    }
-    if verbose {
-        output::verbose(&format!(
-            "{label}: {} (hard: {})",
-            fmt_rlim(soft),
-            fmt_rlim(hard)
-        ));
-    }
-    Ok(true)
+    Ok(Some(PreparedLimit {
+        name: limit.name,
+        resource,
+        soft,
+        hard,
+        explicit,
+    }))
+}
+
+fn apply_one(
+    limit: &EffectiveLimit,
+    warn_clamp: bool,
+    verbose: bool,
+) -> Result<bool, String> {
+    prepare_one(limit, warn_clamp)?
+        .map_or(Ok(false), |limit| limit.apply(verbose))
 }
 
 /// The limits `apply` sets on the supervisor — the ai-jail process that
@@ -615,7 +644,7 @@ pub fn supervisor_limits(config: &Config) -> Vec<EffectiveLimit> {
 
 /// Apply the supervisor's limits before spawning the sandbox. Limits are
 /// inherited across fork+exec. The set is exactly `supervisor_limits`;
-/// explicit values are applied inside the sandbox by `apply_sandbox`.
+/// explicit values are applied inside the sandbox by `apply_sandbox_limits`.
 ///
 /// Returns whether RLIMIT_FSIZE was set, so a later explanation of a
 /// SIGXFSZ death only quotes a value ai-jail actually put in force (#247).
@@ -649,7 +678,10 @@ pub fn apply(config: &Config, verbose: bool) -> Result<bool, String> {
 /// cannot raise a limit back: lowering a hard limit is irreversible for
 /// an unprivileged process.
 #[cfg(target_os = "linux")]
-pub fn apply_sandbox(config: &Config, verbose: bool) -> Result<(), String> {
+pub(crate) fn prepare_sandbox_limits(
+    config: &Config,
+) -> Result<Vec<PreparedLimit>, String> {
+    let mut prepared = Vec::new();
     let clamps = lockdown_clamps(config);
     for limit in effective(config)? {
         // One warning per limit: a lockdown clamp names the host clamp
@@ -675,7 +707,7 @@ pub fn apply_sandbox(config: &Config, verbose: bool) -> Result<(), String> {
                 fmt_rlim(*ceiling),
                 fmt_rlim(applied)
             ));
-            let _ = apply_one(&limit, false, verbose)?;
+            prepared.extend(prepare_one(&limit, false)?);
             continue;
         }
         // `effective` already lowered this value to the supervisor's hard
@@ -696,14 +728,52 @@ pub fn apply_sandbox(config: &Config, verbose: bool) -> Result<(), String> {
                 fmt_rlim(host),
                 fmt_rlim(limit.soft.min(host))
             ));
-            let _ = apply_one(&limit, false, verbose)?;
+            prepared.extend(prepare_one(&limit, false)?);
             continue;
         }
         // The supervisor applied every default except NPROC and warned
         // about its clamps; the wrapper warns only for what it alone sets.
         let warn_clamp = limit.source != LimitSource::Default
             || limit.name == RlimitName::Nproc;
-        let _ = apply_one(&limit, warn_clamp, verbose)?;
+        prepared.extend(prepare_one(&limit, warn_clamp)?);
+    }
+    Ok(prepared)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn apply_sandbox_limits(
+    limits: &[PreparedLimit],
+    verbose: bool,
+) -> Result<(), String> {
+    for limit in limits {
+        limit.apply(verbose)?;
+    }
+    Ok(())
+}
+
+/// Child setup after fork: only setrlimit(2) and an optional fixed write to
+/// stderr. Explicit limit failures stop exec. Defaults retain warn-and-skip.
+#[cfg(target_os = "linux")]
+pub(crate) fn apply_before_exec(
+    limits: &[PreparedLimit],
+) -> std::io::Result<()> {
+    for limit in limits {
+        if let Err(error) = setrlimit(limit.resource, limit.soft, limit.hard) {
+            if limit.explicit {
+                return Err(std::io::Error::from_raw_os_error(error as i32));
+            }
+            let message =
+                b"Cannot apply a default sandbox resource limit; skipping.\n";
+            // SAFETY: message is readable for its full length. write(2)
+            // tolerates a closed stderr and does not use Rust stdio locks.
+            unsafe {
+                nix::libc::write(
+                    nix::libc::STDERR_FILENO,
+                    message.as_ptr().cast(),
+                    message.len(),
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -873,7 +943,8 @@ mod tests {
             getrlimit(Resource::RLIMIT_NPROC).expect("getrlimit");
 
         let config = Config::default();
-        apply_sandbox(&config, false).unwrap();
+        apply_sandbox_limits(&prepare_sandbox_limits(&config).unwrap(), false)
+            .unwrap();
 
         let (soft_after, hard_after) =
             getrlimit(Resource::RLIMIT_NPROC).expect("getrlimit");
@@ -1520,7 +1591,11 @@ mod rlimit_explicit_tests {
                 let mut c = explicit(&[("nofile", "8192")], LimitSource::Cli);
                 c.lockdown = Some(true);
                 c.no_rlimits = Some(true);
-                apply_sandbox(&c, false).expect("apply_sandbox");
+                apply_sandbox_limits(
+                    &prepare_sandbox_limits(&c).unwrap(),
+                    false,
+                )
+                .expect("apply_sandbox");
                 assert_eq!(
                     getrlimit(Resource::RLIMIT_NOFILE).expect("getrlimit"),
                     (4096, 4096)
@@ -1531,7 +1606,11 @@ mod rlimit_explicit_tests {
                 let soft = if case == "cpu-short" { "98" } else { "95" };
                 let mut c = explicit(&[("cpu", soft)], LimitSource::Cli);
                 c.no_rlimits = Some(true);
-                apply_sandbox(&c, false).expect("apply_sandbox");
+                apply_sandbox_limits(
+                    &prepare_sandbox_limits(&c).unwrap(),
+                    false,
+                )
+                .expect("apply_sandbox");
                 let want = soft.parse::<u64>().unwrap();
                 assert_eq!(
                     getrlimit(Resource::RLIMIT_CPU).expect("getrlimit"),

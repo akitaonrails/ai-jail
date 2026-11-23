@@ -15,6 +15,7 @@ use super::{
     WireUsage, child_pidfd, list_survivors, signal_pidfd,
     stop_survivors_then_relist,
 };
+use crate::sandbox::rlimits::{self, PreparedLimit};
 use nix::errno::Errno;
 use nix::sys::signal::{
     SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal,
@@ -149,12 +150,17 @@ fn install_signals() -> Result<Inherited, String> {
     Ok(Inherited { actions, mask })
 }
 
-fn spawn_command(cmd: &[String], inherited: Inherited) -> Result<Pid, String> {
+fn spawn_command(
+    cmd: &[String],
+    inherited: Inherited,
+    limits: Vec<PreparedLimit>,
+) -> Result<Pid, String> {
     let mut command = std::process::Command::new(&cmd[0]);
     command.args(&cmd[1..]);
     // SAFETY: runs in the forked child before its exec, where only
     // async-signal-safe calls are allowed: sigaction(2) and
-    // pthread_sigmask(2) with values copied in, no allocation, no lock.
+    // pthread_sigmask(2), setrlimit(2), and a fixed write on a default-limit
+    // failure. The hook does not allocate or take a lock.
     unsafe {
         command.pre_exec(move || {
             for (signal, action) in inherited.actions {
@@ -165,7 +171,7 @@ fn spawn_command(cmd: &[String], inherited: Inherited) -> Result<Pid, String> {
                 Some(&inherited.mask),
                 None,
             )?;
-            Ok(())
+            rlimits::apply_before_exec(&limits)
         });
     }
     // Same message as the exec path's, so a missing command reads alike.
@@ -218,6 +224,8 @@ pub fn run_command_as_reaper(
     cmd: &[String],
     report: OwnedFd,
     bridge_pids: &[i32],
+    limits: Vec<PreparedLimit>,
+    verbose: bool,
 ) -> Result<i32, String> {
     if cmd.is_empty() {
         return Err("--landlock-exec requires a command".into());
@@ -238,11 +246,12 @@ pub fn run_command_as_reaper(
         || nix::sys::prctl::set_dumpable(false).is_err()
     {
         drop(report);
+        rlimits::apply_sandbox_limits(&limits, verbose)?;
         let error = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();
         return Err(format!("Failed to exec {}: {error}", cmd[0]));
     }
     let inherited = install_signals()?;
-    let child = spawn_command(cmd, inherited)?;
+    let child = spawn_command(cmd, inherited, limits)?;
     let child_handle = child_pidfd(child.as_raw()).ok();
     if let Some(handle) = &child_handle {
         REAPER_CHILD_FD.store(handle.as_raw_fd(), Ordering::SeqCst);
