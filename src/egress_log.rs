@@ -27,9 +27,7 @@ pub struct EgressStats {
     bytes_down: AtomicU64,
 }
 
-/// A plain copy of [`EgressStats`] at one instant. Only the tests read
-/// the totals on their own; a consumer of the counters adds its reader.
-#[cfg(test)]
+/// A plain copy of [`EgressStats`] at one instant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EgressTotals {
     pub allowed: u64,
@@ -40,7 +38,6 @@ pub struct EgressTotals {
 }
 
 impl EgressStats {
-    #[cfg(test)]
     pub fn snapshot(&self) -> EgressTotals {
         EgressTotals {
             allowed: self.allowed.load(Ordering::Relaxed),

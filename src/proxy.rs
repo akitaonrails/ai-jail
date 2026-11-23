@@ -433,7 +433,7 @@ impl Proxy {
     /// relay pumps return, and wait up to `grace` for the handlers to
     /// finish. A handler writes its egress line before it leaves `active`,
     /// so once this sees 0 every line and every byte is counted.
-    pub(crate) fn drain(&self, grace: Duration) {
+    pub(crate) fn drain(&self, grace: Duration) -> bool {
         let shared = &self.shared;
         shared.draining.store(true, Ordering::SeqCst);
         // Connections waiting on another connection's prompt give up now.
@@ -457,16 +457,21 @@ impl Proxy {
                 // A handler still resolving, dialing or awaiting a prompt
                 // holds a registered socket too, so the open count is not
                 // split by phase: it would claim a precision it lacks.
+                let effect = if shared.config.egress.is_some() {
+                    "their egress lines are missing from the log"
+                } else {
+                    "the run summary has partial egress totals"
+                };
                 crate::output::security_warn(&format!(
                     "egress proxy: {open} connection(s) still open after a \
-                     {} ms drain ({undrainable} could not be shut); their \
-                     egress lines are missing from the log",
+                     {} ms drain ({undrainable} could not be shut); {effect}",
                     grace.as_millis()
                 ));
-                return;
+                return false;
             }
             thread::sleep(DRAIN_POLL);
         }
+        true
     }
 }
 

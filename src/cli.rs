@@ -157,6 +157,8 @@ OPTIONS:
     --egress-log <PATH>            Append one JSON line per egress-proxy
                                    connection to PATH (mode 0600; needs
                                    filtered networking; Linux only)
+    --run-summary <PATH>            Write one private JSON report to a new file
+                                   after the run; includes Linux teardown
     --teardown-report              Stop processes that outlive the command
                                    (SIGTERM, SIGKILL after 2000 ms) and name
                                    them on stderr (Linux)
@@ -286,6 +288,7 @@ pub struct CliArgs {
     /// connection the filtered-egress proxy accepts. CLI-only, never a
     /// config key.
     pub egress_log: Option<PathBuf>,
+    pub run_summary: Option<PathBuf>,
     pub audit_verify: bool,
     pub audit_show: bool,
     /// `--teardown-report`: stop what outlives the command
@@ -673,6 +676,15 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     return Err("--egress-log requires a non-empty path".into());
                 }
                 args.egress_log = Some(PathBuf::from(val));
+            }
+            Long("run-summary") => {
+                let path = parser.value().map_err(|e| e.to_string())?;
+                if path.is_empty() || args.run_summary.is_some() {
+                    return Err(
+                        "--run-summary requires one non-empty path".into()
+                    );
+                }
+                args.run_summary = Some(PathBuf::from(path));
             }
             Long("audit-show") => args.audit_show = true,
             Long("teardown-report") => args.teardown_report = true,
@@ -1230,6 +1242,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-audit-log",
     "--audit-verify",
     "--egress-log",
+    "--run-summary",
     "--env",
     "--env-from-file",
     "--secret",
