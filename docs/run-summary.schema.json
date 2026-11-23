@@ -2,14 +2,28 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ai-jail run summary version 1",
   "type": "object",
-  "required": ["schema_version", "run_id", "started_at", "finished_at", "duration_ms", "program", "exit", "egress", "teardown", "resources"],
+  "required": [
+    "schema_version",
+    "run_id",
+    "started_at",
+    "finished_at",
+    "duration_ms",
+    "program",
+    "exit",
+    "egress",
+    "teardown",
+    "resources"
+  ],
   "properties": {
     "schema_version": { "const": 1 },
     "run_id": { "type": "string", "pattern": "^[a-f0-9]{32}$" },
     "started_at": { "type": "string", "format": "date-time" },
     "finished_at": { "type": "string", "format": "date-time" },
     "duration_ms": { "$ref": "#/$defs/counter" },
-    "program": { "type": ["null", "string"], "description": "Command basename only." },
+    "program": {
+      "type": ["null", "string"],
+      "description": "Command basename only."
+    },
     "exit": {
       "oneOf": [
         {
@@ -19,7 +33,14 @@
         },
         {
           "type": "object",
-          "required": ["code", "signal", "core_dumped", "kind", "source", "limit"],
+          "required": [
+            "code",
+            "signal",
+            "core_dumped",
+            "kind",
+            "source",
+            "limit"
+          ],
           "properties": {
             "code": { "type": "integer" },
             "signal": { "type": ["integer", "null"] },
@@ -33,7 +54,14 @@
     },
     "egress": {
       "type": ["object", "null"],
-      "required": ["complete", "allowed", "denied", "errored", "bytes_up", "bytes_down"],
+      "required": [
+        "complete",
+        "allowed",
+        "denied",
+        "errored",
+        "bytes_up",
+        "bytes_down"
+      ],
       "properties": {
         "complete": { "type": "boolean" },
         "allowed": { "$ref": "#/$defs/counter" },
