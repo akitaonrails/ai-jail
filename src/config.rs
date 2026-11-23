@@ -10336,7 +10336,12 @@ mod profile_save_tests {
 
     impl Fixture {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!(
+            // The trusted store refuses a symlink anywhere in its path, and
+            // macOS's temp dir sits under the /var -> /private/var symlink:
+            // resolve it first, as config_store's own tests do.
+            let temp = std::fs::canonicalize(std::env::temp_dir())
+                .expect("temp dir resolves");
+            let root = temp.join(format!(
                 "ai-jail-profile-save-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
