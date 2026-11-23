@@ -539,6 +539,38 @@ for <launch dir> is ignored`. Restrictions saved only in that per-directory
 
 The setting is global only. A repository file cannot enable it.
 
+## Resource limits
+
+Per-process resource limits are an advanced CLI/config-only control: the
+onboarding screens do not offer them, because the right numbers
+depend on the machine, not on the access you grant. Set them per launch or in
+the trusted global config:
+
+```toml
+# ~/.config/ai-jail/config.toml
+[rlimit]
+nofile = 4096
+data = "8G"
+```
+
+- `--rlimit NAME=VALUE` sets one limit for this launch; repeat it for more.
+  In config, the `[rlimit]` table takes the same names and values. A project
+  policy may only tighten a limit, never raise it.
+- Explicit limits are Linux only: elsewhere the launch is refused.
+- Under `--lockdown`, a value above the lockdown limit runs at that limit,
+  with a warning.
+- A `--rlimit` given on the command line applies to that launch only. It is never saved into the project policy.
+- A limit this host cannot apply is caught before anything is
+  written or reported ready: `--init` and the launch are refused before any
+  policy is saved, `status --json` lists it as the `limits_unavailable`
+  blocker, and plain `status` warns that a launch would be refused.
+
+The final `Complete effective access` review lists each explicit limit as
+`rlimit NAME=SOFT/HARD (SOURCE)`. `--dry-run` prints every effective limit,
+defaults included. The README section
+[Resource limits without root](../README.md#resource-limits-without-root---rlimit)
+covers each limit name and what it does to a process.
+
 ## Run observability
 
 Onboarding has no control for `--egress-log PATH`, by design: it records a run,
@@ -573,38 +605,6 @@ teardown. Survivors are named by their kernel command
 name (`comm`) only; their command lines and environments are never read.
 The exit code is the command's own. On macOS the flag is accepted and
 changes nothing.
-
-## Resource limits
-
-Per-process resource limits are an advanced CLI/config-only control: the
-onboarding screens do not offer them, because the right numbers
-depend on the machine, not on the access you grant. Set them per launch or in
-the trusted global config:
-
-```toml
-# ~/.config/ai-jail/config.toml
-[rlimit]
-nofile = 4096
-data = "8G"
-```
-
-- `--rlimit NAME=VALUE` sets one limit for this launch; repeat it for more.
-  In config, the `[rlimit]` table takes the same names and values. A project
-  policy may only tighten a limit, never raise it.
-- Explicit limits are Linux only: elsewhere the launch is refused.
-- Under `--lockdown`, a value above the lockdown limit runs at that limit,
-  with a warning.
-- A `--rlimit` given on the command line applies to that launch only. It is never saved into the project policy.
-- A limit this host cannot apply is caught before anything is
-  written or reported ready: `--init` and the launch are refused before any
-  policy is saved, `status --json` lists it as the `limits_unavailable`
-  blocker, and plain `status` warns that a launch would be refused.
-
-The final `Complete effective access` review lists each explicit limit as
-`rlimit NAME=SOFT/HARD (SOURCE)`. `--dry-run` prints every effective limit,
-defaults included. The README section
-[Resource limits without root](../README.md#resource-limits-without-root---rlimit)
-covers each limit name and what it does to a process.
 
 ## Named profiles
 

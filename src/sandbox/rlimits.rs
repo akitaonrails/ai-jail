@@ -410,8 +410,9 @@ pub fn effective(config: &Config) -> Result<Vec<EffectiveLimit>, String> {
             // the hard limit SIGKILL. With soft == hard the process gets
             // SIGKILL straight away and no chance to report; five seconds
             // of grace keep the catchable signal first.
-            hard: if name == RlimitName::Cpu {
-                soft.saturating_add(5)
+            hard: if name == RlimitName::Cpu && soft < nix::libc::RLIM_INFINITY
+            {
+                soft + (nix::libc::RLIM_INFINITY - soft).min(5)
             } else {
                 soft
             },
@@ -1207,7 +1208,10 @@ mod effective_tests {
     fn explicit_value_adds_a_limit_with_no_default() {
         let got = limits(&config(&[("data", "8G"), ("as", "unlimited")]));
         assert_eq!(pair(&got, "data"), (8 * GIB, 8 * GIB));
-        assert_eq!(pair(&got, "as"), (u64::MAX, u64::MAX));
+        assert_eq!(
+            pair(&got, "as"),
+            (nix::libc::RLIM_INFINITY, nix::libc::RLIM_INFINITY)
+        );
         assert_eq!(pair(&got, "nofile"), (65536, 65536));
     }
 
@@ -1248,14 +1252,14 @@ mod effective_tests {
         assert_eq!(pair(&limits(&config(&[("cpu", "60")])), "cpu"), (60, 65));
         assert_eq!(pair(&limits(&config(&[("cpu", "1")])), "cpu"), (1, 6));
         // Saturating, never wrapping to a tiny hard limit.
-        let near = (u64::MAX - 2).to_string();
+        let near = (nix::libc::RLIM_INFINITY - 2).to_string();
         assert_eq!(
             pair(&limits(&config(&[("cpu", &near)])), "cpu"),
-            (u64::MAX - 2, u64::MAX)
+            (nix::libc::RLIM_INFINITY - 2, nix::libc::RLIM_INFINITY)
         );
         assert_eq!(
             pair(&limits(&config(&[("cpu", "unlimited")])), "cpu"),
-            (u64::MAX, u64::MAX)
+            (nix::libc::RLIM_INFINITY, nix::libc::RLIM_INFINITY)
         );
     }
 
@@ -2189,7 +2193,11 @@ mod effective_ceiling_tests {
         ]));
         assert_eq!(pair(&got, "nofile"), (65536, 65536));
         for name in ["data", "as", "fsize"] {
-            assert_eq!(pair(&got, name), (u64::MAX, u64::MAX), "{name}");
+            assert_eq!(
+                pair(&got, name),
+                (nix::libc::RLIM_INFINITY, nix::libc::RLIM_INFINITY),
+                "{name}"
+            );
             assert_eq!(marker(&got, name), None, "{name}");
         }
         assert_eq!(pair(&got, "cpu"), (600, 605));
@@ -2204,7 +2212,10 @@ mod effective_ceiling_tests {
         c.no_rlimits = Some(true);
         let got = limits(&c);
         assert_eq!(pair(&got, "nofile"), (100000, 100000));
-        assert_eq!(pair(&got, "core"), (u64::MAX, u64::MAX));
+        assert_eq!(
+            pair(&got, "core"),
+            (nix::libc::RLIM_INFINITY, nix::libc::RLIM_INFINITY)
+        );
         assert_eq!(marker(&got, "nofile"), None);
         assert_eq!(marker(&got, "core"), None);
     }
@@ -2233,7 +2244,7 @@ mod effective_ceiling_tests {
         // is added, since the dry-run line is read by scripts.
         assert_eq!(
             fmt_rlim(nix::libc::RLIM_INFINITY - 1),
-            "18446744073709551614"
+            (nix::libc::RLIM_INFINITY - 1).to_string()
         );
         assert_eq!(fmt_rlim(0), "0");
         assert_eq!(fmt_rlim(65536), "65536");
@@ -2323,7 +2334,10 @@ mod clamp_to_host_tests {
             ],
         );
         assert_eq!(pair(&got, "cpu"), (60, 65));
-        assert_eq!(pair(&got, "as"), (u64::MAX, u64::MAX));
+        assert_eq!(
+            pair(&got, "as"),
+            (nix::libc::RLIM_INFINITY, nix::libc::RLIM_INFINITY)
+        );
         assert_eq!(marker(&got, "cpu"), None);
         assert_eq!(marker(&got, "as"), None);
     }

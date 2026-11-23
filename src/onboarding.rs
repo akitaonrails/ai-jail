@@ -4011,7 +4011,7 @@ mod rlimit_unlimited_review_tests {
 
     use crate::{config::Config, sandbox::rlimits::LimitSource};
 
-    const RLIMIT_UNLIMITED_RAW: &str = "18446744073709551615";
+    const UNLIMITED: u64 = nix::libc::RLIM_INFINITY;
 
     fn rlimit_unlimited_review(pairs: &[(&str, &str)]) -> String {
         let config = Config {
@@ -4046,10 +4046,14 @@ mod rlimit_unlimited_review_tests {
     fn rlimit_unlimited_review_keeps_the_largest_finite_value_a_number() {
         // Hostile half first: one below RLIM_INFINITY is a real limit and
         // must not collapse into the word.
-        let text = rlimit_unlimited_review(&[("as", "18446744073709551614")]);
+        use crate::sandbox::rlimits::{RlimitName, host_hard_limit};
+        let finite = UNLIMITED - 1;
+        let expected =
+            finite.min(host_hard_limit(RlimitName::As).unwrap_or(UNLIMITED));
+        let text = rlimit_unlimited_review(&[("as", &finite.to_string())]);
         let line = rlimit_unlimited_line(&text, "as");
         assert!(
-            line.contains("as=18446744073709551614/18446744073709551614"),
+            line.contains(&format!("as={expected}/{expected}")),
             "{line}"
         );
         assert!(!line.contains("unlimited"), "{line}");
@@ -4057,13 +4061,14 @@ mod rlimit_unlimited_review_tests {
 
     #[test]
     fn rlimit_unlimited_review_spells_the_raw_maximum_as_the_word() {
-        // Hostile half: the 20-digit value typed by hand is RLIM_INFINITY
-        // too, and reads the same as `unlimited`.
-        let text = rlimit_unlimited_review(&[("as", RLIMIT_UNLIMITED_RAW)]);
-        let line = rlimit_unlimited_line(&text, "as");
-        assert!(line.contains("as=unlimited/unlimited"), "{line}");
-        // The line only: the review also echoes the config as typed.
-        assert!(!line.contains(RLIMIT_UNLIMITED_RAW), "{line}");
+        let raw = UNLIMITED.to_string();
+        let raw_review = rlimit_unlimited_review(&[("as", &raw)]);
+        let typed_review = rlimit_unlimited_review(&[("as", "unlimited")]);
+        assert_eq!(
+            rlimit_unlimited_line(&raw_review, "as"),
+            rlimit_unlimited_line(&typed_review, "as")
+        );
+        assert!(!rlimit_unlimited_line(&raw_review, "as").contains(&raw));
     }
 
     #[test]
@@ -4077,6 +4082,6 @@ mod rlimit_unlimited_review_tests {
         // cpu's five-second grace saturates: hard is RLIM_INFINITY as well.
         let line = rlimit_unlimited_line(&text, "cpu");
         assert!(line.contains("cpu=unlimited/unlimited"), "{line}");
-        assert!(!text.contains(RLIMIT_UNLIMITED_RAW), "{text}");
+        assert!(!text.contains(&UNLIMITED.to_string()), "{text}");
     }
 }

@@ -211,9 +211,8 @@ fn dry_run_reports_the_supervisor_ceiling_the_sandbox_gets() {
 }
 
 #[test]
-fn dry_run_without_the_default_set_prints_unlimited_unmarked() {
-    // With `--no-rlimits` the supervisor holds no ceiling, so the request
-    // is what is reported, and RLIM_INFINITY reads as typed.
+fn dry_run_without_the_default_set_uses_only_host_ceilings() {
+    use nix::sys::resource::{Resource, getrlimit};
     require_bwrap!();
     let stdout = dry_run(&[
         "--no-rlimits",
@@ -222,14 +221,25 @@ fn dry_run_without_the_default_set_prints_unlimited_unmarked() {
         "--rlimit",
         "core=unlimited",
     ]);
-    let nofile = line(&stdout, "nofile");
-    let core = line(&stdout, "core");
-    assert_eq!(field(nofile, "soft"), Some("100000"), "{nofile}");
-    assert_eq!(field(core, "soft"), Some("unlimited"), "{core}");
-    assert_eq!(field(core, "hard"), Some("unlimited"), "{core}");
-    assert_eq!(field(nofile, "ceiling"), None, "{nofile}");
-    assert_eq!(field(core, "ceiling"), None, "{core}");
-    assert!(!stdout.contains("18446744073709551615"), "{stdout}");
+    let infinity = nix::libc::RLIM_INFINITY;
+    for (name, resource, requested) in [
+        ("nofile", Resource::RLIMIT_NOFILE, 100000),
+        ("core", Resource::RLIMIT_CORE, infinity),
+    ] {
+        let (_, host_hard) = getrlimit(resource).unwrap();
+        let effective = requested.min(host_hard);
+        let ceiling = (effective < requested).then_some("host");
+        let printed = if effective == infinity {
+            "unlimited".to_string()
+        } else {
+            effective.to_string()
+        };
+        let limit = line(&stdout, name);
+        assert_eq!(field(limit, "soft"), Some(printed.as_str()), "{limit}");
+        assert_eq!(field(limit, "hard"), Some(printed.as_str()), "{limit}");
+        assert_eq!(field(limit, "ceiling"), ceiling, "{limit}");
+    }
+    assert!(!stdout.contains(&infinity.to_string()), "{stdout}");
 }
 
 #[test]
