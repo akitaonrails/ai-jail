@@ -212,6 +212,7 @@ fn explicit_limit_clamped_by_the_host_is_warned_about_once() {
 #[test]
 fn lockdown_clamps_an_explicit_value_and_warns_once() {
     require_bwrap_net!();
+    require_lockdown_tools!("bash");
     let tree = Tree::new("lockdown-clamp");
     let out = tree.jail(
         None,
