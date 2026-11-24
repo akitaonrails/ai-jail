@@ -125,6 +125,10 @@ pub(crate) struct LegacyMaskPlaceholder {
     path: Option<PathBuf>,
     dev: u64,
     ino: u64,
+    /// Whether bwrap can bind the empty file over the legacy `.ai-jail`
+    /// name. False when the project filesystem is read-only: the file
+    /// cannot exist there, and bwrap cannot create a mountpoint for it.
+    mountable: bool,
 }
 
 struct LegacyFile {
@@ -146,26 +150,53 @@ impl Drop for StoreLock {
 
 impl LegacyMaskPlaceholder {
     pub(crate) fn prepare(paths: &StorePaths) -> Result<Self, String> {
+        Self::prepare_with(paths, |path| {
+            OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+                .open(path)
+        })
+    }
+
+    fn prepare_with(
+        paths: &StorePaths,
+        open: impl FnOnce(&Path) -> std::io::Result<File>,
+    ) -> Result<Self, String> {
         let path = paths.canonical_project.join(".ai-jail");
         if !paths.project.is_file() || path.exists() {
             return Ok(Self {
                 path: None,
                 dev: 0,
                 ino: 0,
+                mountable: true,
             });
         }
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
-            .open(&path)
-            .map_err(|e| {
-                format!(
-                    "Cannot create secure legacy config mask {}: {e}",
+        let file = match open(&path) {
+            Ok(file) => file,
+            // A read-only project cannot contain the legacy file, and
+            // bwrap cannot create the mountpoint the mask needs. Skipping
+            // the mask grants nothing: the path is guaranteed absent.
+            Err(error) if error.raw_os_error() == Some(nix::libc::EROFS) => {
+                output::security_warn(&format!(
+                    "Legacy .ai-jail mask skipped: {} is on a read-only filesystem, so the file cannot exist there",
+                    paths.canonical_project.display()
+                ));
+                return Ok(Self {
+                    path: None,
+                    dev: 0,
+                    ino: 0,
+                    mountable: false,
+                });
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Cannot create secure legacy config mask {}: {error}",
                     path.display()
-                )
-            })?;
+                ));
+            }
+        };
         let meta = file
             .metadata()
             .map_err(|e| format!("Cannot verify {}: {e}", path.display()))?;
@@ -173,7 +204,12 @@ impl LegacyMaskPlaceholder {
             path: Some(path),
             dev: meta.dev(),
             ino: meta.ino(),
+            mountable: true,
         })
+    }
+
+    pub(crate) fn legacy_mask_mountable(&self) -> bool {
+        self.mountable
     }
 }
 
@@ -2941,9 +2977,35 @@ mod tests {
             path: Some(path.clone()),
             dev: meta.dev(),
             ino: meta.ino() + 1,
+            mountable: true,
         });
         assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn placeholder_prepare_tolerates_read_only_project() {
+        let base = canonical_temp_dir().join(format!(
+            "ai-jail-placeholder-readonly-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let project = base.join("project");
+        let store = base.join("store");
+        let home = base.join("home");
+        fs::create_dir_all(&project).unwrap();
+        let paths = store_paths_at(&project, &store, &home);
+        fs::create_dir_all(paths.project.parent().unwrap()).unwrap();
+        fs::write(&paths.project, "").unwrap();
+
+        let placeholder = LegacyMaskPlaceholder::prepare_with(&paths, |_| {
+            Err(std::io::Error::from_raw_os_error(nix::libc::EROFS))
+        })
+        .unwrap();
+
+        assert!(!placeholder.legacy_mask_mountable());
+        assert!(!project.join(".ai-jail").exists());
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

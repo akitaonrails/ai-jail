@@ -2347,8 +2347,9 @@ fn run(
     // placeholder we created, never a replacement made concurrently. A hard
     // crash may leave an empty 0600 file; it grants no authority and the next
     // migration/launch treats it as recoverable masking debris.
-    let _legacy_mask_placeholder =
+    let legacy_mask_placeholder =
         config_store::LegacyMaskPlaceholder::prepare(&store)?;
+    let legacy_mask_mountable = legacy_mask_placeholder.legacy_mask_mountable();
 
     // macOS has no private /tmp mount. Hard browser profiles therefore live
     // inside the launch's dedicated session scratch directory and must be
@@ -2453,6 +2454,7 @@ fn run(
             final_config,
             &project_dir,
             cli.verbose,
+            legacy_mask_mountable,
             sandbox_tty.as_deref(),
             egress_proxy.as_ref(),
             &bridge_sockets,
