@@ -579,15 +579,19 @@ fail-closed guarantee regardless. `--no-network` by itself keeps the sandbox
 fully offline; adding a trusted `--allow-host` composes it into filtered
 egress to exactly those hosts. `--network` gives unrestricted access instead.
 
-When the invoked command is a known API agent whose canonical API host ai-jail
-knows — `claude` → `api.anthropic.com`, `codex` → `api.openai.com`, `gemini` →
-`generativelanguage.googleapis.com`, `grok` → `api.x.ai`, `devin` →
+When the invoked command is a known API agent whose canonical API hosts ai-jail
+knows — `claude` → `api.anthropic.com`, `codex` → `api.openai.com` and
+`chatgpt.com`, `gemini` → `generativelanguage.googleapis.com`, `antigravity`
+(`agy` / `antigravity-cli`) → `daily-cloudcode-pa.googleapis.com`,
+`cloudcode-pa.googleapis.com`, `aicode.googleapis.com`, `www.googleapis.com`,
+and `oauth2.googleapis.com`, `grok` → `api.x.ai`, `devin` →
 `server.codeium.com` — and the network
 posture is unset (no `--network`, no `--no-network`, not `--lockdown`, not a
-browser launch), ai-jail also default-allows filtered egress to that one host,
-so a bare `ai-jail claude` or `ai-jail codex` reaches its model API out of the
-box without opening the whole network. Only the agent's own functional API host
-is added — telemetry endpoints are not — and the sandbox stays deny-by-default.
+browser launch), ai-jail also default-allows filtered egress to those hosts,
+so a bare `ai-jail claude`, `ai-jail codex`, or `ai-jail agy` reaches its model
+API out of the box without opening the whole network. Only the agent's own
+functional API hosts are added — telemetry endpoints are not — and the sandbox
+stays deny-by-default.
 Unlike the package-registry default this is not Linux-only: on macOS filtered
 egress is a seatbelt loopback rule, so the same default applies there
 (issue #156).
