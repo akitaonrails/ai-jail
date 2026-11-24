@@ -2682,7 +2682,7 @@ pub(crate) fn render_effective_access_with_profile(
     );
     authority(
         config.macos_pasteboard_enabled(),
-        "ALLOWED: macOS pasteboard; read and write native clipboard contents, including text and images; only com.apple.pasteboard.1; copied private data can be read and clipboard contents replaced",
+        "ALLOWED: macOS pasteboard; read and write native clipboard contents, including text and images; only com.apple.pasteboard.1 and com.apple.lsd.mapdb; copied private data can be read and clipboard contents replaced",
     );
     authority(
         config.allow_pty_enabled(),
