@@ -276,7 +276,8 @@ pub struct Config {
     /// `com.apple.trustd.agent` lookup is granted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub macos_trustd: Option<bool>,
-    /// Native clipboard access through only com.apple.pasteboard.1.
+    /// Native clipboard access through only `com.apple.pasteboard.1` and
+    /// `com.apple.lsd.mapdb` (LaunchServices UTI mapping for `pbcopy`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub macos_pasteboard: Option<bool>,
     /// Allow the sandboxed process to open PTY slave nodes it allocates at

@@ -901,13 +901,18 @@ fn push_chromium_rendezvous_section(profile: &mut String, config: &Config) {
 }
 
 /// Native clipboard access without the broad host IPC compatibility rules.
+/// `pbcopy` also queries `com.apple.lsd.mapdb` (LaunchServices UTI mapping)
+/// when writing to the pasteboard; denying it leaves the clipboard cleared
+/// (#257).
 fn push_pasteboard_section(profile: &mut String, config: &Config) {
     if config.lockdown_enabled() || !config.macos_pasteboard_enabled() {
         return;
     }
     profile.push_str("; Native macOS clipboard (--macos-pasteboard)\n");
     profile.push_str(
-        "(allow mach-lookup (global-name \"com.apple.pasteboard.1\"))\n\n",
+        "(allow mach-lookup\n\
+         \x20 (global-name \"com.apple.pasteboard.1\")\n\
+         \x20 (global-name \"com.apple.lsd.mapdb\"))\n\n",
     );
 }
 
@@ -2187,6 +2192,7 @@ mod tests {
         let project = Path::new("/tmp/test-project");
         let disabled = generate_sbpl_profile(&base, project);
         assert!(!disabled.contains("com.apple.pasteboard.1"));
+        assert!(!disabled.contains("com.apple.lsd.mapdb"));
         for (grant, lockdown, expected) in [
             (false, false, false),
             (true, false, true),
@@ -2199,6 +2205,7 @@ mod tests {
             };
             let profile = generate_sbpl_profile(&config, project);
             assert_eq!(profile.contains("com.apple.pasteboard.1"), expected);
+            assert_eq!(profile.contains("com.apple.lsd.mapdb"), expected);
             assert!(!profile.contains("(allow mach-lookup)"));
             assert!(!profile.contains("(allow iokit-open)"));
             assert!(!profile.contains("(allow signal)"));
