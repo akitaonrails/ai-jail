@@ -1017,14 +1017,7 @@ fn duration(saved: Option<bool>) -> String {
 }
 
 fn api_hosts(harness: &str) -> &'static [&'static str] {
-    match harness {
-        "claude" => &["api.anthropic.com"],
-        "codex" => &["api.openai.com", "chatgpt.com"],
-        "gemini" => &["generativelanguage.googleapis.com"],
-        "grok" => &["api.x.ai"],
-        "devin" => &["server.codeium.com"],
-        _ => &[],
-    }
+    crate::command::api_hosts(harness)
 }
 
 pub(crate) fn is_interactive() -> bool {
@@ -3372,6 +3365,43 @@ mod tests {
         assert!(grants.network_enabled());
         assert!(grants.allow_hosts.is_empty());
         assert!(!grants.has_filtered_hosts());
+    }
+
+    #[test]
+    fn onboarding_api_hosts_stay_in_sync_with_command_defaults() {
+        for harness in [
+            "claude",
+            "codex",
+            "gemini",
+            "antigravity",
+            "grok",
+            "devin",
+            "opencode",
+            "kimi",
+        ] {
+            let expected =
+                crate::command::default_egress_hosts(&[harness.into()]);
+            assert_eq!(
+                api_hosts(harness),
+                expected.as_slice(),
+                "onboarding and command API hosts drifted for {harness}"
+            );
+        }
+
+        let mut selection = Selection::default();
+        selection.apply_recommended_developer_baseline("antigravity");
+        assert!(selection.api_access);
+        let grants = selection.grants("antigravity");
+        assert_eq!(
+            grants.allow_hosts,
+            vec![
+                "daily-cloudcode-pa.googleapis.com",
+                "cloudcode-pa.googleapis.com",
+                "aicode.googleapis.com",
+                "www.googleapis.com",
+                "oauth2.googleapis.com",
+            ]
+        );
     }
 
     #[test]

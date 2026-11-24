@@ -227,13 +227,10 @@ pub(crate) fn default_egress_hosts_for(
         harnesses.iter().map(String::as_str).collect()
     };
     for name in names {
-        if let Some(host) = api_host(name)
-            && !hosts.contains(&host)
-        {
-            hosts.push(host);
-        }
-        if name == "codex" && !hosts.contains(&"chatgpt.com") {
-            hosts.push("chatgpt.com");
+        for host in api_hosts(name) {
+            if !hosts.contains(host) {
+                hosts.push(host);
+            }
         }
     }
     hosts
@@ -245,6 +242,7 @@ const KNOWN_API_AGENTS: &[&str] = &[
     "claude",
     "codex",
     "gemini",
+    "antigravity",
     "opencode",
     "crush",
     "grok",
@@ -266,36 +264,44 @@ pub(crate) fn normalize_harness_name(value: &str) -> Option<&str> {
         .or_else(|| is_known_api_agent(value).then_some(value))
 }
 
-/// The hosted-API hostname an agent needs in filtered-egress mode, for
-/// the precise "your allowlist doesn't cover it" warning. Agents not
-/// listed have no canonical host we can name.
-fn api_host(name: &str) -> Option<&'static str> {
+/// Functional hosted-API hostnames an agent needs in filtered-egress mode.
+/// Codex also needs chatgpt.com for ChatGPT OAuth workspace routing;
+/// api.openai.com alone only covers API-key traffic. Antigravity (`agy` /
+/// `antigravity-cli`) uses Cloud Code Assist and AICode endpoints plus Google
+/// OAuth token refresh and userinfo eligibility checks. Telemetry hosts
+/// (such as `play.googleapis.com`) and cosmetic assets are deliberately
+/// excluded. Agents not listed have no canonical host we can name.
+pub(crate) fn api_hosts(name: &str) -> &'static [&'static str] {
     match name {
-        "claude" => Some("api.anthropic.com"),
-        "codex" => Some("api.openai.com"),
-        "gemini" => Some("generativelanguage.googleapis.com"),
-        "grok" => Some("api.x.ai"),
-        "devin" => Some("server.codeium.com"),
-        _ => None,
+        "claude" => &["api.anthropic.com"],
+        "codex" => &["api.openai.com", "chatgpt.com"],
+        "gemini" => &["generativelanguage.googleapis.com"],
+        "antigravity" => &[
+            "daily-cloudcode-pa.googleapis.com",
+            "cloudcode-pa.googleapis.com",
+            "aicode.googleapis.com",
+            "www.googleapis.com",
+            "oauth2.googleapis.com",
+        ],
+        "grok" => &["api.x.ai"],
+        "devin" => &["server.codeium.com"],
+        _ => &[],
     }
 }
 
+/// Primary hosted-API hostname for the precise "your allowlist doesn't cover
+/// it" capability-gap warning.
+fn api_host(name: &str) -> Option<&'static str> {
+    api_hosts(name).first().copied()
+}
+
 /// The functional hosts to default-allow (filtered egress) for a bare launch
-/// of a known API agent. Codex also needs chatgpt.com for ChatGPT OAuth
-/// workspace routing; api.openai.com alone only covers API-key traffic.
-/// Telemetry hosts are deliberately not default-allowed.
+/// of a known API agent. Telemetry hosts are deliberately not default-allowed.
 pub(crate) fn default_egress_hosts(command: &[String]) -> Vec<&'static str> {
     let Some(name) = effective_name(command) else {
         return Vec::new();
     };
-    let Some(host) = api_host(name) else {
-        return Vec::new();
-    };
-    let mut hosts = vec![host];
-    if name == "codex" {
-        hosts.push("chatgpt.com");
-    }
-    hosts
+    api_hosts(name).to_vec()
 }
 
 /// The well-known API-key environment variable(s) a harness reads, so that a
@@ -813,5 +819,59 @@ mod tests {
             ),
             vec!["api.anthropic.com", "api.openai.com", "chatgpt.com"]
         );
+    }
+
+    #[test]
+    fn antigravity_default_egress_hosts_cover_functional_endpoints() {
+        let expected = vec![
+            "daily-cloudcode-pa.googleapis.com",
+            "cloudcode-pa.googleapis.com",
+            "aicode.googleapis.com",
+            "www.googleapis.com",
+            "oauth2.googleapis.com",
+        ];
+        for cmd in [
+            args(&["antigravity"]),
+            args(&["agy"]),
+            args(&["antigravity-cli"]),
+            args(&["ai-memory", "run", "agy"]),
+        ] {
+            let hosts = default_egress_hosts(&cmd);
+            assert_eq!(hosts, expected, "unexpected hosts for {cmd:?}");
+            assert!(!hosts.contains(&"play.googleapis.com"));
+            assert!(!hosts.contains(&"lh3.googleusercontent.com"));
+        }
+        assert_eq!(
+            default_egress_hosts_for(
+                &["antigravity".into()],
+                &["ai-memory".into()],
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn antigravity_uses_known_api_agent_policy() {
+        assert!(is_known_api_agent("antigravity"));
+        assert_eq!(
+            resolve_harnesses(&args(&["agy"]), &[]).unwrap(),
+            vec!["antigravity"]
+        );
+        assert!(
+            resolve_harnesses(&args(&["agy"]), &["claude".into()]).is_err()
+        );
+
+        let mut config = gap_config("agy", None, None);
+        let offline = capability_gap_warnings(&config);
+        assert_eq!(offline.len(), 1);
+        assert!(offline[0].contains("network is off"));
+
+        config.allow_hosts = vec!["github.com".into()];
+        let filtered = capability_gap_warnings(&config);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].contains("daily-cloudcode-pa.googleapis.com"));
+
+        config.allow_hosts = vec!["daily-cloudcode-pa.googleapis.com".into()];
+        assert!(capability_gap_warnings(&config).is_empty());
     }
 }

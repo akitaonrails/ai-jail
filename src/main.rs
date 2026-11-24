@@ -2874,7 +2874,16 @@ mod tests {
     fn default_agent_api_egress_follows_the_api_host_table() {
         // A bare launch of a known API agent with a canonical host applies,
         // on both platforms (macOS filtered egress is a seatbelt loopback).
-        for agent in ["claude", "codex", "gemini", "grok", "devin"] {
+        for agent in [
+            "claude",
+            "codex",
+            "gemini",
+            "antigravity",
+            "agy",
+            "antigravity-cli",
+            "grok",
+            "devin",
+        ] {
             assert!(
                 default_agent_api_egress_applies(&Config {
                     command: vec![agent.into()],

@@ -96,13 +96,15 @@ must durably verify its external destination before deleting the source.
     fixed list of package-registry hosts (`TOOLCHAIN_REGISTRY_HOSTS` in
     `sandbox/mod.rs`) so dependency fetches work out of the box. Linux-only.
   - Agent API egress (issue #156): when the invoked command is a known API
-    agent with a canonical host in `command::api_host`
-    (`command::default_egress_host` exposes it — claude/codex/gemini/grok/devin) and
+    agent with canonical hosts in `command::api_hosts`
+    (`command::default_egress_hosts` exposes them —
+    claude/codex/gemini/antigravity/grok/devin) and
     the posture is unset (no `--network`/`--no-network`, not `--lockdown`, not
-    a browser launch), ai-jail default-allows that one host so `ai-jail claude`
-    reaches its model API. Only the functional API host is added, never a
-    telemetry host, and it stays in lockstep with the capability-gap warning's
-    `api_host` table (the injection is exactly what silences that warning). Not
+    a browser launch), ai-jail default-allows those hosts so `ai-jail claude` or
+    `ai-jail agy` reaches its model API. Only the functional API hosts are
+    added, never telemetry hosts, and `onboarding::api_hosts` delegates to
+    `command::api_hosts` so CLI, onboarding, and the capability-gap warning
+    stay in lockstep. Not
     Linux-only: macOS filtered egress is a seatbelt loopback rule, so it
     applies there too.
 
