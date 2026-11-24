@@ -2537,9 +2537,10 @@ fn discover_mask_mounts(
     if !legacy_mask_mountable {
         // `prepare` could not create the mountpoint, which only happens when
         // the file is absent on a read-only filesystem. Keep the mask if the
-        // name nevertheless exists (a concurrent remount, for example).
+        // name nevertheless exists (including a dangling symlink or concurrent
+        // remount).
         let legacy = project_dir.join(".ai-jail");
-        let legacy_exists = legacy.exists();
+        let legacy_exists = legacy.symlink_metadata().is_ok();
         expanded.retain(|path| path != &legacy || legacy_exists);
     }
     build_mask_mounts(&expanded, project_dir, empty_path, verbose)
@@ -4621,6 +4622,34 @@ mod tests {
         let legacy = project.join(".ai-jail");
         std::fs::write(&legacy, "").unwrap();
         let empty = std::env::temp_dir().join("ai-jail-mask-empty-present");
+        let _ = std::fs::File::create(&empty).unwrap();
+
+        let mounts = discover_mask_mounts(
+            &minimal_test_config(),
+            &project,
+            &empty,
+            false,
+            false,
+        );
+
+        assert!(mounts.iter().any(|mount| matches!(
+            mount,
+            Mount::FileRoBind { dest, .. } if dest == &legacy
+        )));
+        let _ = std::fs::remove_dir_all(&project);
+        let _ = std::fs::remove_file(&empty);
+    }
+
+    #[test]
+    fn discover_mask_mounts_keeps_dangling_legacy_symlink_without_mountpoint() {
+        let project = std::env::temp_dir()
+            .join(format!("ai-jail-mask-dangling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        let legacy = project.join(".ai-jail");
+        std::os::unix::fs::symlink(project.join("nonexistent-target"), &legacy)
+            .unwrap();
+        let empty = std::env::temp_dir().join("ai-jail-mask-empty-dangling");
         let _ = std::fs::File::create(&empty).unwrap();
 
         let mounts = discover_mask_mounts(
