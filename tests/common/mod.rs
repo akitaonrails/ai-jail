@@ -177,7 +177,9 @@ pub fn curl(port: u16) -> String {
 pub fn run_in(dir: Option<&Path>, flags: &[&str], script: &str) -> Output {
     static NEXT_RUN: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
-    let _lock = SANDBOX_RUN_LOCK.lock().unwrap();
+    let _lock = SANDBOX_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let run_id = NEXT_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temp_base = std::env::temp_dir()
         .canonicalize()
