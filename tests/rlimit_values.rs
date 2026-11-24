@@ -334,6 +334,7 @@ fn lockdown_clamps_a_limit_above_its_default_and_keeps_one_below() {
 #[test]
 fn lockdown_clamp_under_a_lower_host_limit_warns_once() {
     require_bwrap_net!();
+    require_lockdown_tools!("bash");
     let tree = Tree::new("lockdown-host");
     let _lock = common::SANDBOX_RUN_LOCK
         .lock()
