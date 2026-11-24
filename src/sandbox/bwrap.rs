@@ -1547,14 +1547,20 @@ pub fn build(
     config: &Config,
     project_dir: &Path,
     verbose: bool,
+    legacy_mask_mountable: bool,
     proxy_socket: Option<&Path>,
     bridge_sockets: &super::BridgeSockets,
     teardown_report_fd: Option<std::os::fd::RawFd>,
     ecryptfs_lower_fds: &mut Vec<std::os::fd::OwnedFd>,
 ) -> Result<Command, String> {
     let sources = MountSources::from_guard(guard);
-    let mount_set =
-        discover_mounts_full(config, project_dir, &sources, verbose)?;
+    let mount_set = discover_mounts_full(
+        config,
+        project_dir,
+        &sources,
+        verbose,
+        legacy_mask_mountable,
+    )?;
     let map_args = mounted_map_args(mount_set.landlock_map_mounts());
     let lockdown = config.lockdown_enabled();
     let bwrap = bwrap_binary_path()?;
@@ -2069,7 +2075,7 @@ fn build_dry_run_args_forwarded(
     teardown_report: bool,
 ) -> Result<Vec<String>, String> {
     let mount_set =
-        discover_mounts_full(config, project_dir, sources, verbose)?;
+        discover_mounts_full(config, project_dir, sources, verbose, true)?;
     let map_args = mounted_map_args(mount_set.landlock_map_mounts());
     let lockdown = config.lockdown_enabled();
     let launch = super::build_launch_command(config);
@@ -2208,6 +2214,7 @@ fn discover_mounts_full(
     project_dir: &Path,
     sources: &MountSources<'_>,
     verbose: bool,
+    legacy_mask_mountable: bool,
 ) -> Result<MountSet, String> {
     let lockdown = config.lockdown_enabled();
     let browser_profile = config.browser_profile();
@@ -2271,8 +2278,13 @@ fn discover_mounts_full(
     } else {
         vec![]
     };
-    let mask_mounts =
-        discover_mask_mounts(config, project_dir, sources.empty_path, verbose);
+    let mask_mounts = discover_mask_mounts(
+        config,
+        project_dir,
+        sources.empty_path,
+        verbose,
+        legacy_mask_mountable,
+    );
     let deny_mounts = discover_deny_mounts(
         config,
         project_dir,
@@ -2519,8 +2531,17 @@ fn discover_mask_mounts(
     project_dir: &Path,
     empty_path: &Path,
     verbose: bool,
+    legacy_mask_mountable: bool,
 ) -> Vec<Mount> {
-    let expanded = super::effective_mask_patterns(config, project_dir);
+    let mut expanded = super::effective_mask_patterns(config, project_dir);
+    if !legacy_mask_mountable {
+        // `prepare` could not create the mountpoint, which only happens when
+        // the file is absent on a read-only filesystem. Keep the mask if the
+        // name nevertheless exists (a concurrent remount, for example).
+        let legacy = project_dir.join(".ai-jail");
+        let legacy_exists = legacy.exists();
+        expanded.retain(|path| path != &legacy || legacy_exists);
+    }
     build_mask_mounts(&expanded, project_dir, empty_path, verbose)
 }
 
@@ -4562,6 +4583,59 @@ mod tests {
         );
 
         assert!(mounts.is_empty());
+        let _ = std::fs::remove_file(&empty);
+    }
+
+    #[test]
+    fn discover_mask_mounts_skips_absent_legacy_name_without_mountpoint() {
+        let project = std::env::temp_dir()
+            .join(format!("ai-jail-mask-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        let empty = std::env::temp_dir().join("ai-jail-mask-empty-absent");
+        let _ = std::fs::File::create(&empty).unwrap();
+
+        let mounts = discover_mask_mounts(
+            &minimal_test_config(),
+            &project,
+            &empty,
+            false,
+            false,
+        );
+
+        let legacy = project.join(".ai-jail");
+        assert!(!mounts.iter().any(|mount| matches!(
+            mount,
+            Mount::FileRoBind { dest, .. } if dest == &legacy
+        )));
+        let _ = std::fs::remove_dir_all(&project);
+        let _ = std::fs::remove_file(&empty);
+    }
+
+    #[test]
+    fn discover_mask_mounts_keeps_present_legacy_name_without_mountpoint() {
+        let project = std::env::temp_dir()
+            .join(format!("ai-jail-mask-present-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        let legacy = project.join(".ai-jail");
+        std::fs::write(&legacy, "").unwrap();
+        let empty = std::env::temp_dir().join("ai-jail-mask-empty-present");
+        let _ = std::fs::File::create(&empty).unwrap();
+
+        let mounts = discover_mask_mounts(
+            &minimal_test_config(),
+            &project,
+            &empty,
+            false,
+            false,
+        );
+
+        assert!(mounts.iter().any(|mount| matches!(
+            mount,
+            Mount::FileRoBind { dest, .. } if dest == &legacy
+        )));
+        let _ = std::fs::remove_dir_all(&project);
         let _ = std::fs::remove_file(&empty);
     }
 
@@ -7555,6 +7629,7 @@ mod tests {
             &config,
             &project,
             false,
+            true,
             None,
             &crate::sandbox::BridgeSockets::default(),
             None,
@@ -7774,6 +7849,7 @@ mod tests {
                 &config,
                 &project,
                 false,
+                true,
                 None,
                 &crate::sandbox::BridgeSockets::default(),
                 fd,

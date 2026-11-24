@@ -1957,6 +1957,7 @@ pub fn build(
     config: &Config,
     project_dir: &Path,
     verbose: bool,
+    legacy_mask_mountable: bool,
     sandbox_tty: Option<&Path>,
     proxy: Option<&crate::proxy::Proxy>,
     bridge_sockets: &BridgeSockets,
@@ -1973,6 +1974,7 @@ pub fn build(
             config,
             project_dir,
             verbose,
+            legacy_mask_mountable,
             proxy.and_then(|p| p.unix_path()),
             bridge_sockets,
             teardown_report_fd,
@@ -1983,6 +1985,7 @@ pub fn build(
     {
         // No teardown report on macOS.
         let _ = (guard, bridge_sockets, teardown_report_fd);
+        let _ = legacy_mask_mountable;
         let prepared = prepare_seatbelt_config(config)?;
         seatbelt::build(
             &prepared,
