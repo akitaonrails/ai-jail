@@ -51,7 +51,17 @@ pub(crate) struct ManagedHarness<'a> {
 impl<'a> ManagedHarness<'a> {
     /// Executable ai-memory will resolve for the selected harness.
     pub(crate) fn executable(self) -> &'a str {
-        self.executable.unwrap_or(self.name)
+        self.executable
+            .unwrap_or_else(|| default_executable(self.name))
+    }
+}
+
+/// Default binary name `ai-memory run` resolves on `PATH` for a canonical
+/// harness when `--executable` is not supplied.
+fn default_executable(canonical_name: &str) -> &str {
+    match canonical_name {
+        "antigravity" => "agy",
+        other => other,
     }
 }
 
@@ -873,5 +883,43 @@ mod tests {
 
         config.allow_hosts = vec!["daily-cloudcode-pa.googleapis.com".into()];
         assert!(capability_gap_warnings(&config).is_empty());
+    }
+
+    #[test]
+    fn managed_antigravity_resolves_agy_executable_candidate() {
+        for command in [
+            args(&["ai-memory", "run", "agy"]),
+            args(&["ai-memory", "run", "antigravity"]),
+            args(&["ai-memory", "run", "antigravity-cli"]),
+            args(&["ai-memory", "run", "--yolo", "--jail", "agy"]),
+        ] {
+            let harness = managed_harness(&command).unwrap();
+            assert_eq!(harness.name, "antigravity");
+            assert_eq!(harness.executable(), "agy");
+            assert_eq!(
+                executable_candidates(&command),
+                vec!["ai-memory", "agy"],
+                "expected agy candidate for {command:?}"
+            );
+            assert_eq!(
+                resolve_harnesses(&command, &["antigravity".into()]).unwrap(),
+                vec!["antigravity"]
+            );
+            assert!(resolve_harnesses(&command, &["claude".into()]).is_err());
+        }
+
+        let explicit = args(&[
+            "ai-memory",
+            "run",
+            "--executable=/home/u/bin/custom-agy",
+            "antigravity",
+        ]);
+        let harness = managed_harness(&explicit).unwrap();
+        assert_eq!(harness.name, "antigravity");
+        assert_eq!(harness.executable(), "/home/u/bin/custom-agy");
+        assert_eq!(
+            executable_candidates(&explicit),
+            vec!["ai-memory", "/home/u/bin/custom-agy"]
+        );
     }
 }
