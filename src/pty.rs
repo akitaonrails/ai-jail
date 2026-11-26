@@ -1399,7 +1399,13 @@ impl TerminalFilter {
                 // `b` stands on its own.
                 out.push(0xc2);
                 self.utf8_remaining = 0;
-            } else if matches!(self.state, FilterState::Ground) && b == 0xc2 {
+            }
+            if matches!(self.state, FilterState::Esc) && b == 0xc2 {
+                out.extend_from_slice(&self.pending);
+                self.pending.clear();
+                self.state = FilterState::Ground;
+            }
+            if matches!(self.state, FilterState::Ground) && b == 0xc2 {
                 self.c1_lead = true;
                 self.utf8_remaining = 1;
                 continue;
@@ -2453,6 +2459,35 @@ mod tests {
         let mut filter = super::TerminalFilter::new();
         assert!(filter.feed(b"\xc2").is_empty());
         assert_eq!(filter.feed(b"x"), b"\xc2x");
+    }
+
+    #[test]
+    fn utf8_encoded_c1_after_lone_lead_or_esc_is_dropped() {
+        // Consecutive 0xc2 lead bytes: the second lead must be held rather
+        // than treated as plain character data.
+        let mut filter = super::TerminalFilter::new();
+        assert_eq!(filter.feed(b"\xc2\xc2\x9b6n"), b"\xc26n");
+
+        // Same sequence split byte-by-byte across reads.
+        let mut filter = super::TerminalFilter::new();
+        let mut out = Vec::new();
+        for &byte in b"\xc2\xc2\x9b6n" {
+            out.extend_from_slice(&filter.feed(&[byte]));
+        }
+        assert_eq!(out, b"\xc26n");
+
+        // Runs of lone 0xc2 leads: drop only a trailing encoded C1, keep
+        // legitimate non-C1 continuations (e.g. U+00A0).
+        let mut filter = super::TerminalFilter::new();
+        assert_eq!(filter.feed(b"\xc2\xc2\xc2\x9d"), b"\xc2\xc2");
+        let mut filter = super::TerminalFilter::new();
+        assert_eq!(filter.feed(b"\xc2\xc2\xc2\xa0"), b"\xc2\xc2\xc2\xa0");
+
+        // A lone ESC before 0xc2 returns to Ground and must still hold 0xc2.
+        let mut filter = super::TerminalFilter::new();
+        assert_eq!(filter.feed(b"\x1b\xc2\x9b6n"), b"\x1b6n");
+        let mut filter = super::TerminalFilter::new();
+        assert_eq!(filter.feed(b"\x1b\xc2\xa0"), b"\x1b\xc2\xa0");
     }
 
     /// Run child-output chunks through the real IO-loop rendering path.
