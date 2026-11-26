@@ -356,8 +356,9 @@ pub fn parse() -> Result<CliArgs, String> {
 }
 
 /// Split the argument vector on the first `--` so everything after it is the
-/// command and its arguments, verbatim: never scanned for sandbox flags, and
-/// the `--` separator itself is not forwarded to the child. Options — and a
+/// command and its arguments, verbatim: never scanned for sandbox flags. A
+/// `--` before the command is consumed; one after a bare command belongs to
+/// that command and is forwarded (`ai-jail grep -- -v`). Options — and a
 /// command given *without* `--` — before the separator are parsed normally,
 /// including the ambiguity guard that rejects a sandbox flag after a bare
 /// command. This is what lets `ai-jail <opts> -- <cmd> --flag` forward `--flag`
@@ -373,10 +374,15 @@ pub(crate) fn parse_argv(
             let (opts, rest) = argv.split_at(sep);
             let mut args =
                 parse_from(lexopt::Parser::from_args(opts.iter().cloned()))?;
-            // rest[0] is the "--" separator; skip it, take the command as-is.
+            // A `--` that follows a bare command belongs to that command
+            // (`ai-jail grep -- -v`, `ai-jail git checkout -- file`), so it
+            // is forwarded. Only a `--` before the command terminates
+            // ai-jail's own options and is consumed.
+            let before_command =
+                args.command.is_empty() || args.configure.is_some();
             args.command.extend(
                 rest.iter()
-                    .skip(1)
+                    .skip(usize::from(before_command))
                     .map(|a| a.to_string_lossy().into_owned()),
             );
             Ok(args)
@@ -2141,6 +2147,35 @@ mod tests {
     }
 
     #[test]
+    fn separator_after_bare_command_is_forwarded_to_the_child() {
+        // `grep -- -v pattern` must not become `grep -v pattern`, which
+        // inverts the match; the same holds for `rm -- -f` and
+        // `git checkout -- path`.
+        let args = parse_test(&["grep", "--", "-v", "pattern"]).unwrap();
+        assert_eq!(args.command, ["grep", "--", "-v", "pattern"]);
+        let args = parse_test(&["rm", "--", "-f"]).unwrap();
+        assert_eq!(args.command, ["rm", "--", "-f"]);
+        let args =
+            parse_test(&["git", "checkout", "--", "src/main.rs"]).unwrap();
+        assert_eq!(args.command, ["git", "checkout", "--", "src/main.rs"]);
+        // Only the first `--` after the command is the child's; later
+        // ones are ordinary child arguments either way.
+        let args = parse_test(&["sh", "--", "-c", "--"]).unwrap();
+        assert_eq!(args.command, ["sh", "--", "-c", "--"]);
+
+        // A leading `--` is still ai-jail's option terminator.
+        let args = parse_test(&["--network", "--", "grep", "-v"]).unwrap();
+        assert_eq!(args.network, Some(true));
+        assert_eq!(args.command, ["grep", "-v"]);
+        let args = parse_test(&["--", "grep", "--", "-v"]).unwrap();
+        assert_eq!(args.command, ["grep", "--", "-v"]);
+
+        // Sandbox flags between the command and `--` are still refused.
+        let err = parse_test(&["grep", "--network", "--", "x"]).unwrap_err();
+        assert!(err.contains("after command"), "{err}");
+    }
+
+    #[test]
     fn sandbox_flag_after_bare_command_without_separator_still_errors() {
         // The ambiguous no-`--` case must keep erroring.
         let err = parse_test(&["claude", "--network"]).unwrap_err();
@@ -3012,13 +3047,11 @@ mod tests {
             assert!(!args.audit_show);
         }
         // `--audit-show` as or after a command positional is a child concern,
-        // never the ai-jail action. The first `--` is the option terminator:
-        // consumed, not forwarded to the child (so all three yield the same
-        // command).
+        // never the ai-jail action. A `--` before the command is the option
+        // terminator and is consumed; one after the command is the child's.
         for argv in [
             vec!["command", "--audit-show"],
             vec!["--", "command", "--audit-show"],
-            vec!["command", "--", "--audit-show"],
         ] {
             let args = parse_test(&argv).unwrap();
             assert_eq!(
@@ -3028,6 +3061,9 @@ mod tests {
             );
             assert!(!args.audit_show);
         }
+        let args = parse_test(&["command", "--", "--audit-show"]).unwrap();
+        assert_eq!(args.command, ["command", "--", "--audit-show"]);
+        assert!(!args.audit_show);
     }
 
     #[test]
